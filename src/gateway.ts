@@ -157,15 +157,6 @@ export class DiscordGateway {
   }
 
   public handlePayload(payload: GatewayPayload): void {
-    if (typeof payload.s === "number") {
-      const current = this.options.store.gatewayState();
-      this.options.store.saveGatewayState({
-        sessionId: current.sessionId,
-        sequence: payload.s,
-        resumeGatewayUrl: current.resumeGatewayUrl,
-      });
-      this.statusValue.lastSequence = payload.s;
-    }
     switch (payload.op) {
       case 0:
         this.handleDispatch(payload);
@@ -197,6 +188,15 @@ export class DiscordGateway {
         break;
       default:
         break;
+    }
+    if (typeof payload.s === "number") {
+      const current = this.options.store.gatewayState();
+      this.options.store.saveGatewayState({
+        sessionId: current.sessionId,
+        sequence: payload.s,
+        resumeGatewayUrl: current.resumeGatewayUrl,
+      });
+      this.statusValue.lastSequence = payload.s;
     }
   }
 

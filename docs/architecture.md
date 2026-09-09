@@ -3,10 +3,12 @@
 ## Composition boundaries
 
 `DiscordGateway` owns Discord protocol state and persists the latest sequence,
-session ID, and resume URL in SQLite before dispatching messages. On a fresh
-connection it identifies; after restart it resumes when Discord has supplied a
-resumable session. Invalid non-resumable sessions clear the session ID and
-identify on the next connection.
+session ID, and resume URL in SQLite. A message dispatch is synchronously
+enqueued before its sequence advances, so a persistence failure leaves the
+older cursor available for replay. On a fresh connection the client identifies;
+after restart it resumes when Discord has supplied a resumable session. Invalid
+non-resumable sessions clear the session ID and identify on the next
+connection.
 
 `EarService` is the ingestion composition boundary. It snapshots the current
 validated policy, classifies a message, records suppression counters, and calls

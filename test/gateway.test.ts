@@ -221,6 +221,7 @@ test("Gateway replay flows through service and remains idempotent", () => {
     onMessage: (event) => service.ingest(event),
     socketFactory: () => new FakeSocket(),
   });
+
   service = new EarService({
     store,
     policy: () => policy,
@@ -236,6 +237,41 @@ test("Gateway replay flows through service and remains idempotent", () => {
     gateway.handlePayload({ op: 0, t: "MESSAGE_CREATE", s: 12, d: event });
     assert.equal(store.listEvents().length, 1);
     assert.equal(store.counters().duplicates, 1);
+  } finally {
+    gateway.stop();
+    store.close();
+  }
+});
+
+test("failed event persistence does not advance the durable Gateway sequence", () => {
+  const store = new EventStore(":memory:", new FakeClock(1_000));
+  store.saveGatewayState({
+    sessionId: "session",
+    sequence: 20,
+    resumeGatewayUrl: "wss://resume.example",
+  });
+  const gateway = new DiscordGateway({
+    token: "fixture-token",
+    gatewayUrl: "wss://gateway.example",
+    store,
+    logger: new StructuredLogger(() => undefined, ["fixture-token"]),
+    onMessage: () => {
+      throw new Error("simulated persistence failure");
+    },
+    socketFactory: () => new FakeSocket(),
+  });
+  try {
+    assert.throws(
+      () =>
+        gateway.handlePayload({
+          op: 0,
+          t: "MESSAGE_CREATE",
+          s: 21,
+          d: message("not-persisted"),
+        }),
+      /simulated persistence failure/u,
+    );
+    assert.equal(store.gatewayState().sequence, 20);
   } finally {
     gateway.stop();
     store.close();
