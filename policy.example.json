@@ -1,0 +1,18 @@
+{
+  "allowedGuildIds": ["REPLACE_WITH_GUILD_ID"],
+  "allowedChannelIds": ["REPLACE_WITH_CHANNEL_ID"],
+  "priorityAuthorIds": ["REPLACE_WITH_FIGS_AUTHOR_ID"],
+  "ignoredAuthorIds": [],
+  "ignoredPatterns": ["^routine heartbeat$"],
+  "ignoredEventClasses": [],
+  "botUserId": "REPLACE_WITH_BOT_USER_ID",
+  "quietWindowMs": 5000,
+  "maxSummaryChars": 4000,
+  "maxQueueCount": 1000,
+  "maxQueueWeight": 2000000,
+  "maxMessageChars": 4000,
+  "retentionMs": 604800000,
+  "maxDeliveryAttempts": 5,
+  "gatewayEnabled": true,
+  "wakeDeliveryPaused": false
+}

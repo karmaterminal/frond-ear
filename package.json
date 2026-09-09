@@ -1,0 +1,25 @@
+{
+  "name": "frond-ear",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "pnpm format:check && pnpm typecheck && pnpm test && pnpm scan:credentials",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "start": "node dist/main.js",
+    "cli": "node dist/cli.js",
+    "test": "node --experimental-strip-types --test --test-concurrency=1 test/*.test.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "scan:credentials": "node scripts/scan-credentials.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.0",
+    "prettier": "3.6.2",
+    "typescript": "5.9.3"
+  }
+}

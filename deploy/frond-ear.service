@@ -1,0 +1,22 @@
+[Unit]
+Description=Durable Discord Gateway ear for frond-scribe
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=frond-ear
+Group=frond-ear
+WorkingDirectory=/opt/frond-ear
+EnvironmentFile=/etc/frond-ear/runtime.env
+ExecStart=/usr/bin/node /opt/frond-ear/dist/main.js
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/frond-ear
+
+[Install]
+WantedBy=multi-user.target
