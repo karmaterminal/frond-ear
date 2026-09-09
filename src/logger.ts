@@ -1,4 +1,5 @@
-const SENSITIVE_KEY = /(token|secret|authorization|content|payload|body)/iu;
+const SENSITIVE_KEY =
+  /(token|secret|authorization|content|payload|body|error)/iu;
 
 function redact(value: unknown, secrets: readonly string[]): unknown {
   if (typeof value === "string") {
@@ -26,11 +27,16 @@ function redact(value: unknown, secrets: readonly string[]): unknown {
 
 export class StructuredLogger {
   public constructor(
-    private readonly sink: (line: string) => void = (line) => process.stdout.write(`${line}\n`),
+    private readonly sink: (line: string) => void = (line) =>
+      process.stdout.write(`${line}\n`),
     private readonly secrets: readonly string[] = [],
   ) {}
 
-  public log(level: "debug" | "info" | "warn" | "error", event: string, fields = {}): void {
+  public log(
+    level: "debug" | "info" | "warn" | "error",
+    event: string,
+    fields = {},
+  ): void {
     this.sink(
       JSON.stringify(
         redact(

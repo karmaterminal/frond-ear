@@ -9,6 +9,7 @@ export const defaultPolicy: Policy = {
   ignoredEventClasses: [],
   botUserId: "",
   quietWindowMs: 5_000,
+  maxCoalesceWindowMs: 60_000,
   maxSummaryChars: 4_000,
   maxQueueCount: 1_000,
   maxQueueWeight: 2_000_000,
@@ -37,7 +38,10 @@ export function validatePolicy(candidate: unknown): Policy {
   ];
   for (const key of stringArrays) {
     const value = merged[key];
-    if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
+    if (
+      !Array.isArray(value) ||
+      value.some((item) => typeof item !== "string")
+    ) {
       throw new Error(`${key} must be an array of strings`);
     }
   }
@@ -45,13 +49,19 @@ export function validatePolicy(candidate: unknown): Policy {
     !Array.isArray(merged.ignoredEventClasses) ||
     merged.ignoredEventClasses.some((item) => !isNonNegativeInteger(item))
   ) {
-    throw new Error("ignoredEventClasses must be an array of non-negative integers");
+    throw new Error(
+      "ignoredEventClasses must be an array of non-negative integers",
+    );
   }
-  if (typeof merged.botUserId !== "string") {
-    throw new Error("botUserId must be a string");
+  if (
+    typeof merged.botUserId !== "string" ||
+    merged.botUserId.trim().length === 0
+  ) {
+    throw new Error("botUserId must be a non-empty string");
   }
   const positiveIntegers: Array<keyof Policy> = [
     "maxSummaryChars",
+    "maxCoalesceWindowMs",
     "maxQueueCount",
     "maxQueueWeight",
     "maxMessageChars",
@@ -60,12 +70,19 @@ export function validatePolicy(candidate: unknown): Policy {
   ];
   for (const key of positiveIntegers) {
     const value = merged[key];
-    if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
+    if (
+      typeof value !== "number" ||
+      !Number.isSafeInteger(value) ||
+      value <= 0
+    ) {
       throw new Error(`${key} must be a positive integer`);
     }
   }
   if (!isNonNegativeInteger(merged.quietWindowMs)) {
     throw new Error("quietWindowMs must be a non-negative integer");
+  }
+  if (merged.maxCoalesceWindowMs < merged.quietWindowMs) {
+    throw new Error("maxCoalesceWindowMs must be at least quietWindowMs");
   }
   if (
     typeof merged.gatewayEnabled !== "boolean" ||
@@ -83,36 +100,67 @@ export function validatePolicy(candidate: unknown): Policy {
   return structuredClone(merged);
 }
 
-export function classifyMessage(message: DiscordMessage, policy: Policy): Classification {
+export function classifyMessage(
+  message: DiscordMessage,
+  policy: Policy,
+): Classification {
   if (!policy.gatewayEnabled) {
-    return { accepted: false, priority: false, reason: "gateway_disabled", weight: 0 };
+    return {
+      accepted: false,
+      priority: false,
+      reason: "gateway_disabled",
+      weight: 0,
+    };
   }
   if (!message.guild_id || !policy.allowedGuildIds.includes(message.guild_id)) {
-    return { accepted: false, priority: false, reason: "guild_not_allowed", weight: 0 };
+    return {
+      accepted: false,
+      priority: false,
+      reason: "guild_not_allowed",
+      weight: 0,
+    };
   }
   if (!policy.allowedChannelIds.includes(message.channel_id)) {
-    return { accepted: false, priority: false, reason: "channel_not_allowed", weight: 0 };
+    return {
+      accepted: false,
+      priority: false,
+      reason: "channel_not_allowed",
+      weight: 0,
+    };
   }
   if (
     message.author.id === policy.botUserId ||
     (message.author.bot === true && message.author.id === policy.botUserId)
   ) {
-    return { accepted: false, priority: false, reason: "self_message", weight: 0 };
+    return {
+      accepted: false,
+      priority: false,
+      reason: "self_message",
+      weight: 0,
+    };
   }
 
   const priority =
     policy.priorityAuthorIds.includes(message.author.id) ||
-    message.mentions?.some((mention) => mention.id === policy.botUserId) === true;
+    message.mentions?.some((mention) => mention.id === policy.botUserId) ===
+      true;
   const eventClass = message.type ?? 0;
   if (!priority && policy.ignoredEventClasses.includes(eventClass)) {
-    return { accepted: false, priority, reason: "ignored_event_class", weight: 0 };
+    return {
+      accepted: false,
+      priority,
+      reason: "ignored_event_class",
+      weight: 0,
+    };
   }
   if (!priority && policy.ignoredAuthorIds.includes(message.author.id)) {
     return { accepted: false, priority, reason: "ignored_author", weight: 0 };
   }
   if (
     !priority &&
-    policy.ignoredPatterns.some((pattern) => new RegExp(pattern, "iu").test(message.content))
+    policy.ignoredPatterns.some((pattern) =>
+      new RegExp(pattern, "iu").test(message.content),
+    )
   ) {
     return { accepted: false, priority, reason: "ignored_pattern", weight: 0 };
   }

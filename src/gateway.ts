@@ -5,11 +5,18 @@ import type { StructuredLogger } from "./logger.js";
 const GATEWAY_VERSION = 10;
 const MESSAGE_CONTENT_INTENT = 1 << 15;
 const GUILD_MESSAGES_INTENT = 1 << 9;
+const FATAL_CLOSE_CODES = new Set([4_004, 4_010, 4_011, 4_012, 4_013, 4_014]);
 
 export interface GatewaySocket {
   addEventListener(type: "open", listener: () => void): void;
-  addEventListener(type: "message", listener: (event: { data: string }) => void): void;
-  addEventListener(type: "close", listener: () => void): void;
+  addEventListener(
+    type: "message",
+    listener: (event: { data: string }) => void,
+  ): void;
+  addEventListener(
+    type: "close",
+    listener: (event: { code: number; reason?: string }) => void,
+  ): void;
   addEventListener(type: "error", listener: (event: unknown) => void): void;
   send(data: string): void;
   close(code?: number): void;
@@ -18,10 +25,17 @@ export interface GatewaySocket {
 export type GatewaySocketFactory = (url: string) => GatewaySocket;
 
 export interface GatewayStatus {
-  state: "stopped" | "connecting" | "connected" | "resuming" | "backoff";
+  state:
+    | "stopped"
+    | "connecting"
+    | "connected"
+    | "resuming"
+    | "backoff"
+    | "failed";
   lastSequence: number | null;
   lastEventTime: number | null;
   sessionId: string | null;
+  lastError: string | null;
 }
 
 export class DiscordGateway {
@@ -29,11 +43,15 @@ export class DiscordGateway {
   private heartbeatTimer: NodeJS.Timeout | undefined;
   private reconnectTimer: NodeJS.Timeout | undefined;
   private stopped = true;
+  private generation = 0;
+  private reconnectAttempt = 0;
+  private awaitingHeartbeatAck = false;
   private statusValue: GatewayStatus = {
     state: "stopped",
     lastSequence: null,
     lastEventTime: null,
     sessionId: null,
+    lastError: null,
   };
 
   public constructor(
@@ -64,6 +82,7 @@ export class DiscordGateway {
 
   public stop(): void {
     this.stopped = true;
+    this.generation += 1;
     this.statusValue.state = "stopped";
     this.clearTimers();
     this.socket?.close(1_000);
@@ -74,6 +93,9 @@ export class DiscordGateway {
     if (this.stopped) {
       return;
     }
+    this.clearHeartbeat();
+    this.awaitingHeartbeatAck = false;
+    const generation = ++this.generation;
     const persisted = this.options.store.gatewayState();
     const baseUrl = persisted.resumeGatewayUrl ?? this.options.gatewayUrl;
     const url = `${baseUrl.replace(/\/+$/u, "")}/?v=${GATEWAY_VERSION}&encoding=json`;
@@ -82,6 +104,7 @@ export class DiscordGateway {
       state: persisted.sessionId ? "resuming" : "connecting",
       lastSequence: persisted.sequence,
       sessionId: persisted.sessionId,
+      lastError: null,
     };
     const factory =
       this.options.socketFactory ??
@@ -89,13 +112,33 @@ export class DiscordGateway {
     const socket = factory(url);
     this.socket = socket;
     socket.addEventListener("message", (event) => {
+      if (generation !== this.generation || socket !== this.socket) {
+        return;
+      }
       this.handleRawPayload(event.data);
     });
-    socket.addEventListener("close", () => {
+    socket.addEventListener("close", (event) => {
+      if (generation !== this.generation || socket !== this.socket) {
+        return;
+      }
+      this.socket = undefined;
       this.clearHeartbeat();
+      this.awaitingHeartbeatAck = false;
+      if (FATAL_CLOSE_CODES.has(event.code)) {
+        this.stopped = true;
+        this.statusValue.state = "failed";
+        this.statusValue.lastError = `gateway_closed_${event.code}`;
+        this.options.logger.log("error", "gateway.fatal_close", {
+          closeCode: event.code,
+        });
+        return;
+      }
       this.scheduleReconnect();
     });
     socket.addEventListener("error", () => {
+      if (generation !== this.generation || socket !== this.socket) {
+        return;
+      }
       this.options.logger.log("warn", "gateway.socket_error", {
         state: this.statusValue.state,
       });
@@ -128,7 +171,7 @@ export class DiscordGateway {
         this.handleDispatch(payload);
         break;
       case 1:
-        this.sendHeartbeat();
+        this.sendHeartbeat(false);
         break;
       case 7:
         this.reconnectNow();
@@ -137,13 +180,20 @@ export class DiscordGateway {
         if (payload.d === false) {
           this.options.store.clearGatewaySession();
         }
-        this.reconnectNow();
+        this.reconnectNow(
+          1_000 +
+            Math.floor((this.options.random?.() ?? Math.random()) * 4_000),
+        );
         break;
       case 10:
         this.handleHello(payload.d);
         break;
       case 11:
-        this.options.store.setRuntimeState("last_gateway_heartbeat_ack", String(Date.now()));
+        this.awaitingHeartbeatAck = false;
+        this.options.store.setRuntimeState(
+          "last_gateway_heartbeat_ack",
+          String(Date.now()),
+        );
         break;
       default:
         break;
@@ -161,12 +211,20 @@ export class DiscordGateway {
       this.reconnectNow();
       return;
     }
+    const heartbeatInterval = data.heartbeat_interval;
+    this.clearHeartbeat();
+    this.awaitingHeartbeatAck = false;
     this.statusValue.state = "connected";
     const jitter = this.options.random?.() ?? Math.random();
-    this.heartbeatTimer = (this.options.setTimeout ?? globalThis.setTimeout)(() => {
-      this.sendHeartbeat();
-      this.startHeartbeatLoop(data.heartbeat_interval);
-    }, Math.floor(data.heartbeat_interval * jitter));
+    this.heartbeatTimer = (this.options.setTimeout ?? globalThis.setTimeout)(
+      () => {
+        if (!this.sendHeartbeat(true)) {
+          return;
+        }
+        this.startHeartbeatLoop(heartbeatInterval);
+      },
+      Math.floor(heartbeatInterval * jitter),
+    );
     const state = this.options.store.gatewayState();
     if (state.sessionId && state.sequence !== null) {
       this.send({
@@ -194,14 +252,27 @@ export class DiscordGateway {
   }
 
   private startHeartbeatLoop(interval: number): void {
-    this.heartbeatTimer = (this.options.setTimeout ?? globalThis.setTimeout)(() => {
-      this.sendHeartbeat();
-      this.startHeartbeatLoop(interval);
-    }, interval);
+    this.heartbeatTimer = (this.options.setTimeout ?? globalThis.setTimeout)(
+      () => {
+        if (!this.sendHeartbeat(true)) {
+          return;
+        }
+        this.startHeartbeatLoop(interval);
+      },
+      interval,
+    );
   }
 
-  private sendHeartbeat(): void {
+  private sendHeartbeat(checkAck: boolean): boolean {
+    if (checkAck && this.awaitingHeartbeatAck) {
+      this.statusValue.lastError = "gateway_heartbeat_ack_timeout";
+      this.options.logger.log("warn", "gateway.heartbeat_ack_timeout");
+      this.reconnectNow();
+      return false;
+    }
     this.send({ op: 1, d: this.options.store.gatewayState().sequence });
+    this.awaitingHeartbeatAck = true;
+    return true;
   }
 
   private handleDispatch(payload: GatewayPayload): void {
@@ -211,18 +282,25 @@ export class DiscordGateway {
         session_id?: unknown;
         resume_gateway_url?: unknown;
       };
-      if (typeof ready.session_id === "string" && typeof ready.resume_gateway_url === "string") {
+      if (
+        typeof ready.session_id === "string" &&
+        typeof ready.resume_gateway_url === "string"
+      ) {
         this.options.store.saveGatewayState({
           sessionId: ready.session_id,
           sequence: typeof payload.s === "number" ? payload.s : null,
           resumeGatewayUrl: ready.resume_gateway_url,
         });
         this.statusValue.sessionId = ready.session_id;
+        this.reconnectAttempt = 0;
+        this.statusValue.lastError = null;
       }
       return;
     }
     if (payload.t === "RESUMED") {
       this.statusValue.state = "connected";
+      this.reconnectAttempt = 0;
+      this.statusValue.lastError = null;
       return;
     }
     if (payload.t === "MESSAGE_CREATE") {
@@ -234,27 +312,39 @@ export class DiscordGateway {
     this.socket?.send(JSON.stringify(payload));
   }
 
-  private reconnectNow(): void {
+  private reconnectNow(delayMs = 0): void {
     this.clearHeartbeat();
-    this.socket?.close(4_000);
+    this.awaitingHeartbeatAck = false;
+    const socket = this.socket;
     this.socket = undefined;
-    this.scheduleReconnect(0);
+    this.generation += 1;
+    socket?.close(4_000);
+    this.scheduleReconnect(delayMs);
   }
 
-  private scheduleReconnect(delayMs = 1_000): void {
+  private scheduleReconnect(delayMs?: number): void {
     if (this.stopped || this.reconnectTimer) {
       return;
     }
     this.statusValue.state = "backoff";
-    this.reconnectTimer = (this.options.setTimeout ?? globalThis.setTimeout)(() => {
-      this.reconnectTimer = undefined;
-      this.connect();
-    }, delayMs);
+    const backoff =
+      delayMs ??
+      Math.min(30_000, 1_000 * 2 ** Math.min(this.reconnectAttempt++, 5)) +
+        Math.floor((this.options.random?.() ?? Math.random()) * 1_000);
+    this.reconnectTimer = (this.options.setTimeout ?? globalThis.setTimeout)(
+      () => {
+        this.reconnectTimer = undefined;
+        this.connect();
+      },
+      backoff,
+    );
   }
 
   private clearHeartbeat(): void {
     if (this.heartbeatTimer) {
-      (this.options.clearTimeout ?? globalThis.clearTimeout)(this.heartbeatTimer);
+      (this.options.clearTimeout ?? globalThis.clearTimeout)(
+        this.heartbeatTimer,
+      );
       this.heartbeatTimer = undefined;
     }
   }
@@ -262,7 +352,9 @@ export class DiscordGateway {
   private clearTimers(): void {
     this.clearHeartbeat();
     if (this.reconnectTimer) {
-      (this.options.clearTimeout ?? globalThis.clearTimeout)(this.reconnectTimer);
+      (this.options.clearTimeout ?? globalThis.clearTimeout)(
+        this.reconnectTimer,
+      );
       this.reconnectTimer = undefined;
     }
   }

@@ -9,11 +9,12 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "check": "pnpm format:check && pnpm typecheck && pnpm test && pnpm scan:credentials",
+    "demo": "pnpm build && node scripts/demo.mjs",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "start": "node dist/main.js",
-    "cli": "node dist/cli.js",
-    "test": "node --experimental-strip-types --test --test-concurrency=1 test/*.test.ts",
+    "start": "node dist/src/main.js",
+    "cli": "node dist/src/cli.js",
+    "test": "pnpm build && node --test --test-concurrency=1 dist/test/*.test.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "scan:credentials": "node scripts/scan-credentials.mjs"
   },

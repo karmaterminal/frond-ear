@@ -61,28 +61,54 @@ export function loadPolicy(path: string): Policy {
 export function loadConfig(): AppConfig {
   const host = process.env.FROND_EAR_HOST ?? "127.0.0.1";
   if (!isLoopbackHost(host)) {
-    throw new Error("FROND_EAR_HOST must resolve to an explicit loopback address");
+    throw new Error(
+      "FROND_EAR_HOST must resolve to an explicit loopback address",
+    );
   }
   const token = process.env.DISCORD_BOT_TOKEN;
   if (!token) {
     throw new Error("DISCORD_BOT_TOKEN is required");
   }
   const adapterExecutable = process.env.FROND_EAR_ADAPTER_COMMAND;
+  const leaseMs = integerFromEnvironment("FROND_EAR_LEASE_MS", 60_000);
+  const adapterTimeoutMs = integerFromEnvironment(
+    "FROND_EAR_ADAPTER_TIMEOUT_MS",
+    30_000,
+  );
+  const parsedAdapterArgs = JSON.parse(
+    process.env.FROND_EAR_ADAPTER_ARGS ?? "[]",
+  ) as unknown;
+  if (
+    !Array.isArray(parsedAdapterArgs) ||
+    parsedAdapterArgs.some((argument) => typeof argument !== "string")
+  ) {
+    throw new Error("FROND_EAR_ADAPTER_ARGS must be a JSON array of strings");
+  }
+  if (adapterExecutable && adapterTimeoutMs >= leaseMs) {
+    throw new Error(
+      "FROND_EAR_ADAPTER_TIMEOUT_MS must be less than FROND_EAR_LEASE_MS",
+    );
+  }
   return {
-    databasePath: resolve(process.env.FROND_EAR_DATABASE ?? "./data/frond-ear.db"),
+    databasePath: resolve(
+      process.env.FROND_EAR_DATABASE ?? "./data/frond-ear.db",
+    ),
     policyPath: resolve(process.env.FROND_EAR_POLICY ?? "./policy.json"),
     host,
     port: integerFromEnvironment("FROND_EAR_PORT", 8791),
     discordToken: token,
     gatewayUrl: process.env.FROND_EAR_GATEWAY_URL ?? "wss://gateway.discord.gg",
-    leaseMs: integerFromEnvironment("FROND_EAR_LEASE_MS", 60_000),
+    leaseMs,
     adapter: adapterExecutable
       ? {
           kind: "command",
           executable: adapterExecutable,
-          args: JSON.parse(process.env.FROND_EAR_ADAPTER_ARGS ?? "[]") as string[],
-          timeoutMs: integerFromEnvironment("FROND_EAR_ADAPTER_TIMEOUT_MS", 30_000),
-          maxPayloadBytes: integerFromEnvironment("FROND_EAR_ADAPTER_MAX_BYTES", 64 * 1_024),
+          args: parsedAdapterArgs,
+          timeoutMs: adapterTimeoutMs,
+          maxPayloadBytes: integerFromEnvironment(
+            "FROND_EAR_ADAPTER_MAX_BYTES",
+            64 * 1_024,
+          ),
         }
       : { kind: "manual" },
   };

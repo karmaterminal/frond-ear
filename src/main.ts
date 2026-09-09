@@ -75,13 +75,13 @@ server.listen(config.port, config.host, () => {
 });
 
 let shuttingDown = false;
-function shutdown(signal: string): void {
+async function shutdown(signal: string): Promise<void> {
   if (shuttingDown) {
     return;
   }
   shuttingDown = true;
   logger.log("info", "service.stopping", { signal });
-  service.stop();
+  await service.stop();
   server.close(() => {
     store.close();
     process.exitCode = 0;
@@ -92,5 +92,5 @@ function shutdown(signal: string): void {
   }, 10_000).unref();
 }
 
-process.on("SIGINT", () => shutdown("SIGINT"));
-process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => void shutdown("SIGINT"));
+process.on("SIGTERM", () => void shutdown("SIGTERM"));

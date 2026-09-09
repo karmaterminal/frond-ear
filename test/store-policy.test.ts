@@ -6,6 +6,7 @@ import test from "node:test";
 
 import { StructuredLogger } from "../src/logger.js";
 import { classifyMessage } from "../src/policy.js";
+import { validatePolicy } from "../src/policy.js";
 import { EventStore } from "../src/store.js";
 import { FakeClock, message, testPolicy } from "./helpers.js";
 
@@ -33,7 +34,10 @@ test("duplicate Discord message replay remains idempotent across restart", () =>
   first.close();
   const restarted = new EventStore(path, new FakeClock(2_000));
   try {
-    assert.equal(restarted.enqueue(message("same"), policy, false, 12), "duplicate");
+    assert.equal(
+      restarted.enqueue(message("same"), policy, false, 12),
+      "duplicate",
+    );
     assert.equal(restarted.listEvents().length, 1);
   } finally {
     restarted.close();
@@ -47,8 +51,12 @@ test("priority authors and direct mentions override suppressions inside allowlis
     ignoredAuthorIds: ["figs", "noisy"],
     ignoredPatterns: ["ignore me"],
   });
+
   assert.deepEqual(
-    classifyMessage(message("figs", { author: { id: "figs" }, content: "ignore me" }), policy),
+    classifyMessage(
+      message("figs", { author: { id: "figs" }, content: "ignore me" }),
+      policy,
+    ),
     { accepted: true, priority: true, reason: "priority", weight: 9 },
   );
   assert.equal(
@@ -64,6 +72,22 @@ test("priority authors and direct mentions override suppressions inside allowlis
   );
 });
 
+test("policy requires bot identity and bounds coalescing latency", () => {
+  assert.throws(
+    () => validatePolicy({ ...testPolicy(), botUserId: "" }),
+    /botUserId must be a non-empty string/u,
+  );
+  assert.throws(
+    () =>
+      validatePolicy({
+        ...testPolicy(),
+        quietWindowMs: 101,
+        maxCoalesceWindowMs: 100,
+      }),
+    /maxCoalesceWindowMs/u,
+  );
+});
+
 test("ignored authors, patterns, event classes, guilds, channels, and self are rejected", () => {
   const policy = testPolicy({
     ignoredAuthorIds: ["ignored"],
@@ -75,10 +99,14 @@ test("ignored authors, patterns, event classes, guilds, channels, and self are r
     "ignored_author",
   );
   assert.equal(
-    classifyMessage(message("b", { content: "HEARTBEAT pulse" }), policy).reason,
+    classifyMessage(message("b", { content: "HEARTBEAT pulse" }), policy)
+      .reason,
     "ignored_pattern",
   );
-  assert.equal(classifyMessage(message("c", { type: 19 }), policy).reason, "ignored_event_class");
+  assert.equal(
+    classifyMessage(message("c", { type: 19 }), policy).reason,
+    "ignored_event_class",
+  );
   assert.equal(
     classifyMessage(message("d", { guild_id: "other" }), policy).reason,
     "guild_not_allowed",
@@ -88,7 +116,10 @@ test("ignored authors, patterns, event classes, guilds, channels, and self are r
     "channel_not_allowed",
   );
   assert.equal(
-    classifyMessage(message("f", { author: { id: "bot-1", bot: true } }), policy).reason,
+    classifyMessage(
+      message("f", { author: { id: "bot-1", bot: true } }),
+      policy,
+    ).reason,
     "self_message",
   );
 });
@@ -96,17 +127,34 @@ test("ignored authors, patterns, event classes, guilds, channels, and self are r
 test("noisy burst coalesces while priority remains an independent first lease", () => {
   withDatabase(({ store, clock }) => {
     const policy = testPolicy({ priorityAuthorIds: ["figs"] });
-    assert.equal(store.enqueue(message("normal-1"), policy, false, 10), "inserted");
-    assert.equal(store.enqueue(message("normal-2"), policy, false, 10), "inserted");
     assert.equal(
-      store.enqueue(message("priority", { author: { id: "figs" } }), policy, true, 10),
+      store.enqueue(message("normal-1"), policy, false, 10),
+      "inserted",
+    );
+    clock.advance(50);
+    assert.equal(
+      store.enqueue(message("normal-2"), policy, false, 10),
+      "inserted",
+    );
+    assert.equal(
+      store.enqueue(
+        message("priority", { author: { id: "figs" } }),
+        policy,
+        true,
+        10,
+      ),
       "inserted",
     );
     const priority = store.leaseNext(policy, 500);
     assert.equal(priority?.priority, true);
-    assert.deepEqual(priority?.events.map((event) => event.messageId), ["priority"]);
+    assert.deepEqual(
+      priority?.events.map((event) => event.messageId),
+      ["priority"],
+    );
     assert.equal(store.ack(priority?.claimToken ?? ""), 1);
-    clock.advance(101);
+    clock.advance(51);
+    assert.equal(store.leaseNext(policy, 500), undefined);
+    clock.advance(50);
     const burst = store.leaseNext(policy, 500);
     assert.equal(burst?.priority, false);
     assert.deepEqual(
@@ -118,13 +166,45 @@ test("noisy burst coalesces while priority remains an independent first lease", 
   });
 });
 
+test("continuous channel traffic cannot postpone a burst beyond the coalesce bound", () => {
+  withDatabase(({ store, clock }) => {
+    const policy = testPolicy({
+      quietWindowMs: 100,
+      maxCoalesceWindowMs: 200,
+    });
+    store.enqueue(message("bounded-1"), policy, false, 10);
+    clock.advance(80);
+    store.enqueue(message("bounded-2"), policy, false, 10);
+    clock.advance(80);
+    store.enqueue(message("bounded-3"), policy, false, 10);
+    clock.advance(41);
+    const batch = store.leaseNext(policy, 100);
+    assert.deepEqual(
+      batch?.events.map((event) => event.messageId),
+      ["bounded-1"],
+    );
+  });
+});
+
 test("overflow explicitly dead-letters noise and preserves admitted priority", () => {
   withDatabase(({ store }) => {
     const policy = testPolicy({ maxQueueCount: 2, maxQueueWeight: 30 });
-    assert.equal(store.enqueue(message("normal-1"), policy, false, 15), "inserted");
-    assert.equal(store.enqueue(message("normal-2"), policy, false, 15), "inserted");
-    assert.equal(store.enqueue(message("normal-3"), policy, false, 15), "overflow");
-    assert.equal(store.enqueue(message("priority"), policy, true, 15), "inserted");
+    assert.equal(
+      store.enqueue(message("normal-1"), policy, false, 15),
+      "inserted",
+    );
+    assert.equal(
+      store.enqueue(message("normal-2"), policy, false, 15),
+      "inserted",
+    );
+    assert.equal(
+      store.enqueue(message("normal-3"), policy, false, 15),
+      "overflow",
+    );
+    assert.equal(
+      store.enqueue(message("priority"), policy, true, 15),
+      "inserted",
+    );
     const states = Object.fromEntries(
       store.listEvents().map((event) => [event.messageId, event.state]),
     );
@@ -155,7 +235,10 @@ test("delivery failures release then dead-letter at the configured attempt bound
     assert.equal(store.release(first?.claimToken ?? "", "first failure", 2), 1);
     assert.equal(store.listEvents()[0]?.state, "pending");
     const second = store.leaseNext(policy, 50);
-    assert.equal(store.release(second?.claimToken ?? "", "second failure", 2), 1);
+    assert.equal(
+      store.release(second?.claimToken ?? "", "second failure", 2),
+      1,
+    );
     assert.equal(store.listEvents()[0]?.state, "dead_letter");
   });
 });
@@ -163,7 +246,10 @@ test("delivery failures release then dead-letter at the configured attempt bound
 test("Gateway kill switch rejects new ingestion and wake pause preserves queued work", () => {
   withDatabase(({ store }) => {
     const stopped = testPolicy({ gatewayEnabled: false });
-    assert.equal(classifyMessage(message("stopped"), stopped).reason, "gateway_disabled");
+    assert.equal(
+      classifyMessage(message("stopped"), stopped).reason,
+      "gateway_disabled",
+    );
     assert.equal(store.listEvents().length, 0);
 
     const active = testPolicy({ quietWindowMs: 0 });
@@ -180,10 +266,15 @@ test("structured logs redact token values and content fields", () => {
   const logger = new StructuredLogger((line) => lines.push(line), [token]);
   logger.log("info", "fixture", {
     token,
-    nested: { content: "untrusted words", message: `prefix ${token} suffix` },
+    nested: {
+      content: "untrusted words",
+      error: "adapter echoed message",
+      message: `prefix ${token} suffix`,
+    },
   });
   assert.equal(lines.length, 1);
   assert.doesNotMatch(lines[0] ?? "", new RegExp(token, "u"));
   assert.doesNotMatch(lines[0] ?? "", /untrusted words/u);
+  assert.doesNotMatch(lines[0] ?? "", /adapter echoed message/u);
   assert.match(lines[0] ?? "", /\[REDACTED\]/u);
 });

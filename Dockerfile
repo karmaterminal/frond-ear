@@ -13,6 +13,7 @@ ENV NODE_ENV=production \
     FROND_EAR_POLICY=/config/policy.json
 WORKDIR /app
 COPY --from=build /app/dist/src ./dist
+RUN mkdir -p /data /config && chown -R node:node /data /config
 USER node
 VOLUME ["/data", "/config"]
 EXPOSE 8791

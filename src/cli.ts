@@ -1,12 +1,18 @@
 const baseUrl = process.env.FROND_EAR_URL ?? "http://127.0.0.1:8791";
 const [command, ...args] = process.argv.slice(2);
 
-async function request(path: string, body?: Record<string, unknown>): Promise<unknown> {
-  const response = await fetch(`${baseUrl}${path}`, {
-    method: body ? "POST" : "GET",
-    headers: body ? { "content-type": "application/json" } : undefined,
-    body: body ? JSON.stringify(body) : undefined,
-  });
+async function request(
+  path: string,
+  body?: Record<string, unknown>,
+): Promise<unknown> {
+  const init: RequestInit = body
+    ? {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      }
+    : { method: "GET" };
+  const response = await fetch(`${baseUrl}${path}`, init);
   const result = (await response.json()) as unknown;
   if (!response.ok) {
     throw new Error(JSON.stringify(result));
@@ -44,6 +50,8 @@ switch (command) {
     result = await request("/policy/reload", {});
     break;
   default:
-    throw new Error("usage: frond-ear <health|status|lease|ack|release|reload>");
+    throw new Error(
+      "usage: frond-ear <health|status|lease|ack|release|reload>",
+    );
 }
 process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);

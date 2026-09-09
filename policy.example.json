@@ -7,6 +7,7 @@
   "ignoredEventClasses": [],
   "botUserId": "REPLACE_WITH_BOT_USER_ID",
   "quietWindowMs": 5000,
+  "maxCoalesceWindowMs": 60000,
   "maxSummaryChars": 4000,
   "maxQueueCount": 1000,
   "maxQueueWeight": 2000000,

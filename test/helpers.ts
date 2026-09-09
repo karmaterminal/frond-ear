@@ -1,5 +1,3 @@
-import { EventEmitter } from "node:events";
-
 import type { GatewaySocket } from "../src/gateway.js";
 import type { Clock, DiscordMessage, Policy } from "../src/types.js";
 import { defaultPolicy } from "../src/policy.js";
@@ -46,22 +44,50 @@ export function message(
   };
 }
 
-export class FakeSocket extends EventEmitter implements GatewaySocket {
+export class FakeSocket implements GatewaySocket {
   public readonly sent: Array<Record<string, unknown>> = [];
   public closed = false;
+  private readonly listeners = {
+    open: [] as Array<() => void>,
+    message: [] as Array<(event: { data: string }) => void>,
+    close: [] as Array<(event: { code: number; reason?: string }) => void>,
+    error: [] as Array<(event: unknown) => void>,
+  };
 
-  public override addListener(
-    eventName: string | symbol,
-    listener: (...args: unknown[]) => void,
-  ): this {
-    return super.addListener(eventName, listener);
-  }
-
+  public addEventListener(type: "open", listener: () => void): void;
+  public addEventListener(
+    type: "message",
+    listener: (event: { data: string }) => void,
+  ): void;
+  public addEventListener(
+    type: "close",
+    listener: (event: { code: number; reason?: string }) => void,
+  ): void;
+  public addEventListener(
+    type: "error",
+    listener: (event: unknown) => void,
+  ): void;
   public addEventListener(
     type: "open" | "message" | "close" | "error",
-    listener: (...args: never[]) => void,
+    listener:
+      | (() => void)
+      | ((event: { data: string }) => void)
+      | ((event: { code: number; reason?: string }) => void)
+      | ((event: unknown) => void),
   ): void {
-    this.on(type, listener);
+    if (type === "message") {
+      this.listeners.message.push(
+        listener as (event: { data: string }) => void,
+      );
+    } else if (type === "error") {
+      this.listeners.error.push(listener as (event: unknown) => void);
+    } else if (type === "close") {
+      this.listeners.close.push(
+        listener as (event: { code: number; reason?: string }) => void,
+      );
+    } else {
+      this.listeners.open.push(listener as () => void);
+    }
   }
 
   public send(data: string): void {
@@ -70,5 +96,12 @@ export class FakeSocket extends EventEmitter implements GatewaySocket {
 
   public close(): void {
     this.closed = true;
+  }
+
+  public emitClose(code: number, reason?: string): void {
+    const event = reason === undefined ? { code } : { code, reason };
+    for (const listener of this.listeners.close) {
+      listener(event);
+    }
   }
 }

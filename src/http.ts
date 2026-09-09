@@ -6,11 +6,15 @@ import type { Policy } from "./types.js";
 
 const MAX_BODY_BYTES = 64 * 1_024;
 
-async function readJson(request: NodeJS.ReadableStream): Promise<Record<string, unknown>> {
+async function readJson(
+  request: NodeJS.ReadableStream,
+): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of request) {
-    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array);
+    const buffer = Buffer.isBuffer(chunk)
+      ? chunk
+      : Buffer.from(typeof chunk === "string" ? chunk : (chunk as Uint8Array));
     size += buffer.length;
     if (size > MAX_BODY_BYTES) {
       throw new Error("request body too large");
@@ -50,7 +54,10 @@ export function createHttpServer(options: {
 }): Server {
   return createServer(async (request, response) => {
     try {
-      const url = new URL(request.url ?? "/", `http://${options.host}:${options.port}`);
+      const url = new URL(
+        request.url ?? "/",
+        `http://${options.host}:${options.port}`,
+      );
       if (request.method === "GET" && url.pathname === "/health") {
         writeJson(response, 200, { ok: true, ...options.service.status() });
         return;
@@ -76,7 +83,9 @@ export function createHttpServer(options: {
         if (typeof body.claimToken !== "string") {
           throw new Error("claimToken is required");
         }
-        writeJson(response, 200, { updated: options.store.ack(body.claimToken) });
+        writeJson(response, 200, {
+          updated: options.store.ack(body.claimToken),
+        });
         return;
       }
       if (request.method === "POST" && url.pathname === "/queue/release") {
@@ -84,7 +93,8 @@ export function createHttpServer(options: {
         if (typeof body.claimToken !== "string") {
           throw new Error("claimToken is required");
         }
-        const error = typeof body.error === "string" ? body.error : "released by client";
+        const error =
+          typeof body.error === "string" ? body.error : "released by client";
         writeJson(response, 200, {
           updated: options.store.release(
             body.claimToken,

@@ -30,6 +30,7 @@ export interface Policy {
   ignoredEventClasses: number[];
   botUserId: string;
   quietWindowMs: number;
+  maxCoalesceWindowMs: number;
   maxSummaryChars: number;
   maxQueueCount: number;
   maxQueueWeight: number;

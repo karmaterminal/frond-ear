@@ -121,7 +121,9 @@ export class EventStore {
   public counters(): Record<string, number> {
     return Object.fromEntries(
       (
-        this.database.prepare("SELECT name, value FROM counters ORDER BY name").all() as Array<{
+        this.database
+          .prepare("SELECT name, value FROM counters ORDER BY name")
+          .all() as Array<{
           name: string;
           value: number;
         }>
@@ -163,7 +165,8 @@ export class EventStore {
       let queueWeight = totals.weight;
       if (
         priority &&
-        (count + 1 > policy.maxQueueCount || queueWeight + weight > policy.maxQueueWeight)
+        (count + 1 > policy.maxQueueCount ||
+          queueWeight + weight > policy.maxQueueWeight)
       ) {
         const candidates = this.database
           .prepare(
@@ -191,7 +194,8 @@ export class EventStore {
         }
       }
       const overflow =
-        count + 1 > policy.maxQueueCount || queueWeight + weight > policy.maxQueueWeight;
+        count + 1 > policy.maxQueueCount ||
+        queueWeight + weight > policy.maxQueueWeight;
       this.database
         .prepare(
           `INSERT INTO events (
@@ -214,6 +218,18 @@ export class EventStore {
           priority ? now : now + policy.quietWindowMs,
           overflow ? "queue_overflow" : null,
         );
+      if (!overflow && !priority && policy.quietWindowMs > 0) {
+        this.database
+          .prepare(
+            `UPDATE events SET quiet_until = MIN(created_at + ?, ?)
+             WHERE state = 'pending' AND priority = 0 AND channel_id = ?`,
+          )
+          .run(
+            policy.maxCoalesceWindowMs,
+            now + policy.quietWindowMs,
+            message.channel_id,
+          );
+      }
       if (overflow) {
         this.incrementCounter("overflow_dead_letters");
       } else {
@@ -342,9 +358,15 @@ export class EventStore {
     return Number(result.changes);
   }
 
-  public release(claimToken: string, error: string, maxAttempts: number): number {
+  public release(
+    claimToken: string,
+    error: string,
+    maxAttempts: number,
+  ): number {
     const rows = this.database
-      .prepare("SELECT id, attempts FROM events WHERE state = 'leased' AND claim_token = ?")
+      .prepare(
+        "SELECT id, attempts FROM events WHERE state = 'leased' AND claim_token = ?",
+      )
       .all(claimToken) as Array<{ id: number; attempts: number }>;
     const update = this.database.prepare(
       `UPDATE events SET state = ?, claim_token = NULL, lease_expires_at = NULL,
@@ -377,7 +399,12 @@ export class EventStore {
   }
 
   public counts(): Counts {
-    const counts: Counts = { pending: 0, leased: 0, delivered: 0, dead_letter: 0 };
+    const counts: Counts = {
+      pending: 0,
+      leased: 0,
+      delivered: 0,
+      dead_letter: 0,
+    };
     const rows = this.database
       .prepare("SELECT state, COUNT(*) AS count FROM events GROUP BY state")
       .all() as Array<{ state: QueueState; count: number }>;
@@ -389,7 +416,9 @@ export class EventStore {
 
   public listEvents(): QueueEvent[] {
     return (
-      this.database.prepare("SELECT * FROM events ORDER BY id").all() as unknown as EventRow[]
+      this.database
+        .prepare("SELECT * FROM events ORDER BY id")
+        .all() as unknown as EventRow[]
     ).map(mapEvent);
   }
 
@@ -409,7 +438,12 @@ export class EventStore {
            resume_gateway_url = excluded.resume_gateway_url,
            updated_at = excluded.updated_at`,
       )
-      .run(state.sessionId, state.sequence, state.resumeGatewayUrl, this.clock.now());
+      .run(
+        state.sessionId,
+        state.sequence,
+        state.resumeGatewayUrl,
+        this.clock.now(),
+      );
   }
 
   public gatewayState(): {
@@ -422,7 +456,11 @@ export class EventStore {
         "SELECT session_id, sequence, resume_gateway_url FROM gateway_state WHERE singleton = 1",
       )
       .get() as
-      | { session_id: string | null; sequence: number | null; resume_gateway_url: string | null }
+      | {
+          session_id: string | null;
+          sequence: number | null;
+          resume_gateway_url: string | null;
+        }
       | undefined;
     return {
       sessionId: row?.session_id ?? null,

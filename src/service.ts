@@ -7,6 +7,9 @@ import type { DiscordMessage, Policy } from "./types.js";
 
 export class EarService {
   private deliveryTimer: NodeJS.Timeout | undefined;
+  private maintenanceTimer: NodeJS.Timeout | undefined;
+  private deliveryInFlight: Promise<void> | undefined;
+  private running = false;
 
   public constructor(
     private readonly options: {
@@ -23,7 +26,9 @@ export class EarService {
     const policy = this.options.policy();
     const classification = classifyMessage(message, policy);
     if (!classification.accepted) {
-      this.options.store.incrementCounter(`suppressed_${classification.reason}`);
+      this.options.store.incrementCounter(
+        `suppressed_${classification.reason}`,
+      );
       return classification.reason;
     }
     const result = this.options.store.enqueue(
@@ -39,8 +44,13 @@ export class EarService {
   }
 
   public start(): void {
+    if (this.running) {
+      return;
+    }
+    this.running = true;
     this.options.store.recoverExpiredLeases();
     this.options.store.prune(this.options.policy().retentionMs);
+    this.scheduleMaintenance();
     if (this.options.policy().gatewayEnabled) {
       this.options.gateway.start();
     }
@@ -49,12 +59,18 @@ export class EarService {
     }
   }
 
-  public stop(): void {
+  public async stop(): Promise<void> {
+    this.running = false;
     if (this.deliveryTimer) {
       clearTimeout(this.deliveryTimer);
       this.deliveryTimer = undefined;
     }
+    if (this.maintenanceTimer) {
+      clearTimeout(this.maintenanceTimer);
+      this.maintenanceTimer = undefined;
+    }
     this.options.gateway.stop();
+    await this.deliveryInFlight;
   }
 
   public onPolicyReload(previous: Policy, next: Policy): void {
@@ -77,9 +93,38 @@ export class EarService {
   }
 
   private scheduleDelivery(delayMs: number): void {
+    if (!this.running) {
+      return;
+    }
     this.deliveryTimer = setTimeout(() => {
-      void this.deliverOnce().finally(() => this.scheduleDelivery(1_000));
+      this.deliveryInFlight = this.deliverOnce()
+        .catch((error: unknown) => {
+          this.options.logger.log("error", "adapter.delivery_loop_failed", {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        })
+        .finally(() => {
+          this.deliveryInFlight = undefined;
+          if (this.running) {
+            this.scheduleDelivery(1_000);
+          }
+        });
     }, delayMs);
+  }
+
+  private scheduleMaintenance(): void {
+    if (!this.running) {
+      return;
+    }
+    const interval = Math.min(
+      this.options.policy().retentionMs,
+      60 * 60 * 1_000,
+    );
+    this.maintenanceTimer = setTimeout(() => {
+      this.options.store.prune(this.options.policy().retentionMs);
+      this.scheduleMaintenance();
+    }, interval);
+    this.maintenanceTimer.unref();
   }
 
   private async deliverOnce(): Promise<void> {
@@ -90,10 +135,20 @@ export class EarService {
     }
     try {
       await this.options.adapter.deliver(batch);
-      this.options.store.ack(batch.claimToken);
+      const updated = this.options.store.ack(batch.claimToken);
+      if (updated === 0) {
+        this.options.store.incrementCounter("lease_lost");
+        this.options.logger.log("warn", "adapter.lease_lost", {
+          claimToken: batch.claimToken,
+        });
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      this.options.store.release(batch.claimToken, message, policy.maxDeliveryAttempts);
+      this.options.store.release(
+        batch.claimToken,
+        message,
+        policy.maxDeliveryAttempts,
+      );
       this.options.logger.log("error", "adapter.delivery_failed", {
         adapter: this.options.adapter.name,
         error: message,
