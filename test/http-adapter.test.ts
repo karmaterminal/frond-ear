@@ -22,6 +22,24 @@ function fixtureBatch(summary = "bounded"): LeasedBatch {
     priority: true,
     eventIds: [1],
     summary,
+    binding: {
+      id: 1,
+      conversation: {
+        key: "guild:g:channel:c",
+        kind: "guild_channel_or_thread",
+        guildId: "g",
+        channelId: "c",
+      },
+      generation: 1,
+      sessionId: "session-1",
+      state: "active",
+      paused: false,
+      createdAt: 1,
+      createdBy: "a",
+      rotationReason: "fixture",
+      predecessorId: null,
+      retiredAt: null,
+    },
     events: [
       {
         messageId: "m",

@@ -16,6 +16,11 @@ export interface AppConfig {
   adapter:
     | { kind: "manual" }
     | {
+        kind: "copilot";
+        timeoutMs: number;
+        maxCachedSessions: number;
+      }
+    | {
         kind: "command";
         executable: string;
         args: string[];
@@ -70,6 +75,16 @@ export function loadConfig(): AppConfig {
     throw new Error("DISCORD_BOT_TOKEN is required");
   }
   const adapterExecutable = process.env.FROND_EAR_ADAPTER_COMMAND;
+  const adapterKind =
+    process.env.FROND_EAR_ADAPTER ?? (adapterExecutable ? "command" : "manual");
+  if (!["manual", "command", "copilot"].includes(adapterKind)) {
+    throw new Error("FROND_EAR_ADAPTER must be manual, command, or copilot");
+  }
+  if (adapterKind === "command" && !adapterExecutable) {
+    throw new Error(
+      "FROND_EAR_ADAPTER_COMMAND is required for the command adapter",
+    );
+  }
   const leaseMs = integerFromEnvironment("FROND_EAR_LEASE_MS", 60_000);
   const adapterTimeoutMs = integerFromEnvironment(
     "FROND_EAR_ADAPTER_TIMEOUT_MS",
@@ -84,7 +99,7 @@ export function loadConfig(): AppConfig {
   ) {
     throw new Error("FROND_EAR_ADAPTER_ARGS must be a JSON array of strings");
   }
-  if (adapterExecutable && adapterTimeoutMs >= leaseMs) {
+  if (adapterKind !== "manual" && adapterTimeoutMs >= leaseMs) {
     throw new Error(
       "FROND_EAR_ADAPTER_TIMEOUT_MS must be less than FROND_EAR_LEASE_MS",
     );
@@ -99,8 +114,9 @@ export function loadConfig(): AppConfig {
     discordToken: token,
     gatewayUrl: process.env.FROND_EAR_GATEWAY_URL ?? "wss://gateway.discord.gg",
     leaseMs,
-    adapter: adapterExecutable
-      ? {
+    adapter:
+      adapterKind === "command" && adapterExecutable
+        ? {
           kind: "command",
           executable: adapterExecutable,
           args: parsedAdapterArgs,
@@ -109,7 +125,16 @@ export function loadConfig(): AppConfig {
             "FROND_EAR_ADAPTER_MAX_BYTES",
             64 * 1_024,
           ),
-        }
-      : { kind: "manual" },
+          }
+        : adapterKind === "copilot"
+          ? {
+              kind: "copilot",
+              timeoutMs: adapterTimeoutMs,
+              maxCachedSessions: integerFromEnvironment(
+                "FROND_EAR_COPILOT_MAX_SESSIONS",
+                16,
+              ),
+            }
+          : { kind: "manual" },
   };
 }

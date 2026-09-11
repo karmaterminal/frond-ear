@@ -112,7 +112,10 @@ export function classifyMessage(
       weight: 0,
     };
   }
-  if (!message.guild_id || !policy.allowedGuildIds.includes(message.guild_id)) {
+  if (
+    message.guild_id &&
+    !policy.allowedGuildIds.includes(message.guild_id)
+  ) {
     return {
       accepted: false,
       priority: false,

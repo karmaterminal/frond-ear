@@ -2,7 +2,7 @@ import { createServer, type Server } from "node:http";
 
 import type { EarService } from "./service.js";
 import type { EventStore } from "./store.js";
-import type { Policy } from "./types.js";
+import type { ConversationIdentity, Policy } from "./types.js";
 
 const MAX_BODY_BYTES = 64 * 1_024;
 
@@ -43,6 +43,35 @@ function writeJson(
   response.end(JSON.stringify(body));
 }
 
+function conversationFromBody(
+  body: Record<string, unknown>,
+): ConversationIdentity {
+  if (typeof body.channelId !== "string" || body.channelId.length === 0) {
+    throw new Error("channelId is required");
+  }
+  if (
+    body.guildId !== undefined &&
+    body.guildId !== null &&
+    typeof body.guildId !== "string"
+  ) {
+    throw new Error("guildId must be a string or null");
+  }
+  const guildId = typeof body.guildId === "string" ? body.guildId : null;
+  return guildId
+    ? {
+        key: `guild:${guildId}:channel:${body.channelId}`,
+        kind: "guild_channel_or_thread",
+        guildId,
+        channelId: body.channelId,
+      }
+    : {
+        key: `dm:${body.channelId}`,
+        kind: "dm",
+        guildId: null,
+        channelId: body.channelId,
+      };
+}
+
 export function createHttpServer(options: {
   host: string;
   port: number;
@@ -64,6 +93,67 @@ export function createHttpServer(options: {
       }
       if (request.method === "GET" && url.pathname === "/queue/status") {
         writeJson(response, 200, options.service.status());
+        return;
+      }
+      if (request.method === "GET" && url.pathname === "/bindings") {
+        writeJson(
+          response,
+          200,
+          options.store.listBindings(
+            url.searchParams.get("includeRetired") === "true",
+          ),
+        );
+        return;
+      }
+      if (request.method === "GET" && url.pathname === "/adapter/capability") {
+        writeJson(response, 200, options.service.status().adapter);
+        return;
+      }
+      if (
+        request.method === "GET" &&
+        url.pathname.startsWith("/bindings/")
+      ) {
+        const conversationKey = decodeURIComponent(
+          url.pathname.slice("/bindings/".length),
+        );
+        const binding = options.store.getBinding(conversationKey);
+        writeJson(
+          response,
+          binding ? 200 : 404,
+          binding ?? { error: "binding_not_found" },
+        );
+        return;
+      }
+      if (request.method === "POST" && url.pathname === "/bindings/rotate") {
+        const body = await readJson(request);
+        if (typeof body.requestId !== "string") {
+          throw new Error("requestId is required");
+        }
+        const binding = options.service.rotateBinding(
+          conversationFromBody(body),
+          body.requestId,
+          typeof body.actorId === "string" ? body.actorId : undefined,
+        );
+        writeJson(response, 200, binding);
+        return;
+      }
+      if (
+        request.method === "POST" &&
+        (url.pathname === "/bindings/pause" ||
+          url.pathname === "/bindings/resume")
+      ) {
+        const body = await readJson(request);
+        if (typeof body.conversationKey !== "string") {
+          throw new Error("conversationKey is required");
+        }
+        writeJson(
+          response,
+          200,
+          options.service.setBindingPaused(
+            body.conversationKey,
+            url.pathname.endsWith("/pause"),
+          ),
+        );
         return;
       }
       if (request.method === "POST" && url.pathname === "/queue/lease-next") {

@@ -19,6 +19,8 @@ test("shutdown waits for in-flight delivery before the store can close", async (
   });
   const adapter: WakeAdapter = {
     name: "controlled",
+    automaticDelivery: true,
+    available: () => true,
     deliver: async (_batch: LeasedBatch) => {
       deliveryStarted?.();
       await new Promise<void>((resolve) => {
@@ -69,6 +71,8 @@ test("automatic delivery reports a lease lost before ack", async () => {
   });
   const adapter: WakeAdapter = {
     name: "lease-expirer",
+    automaticDelivery: true,
+    available: () => true,
     deliver: async () => {
       clock.advance(101);
       store.recoverExpiredLeases();

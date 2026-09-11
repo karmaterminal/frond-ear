@@ -49,9 +49,46 @@ switch (command) {
   case "reload":
     result = await request("/policy/reload", {});
     break;
+  case "bindings":
+    result = await request(
+      `/bindings${args[0] === "--all" ? "?includeRetired=true" : ""}`,
+    );
+    break;
+  case "binding":
+    if (!args[0]) {
+      throw new Error("usage: frond-ear binding <conversation-key>");
+    }
+    result = await request(`/bindings/${encodeURIComponent(args[0])}`);
+    break;
+  case "rotate":
+    if (!args[0] || !args[1]) {
+      throw new Error(
+        "usage: frond-ear rotate <channel-id> <guild-id|dm> [actor-id]",
+      );
+    }
+    result = await request("/bindings/rotate", {
+      channelId: args[0],
+      guildId: args[1] === "dm" ? null : args[1],
+      actorId: args[2] ?? "loopback-operator",
+      requestId: randomUUID(),
+    });
+    break;
+  case "pause":
+  case "resume":
+    if (!args[0]) {
+      throw new Error(`usage: frond-ear ${command} <conversation-key>`);
+    }
+    result = await request(`/bindings/${command}`, {
+      conversationKey: args[0],
+    });
+    break;
+  case "capability":
+    result = await request("/adapter/capability");
+    break;
   default:
     throw new Error(
-      "usage: frond-ear <health|status|lease|ack|release|reload>",
+      "usage: frond-ear <health|status|lease|ack|release|reload|bindings|binding|rotate|pause|resume|capability>",
     );
 }
 process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+import { randomUUID } from "node:crypto";

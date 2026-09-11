@@ -1,7 +1,12 @@
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
-import { CommandAdapter, ManualAdapter } from "./adapters.js";
+import {
+  CommandAdapter,
+  CopilotSdkAdapter,
+  ManualAdapter,
+  ReleasedCopilotSdkFactory,
+} from "./adapters.js";
 import { loadConfig, loadPolicy } from "./config.js";
 import { DiscordGateway } from "./gateway.js";
 import { createHttpServer } from "./http.js";
@@ -33,7 +38,13 @@ const gateway = new DiscordGateway({
 const adapter =
   config.adapter.kind === "manual"
     ? new ManualAdapter()
-    : new CommandAdapter(config.adapter);
+    : config.adapter.kind === "command"
+      ? new CommandAdapter(config.adapter)
+      : new CopilotSdkAdapter({
+          factory: new ReleasedCopilotSdkFactory(),
+          timeoutMs: config.adapter.timeoutMs,
+          maxCachedSessions: config.adapter.maxCachedSessions,
+        });
 service = new EarService({
   store,
   policy: () => policy,

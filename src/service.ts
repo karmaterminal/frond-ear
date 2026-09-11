@@ -1,9 +1,14 @@
-import type { WakeAdapter } from "./adapters.js";
+import { DeliveryError, type WakeAdapter } from "./adapters.js";
 import type { DiscordGateway } from "./gateway.js";
 import type { StructuredLogger } from "./logger.js";
 import { classifyMessage } from "./policy.js";
-import type { EventStore } from "./store.js";
-import type { DiscordMessage, Policy } from "./types.js";
+import { conversationIdentity, type EventStore } from "./store.js";
+import type {
+  ConversationIdentity,
+  DiscordMessage,
+  Policy,
+  SessionBinding,
+} from "./types.js";
 
 export class EarService {
   private deliveryTimer: NodeJS.Timeout | undefined;
@@ -31,6 +36,26 @@ export class EarService {
       );
       return classification.reason;
     }
+    if (this.isNewCommand(message)) {
+      if (policy.priorityAuthorIds.includes(message.author.id)) {
+        const result = this.options.store.rotate(
+          conversationIdentity(message),
+          `discord:${message.id}`,
+          message.author.id,
+          "authorized_discord_new",
+        );
+        this.options.logger.log("info", "binding.rotated", {
+          conversationKey: result.binding.conversation.key,
+          generation: result.binding.generation,
+          sessionId: result.binding.sessionId,
+          actorId: message.author.id,
+          fencedEvents: result.fencedEvents,
+          replay: !result.rotated,
+        });
+        return result.rotated ? "binding_rotated" : "duplicate_control";
+      }
+      this.options.store.incrementCounter("unauthorized_control_messages");
+    }
     const result = this.options.store.enqueue(
       message,
       policy,
@@ -41,6 +66,14 @@ export class EarService {
       this.options.store.incrementCounter("duplicates");
     }
     return result;
+  }
+
+  private isNewCommand(message: DiscordMessage): boolean {
+    const directMention = `<@${this.options.policy().botUserId}>`;
+    return (
+      message.content.trim() === "/new" ||
+      message.content.trim() === `${directMention} /new`
+    );
   }
 
   public start(): void {
@@ -54,7 +87,10 @@ export class EarService {
     if (this.options.policy().gatewayEnabled) {
       this.options.gateway.start();
     }
-    if (this.options.adapter.name !== "manual") {
+    if (
+      this.options.adapter.automaticDelivery &&
+      this.options.adapter.available()
+    ) {
       this.scheduleDelivery(0);
     }
   }
@@ -71,6 +107,7 @@ export class EarService {
     }
     this.options.gateway.stop();
     await this.deliveryInFlight;
+    await this.options.adapter.close?.();
   }
 
   public onPolicyReload(previous: Policy, next: Policy): void {
@@ -90,6 +127,44 @@ export class EarService {
       wakeDeliveryPaused: this.options.policy().wakeDeliveryPaused,
       adapter: this.options.adapter.status(),
     };
+  }
+
+  public rotateBinding(
+    identity: ConversationIdentity,
+    requestId: string,
+    actorId = "loopback-operator",
+  ): SessionBinding {
+    const result = this.options.store.rotate(
+      identity,
+      `loopback:${requestId}`,
+      actorId,
+      "authorized_loopback_new",
+    );
+    this.options.logger.log("info", "binding.rotated", {
+      conversationKey: result.binding.conversation.key,
+      generation: result.binding.generation,
+      sessionId: result.binding.sessionId,
+      actorId,
+      fencedEvents: result.fencedEvents,
+      replay: !result.rotated,
+    });
+    return result.binding;
+  }
+
+  public setBindingPaused(
+    conversationKey: string,
+    paused: boolean,
+  ): SessionBinding {
+    const binding = this.options.store.setBindingPaused(
+      conversationKey,
+      paused,
+    );
+    this.options.logger.log("info", "binding.pause_changed", {
+      conversationKey,
+      generation: binding.generation,
+      paused,
+    });
+    return binding;
   }
 
   private scheduleDelivery(delayMs: number): void {
@@ -127,7 +202,10 @@ export class EarService {
     this.maintenanceTimer.unref();
   }
 
-  private async deliverOnce(): Promise<void> {
+  public async deliverOnce(): Promise<void> {
+    if (!this.options.adapter.available()) {
+      return;
+    }
     const policy = this.options.policy();
     const batch = this.options.store.leaseNext(policy, this.options.leaseMs);
     if (!batch) {
@@ -140,18 +218,36 @@ export class EarService {
         this.options.store.incrementCounter("lease_lost");
         this.options.logger.log("warn", "adapter.lease_lost", {
           claimToken: batch.claimToken,
+          bindingGeneration: batch.binding.generation,
+        });
+      } else {
+        this.options.logger.log("info", "adapter.delivery_accepted", {
+          adapter: this.options.adapter.name,
+          conversationKey: batch.binding.conversation.key,
+          bindingGeneration: batch.binding.generation,
+          sessionId: batch.binding.sessionId,
+          eventCount: batch.eventIds.length,
         });
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      this.options.store.release(
-        batch.claimToken,
-        message,
-        policy.maxDeliveryAttempts,
-      );
+      const disposition =
+        error instanceof DeliveryError ? error.disposition : "retry";
+      if (disposition === "dead_letter") {
+        this.options.store.deadLetterLease(batch.claimToken, message);
+      } else {
+        this.options.store.release(
+          batch.claimToken,
+          message,
+          policy.maxDeliveryAttempts,
+        );
+      }
       this.options.logger.log("error", "adapter.delivery_failed", {
         adapter: this.options.adapter.name,
-        error: message,
+        deliveryError: message,
+        disposition,
+        conversationKey: batch.binding.conversation.key,
+        bindingGeneration: batch.binding.generation,
       });
     }
   }
