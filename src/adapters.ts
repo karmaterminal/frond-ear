@@ -205,6 +205,12 @@ export class CopilotSdkAdapter implements WakeAdapter {
       factory: CopilotSdkFactory;
       timeoutMs: number;
       maxCachedSessions: number;
+      isLeaseActive: (
+        claimToken: string,
+        bindingId: number,
+        generation: number,
+        minimumRemainingMs: number,
+      ) => boolean;
     },
   ) {}
 
@@ -223,26 +229,56 @@ export class CopilotSdkAdapter implements WakeAdapter {
         "retry",
       );
     }
-    const session = await this.sessionFor(batch);
     let timeout: NodeJS.Timeout | undefined;
+    let active = true;
+    let sendStarted = false;
+    const deadlineAt = Date.now() + this.options.timeoutMs;
+    const assertActive = (): void => {
+      if (!active) {
+        throw new DeliveryError(
+          "Copilot SDK delivery deadline elapsed before enqueue",
+          "retry",
+        );
+      }
+    };
+    const operation = async (): Promise<string> => {
+      const session = await this.sessionFor(batch, assertActive);
+      assertActive();
+      if (
+        !this.options.isLeaseActive(
+          batch.claimToken,
+          batch.binding.id,
+          batch.binding.generation,
+          Math.max(1, deadlineAt - Date.now()),
+        )
+      ) {
+        throw new DeliveryError(
+          "queue lease or binding generation is no longer active",
+          "retry",
+        );
+      }
+      sendStarted = true;
+      return session.send({
+        prompt: batch.summary,
+        source: "system",
+        mode: "enqueue",
+      });
+    };
     try {
       const accepted = await Promise.race([
-        session.send({
-          prompt: batch.summary,
-          source: "system",
-          mode: "enqueue",
-        }),
+        operation(),
         new Promise<never>((_resolve, reject) => {
-          timeout = setTimeout(
-            () =>
-              reject(
-                new DeliveryError(
-                  "Copilot SDK enqueue acceptance timed out; outcome is ambiguous",
-                  "dead_letter",
-                ),
+          timeout = setTimeout(() => {
+            active = false;
+            reject(
+              new DeliveryError(
+                sendStarted
+                  ? "Copilot SDK enqueue acceptance timed out; outcome is ambiguous"
+                  : "Copilot SDK setup timed out before enqueue",
+                sendStarted ? "dead_letter" : "retry",
               ),
-            this.options.timeoutMs,
-          );
+            );
+          }, this.options.timeoutMs);
         }),
       ]);
       if (typeof accepted !== "string" || accepted.length === 0) {
@@ -257,43 +293,65 @@ export class CopilotSdkAdapter implements WakeAdapter {
       this.lastError = error instanceof Error ? error.message : String(error);
       throw error;
     } finally {
+      active = false;
       if (timeout) {
         clearTimeout(timeout);
       }
     }
   }
 
-  private async sessionFor(batch: LeasedBatch): Promise<CopilotSdkSession> {
+  private async sessionFor(
+    batch: LeasedBatch,
+    assertActive: () => void,
+  ): Promise<CopilotSdkSession> {
+    assertActive();
     const cached = this.sessions.get(batch.binding.id);
     if (cached) {
       this.sessions.delete(batch.binding.id);
       this.sessions.set(batch.binding.id, cached);
       return cached;
     }
-    const client = await this.clientInstance();
+    const client = await this.clientInstance(assertActive);
+    assertActive();
     const metadata = await client.getSessionMetadata(batch.binding.sessionId);
+    assertActive();
     const session = metadata
       ? await client.resumeSession(batch.binding.sessionId, {
           suppressResumeEvent: true,
           continuePendingWork: false,
         })
       : await client.createSession({ sessionId: batch.binding.sessionId });
+    try {
+      assertActive();
+    } catch (error) {
+      await this.settleWithin(session.disconnect());
+      throw error;
+    }
     this.sessions.set(batch.binding.id, session);
-    await this.evictIfNeeded();
+    this.evictIfNeeded();
     return session;
   }
 
-  private async clientInstance(): Promise<CopilotSdkClient> {
+  private async clientInstance(
+    assertActive: () => void,
+  ): Promise<CopilotSdkClient> {
+    assertActive();
     if (this.client) {
       return this.client;
     }
     const client = this.options.factory.createClient();
     await client.start();
+    try {
+      assertActive();
+    } catch (error) {
+      await this.settleWithin(client.stop());
+      throw error;
+    }
     this.client = client;
     return client;
   }
 
-  private async evictIfNeeded(): Promise<void> {
+  private evictIfNeeded(): void {
     while (this.sessions.size > this.options.maxCachedSessions) {
       const oldest = this.sessions.entries().next().value as
         | [number, CopilotSdkSession]
@@ -302,7 +360,7 @@ export class CopilotSdkAdapter implements WakeAdapter {
         return;
       }
       this.sessions.delete(oldest[0]);
-      await oldest[1].disconnect();
+      void this.settleWithin(oldest[1].disconnect());
     }
   }
 
@@ -310,11 +368,29 @@ export class CopilotSdkAdapter implements WakeAdapter {
     const sessions = [...this.sessions.values()];
     this.sessions.clear();
     await Promise.allSettled(
-      sessions.map(async (session) => session.disconnect()),
+      sessions.map(async (session) => this.settleWithin(session.disconnect())),
     );
     if (this.client) {
-      await this.client.stop();
+      await this.settleWithin(this.client.stop());
       this.client = undefined;
+    }
+  }
+
+  private async settleWithin(operation: Promise<unknown>): Promise<void> {
+    let timeout: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        operation,
+        new Promise<void>((resolve) => {
+          timeout = setTimeout(resolve, this.options.timeoutMs);
+        }),
+      ]);
+    } catch {
+      // Cleanup is best-effort and bounded; delivery state is decided separately.
+    } finally {
+      if (timeout) {
+        clearTimeout(timeout);
+      }
     }
   }
 

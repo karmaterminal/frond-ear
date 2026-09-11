@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
 import {
@@ -52,6 +53,7 @@ class FakeSdkClient implements CopilotSdkClient {
   public starts = 0;
   public creates = 0;
   public resumes = 0;
+  public startWait: Promise<void> | undefined;
 
   public constructor(
     public readonly sessions: Map<string, FakeSdkSession> = new Map(),
@@ -59,6 +61,7 @@ class FakeSdkClient implements CopilotSdkClient {
 
   public async start(): Promise<void> {
     this.starts += 1;
+    await this.startWait;
   }
 
   public async stop(): Promise<readonly Error[]> {
@@ -109,12 +112,22 @@ class FakeSdkFactory implements CopilotSdkFactory {
 
 function sdkAdapter(
   client: FakeSdkClient,
-  overrides: Partial<{ timeoutMs: number; maxCachedSessions: number }> = {},
+  overrides: Partial<{
+    timeoutMs: number;
+    maxCachedSessions: number;
+    isLeaseActive: (
+      claimToken: string,
+      bindingId: number,
+      generation: number,
+      minimumRemainingMs: number,
+    ) => boolean;
+  }> = {},
 ): CopilotSdkAdapter {
   return new CopilotSdkAdapter({
     factory: new FakeSdkFactory(client),
     timeoutMs: overrides.timeoutMs ?? 100,
     maxCachedSessions: overrides.maxCachedSessions ?? 4,
+    isLeaseActive: overrides.isLeaseActive ?? (() => true),
   });
 }
 
@@ -166,6 +179,7 @@ test("first binding persists and a restarted adapter resumes its dedicated sessi
       source: "system",
       mode: "enqueue",
     });
+
     firstStore.ack(firstBatch.claimToken);
     await firstAdapter.close();
     firstStore.close();
@@ -183,6 +197,62 @@ test("first binding persists and a restarted adapter resumes its dedicated sessi
     assert.equal(client.resumes, 1);
     await restartedAdapter.close();
     restartedStore.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("exact v0 queue rows migrate into durable generation-one bindings", () => {
+  const directory = mkdtempSync(join(tmpdir(), "frond-ear-v0-migration-"));
+  const path = join(directory, "queue.db");
+  const legacy = new DatabaseSync(path);
+  legacy.exec(`
+    CREATE TABLE events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      message_id TEXT NOT NULL UNIQUE,
+      guild_id TEXT NOT NULL,
+      channel_id TEXT NOT NULL,
+      author_id TEXT NOT NULL,
+      content TEXT NOT NULL,
+      discord_timestamp TEXT NOT NULL,
+      message_link TEXT NOT NULL,
+      priority INTEGER NOT NULL,
+      state TEXT NOT NULL,
+      weight INTEGER NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      claim_token TEXT,
+      lease_expires_at INTEGER,
+      created_at INTEGER NOT NULL,
+      quiet_until INTEGER NOT NULL,
+      delivered_at INTEGER,
+      dead_letter_reason TEXT,
+      last_error TEXT
+    );
+    INSERT INTO events (
+      message_id, guild_id, channel_id, author_id, content, discord_timestamp,
+      message_link, priority, state, weight, created_at, quiet_until
+    ) VALUES (
+      'legacy', 'guild-1', 'channel-1', 'author-1', 'legacy payload',
+      '2026-01-01T00:00:00.000Z',
+      'https://discord.com/channels/guild-1/channel-1/legacy',
+      0, 'pending', 14, 1000, 1000
+    );
+  `);
+  legacy.close();
+  try {
+    const store = new EventStore(path, new FakeClock(2_000));
+    const binding = store.getBinding("guild:guild-1:channel:channel-1");
+    assert.equal(binding?.generation, 1);
+    assert.equal(binding?.rotationReason, "v0_migration");
+    const event = store.listEvents()[0];
+    assert.equal(event?.bindingId, binding?.id);
+    assert.equal(event?.bindingGeneration, 1);
+    assert.equal(
+      store.leaseNext(testPolicy({ quietWindowMs: 0 }), 1_000)?.events[0]
+        ?.messageId,
+      "legacy",
+    );
+    store.close();
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -262,6 +332,56 @@ test("authorized new rotates once while unauthorized new remains untrusted conte
     store.listEvents().find((event) => event.messageId === "unauthorized")
       ?.content,
     "/new",
+  );
+  store.close();
+});
+
+test("new command replay keeps its original disposition across policy changes", () => {
+  const store = new EventStore(":memory:", new FakeClock(1_000));
+  let policy = testPolicy({
+    quietWindowMs: 0,
+    priorityAuthorIds: ["figs"],
+  });
+  const adapter = sdkAdapter(new FakeSdkClient());
+  const logger = new StructuredLogger(() => undefined, ["fixture-token"]);
+  const gateway = new DiscordGateway({
+    token: "fixture-token",
+    gatewayUrl: "wss://gateway.example",
+    store,
+    logger,
+    onMessage: () => undefined,
+    socketFactory: () => new FakeSocket(),
+  });
+  const service = new EarService({
+    store,
+    policy: () => policy,
+    gateway,
+    adapter,
+    leaseMs: 1_000,
+    logger,
+  });
+  const command = message("policy-change-command", {
+    author: { id: "figs" },
+    content: "/new",
+  });
+  assert.equal(service.ingest(command), "binding_rotated");
+  policy = testPolicy({ quietWindowMs: 0, priorityAuthorIds: [] });
+  assert.equal(service.ingest(command), "duplicate_control");
+  assert.equal(store.listEvents().length, 0);
+
+  const untrusted = message("policy-change-untrusted", {
+    author: { id: "stranger" },
+    content: "/new",
+  });
+  assert.equal(service.ingest(untrusted), "inserted");
+  policy = testPolicy({
+    quietWindowMs: 0,
+    priorityAuthorIds: ["stranger"],
+  });
+  assert.equal(service.ingest(untrusted), "duplicate");
+  assert.equal(
+    store.getBinding("guild:guild-1:channel:channel-1")?.generation,
+    1,
   );
   store.close();
 });
@@ -347,6 +467,66 @@ test("ambiguous SDK timeout dead-letters rather than risking duplicate retry", a
   store.close();
 });
 
+test("expired lease during SDK setup prevents the delayed session send", async () => {
+  const clock = new FakeClock(1_000);
+  const store = new EventStore(":memory:", clock);
+  const policy = testPolicy({ quietWindowMs: 0 });
+  store.enqueue(message("setup-race"), policy, false, 10);
+  const batch = store.leaseNext(policy, 10);
+  assert.ok(batch);
+  const client = new FakeSdkClient();
+  let releaseStart: (() => void) | undefined;
+  client.startWait = new Promise<void>((resolve) => {
+    releaseStart = resolve;
+  });
+  const adapter = sdkAdapter(client, {
+    isLeaseActive: (claimToken, bindingId, generation, minimumRemainingMs) =>
+      store.isLeaseActive(
+        claimToken,
+        bindingId,
+        generation,
+        minimumRemainingMs,
+      ),
+  });
+  const delivery = adapter.deliver(batch);
+  await new Promise((resolve) => setImmediate(resolve));
+  clock.advance(11);
+  assert.equal(store.recoverExpiredLeases(), 1);
+  releaseStart?.();
+  await assert.rejects(delivery, /no longer active/u);
+  assert.equal(
+    [...client.sessions.values()].flatMap((session) => session.sends).length,
+    0,
+  );
+  assert.equal(store.listEvents()[0]?.state, "pending");
+  await adapter.close();
+  store.close();
+});
+
+test("SDK setup timeout cannot continue into send or cache mutation", async () => {
+  const store = new EventStore(":memory:", new FakeClock(1_000));
+  const policy = testPolicy({ quietWindowMs: 0 });
+  store.enqueue(message("setup-timeout"), policy, false, 10);
+  const batch = store.leaseNext(policy, 1_000);
+  assert.ok(batch);
+  const client = new FakeSdkClient();
+  let releaseStart: (() => void) | undefined;
+  client.startWait = new Promise<void>((resolve) => {
+    releaseStart = resolve;
+  });
+  const adapter = sdkAdapter(client, { timeoutMs: 5 });
+  await assert.rejects(
+    adapter.deliver(batch),
+    /SDK setup timed out before enqueue/u,
+  );
+  releaseStart?.();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(client.sessions.size, 0);
+  assert.equal(adapter.status().cachedSessions, 0);
+  await adapter.close();
+  store.close();
+});
+
 test("binding pause and unavailable SDK capability preserve pending queue rows", async () => {
   const store = new EventStore(":memory:", new FakeClock(1_000));
   const policy = testPolicy({ quietWindowMs: 0 });
@@ -360,6 +540,7 @@ test("binding pause and unavailable SDK capability preserve pending queue rows",
     factory: new ReleasedCopilotSdkFactory(),
     timeoutMs: 100,
     maxCachedSessions: 1,
+    isLeaseActive: () => true,
   });
   const service = serviceFixture({ store, policy, adapter: unavailable });
   await service.deliverOnce();

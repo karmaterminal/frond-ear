@@ -28,6 +28,13 @@ active immutable generation, dead-letters all pending or leased predecessor
 events, and inserts the successor with a new UUID session ID and predecessor
 lineage. A late ack for a predecessor claim updates zero rows.
 
+The store also records an immutable ingress disposition by Discord message ID.
+Service replay consults it before current policy, so an authorized `/new`
+cannot later become content and untrusted content cannot later become a
+rotation after a reload. Rotation dispositions are retained permanently;
+ordinary and suppressed dispositions follow queue retention once no event
+tombstone remains.
+
 `CopilotSdkAdapter` owns the isolated SDK client and a bounded LRU-like cache of
 binding-specific sessions. It resolves a persisted session ID through SDK
 metadata, creates it when absent, resumes it after restart when present, and
@@ -35,6 +42,9 @@ accepts delivery only through a system-source enqueue turn. The released SDK
 lacks system-source support, so the production capability object is explicitly
 unavailable and the service does not claim a lease. Tests inject a
 capability-compatible fake at this same boundary.
+One deadline covers setup and enqueue. Immediately before enqueue, the adapter
+requires the claim and active generation to remain valid for the deadline's
+remaining duration.
 
 The HTTP API and optional `CommandAdapter` are consumers of that lease
 boundary. The command adapter uses `spawn` with `shell: false`, fixed

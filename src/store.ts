@@ -192,6 +192,12 @@ export class EventStore {
         binding_id INTEGER NOT NULL REFERENCES session_bindings(id),
         created_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS ingress_dispositions (
+        message_id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL CHECK (kind IN ('event', 'rotation', 'suppressed')),
+        result TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
       CREATE INDEX IF NOT EXISTS events_pending_order
         ON events (state, priority DESC, quiet_until, created_at, id);
       CREATE INDEX IF NOT EXISTS events_claim ON events (claim_token);
@@ -314,6 +320,11 @@ export class EventStore {
         .prepare("SELECT 1 AS found FROM events WHERE message_id = ?")
         .get(message.id);
       if (duplicate) {
+        this.recordIngressDispositionInTransaction(
+          message.id,
+          "event",
+          "inserted",
+        );
         this.database.exec("COMMIT");
         return "duplicate";
       }
@@ -407,6 +418,11 @@ export class EventStore {
       } else {
         this.incrementCounter("enqueued");
       }
+      this.recordIngressDispositionInTransaction(
+        message.id,
+        "event",
+        overflow ? "overflow" : "inserted",
+      );
       this.database.exec("COMMIT");
       return overflow ? "overflow" : "inserted";
     } catch (error) {
@@ -453,6 +469,7 @@ export class EventStore {
     requestId: string,
     actorId: string,
     reason: string,
+    ingressMessageId?: string,
   ): { binding: SessionBinding; rotated: boolean; fencedEvents: number } {
     if (!requestId.trim()) {
       throw new Error("rotation requestId is required");
@@ -467,6 +484,11 @@ export class EventStore {
         )
         .get(requestId) as BindingRow | undefined;
       if (replay) {
+        if (replay.conversation_key !== identity.key) {
+          throw new Error(
+            "rotation requestId was already used for another binding",
+          );
+        }
         this.database.exec("COMMIT");
         return { binding: mapBinding(replay), rotated: false, fencedEvents: 0 };
       }
@@ -521,6 +543,13 @@ export class EventStore {
           "INSERT INTO rotation_requests (request_id, binding_id, created_at) VALUES (?, ?, ?)",
         )
         .run(requestId, binding.id, now);
+      if (ingressMessageId) {
+        this.recordIngressDispositionInTransaction(
+          ingressMessageId,
+          "rotation",
+          "binding_rotated",
+        );
+      }
       this.incrementCounter("binding_rotations");
       if (fencedEvents > 0) {
         this.incrementCounter("rotation_fenced_events", fencedEvents);
@@ -584,6 +613,36 @@ export class EventStore {
     return binding;
   }
 
+  public ingressDisposition(
+    messageId: string,
+  ): { kind: "event" | "rotation" | "suppressed"; result: string } | undefined {
+    return this.database
+      .prepare(
+        "SELECT kind, result FROM ingress_dispositions WHERE message_id = ?",
+      )
+      .get(messageId) as
+      | { kind: "event" | "rotation" | "suppressed"; result: string }
+      | undefined;
+  }
+
+  public recordSuppressed(messageId: string, result: string): void {
+    this.recordIngressDispositionInTransaction(messageId, "suppressed", result);
+  }
+
+  private recordIngressDispositionInTransaction(
+    messageId: string,
+    kind: "event" | "rotation" | "suppressed",
+    result: string,
+  ): void {
+    this.database
+      .prepare(
+        `INSERT INTO ingress_dispositions (message_id, kind, result, created_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(message_id) DO NOTHING`,
+      )
+      .run(messageId, kind, result, this.clock.now());
+  }
+
   public recoverExpiredLeases(): number {
     const result = this.database
       .prepare(
@@ -596,6 +655,34 @@ export class EventStore {
       this.incrementCounter("leases_recovered", Number(result.changes));
     }
     return Number(result.changes);
+  }
+
+  public isLeaseActive(
+    claimToken: string,
+    bindingId: number,
+    generation: number,
+    minimumRemainingMs = 0,
+  ): boolean {
+    return Boolean(
+      this.database
+        .prepare(
+          `SELECT 1 FROM events e
+           JOIN session_bindings b
+             ON b.id = e.binding_id
+            AND b.generation = e.binding_generation
+            AND b.state = 'active'
+           WHERE e.state = 'leased' AND e.claim_token = ?
+             AND e.binding_id = ? AND e.binding_generation = ?
+             AND e.lease_expires_at > ?
+           LIMIT 1`,
+        )
+        .get(
+          claimToken,
+          bindingId,
+          generation,
+          this.clock.now() + minimumRemainingMs,
+        ),
+    );
   }
 
   public leaseNext(
@@ -768,12 +855,23 @@ export class EventStore {
   }
 
   public prune(retentionMs: number): number {
+    const cutoff = this.clock.now() - retentionMs;
     const result = this.database
       .prepare(
         `DELETE FROM events
          WHERE state IN ('delivered', 'dead_letter') AND created_at < ?`,
       )
-      .run(this.clock.now() - retentionMs);
+      .run(cutoff);
+    this.database
+      .prepare(
+        `DELETE FROM ingress_dispositions
+         WHERE created_at < ? AND kind != 'rotation'
+           AND NOT EXISTS (
+             SELECT 1 FROM events
+             WHERE events.message_id = ingress_dispositions.message_id
+           )`,
+      )
+      .run(cutoff);
     return Number(result.changes);
   }
 

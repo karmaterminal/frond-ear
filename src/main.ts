@@ -44,6 +44,18 @@ const adapter =
           factory: new ReleasedCopilotSdkFactory(),
           timeoutMs: config.adapter.timeoutMs,
           maxCachedSessions: config.adapter.maxCachedSessions,
+          isLeaseActive: (
+            claimToken,
+            bindingId,
+            generation,
+            minimumRemainingMs,
+          ) =>
+            store.isLeaseActive(
+              claimToken,
+              bindingId,
+              generation,
+              minimumRemainingMs,
+            ),
         });
 service = new EarService({
   store,

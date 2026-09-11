@@ -143,7 +143,10 @@ after a released SDK provides both capabilities: a bounded cache of dedicated
 sessions, create-or-resume by durable session ID, and
 `send({ prompt, source: "system", mode: "enqueue" })`. SDK rejection releases a
 lease for bounded retry; an acceptance timeout is dead-lettered because its
-outcome is ambiguous and retrying could duplicate a turn.
+outcome is ambiguous and retrying could duplicate a turn. One end-to-end
+deadline covers client startup, session lookup/create/resume, and enqueue.
+Immediately before enqueue, the adapter verifies that the claim and generation
+remain active with enough lease time for the remaining acceptance deadline.
 
 ## Deployment
 

@@ -28,9 +28,23 @@ export class EarService {
   ) {}
 
   public ingest(message: DiscordMessage): string {
+    const previousDisposition = this.options.store.ingressDisposition(
+      message.id,
+    );
+    if (previousDisposition) {
+      if (previousDisposition.kind === "rotation") {
+        return "duplicate_control";
+      }
+      if (previousDisposition.kind === "event") {
+        this.options.store.incrementCounter("duplicates");
+        return "duplicate";
+      }
+      return previousDisposition.result;
+    }
     const policy = this.options.policy();
     const classification = classifyMessage(message, policy);
     if (!classification.accepted) {
+      this.options.store.recordSuppressed(message.id, classification.reason);
       this.options.store.incrementCounter(
         `suppressed_${classification.reason}`,
       );
@@ -43,6 +57,7 @@ export class EarService {
           `discord:${message.id}`,
           message.author.id,
           "authorized_discord_new",
+          message.id,
         );
         this.options.logger.log("info", "binding.rotated", {
           conversationKey: result.binding.conversation.key,
