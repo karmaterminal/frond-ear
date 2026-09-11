@@ -34,6 +34,9 @@ interface EventRow {
   quiet_until: number;
   binding_id: number;
   binding_generation: number;
+  delivered_at: number | null;
+  dead_letter_reason: string | null;
+  last_error: string | null;
 }
 
 interface BindingRow {
@@ -73,6 +76,9 @@ function mapEvent(row: EventRow): QueueEvent {
     quietUntil: row.quiet_until,
     bindingId: row.binding_id,
     bindingGeneration: row.binding_generation,
+    deliveredAt: row.delivered_at,
+    deadLetterReason: row.dead_letter_reason,
+    lastError: row.last_error,
   };
 }
 
@@ -168,6 +174,19 @@ export class EventStore {
       );
       CREATE UNIQUE INDEX IF NOT EXISTS session_bindings_one_active
         ON session_bindings (conversation_key) WHERE state = 'active';
+      CREATE TRIGGER IF NOT EXISTS session_bindings_identity_immutable
+      BEFORE UPDATE OF conversation_key, conversation_kind, guild_id, channel_id,
+        generation, session_id, created_at, created_by, rotation_reason,
+        predecessor_id ON session_bindings
+      BEGIN
+        SELECT RAISE(ABORT, 'session binding identity is immutable');
+      END;
+      CREATE TRIGGER IF NOT EXISTS session_bindings_no_reactivate
+      BEFORE UPDATE OF state ON session_bindings
+      WHEN OLD.state = 'retired' AND NEW.state != 'retired'
+      BEGIN
+        SELECT RAISE(ABORT, 'retired session binding cannot be reactivated');
+      END;
       CREATE TABLE IF NOT EXISTS rotation_requests (
         request_id TEXT PRIMARY KEY,
         binding_id INTEGER NOT NULL REFERENCES session_bindings(id),
@@ -241,12 +260,7 @@ export class EventStore {
                WHERE channel_id = ? AND guild_id = ?
                  AND (binding_id IS NULL OR binding_generation IS NULL)`,
             )
-            .run(
-              binding.id,
-              binding.generation,
-              row.channel_id,
-              row.guild_id,
-            );
+            .run(binding.id, binding.generation, row.channel_id, row.guild_id);
         }
         this.database.exec("COMMIT");
       } catch (error) {

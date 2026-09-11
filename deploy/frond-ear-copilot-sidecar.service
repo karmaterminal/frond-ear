@@ -1,0 +1,27 @@
+[Unit]
+Description=Durable Discord to Copilot session sidecar
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=frond-ear
+Group=frond-ear
+WorkingDirectory=/opt/frond-ear
+EnvironmentFile=/etc/frond-ear/runtime.env
+Environment=FROND_EAR_ADAPTER=copilot
+Environment=FROND_EAR_DATABASE=/var/lib/frond-ear/frond-ear.db
+Environment=COPILOT_HOME=/var/lib/frond-ear/copilot
+ExecStart=/usr/bin/node /opt/frond-ear/dist/src/main.js
+Restart=on-failure
+RestartSec=5
+StateDirectory=frond-ear
+StateDirectoryMode=0700
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/frond-ear
+
+[Install]
+WantedBy=multi-user.target

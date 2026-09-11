@@ -117,14 +117,14 @@ export function loadConfig(): AppConfig {
     adapter:
       adapterKind === "command" && adapterExecutable
         ? {
-          kind: "command",
-          executable: adapterExecutable,
-          args: parsedAdapterArgs,
-          timeoutMs: adapterTimeoutMs,
-          maxPayloadBytes: integerFromEnvironment(
-            "FROND_EAR_ADAPTER_MAX_BYTES",
-            64 * 1_024,
-          ),
+            kind: "command",
+            executable: adapterExecutable,
+            args: parsedAdapterArgs,
+            timeoutMs: adapterTimeoutMs,
+            maxPayloadBytes: integerFromEnvironment(
+              "FROND_EAR_ADAPTER_MAX_BYTES",
+              64 * 1_024,
+            ),
           }
         : adapterKind === "copilot"
           ? {

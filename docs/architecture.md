@@ -17,9 +17,24 @@ count/weight admission, priority eviction, and the queue state machine.
 
 `EventStore.leaseNext` owns delivery composition. It first recovers expired
 leases, chooses priority before routine work, and leases one priority event or
-one quiet channel burst under a random claim token. Ack and release only affect
-rows with the matching active token. Delivery failures return rows to pending
-until `maxDeliveryAttempts`, then dead-letter them.
+one quiet conversation-generation burst under a random claim token. It joins
+the active, unpaused binding while selecting work. Ack requires both the active
+claim and the still-active binding generation. Delivery failures return rows
+to pending until `maxDeliveryAttempts`, then dead-letter them.
+
+`EventStore.rotate` is the binding composition boundary. Under one immediate
+SQLite transaction it idempotently consumes a rotation request, retires the
+active immutable generation, dead-letters all pending or leased predecessor
+events, and inserts the successor with a new UUID session ID and predecessor
+lineage. A late ack for a predecessor claim updates zero rows.
+
+`CopilotSdkAdapter` owns the isolated SDK client and a bounded LRU-like cache of
+binding-specific sessions. It resolves a persisted session ID through SDK
+metadata, creates it when absent, resumes it after restart when present, and
+accepts delivery only through a system-source enqueue turn. The released SDK
+lacks system-source support, so the production capability object is explicitly
+unavailable and the service does not claim a lease. Tests inject a
+capability-compatible fake at this same boundary.
 
 The HTTP API and optional `CommandAdapter` are consumers of that lease
 boundary. The command adapter uses `spawn` with `shell: false`, fixed
@@ -49,6 +64,10 @@ state machine. The bot token is never stored.
 | Duplicate replay                          | Unique message ID returns `duplicate`; the existing row remains unchanged                                              |
 | Crash after lease                         | The row remains leased until expiry, then returns to pending                                                           |
 | Consumer release or adapter failure       | Pending retry until the attempt bound, then explicit dead letter                                                       |
+| Binding rotation during a lease           | Predecessor rows are atomically dead-lettered and the late ack updates zero rows                                       |
+| Per-binding pause                         | Ingestion continues; lease selection skips the binding until resumed                                                   |
+| SDK capability unavailable                | Adapter health is explicitly unavailable and no queue lease is taken                                                   |
+| SDK enqueue acceptance timeout            | Ambiguous lease is dead-lettered instead of retried, preventing a possible duplicate turn                              |
 | Queue count/weight overflow               | Normal event dead-letters; priority first evicts oldest pending normal events                                          |
 | Gateway kill switch                       | Socket stops and new ingestion is rejected; queued rows are unchanged                                                  |
 | Wake pause                                | Claims and automatic adapter delivery stop; Gateway ingestion and queued rows continue                                 |

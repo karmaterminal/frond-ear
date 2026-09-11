@@ -211,9 +211,7 @@ export class CopilotSdkAdapter implements WakeAdapter {
   public available(): boolean {
     const capability = this.options.factory.capability;
     return (
-      capability.available &&
-      capability.systemSource &&
-      capability.enqueueMode
+      capability.available && capability.systemSource && capability.enqueueMode
     );
   }
 

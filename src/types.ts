@@ -90,6 +90,9 @@ export interface QueueEvent {
   quietUntil: number;
   bindingId: number;
   bindingGeneration: number;
+  deliveredAt: number | null;
+  deadLetterReason: string | null;
+  lastError: string | null;
 }
 
 export interface LeasedBatch {

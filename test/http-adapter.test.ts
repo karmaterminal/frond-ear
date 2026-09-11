@@ -198,6 +198,49 @@ test("loopback API leases, acknowledges, and releases through the store boundary
         ?.state,
       "pending",
     );
+    const bindings = (await (await fetch(`${base}/bindings`)).json()) as Array<{
+      conversation: { key: string };
+      generation: number;
+      paused: boolean;
+    }>;
+    assert.equal(bindings.length, 1);
+    const conversationKey = bindings[0]?.conversation.key ?? "";
+    const paused = (await (
+      await fetch(`${base}/bindings/pause`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ conversationKey }),
+      })
+    ).json()) as { paused: boolean };
+    assert.equal(paused.paused, true);
+    const resumed = (await (
+      await fetch(`${base}/bindings/resume`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ conversationKey }),
+      })
+    ).json()) as { paused: boolean };
+    assert.equal(resumed.paused, false);
+    const rotated = (await (
+      await fetch(`${base}/bindings/rotate`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          guildId: "guild-1",
+          channelId: "channel-1",
+          requestId: "api-rotation",
+        }),
+      })
+    ).json()) as { generation: number };
+    assert.equal(rotated.generation, 2);
+    const inspected = (await (
+      await fetch(`${base}/bindings/${encodeURIComponent(conversationKey)}`)
+    ).json()) as { generation: number };
+    assert.equal(inspected.generation, 2);
+    const capability = (await (
+      await fetch(`${base}/adapter/capability`)
+    ).json()) as { automaticDelivery: boolean };
+    assert.equal(capability.automaticDelivery, false);
     const status = await (await fetch(`${base}/health`)).text();
     assert.doesNotMatch(status, /fixture-token/u);
   } finally {

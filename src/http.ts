@@ -109,10 +109,7 @@ export function createHttpServer(options: {
         writeJson(response, 200, options.service.status().adapter);
         return;
       }
-      if (
-        request.method === "GET" &&
-        url.pathname.startsWith("/bindings/")
-      ) {
+      if (request.method === "GET" && url.pathname.startsWith("/bindings/")) {
         const conversationKey = decodeURIComponent(
           url.pathname.slice("/bindings/".length),
         );

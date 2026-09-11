@@ -27,6 +27,14 @@ It does not modify or replace the running Discord MCP container.
 - Structured logs redact fields named like tokens, secrets, content, payloads,
   or bodies, and replace the configured token anywhere else.
 - The HTTP server rejects non-loopback bind addresses.
+- Each Discord guild/channel-or-thread or DM channel has one active durable
+  Copilot session binding. Binding generations and session IDs are immutable.
+  Rotation retires the predecessor and atomically dead-letters all of its
+  pending or leased events, so a late acceptance cannot cross generations.
+- Exact `/new` commands rotate only for configured `priorityAuthorIds`.
+  Unauthorized command-shaped messages remain ordinary untrusted content.
+  The loopback control plane is the separate direct frond-scribe authorization
+  path.
 
 ## Setup
 
@@ -59,19 +67,21 @@ file. Keep it owned by the service administrator and unreadable by other users.
 
 Configuration environment variables:
 
-| Variable                       | Default               | Purpose                               |
-| ------------------------------ | --------------------- | ------------------------------------- |
-| `DISCORD_BOT_TOKEN`            | required              | Existing bot credential               |
-| `FROND_EAR_DATABASE`           | `./data/frond-ear.db` | SQLite path                           |
-| `FROND_EAR_POLICY`             | `./policy.json`       | Reloadable policy file                |
-| `FROND_EAR_HOST`               | `127.0.0.1`           | Loopback bind address only            |
-| `FROND_EAR_PORT`               | `8791`                | Local API port                        |
-| `FROND_EAR_LEASE_MS`           | `60000`               | Default claim lease                   |
-| `FROND_EAR_GATEWAY_URL`        | Discord Gateway       | Test/override endpoint                |
-| `FROND_EAR_ADAPTER_COMMAND`    | unset                 | Optional executable adapter           |
-| `FROND_EAR_ADAPTER_ARGS`       | `[]`                  | JSON array of fixed adapter arguments |
-| `FROND_EAR_ADAPTER_TIMEOUT_MS` | `30000`               | Adapter timeout                       |
-| `FROND_EAR_ADAPTER_MAX_BYTES`  | `65536`               | Maximum adapter stdin payload         |
+| Variable                         | Default               | Purpose                               |
+| -------------------------------- | --------------------- | ------------------------------------- |
+| `DISCORD_BOT_TOKEN`              | required              | Existing bot credential               |
+| `FROND_EAR_DATABASE`             | `./data/frond-ear.db` | SQLite path                           |
+| `FROND_EAR_POLICY`               | `./policy.json`       | Reloadable policy file                |
+| `FROND_EAR_HOST`                 | `127.0.0.1`           | Loopback bind address only            |
+| `FROND_EAR_PORT`                 | `8791`                | Local API port                        |
+| `FROND_EAR_LEASE_MS`             | `60000`               | Default claim lease                   |
+| `FROND_EAR_GATEWAY_URL`          | Discord Gateway       | Test/override endpoint                |
+| `FROND_EAR_ADAPTER_COMMAND`      | unset                 | Optional executable adapter           |
+| `FROND_EAR_ADAPTER_ARGS`         | `[]`                  | JSON array of fixed adapter arguments |
+| `FROND_EAR_ADAPTER_TIMEOUT_MS`   | `30000`               | Adapter timeout                       |
+| `FROND_EAR_ADAPTER_MAX_BYTES`    | `65536`               | Maximum adapter stdin payload         |
+| `FROND_EAR_ADAPTER`              | inferred/manual       | `manual`, `command`, or `copilot`     |
+| `FROND_EAR_COPILOT_MAX_SESSIONS` | `16`                  | Bound on cached SDK sessions          |
 
 Start with `gatewayEnabled: false`, inspect `/health`, then enable and reload
 policy when the allowlists are correct.
@@ -80,14 +90,20 @@ policy when the allowlists are correct.
 
 All responses use JSON and `Cache-Control: no-store`.
 
-| Method | Path                | Purpose                                                   |
-| ------ | ------------------- | --------------------------------------------------------- |
-| `GET`  | `/health`           | Gateway, queue, suppression, delivery, and adapter health |
-| `GET`  | `/queue/status`     | Queue and runtime status                                  |
-| `POST` | `/queue/lease-next` | Lease the next priority event or quiet burst              |
-| `POST` | `/queue/ack`        | Mark a matching claim delivered                           |
-| `POST` | `/queue/release`    | Release or dead-letter a matching claim                   |
-| `POST` | `/policy/reload`    | Atomically validate and load policy from disk             |
+| Method | Path                  | Purpose                                                   |
+| ------ | --------------------- | --------------------------------------------------------- |
+| `GET`  | `/health`             | Gateway, queue, suppression, delivery, and adapter health |
+| `GET`  | `/queue/status`       | Queue and runtime status                                  |
+| `POST` | `/queue/lease-next`   | Lease the next priority event or quiet burst              |
+| `POST` | `/queue/ack`          | Mark a matching claim delivered                           |
+| `POST` | `/queue/release`      | Release or dead-letter a matching claim                   |
+| `POST` | `/policy/reload`      | Atomically validate and load policy from disk             |
+| `GET`  | `/bindings`           | List active bindings (`?includeRetired=true` for history) |
+| `GET`  | `/bindings/:key`      | Inspect one active binding                                |
+| `POST` | `/bindings/rotate`    | Direct loopback-authorized generation rotation            |
+| `POST` | `/bindings/pause`     | Pause wake delivery for one binding                       |
+| `POST` | `/bindings/resume`    | Resume wake delivery for one binding                      |
+| `GET`  | `/adapter/capability` | Report exact adapter and SDK capability                   |
 
 ```sh
 pnpm cli -- status
@@ -95,6 +111,12 @@ pnpm cli -- lease
 pnpm cli -- ack CLAIM_TOKEN
 pnpm cli -- release CLAIM_TOKEN "consumer failed"
 pnpm cli -- reload
+pnpm cli -- bindings --all
+pnpm cli -- binding 'guild:GUILD_ID:channel:CHANNEL_ID'
+pnpm cli -- rotate CHANNEL_ID GUILD_ID
+pnpm cli -- pause 'guild:GUILD_ID:channel:CHANNEL_ID'
+pnpm cli -- resume 'guild:GUILD_ID:channel:CHANNEL_ID'
+pnpm cli -- capability
 ```
 
 The default manual adapter does no automatic delivery; a local consumer polls,
@@ -102,18 +124,36 @@ leases, and acknowledges. The command adapter starts a configured executable
 without a shell and writes one bounded JSON object to stdin. Discord content is
 never interpolated into a shell command or placed in argv.
 
-## Copilot CLI limitation
+## Copilot SDK capability
 
-No real event-driven Copilot wakeup is claimed or included. The current
-supported shape is event-driven Discord ingestion plus cheap loopback polling,
-or an explicitly configured external command adapter. A non-interactive
-Copilot CLI process does not provide this service with a demonstrated API for
-waking and steering an existing terminal session. Any future adapter needs an
-end-to-end proof before it can replace polling.
+The implementation was checked against installed Copilot CLI `1.0.84-4` and
+the latest public npm release `@github/copilot-sdk@1.0.13` (package tarball
+SHA-256
+`238147f38bb7597bdd6864445e27137475ec034c831efb555655f3db28d50b3b`).
+That SDK bundles CLI `1.0.83`. Its released `MessageOptions` supports
+`mode: "enqueue"` but does **not** expose the required `source: "system"`
+field. The repository's inspected upstream README documents that field, but it
+is not in the released package types.
+
+Consequently, `FROND_EAR_ADAPTER=copilot` currently reports
+`available: false` and does not lease queued work. It never downgrades to a
+user-source turn and never reports false delivery success. The adapter boundary
+and fake SDK tests exercise the production contract that will be enabled only
+after a released SDK provides both capabilities: a bounded cache of dedicated
+sessions, create-or-resume by durable session ID, and
+`send({ prompt, source: "system", mode: "enqueue" })`. SDK rejection releases a
+lease for bounded retry; an acceptance timeout is dead-lettered because its
+outcome is ambiguous and retrying could duplicate a turn.
 
 ## Deployment
 
-`deploy/frond-ear.service` provides a hardened, restartable systemd shape.
+`deploy/frond-ear.service` provides the ingress service shape.
+`deploy/frond-ear-copilot-sidecar.service` adds a dedicated `COPILOT_HOME`
+under the persistent state directory and selects the capability-gated Copilot
+adapter. Authenticate that service-owned home through the ordinary Copilot
+login flow before startup; do not point it at an active interactive CLI home.
+Both units reference the existing protected `/etc/frond-ear/runtime.env` and
+do not copy its bot token.
 `Dockerfile` provides a non-root container shape. Because the service binds to
 `127.0.0.1`, containers should use host networking when a host-local consumer
 must reach the API; do not broaden the bind address to publish it externally.

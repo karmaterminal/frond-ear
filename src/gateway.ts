@@ -5,6 +5,7 @@ import type { StructuredLogger } from "./logger.js";
 const GATEWAY_VERSION = 10;
 const MESSAGE_CONTENT_INTENT = 1 << 15;
 const GUILD_MESSAGES_INTENT = 1 << 9;
+const DIRECT_MESSAGES_INTENT = 1 << 12;
 const FATAL_CLOSE_CODES = new Set([4_004, 4_010, 4_011, 4_012, 4_013, 4_014]);
 
 export interface GatewaySocket {
@@ -240,7 +241,10 @@ export class DiscordGateway {
         op: 2,
         d: {
           token: this.options.token,
-          intents: GUILD_MESSAGES_INTENT | MESSAGE_CONTENT_INTENT,
+          intents:
+            GUILD_MESSAGES_INTENT |
+            DIRECT_MESSAGES_INTENT |
+            MESSAGE_CONTENT_INTENT,
           properties: {
             os: process.platform,
             browser: "frond-ear",
