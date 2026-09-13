@@ -14,6 +14,14 @@ export interface DiscordMessage {
   type?: number;
 }
 
+export interface EventSource<TEvent = unknown> {
+  readonly kind?: string;
+  start(): void;
+  stop(): void;
+  status(): object;
+  onEvent?(listener: (event: TEvent) => void): void;
+}
+
 export interface GatewayPayload {
   op: number;
   d: unknown;

@@ -1,11 +1,11 @@
 import { DeliveryError, type WakeAdapter } from "./adapters.js";
-import type { DiscordGateway } from "./gateway.js";
 import type { StructuredLogger } from "./logger.js";
 import { classifyMessage } from "./policy.js";
 import { conversationIdentity, type EventStore } from "./store.js";
 import type {
   ConversationIdentity,
   DiscordMessage,
+  EventSource,
   Policy,
   SessionBinding,
 } from "./types.js";
@@ -20,7 +20,7 @@ export class EarService {
     private readonly options: {
       store: EventStore;
       policy: () => Policy;
-      gateway: DiscordGateway;
+      gateway: EventSource<DiscordMessage>;
       adapter: WakeAdapter;
       leaseMs: number;
       logger: StructuredLogger;

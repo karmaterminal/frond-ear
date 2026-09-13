@@ -6,8 +6,41 @@ import { DiscordGateway } from "../src/gateway.js";
 import { StructuredLogger } from "../src/logger.js";
 import { EarService } from "../src/service.js";
 import { EventStore } from "../src/store.js";
-import type { LeasedBatch } from "../src/types.js";
+import type { DiscordMessage, EventSource, LeasedBatch } from "../src/types.js";
 import { FakeClock, FakeSocket, message, testPolicy } from "./helpers.js";
+
+test("generic event-source boundary accepts non-Discord harness adapters", () => {
+  const store = new EventStore(":memory:", new FakeClock(1_000));
+  const policy = testPolicy({ quietWindowMs: 0 });
+  const logger = new StructuredLogger(() => undefined, ["fixture-token"]);
+  const gateway: EventSource<DiscordMessage> = {
+    kind: "teams-harness",
+    start: () => undefined,
+    stop: () => undefined,
+    status: () => ({ kind: "teams-harness", ready: true }),
+  };
+  const service = new EarService({
+    store,
+    policy: () => policy,
+    gateway,
+    adapter: {
+      name: "manual",
+      automaticDelivery: false,
+      available: () => false,
+      deliver: async () => undefined,
+      status: () => ({ name: "manual" }),
+    },
+    leaseMs: 1_000,
+    logger,
+  });
+  assert.deepEqual(service.status().gateway, {
+    kind: "teams-harness",
+    ready: true,
+  });
+  service.start();
+  service.stop();
+  store.close();
+});
 
 test("shutdown waits for in-flight delivery before the store can close", async () => {
   const store = new EventStore(":memory:", new FakeClock(1_000));

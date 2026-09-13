@@ -1,10 +1,11 @@
 # frond-ear
 
-`frond-ear` is a small Discord Gateway ingress service for frond-scribe. It
-accepts allowlisted `MESSAGE_CREATE` events, applies deterministic suppression
-and priority policy, and stores them in a durable SQLite lease/ack queue. It is
-an ear and bounded wake bridge, not a Discord speaker or administration tool.
-It does not modify or replace the running Discord MCP container.
+`frond-ear` is a generic Copilot sidecar/plugin for harness-room event sources. It
+accepts allowlisted event payloads from Discord now and can be reused for other
+chat or message sources later, applies deterministic suppression and priority
+policy, and stores them in a durable SQLite lease/ack queue. It is an ear and
+bounded wake bridge, not a production speaker or administration tool, and it does
+not modify or replace the running Discord MCP container.
 
 ## Safety model
 
@@ -138,13 +139,15 @@ explicitly acceptable for disposable canary work as long as the prompt includes
 its provenance label and the adapter never targets the primary frond-scribe
 session.
 
-The adapter boundary and fake-SDK tests exercise the production contract for
-both cases: a bounded cache of dedicated sessions, create-or-resume by durable
-session ID, and a bounded enqueue call with explicit provenance. The live
-canary path is opt-in and requires `FROND_EAR_CANARY_LIVE=1` together with a
-non-empty allowlist of explicit session IDs or conversation keys. Without that
-explicit allowlist, the adapter stays offline and never leases work for the
-primary session.
+The adapter boundary is generic: `EventSource` implementations represent the
+incoming event stream (Discord today, Teams or other harness sources later), and
+`CopilotSdkAdapter` sits behind that boundary. The fake-SDK tests exercise the
+production contract for both cases: a bounded cache of dedicated sessions,
+create-or-resume by durable session ID, and a bounded enqueue call with explicit
+provenance. The live canary path is opt-in and requires
+`FROND_EAR_CANARY_LIVE=1` together with a non-empty allowlist of explicit
+session IDs or conversation keys. Without that explicit allowlist, the adapter
+stays offline and never leases work for the primary session.
 
 For an explicit system-source SDK, the adapter keeps using
 `send({ prompt, source: "system", mode: "enqueue" })`. For the live canary,
