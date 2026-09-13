@@ -89,3 +89,20 @@ Alternative rejected: adopting Sol's retry-on-empty-history protocol.
 Uncertainty: runtime side-effect fencing needs exclusive process ownership,
 not a DB epoch; positive acceptance does not prove durable execution.
 Deviation: none in product scope. Next: state/data architecture checkpoint.
+
+## 2026-09-13T04:08Z — Phase 3: state, data and trust boundaries
+
+HEAD `5909150145d3393822e29d081b2c86296a51bba4`.
+Authored explicit transitions, owners, transactional/repetition semantics,
+22 invariants, generic native tuples/envelopes, attempt ledger, crash table,
+primary exclusion and tenant isolation. Every proposed addition preserves
+named source properties; source gaps remain explicit.
+Rejected alternatives: trusted control envelope; optimistic expiry recovery
+after send; implicit session adoption; raw-identifier metrics; lease-only SDK
+takeover. Exclusive runtime fencing remains a separate implementation proof,
+not supplied magically by owner epochs.
+Consistency pass: terminal outcomes have no scheduling exit; accepted has no
+retry edge; late evidence goes to reconciliation, not expired ack; every
+durable table has an owner. §7 is an explicitly pending next-phase section.
+Worktree changes confined to design and journal; no prohibited resource used.
+Next bounded action: continuation/HB budgets and completion evidence.
