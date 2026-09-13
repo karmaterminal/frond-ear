@@ -34,9 +34,9 @@
     review required; no unrelated index substitution.
   - Issue #1 body, all four current comments, Project 92
     `PVT_kwDOAYLGvs4BjUmx` and its one issue item inspected read-only.
-  Operational runbook disciplines apply; OpenClaw presentation, deployment
-  and force-push procedures do not. The task-specific design branch name is
-  intentional, not an OpenClaw taxonomy exception inferred silently.
+    Operational runbook disciplines apply; OpenClaw presentation, deployment
+    and force-push procedures do not. The task-specific design branch name is
+    intentional, not an OpenClaw taxonomy exception inferred silently.
 - Released SDK inspected in memory from public npm, without installation:
   `@github/copilot-sdk@1.0.13`, bundled runtime `1.0.83`.
   Tarball SHA-256
@@ -122,3 +122,35 @@ message/turn IDs; no live runtime instantiated. Fake/live independent proof
 still required for follow-on behavior; no claim the apparent +1 is solved live.
 All changes design/journal only. No prohibited resource accessed.
 Next gate: scenario matrix, threat model, rollout, available offline checks.
+
+## 2026-09-13T04:14Z — Phase 5: proof, threats, rollout and slices
+
+HEAD `65f1c1ea9f17160bb482d65d486d1031d41f777a`.
+Completed observability, threat-boundary/prevention/detection/recovery/residual
+matrix, rollout/rollback, twelve dependency-ordered future slices, twelve
+explicit decisions, fake SDK scenario specification and separate disposable
+canary plan. Live status remains NOT RUN — REQUIRES SEPARATE OPT-IN.
+Existing source tests executed under sanitized environment and project-local
+fixture root: compiler exit 0; 37/37 pass, no skips. Same installed pinned
+compiler/types used without dependencies in lane worktree or installation.
+This validates unchanged current behavior, not proposed v2 implementation.
+Decision: output-based bounded untrusted disposition avoids requiring new
+custom tools; its semantics and runtime correlation remain explicit proof gates.
+Uncertainty: lifetime/suspension fence and live continuation unproved; future
+activation blocked until relevant proofs, not hidden under offline success.
+No product/dependency mutation, credential/primary access or live sources.
+Next bounded action: formatting/scanner, exact-worktree GitNexus, independent
+second-model design review. Worktree currently dirty only in allowed documents.
+
+### 2026-09-13T04:13:08Z — validation and journal precision
+
+Phase 5; HEAD `65f1c1ea9f17160bb482d65d486d1031d41f777a`.
+Earlier phase-heading times were minute estimates; Phase 5 heading 04:14Z
+was ahead of actual command time 04:12:51Z. This exact observed-time entry
+corrects that timestamp, without changing prior reasoning entries.
+Repository formatter passed all source/proof files but found three indentation
+lines in the journal's first nested list. Apply only that formatter indentation;
+no words or prior reasoning are removed. This is a disclosed mechanical
+deviation from byte-literal append-only, retaining semantic append-only history
+and every original committed entry in git. No broader journal rewrite.
+Next: publish proof/checkpoint and exact index. No prohibited resources used.

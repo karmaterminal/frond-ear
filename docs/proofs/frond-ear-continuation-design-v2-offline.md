@@ -61,13 +61,13 @@ test/store-policy.test.ts
 tsconfig.json
 ```
 
-| Executable file | Tests | Existing asserted properties |
-|---|---:|---|
-| copilot-sidecar.test.ts | 12 | first binding/restart resume; v0 migration; conversation isolation; authorized new; policy-reload command replay; rotation fencing; busy enqueue/rejection; ambiguous timeout; setup lease expiry; setup timeout; pause/unavailable; redaction |
-| gateway.test.ts | 7 | persisted resume; fatal close; missed ACK; stale socket; invalid session; replay; persistence failure leaves cursor |
-| http-adapter.test.ts | 5 | loopback; timeout below lease; no-shell bounded stdin; SIGTERM-resistant child timeout; lease/ack/release/bind/pause/rotate/capability API |
-| service.test.ts | 2 | shutdown drains; recovered lease loses ack |
-| store-policy.test.ts | 11 | restart dedupe; priority overrides; policy validation; suppression/allowlists/self; priority-first burst; max delay; overflow; stale lease; bounded failures; kill/pause; log redaction |
+| Executable file         | Tests | Existing asserted properties                                                                                                                                                                                                                   |
+| ----------------------- | ----: | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| copilot-sidecar.test.ts |    12 | first binding/restart resume; v0 migration; conversation isolation; authorized new; policy-reload command replay; rotation fencing; busy enqueue/rejection; ambiguous timeout; setup lease expiry; setup timeout; pause/unavailable; redaction |
+| gateway.test.ts         |     7 | persisted resume; fatal close; missed ACK; stale socket; invalid session; replay; persistence failure leaves cursor                                                                                                                            |
+| http-adapter.test.ts    |     5 | loopback; timeout below lease; no-shell bounded stdin; SIGTERM-resistant child timeout; lease/ack/release/bind/pause/rotate/capability API                                                                                                     |
+| service.test.ts         |     2 | shutdown drains; recovered lease loses ack                                                                                                                                                                                                     |
+| store-policy.test.ts    |    11 | restart dedupe; priority overrides; policy validation; suppression/allowlists/self; priority-first burst; max delay; overflow; stale lease; bounded failures; kill/pause; log redaction                                                        |
 
 ## Current architecture: facts, not upgraded guarantees
 
@@ -133,36 +133,36 @@ SHA256 238147f38bb7597bdd6864445e27137475ec034c831efb555655f3db28d50b3b
 integrity sha512-/j6/tGc9HOtcupuYFloOKk0fpScdpy65EVF1LKg2Z2VQOojCGPgBGkhgVGVDaqW7UB6TV2qbQZa9rKJimJ0wWQ==
 ```
 
-| Released file in package/dist | SHA-256 |
-|---|---|
-| client.d.ts | 976ef43b72913a493696ad229449231edb0625891b64eff3356be00e77419945 |
-| client.js | 23be6340fabd555ccd8f0c9fc20786bcb743902f73e0a30e26157a1c55c36abf |
-| session.d.ts | 645c3f06dc0206a2963eb6874fd09a0db612a0c00637a0da48cb9462695ad720 |
-| session.js | e0bcdd68532f4108906af199531359f422cf192f1e5d61124b82e734ea0f5546 |
-| types.d.ts | 6b5d15d17d9445b12479dfb9e34e5194397818ec190fa308f8fe9c5b05d5e63f |
-| generated/rpc.d.ts | f262cd7e036ea1c862e17f90a72340d918943761413552e6019a96f4aee33c3c |
+| Released file in package/dist | SHA-256                                                          |
+| ----------------------------- | ---------------------------------------------------------------- |
+| client.d.ts                   | 976ef43b72913a493696ad229449231edb0625891b64eff3356be00e77419945 |
+| client.js                     | 23be6340fabd555ccd8f0c9fc20786bcb743902f73e0a30e26157a1c55c36abf |
+| session.d.ts                  | 645c3f06dc0206a2963eb6874fd09a0db612a0c00637a0da48cb9462695ad720 |
+| session.js                    | e0bcdd68532f4108906af199531359f422cf192f1e5d61124b82e734ea0f5546 |
+| types.d.ts                    | 6b5d15d17d9445b12479dfb9e34e5194397818ec190fa308f8fe9c5b05d5e63f |
+| generated/rpc.d.ts            | f262cd7e036ea1c862e17f90a72340d918943761413552e6019a96f4aee33c3c |
 | generated/session-events.d.ts | c9bde505b270207f6015a83af7e8a6054352f17699ef0c380dc6417433edbc98 |
 
 ## Released SDK capability matrix
 
-| Operation/evidence | Exact declaration/implementation | Design consequence |
-|---|---|---|
-| start | client.d.ts:124; client.js:595 starts/handshakes/verifies protocol | Ready only after successful awaited start; no inferred readiness from process existence |
-| stop | client.d.ts:126–149; releases resources, returns Error[], preserves data | Nonempty errors recorded; stop not proof of completion |
-| create | types.d.ts:2440–2449 accepts custom ID; client.js:1056+ uses it | Preallocate ID and owner intent; compare returned ID; cloud off |
-| metadata | client.d.ts:351; client.js:1747–1756 targeted session.getMetadata | Undefined means absent in that namespace, not permission to overwrite a previously active generation |
-| resume | client.d.ts:214–237; types.d.ts:2455–2473 | Explicit ID and safe config; suppressResumeEvent true, continuePendingWork false; interrupted work needs reconciliation |
-| isolated storage | types.d.ts:247–277, 345–350 | empty mode plus explicit baseDirectory for spawned runtime; forUri ignores baseDirectory and is forbidden |
-| send | session.js:448–460 returns response.messageId | Successful RPC response establishes assigned message identity, not completed work or fsync/durable exactly-once guarantee |
-| message modes | types.d.ts:2733–2789 | enqueue default; immediate distinct; no source setter in released public MessageOptions |
-| sendAndWait | session.js:462–504; session.d.ts:144–167 | Subscribes before send; waits session.idle/non-autopilot or error; timeout begins after send returns, does not abort; no acceptance ID exposed |
-| disconnect | session.d.ts:252–272 | Releases handlers/resources; retains history; handle invalid afterward |
-| history | session.d.ts:250 | getEvents returns events; not documented as linearizable negative-acceptance oracle |
-| user.message | generated/session-events.d.ts:3387–3463 | optional messageId matches returned send ID; optional turnId correlates consumption; event ID is a different identity |
-| turn end | generated/session-events.d.ts:5056–5064 | turnId correlates end, not semantic work completion |
-| idle | generated/session-events.d.ts:1324–1332 | global idle may be aborted and has no message ID; never alone proves a particular send completed |
-| reject/timeout | send throws on disconnected/connection failure | Exception after invocation is not proof of non-acceptance; quarantine unless pinned explicit pre-acceptance rejection contract |
-| idempotent send | no caller message/idempotency ID in public MessageOptions | Stable envelope ID detects duplicates; cannot prevent runtime duplication or authorize retry on history absence |
+| Operation/evidence | Exact declaration/implementation                                         | Design consequence                                                                                                                             |
+| ------------------ | ------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| start              | client.d.ts:124; client.js:595 starts/handshakes/verifies protocol       | Ready only after successful awaited start; no inferred readiness from process existence                                                        |
+| stop               | client.d.ts:126–149; releases resources, returns Error[], preserves data | Nonempty errors recorded; stop not proof of completion                                                                                         |
+| create             | types.d.ts:2440–2449 accepts custom ID; client.js:1056+ uses it          | Preallocate ID and owner intent; compare returned ID; cloud off                                                                                |
+| metadata           | client.d.ts:351; client.js:1747–1756 targeted session.getMetadata        | Undefined means absent in that namespace, not permission to overwrite a previously active generation                                           |
+| resume             | client.d.ts:214–237; types.d.ts:2455–2473                                | Explicit ID and safe config; suppressResumeEvent true, continuePendingWork false; interrupted work needs reconciliation                        |
+| isolated storage   | types.d.ts:247–277, 345–350                                              | empty mode plus explicit baseDirectory for spawned runtime; forUri ignores baseDirectory and is forbidden                                      |
+| send               | session.js:448–460 returns response.messageId                            | Successful RPC response establishes assigned message identity, not completed work or fsync/durable exactly-once guarantee                      |
+| message modes      | types.d.ts:2733–2789                                                     | enqueue default; immediate distinct; no source setter in released public MessageOptions                                                        |
+| sendAndWait        | session.js:462–504; session.d.ts:144–167                                 | Subscribes before send; waits session.idle/non-autopilot or error; timeout begins after send returns, does not abort; no acceptance ID exposed |
+| disconnect         | session.d.ts:252–272                                                     | Releases handlers/resources; retains history; handle invalid afterward                                                                         |
+| history            | session.d.ts:250                                                         | getEvents returns events; not documented as linearizable negative-acceptance oracle                                                            |
+| user.message       | generated/session-events.d.ts:3387–3463                                  | optional messageId matches returned send ID; optional turnId correlates consumption; event ID is a different identity                          |
+| turn end           | generated/session-events.d.ts:5056–5064                                  | turnId correlates end, not semantic work completion                                                                                            |
+| idle               | generated/session-events.d.ts:1324–1332                                  | global idle may be aborted and has no message ID; never alone proves a particular send completed                                               |
+| reject/timeout     | send throws on disconnected/connection failure                           | Exception after invocation is not proof of non-acceptance; quarantine unless pinned explicit pre-acceptance rejection contract                 |
+| idempotent send    | no caller message/idempotency ID in public MessageOptions                | Stable envelope ID detects duplicates; cannot prevent runtime duplication or authorize retry on history absence                                |
 
 Public upstream `github/copilot-sdk@f45c46fd1812f8bed5b4cbc250f47177c83068f0`
 has `nodejs/src/session.ts:715–730` forwarding `source`, unlike published bytes.
@@ -183,16 +183,16 @@ Commit `8dcd6698d0696943b518c11b560f0eaf167abf31`, blob
 `8afd70f1958055f0c6094975437ee65a18f7b6489269dd380ebeb50d77cdf315`;
 49,049 bytes, independently verified. Branch unchanged.
 
-| Sol section | Finding | Disposition in this lane |
-|---|---|---|
-| 6.2 | trusted host continuation envelope contradicts workorder | both ingress and heartbeat render untrusted user-source envelopes |
-| 11 | absence after reconciliation horizon permits retry | absence never authorizes retry; explicit reconciliation required |
-| 19 | owner epoch purportedly prevents two SDK drivers | single host process/OS lock and confirmed old-runtime termination; no lease-only takeover |
-| 14 | prints canonicalized sensitive paths | only redacted assertion codes and tenant-scoped opaque references |
-| 12 | priority stays separate instead of nearby-context merge intent | add bounded same-generation nearby merge with member accounting |
-| 9, 23 | checkpoint tool and broad lanes become mandatory | no new tool ecosystem; constrained continuation request is optional future decision, not shipped/assumed SDK feature |
-| 17 | incomplete states and accepted-work retry arrows | explicit split delivery/completion states; no accepted-to-retry transition |
-| 2 | candidate safety claims stronger than source | corrections above; no inherited proof laundering |
+| Sol section | Finding                                                        | Disposition in this lane                                                                                             |
+| ----------- | -------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| 6.2         | trusted host continuation envelope contradicts workorder       | both ingress and heartbeat render untrusted user-source envelopes                                                    |
+| 11          | absence after reconciliation horizon permits retry             | absence never authorizes retry; explicit reconciliation required                                                     |
+| 19          | owner epoch purportedly prevents two SDK drivers               | single host process/OS lock and confirmed old-runtime termination; no lease-only takeover                            |
+| 14          | prints canonicalized sensitive paths                           | only redacted assertion codes and tenant-scoped opaque references                                                    |
+| 12          | priority stays separate instead of nearby-context merge intent | add bounded same-generation nearby merge with member accounting                                                      |
+| 9, 23       | checkpoint tool and broad lanes become mandatory               | no new tool ecosystem; constrained continuation request is optional future decision, not shipped/assumed SDK feature |
+| 17          | incomplete states and accepted-work retry arrows               | explicit split delivery/completion states; no accepted-to-retry transition                                           |
+| 2           | candidate safety claims stronger than source                   | corrections above; no inherited proof laundering                                                                     |
 
 ## Proof boundary
 
@@ -200,3 +200,119 @@ The fake harness specified by the design is **not implemented or executed in
 this lane**. Existing tests do not validate the proposed schema or scheduler.
 Their results, exact command/SHA receipts, future scenario matrix, independent
 review and final identities are recorded in subsequent sections/journal entries.
+
+## Deterministic fake SDK harness specification
+
+**Specification only — not a newly executed harness.** Implement with a virtual
+clock (UTC and monotonic channels), seeded jitter, ordered scripted SDK
+operations/events, explicit before/after-commit failpoints, and a persistent
+fake runtime store separate from plugin SQLite. Restart clears client handles
+but preserves chosen runtime/DB facts. Crash can independently remove process,
+transport response or event notification. Do not model every rejection as
+pre-acceptance. Support history omission/truncation and duplicate events.
+
+Expose ordered transcript entries `(step,time,operation,tenant,generation,
+attempt,event-type,result-class)` without content, durable snapshots after
+each failpoint, and an assert-no-send-after-fence oracle. A test must assert
+queue/attempt/binding/disposition state and evidence, not just spy call counts.
+Replay the same seed to reproduce schedule ordering.
+
+| Scenario                                          | Required assertion / invariant coverage                                                           |
+| ------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| metadata absent → create                          | creation intent predates call; returned ID/marker match before active; I01,I13                    |
+| metadata present → resume                         | same owned ID, safe options, history reconciled; I02,I15                                          |
+| persisted-ID restart between sends                | no original replay, new delivery distinct; I03,I15                                                |
+| multiple isolated conversations/tenants           | no cross lookup/DB/coalescing/metrics/replay; I01,I14                                             |
+| busy enqueue accepted                             | bounded outstanding real messages; accepted≠completed; I05,I19                                    |
+| synchronous explicit local validation reject      | no send-started effect; bounded safe retry; I04,I07                                               |
+| delayed rejection before/after runtime acceptance | only proved pre-acceptance retries; generic rejection quarantines; I06,I07                        |
+| accepted message ID                               | durable positive evidence before ack; I05,I06,I18                                                 |
+| empty/malformed acceptance                        | ambiguous; no retry or ack; I06,I07                                                               |
+| timeout before send begins                        | setup cancelled; late setup cannot initiate; I04                                                  |
+| timeout after invocation                          | quarantine survives expiry/restart; I07,I15                                                       |
+| late acceptance after timeout                     | evidence retained, stale ack denied, reconciler no resend; I16,I18                                |
+| completion before acceptance persistence          | durable event buffered; no premature complete; I05,I06                                            |
+| completion after persistence                      | exact message→turn join; separate timestamps; I05                                                 |
+| no completion/aborted idle                        | accepted/unknown or failed, not success; I05,I20                                                  |
+| duplicate lifecycle events                        | unique event evidence, one budget reservation; I03,I09                                            |
+| session disappears after active                   | recovery-required; no same-generation create; I02,I15                                             |
+| session-ID mismatch                               | no cache/send; binding blocked; I13                                                               |
+| permission request                                | deny, blocked work, no approve-all retry; I21                                                     |
+| client crash during create/resume/send            | respective §11 states; no optimistic retry; I07,I15                                               |
+| disconnect/stop failure                           | runtime ownership remains uncertain; no successor start; I17                                      |
+| rotation during setup/invocation                  | setup cannot send if rotation won; old invoked evidence retained only for old generation; I02,I04 |
+| lease expiry during setup                         | no invocation; I04,I18                                                                            |
+| lease expiry after invocation                     | no stale ack or lease recovery to pending; I07,I18                                                |
+| heartbeat no-progress/exhaustion                  | finite reservations/time across restart; I09,I11                                                  |
+| real work supersedes scheduled/due HB             | suppression, no duplicate budget reset; I10,I11                                                   |
+| foreign/primary-like synthetic ID                 | rejected before metadata/resume/send or outside-root read; I13                                    |
+| ownership lease expiry while old runtime lives    | new driver cannot acquire SDK authority; I17                                                      |
+| process suspension at final pre-send boundary     | either launcher proves serialized boundary or activation blocked; I04,I17                         |
+| key/hash collision, envelope delimiter injection  | quarantine conflict; round-trip string remains nested; I08,I12                                    |
+| every source disposition/coalesced member         | exactly one retained disposition/membership, no omitted member ack; I08                           |
+| quota/full disk/retention pressure                | explicit overflow or withheld cursor/ACK; I19                                                     |
+| fair scheduling sustained priority load           | bounded streak gives routine progress across tenants; I10,I14,I19                                 |
+| shutdown with HTTP/manual lease request           | claim denied after draining fence; DB closes last; I22                                            |
+| readiness without canary                          | liveness not live-proven; I20                                                                     |
+| forged model disposition/budget request           | no authority/tenant/budget escalation; I11,I21                                                    |
+
+### Invariant-to-proof mapping
+
+I01–I04: unique constraints, migration, creation/rotation and driver-boundary
+tests; source's binding tests are partial precedent, not proof of v2.
+I05–I07: independent acceptance/event/error script and crash table.
+I08: admission/member/tombstone conservation under overflow and failure.
+I09–I11: heartbeat finite-state, virtual clock/jitter and real-work races.
+I12: canonical serialization round-trip with malicious newlines/delimiters.
+I13–I14: foreign-root/ID and adversarial tenant-principal access matrix.
+I15–I18: fresh-process recovery snapshots, late events and runtime-exit fencing.
+I19: count/UTF-8/retention/disk and fairness stress.
+I20: readiness vector without live receipts.
+I21: model output cannot change control principal or quotas.
+I22: ordered source/control/pump/runtime/DB shutdown transcript.
+
+### State-machine consistency review
+
+- Every state in the workorder has a table entry or explicit terminal
+  subdisposition; source delivery and completion are orthogonal.
+- Every durable record has an owner and unique transition key; all T changes
+  include audit reason, no SDK call executes inside a DB transaction.
+- Retry edges require proved no invocation/no acceptance. Accepted and
+  ambiguous have no ordinary pending edge. Late evidence is not stale authority.
+- Each terminal retains an explicit operator-visible result; replay creates
+  new lineage, never erases a result. Unresolved rows cannot silently expire.
+- Budgets are reserved transactionally and do not reset after cancellation,
+  policy change, pause or restart.
+- OS/runtime lifetime exclusion is separate from DB CAS. Implementation
+  activation is blocked if process-suspension safety cannot be proved.
+
+These are checklist checks over a design, not model checking or execution of
+the proposed state machine.
+
+## Existing repository validation
+
+At exact lane HEAD `65f1c1ea9f17160bb482d65d486d1031d41f777a`:
+
+1. `node <existing-product-node_modules>/typescript/bin/tsc -p tsconfig.json
+--typeRoots <existing-product-node_modules>/@types` — **exit 0**.
+2. `node --test --test-concurrency=1 dist/test/*.test.js` — **exit 0**,
+   **37 passed, 0 failed, 0 skipped, 0 cancelled**.
+
+Both run in the isolated design worktree under `env -i`, with only PATH and
+project-local isolated HOME/TMPDIR supplied. Existing tests use synthetic
+credentials and fake SDK/Gateway; the HTTP test connects only to its own
+ephemeral loopback server. No inherited credential values are read.
+Scratch/build outputs are under ignored `dist/`, not system temporary paths.
+
+Adaptation: use the already installed matching TypeScript package directly
+and explicit typeRoots, instead of installing/symlinking dependencies into
+the new worktree. This is the same tsconfig/compiler/test runner as package
+scripts, with resolution pointed to existing types. No manifest, lock or
+dependency tree was modified. Repository script inventory:
+`pnpm format:check`, `pnpm typecheck`, `pnpm test`,
+`pnpm scan:credentials`; `pnpm check` chains these. Formatting and scanner
+receipts are appended at the final candidate. No claim `pnpm check` itself ran.
+
+No source/test/dependency/policy/deployment/workflow file changed. No network
+connection to Discord, Teams or a live Copilot session. No credential file,
+credential value or primary-session storage/transcript/process was accessed.
