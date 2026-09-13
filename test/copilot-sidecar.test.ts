@@ -99,7 +99,9 @@ class FakeSdkFactory implements CopilotSdkFactory {
     sdkVersion: "future-test",
     cliVersion: "future-test",
     systemSource: true,
+    userSource: true,
     enqueueMode: true,
+    sourceMode: "system" as const,
     reason: null,
   };
 
@@ -130,6 +132,91 @@ function sdkAdapter(
     isLeaseActive: overrides.isLeaseActive ?? (() => true),
   });
 }
+
+test("user-source fallback remains explicit and untrusted for disposable canary sessions", async () => {
+  const store = new EventStore(":memory:", new FakeClock(1_000));
+  const policy = testPolicy({ quietWindowMs: 0 });
+  const client = new FakeSdkClient();
+  const adapter = new CopilotSdkAdapter({
+    factory: {
+      capability: {
+        available: true,
+        sdkVersion: "user-fallback",
+        cliVersion: "user-fallback",
+        systemSource: false,
+        userSource: true,
+        enqueueMode: true,
+        sourceMode: "user" as const,
+        reason: null,
+      },
+      createClient: () => client,
+    },
+    timeoutMs: 100,
+    maxCachedSessions: 4,
+    maxPayloadBytes: 8_192,
+    sourceMode: "user",
+    isLeaseActive: () => true,
+  });
+  store.enqueue(message("user-source"), policy, false, 10);
+  const batch = store.leaseNext(policy, 1_000);
+  assert.ok(batch);
+  await adapter.deliver(batch);
+  assert.equal(
+    client.sessions.get(batch.binding.sessionId)?.sends[0]?.source,
+    "user",
+  );
+  assert.match(
+    client.sessions.get(batch.binding.sessionId)?.sends[0]?.prompt ?? "",
+    /UNTRUSTED DISCORD EVENT SUMMARY/u,
+  );
+  await adapter.close();
+  store.close();
+});
+
+test("canary sessions refuse primary frond-scribe targets and require explicit allowlists", async () => {
+  const store = new EventStore(":memory:", new FakeClock(1_000));
+  const policy = testPolicy({ quietWindowMs: 0 });
+  store.enqueue(message("canary-local"), policy, false, 10);
+  const adapter = new CopilotSdkAdapter({
+    factory: {
+      capability: {
+        available: true,
+        sdkVersion: "canary-test",
+        cliVersion: "canary-test",
+        systemSource: false,
+        userSource: true,
+        enqueueMode: true,
+        sourceMode: "user" as const,
+        reason: null,
+      },
+      createClient: () => new FakeSdkClient(),
+    },
+    timeoutMs: 100,
+    maxCachedSessions: 4,
+    maxPayloadBytes: 8_192,
+    sourceMode: "user",
+    canary: {
+      enabled: true,
+      sessionPrefix: "frond-ear-canary",
+      allowlist: ["guild:guild-1:channel:channel-1"],
+      primarySessionIds: ["frond-scribe"],
+      maxPayloadBytes: 8_192,
+    },
+    isLeaseActive: () => true,
+  });
+  const binding = store.getBinding("guild:guild-1:channel:channel-1");
+  assert.ok(binding);
+  assert.equal(
+    adapter.resolveSessionId(binding),
+    `frond-ear-canary:guild:guild-1:channel:channel-1:1:${binding.sessionId}`,
+  );
+  const primary = { ...binding, sessionId: "frond-scribe" };
+  assert.throws(
+    () => adapter.resolveSessionId(primary),
+    /primary session frond-scribe/u,
+  );
+  store.close();
+});
 
 function serviceFixture(options: {
   store: EventStore;

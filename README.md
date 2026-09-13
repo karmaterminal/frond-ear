@@ -67,21 +67,26 @@ file. Keep it owned by the service administrator and unreadable by other users.
 
 Configuration environment variables:
 
-| Variable                         | Default               | Purpose                               |
-| -------------------------------- | --------------------- | ------------------------------------- |
-| `DISCORD_BOT_TOKEN`              | required              | Existing bot credential               |
-| `FROND_EAR_DATABASE`             | `./data/frond-ear.db` | SQLite path                           |
-| `FROND_EAR_POLICY`               | `./policy.json`       | Reloadable policy file                |
-| `FROND_EAR_HOST`                 | `127.0.0.1`           | Loopback bind address only            |
-| `FROND_EAR_PORT`                 | `8791`                | Local API port                        |
-| `FROND_EAR_LEASE_MS`             | `60000`               | Default claim lease                   |
-| `FROND_EAR_GATEWAY_URL`          | Discord Gateway       | Test/override endpoint                |
-| `FROND_EAR_ADAPTER_COMMAND`      | unset                 | Optional executable adapter           |
-| `FROND_EAR_ADAPTER_ARGS`         | `[]`                  | JSON array of fixed adapter arguments |
-| `FROND_EAR_ADAPTER_TIMEOUT_MS`   | `30000`               | Adapter timeout                       |
-| `FROND_EAR_ADAPTER_MAX_BYTES`    | `65536`               | Maximum adapter stdin payload         |
-| `FROND_EAR_ADAPTER`              | inferred/manual       | `manual`, `command`, or `copilot`     |
-| `FROND_EAR_COPILOT_MAX_SESSIONS` | `16`                  | Bound on cached SDK sessions          |
+| Variable                             | Default               | Purpose                                                           |
+| ------------------------------------ | --------------------- | ----------------------------------------------------------------- |
+| `DISCORD_BOT_TOKEN`                  | required              | Existing bot credential                                           |
+| `FROND_EAR_DATABASE`                 | `./data/frond-ear.db` | SQLite path                                                       |
+| `FROND_EAR_POLICY`                   | `./policy.json`       | Reloadable policy file                                            |
+| `FROND_EAR_HOST`                     | `127.0.0.1`           | Loopback bind address only                                        |
+| `FROND_EAR_PORT`                     | `8791`                | Local API port                                                    |
+| `FROND_EAR_LEASE_MS`                 | `60000`               | Default claim lease                                               |
+| `FROND_EAR_GATEWAY_URL`              | Discord Gateway       | Test/override endpoint                                            |
+| `FROND_EAR_ADAPTER_COMMAND`          | unset                 | Optional executable adapter                                       |
+| `FROND_EAR_ADAPTER_ARGS`             | `[]`                  | JSON array of fixed adapter arguments                             |
+| `FROND_EAR_ADAPTER_TIMEOUT_MS`       | `30000`               | Adapter timeout                                                   |
+| `FROND_EAR_ADAPTER_MAX_BYTES`        | `65536`               | Maximum adapter stdin payload                                     |
+| `FROND_EAR_ADAPTER`                  | inferred/manual       | `manual`, `command`, or `copilot`                                 |
+| `FROND_EAR_COPILOT_MAX_SESSIONS`     | `16`                  | Bound on cached SDK sessions                                      |
+| `FROND_EAR_COPILOT_SOURCE_MODE`      | `auto`                | `system`, `user`, or `none`                                       |
+| `FROND_EAR_CANARY_LIVE`              | `0`                   | Opt-in disposable test canary                                     |
+| `FROND_EAR_CANARY_SESSION_ALLOWLIST` | `[]`                  | Explicit session IDs or conversation keys allowed for live canary |
+| `FROND_EAR_CANARY_SESSION_PREFIX`    | `frond-ear-canary`    | Prefix for dedicated test sessions                                |
+| `FROND_EAR_CANARY_MAX_BYTES`         | `65536`               | Bound on summary payload to Copilot                               |
 
 Start with `gatewayEnabled: false`, inspect `/health`, then enable and reload
 policy when the allowlists are correct.
@@ -126,27 +131,31 @@ never interpolated into a shell command or placed in argv.
 
 ## Copilot SDK capability
 
-The implementation was checked against installed Copilot CLI `1.0.84-4` and
-the latest public npm release `@github/copilot-sdk@1.0.13` (package tarball
-SHA-256
-`238147f38bb7597bdd6864445e27137475ec034c831efb555655f3db28d50b3b`).
-That SDK bundles CLI `1.0.83`. Its released `MessageOptions` supports
-`mode: "enqueue"` but does **not** expose the required `source: "system"`
-field. The repository's inspected upstream README documents that field, but it
-is not in the released package types.
+The implementation is intentionally compatible with the released Copilot SDK
+contract that is available in the field today: `mode: "enqueue"` is accepted,
+while `source: "system"` is not guaranteed. User-source delivery is therefore
+explicitly acceptable for disposable canary work as long as the prompt includes
+its provenance label and the adapter never targets the primary frond-scribe
+session.
 
-Consequently, `FROND_EAR_ADAPTER=copilot` currently reports
-`available: false` and does not lease queued work. It never downgrades to a
-user-source turn and never reports false delivery success. The adapter boundary
-and fake SDK tests exercise the production contract that will be enabled only
-after a released SDK provides both capabilities: a bounded cache of dedicated
-sessions, create-or-resume by durable session ID, and
-`send({ prompt, source: "system", mode: "enqueue" })`. SDK rejection releases a
-lease for bounded retry; an acceptance timeout is dead-lettered because its
-outcome is ambiguous and retrying could duplicate a turn. One end-to-end
-deadline covers client startup, session lookup/create/resume, and enqueue.
-Immediately before enqueue, the adapter verifies that the claim and generation
-remain active with enough lease time for the remaining acceptance deadline.
+The adapter boundary and fake-SDK tests exercise the production contract for
+both cases: a bounded cache of dedicated sessions, create-or-resume by durable
+session ID, and a bounded enqueue call with explicit provenance. The live
+canary path is opt-in and requires `FROND_EAR_CANARY_LIVE=1` together with a
+non-empty allowlist of explicit session IDs or conversation keys. Without that
+explicit allowlist, the adapter stays offline and never leases work for the
+primary session.
+
+For an explicit system-source SDK, the adapter keeps using
+`send({ prompt, source: "system", mode: "enqueue" })`. For the live canary,
+source falls back to `"user"` while the prompt prefix states that the content is
+an untrusted Discord event summary and not a trusted system message. SDK
+rejection releases a lease for bounded retry; an acceptance timeout is
+dead-lettered because its outcome is ambiguous and retrying could duplicate a
+turn. One end-to-end deadline covers client startup, session lookup/create/
+resume, and enqueue. Immediately before enqueue, the adapter verifies that the
+claim and generation remain active with enough lease time for the remaining
+acceptance deadline.
 
 ## Deployment
 

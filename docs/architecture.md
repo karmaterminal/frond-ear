@@ -38,13 +38,15 @@ tombstone remains.
 `CopilotSdkAdapter` owns the isolated SDK client and a bounded LRU-like cache of
 binding-specific sessions. It resolves a persisted session ID through SDK
 metadata, creates it when absent, resumes it after restart when present, and
-accepts delivery only through a system-source enqueue turn. The released SDK
-lacks system-source support, so the production capability object is explicitly
-unavailable and the service does not claim a lease. Tests inject a
-capability-compatible fake at this same boundary.
-One deadline covers setup and enqueue. Immediately before enqueue, the adapter
-requires the claim and active generation to remain valid for the deadline's
-remaining duration.
+accepts delivery only through the configured source mode. The released SDK
+lacks system-source support in some installs, so the live canary path is opt-in
+and explicitly switches to a user-source enqueue with an untrusted provenance
+prefix. The primary frond-scribe session is never used for canary work, and a
+non-empty session allowlist is required before a live enqueue can be attempted.
+Tests inject a capability-compatible fake at this same boundary. One deadline
+covers setup and enqueue. Immediately before enqueue, the adapter requires the
+claim and active generation to remain valid for the deadline's remaining
+duration.
 
 The HTTP API and optional `CommandAdapter` are consumers of that lease
 boundary. The command adapter uses `spawn` with `shell: false`, fixed

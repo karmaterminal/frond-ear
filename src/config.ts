@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { isIP } from "node:net";
 import { resolve } from "node:path";
 
+import { parseCanaryConfig, type CopilotSendSource } from "./adapters.js";
 import { validatePolicy } from "./policy.js";
 import type { Policy } from "./types.js";
 
@@ -19,6 +20,9 @@ export interface AppConfig {
         kind: "copilot";
         timeoutMs: number;
         maxCachedSessions: number;
+        maxPayloadBytes: number;
+        sourceMode: CopilotSendSource | "none";
+        canary: ReturnType<typeof parseCanaryConfig>;
       }
     | {
         kind: "command";
@@ -85,6 +89,15 @@ export function loadConfig(): AppConfig {
       "FROND_EAR_ADAPTER_COMMAND is required for the command adapter",
     );
   }
+  const canary = parseCanaryConfig();
+  const desiredSourceMode =
+    (process.env.FROND_EAR_COPILOT_SOURCE_MODE as CopilotSendSource | "none") ??
+    (canary.enabled ? "user" : "system");
+  if (!["system", "user", "none"].includes(desiredSourceMode)) {
+    throw new Error(
+      "FROND_EAR_COPILOT_SOURCE_MODE must be system, user, or none",
+    );
+  }
   const leaseMs = integerFromEnvironment("FROND_EAR_LEASE_MS", 60_000);
   const adapterTimeoutMs = integerFromEnvironment(
     "FROND_EAR_ADAPTER_TIMEOUT_MS",
@@ -134,6 +147,12 @@ export function loadConfig(): AppConfig {
                 "FROND_EAR_COPILOT_MAX_SESSIONS",
                 16,
               ),
+              maxPayloadBytes: integerFromEnvironment(
+                "FROND_EAR_ADAPTER_MAX_BYTES",
+                64 * 1_024,
+              ),
+              sourceMode: desiredSourceMode,
+              canary,
             }
           : { kind: "manual" },
   };

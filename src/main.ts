@@ -44,6 +44,9 @@ const adapter =
           factory: new ReleasedCopilotSdkFactory(),
           timeoutMs: config.adapter.timeoutMs,
           maxCachedSessions: config.adapter.maxCachedSessions,
+          maxPayloadBytes: config.adapter.maxPayloadBytes,
+          sourceMode: config.adapter.sourceMode,
+          canary: config.adapter.canary,
           isLeaseActive: (
             claimToken,
             bindingId,

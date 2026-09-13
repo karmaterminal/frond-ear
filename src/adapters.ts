@@ -1,6 +1,82 @@
 import { spawn } from "node:child_process";
 
-import type { LeasedBatch } from "./types.js";
+import type { LeasedBatch, SessionBinding } from "./types.js";
+
+export type CopilotSendSource = "system" | "user";
+
+export interface CopilotCanaryConfig {
+  readonly enabled: boolean;
+  readonly sessionPrefix: string;
+  readonly allowlist: readonly string[];
+  readonly primarySessionIds: readonly string[];
+  readonly maxPayloadBytes: number;
+}
+
+export function parseCanaryConfig(
+  env: NodeJS.ProcessEnv = process.env,
+): CopilotCanaryConfig {
+  const enabled =
+    env.FROND_EAR_CANARY_LIVE === "1" ||
+    env.FROND_EAR_CANARY_LIVE === "true" ||
+    env.FROND_EAR_LIVE_CANARY === "1" ||
+    env.FROND_EAR_LIVE_CANARY === "true" ||
+    env.FROND_EAR_CANARY_MODE === "live" ||
+    env.FROND_EAR_CANARY_MODE === "enabled";
+  const readList = (...keys: string[]): string[] => {
+    for (const key of keys) {
+      const raw = env[key];
+      if (!raw) {
+        continue;
+      }
+      try {
+        const parsed = JSON.parse(raw) as unknown;
+        if (Array.isArray(parsed)) {
+          const values = parsed.filter(
+            (item): item is string => typeof item === "string",
+          );
+          if (values.length > 0) {
+            return values;
+          }
+        }
+      } catch {
+        // Fall back to a comma-separated string below.
+      }
+      return raw
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean);
+    }
+    return [];
+  };
+  const allowlist = readList(
+    "FROND_EAR_CANARY_SESSION_ALLOWLIST",
+    "FROND_EAR_CANARY_ALLOWLIST",
+    "FROND_EAR_CANARY_ALLOWED_SESSIONS",
+    "FROND_EAR_CANARY_SESSION_IDS",
+  );
+  const primarySessionIds = readList(
+    "FROND_EAR_PRIMARY_SESSION_ID",
+    "FROND_EAR_PRIMARY_SESSION_IDS",
+    "FROND_EAR_CANARY_FORBIDDEN_SESSIONS",
+    "FROND_EAR_CANARY_PRIMARY_SESSION_IDS",
+    "frond-scribe",
+  );
+  return {
+    enabled,
+    sessionPrefix:
+      env.FROND_EAR_CANARY_SESSION_PREFIX ??
+      env.FROND_EAR_CANARY_PREFIX ??
+      "frond-ear-canary",
+    allowlist,
+    primarySessionIds:
+      primarySessionIds.length > 0 ? primarySessionIds : ["frond-scribe"],
+    maxPayloadBytes: Number(
+      env.FROND_EAR_CANARY_MAX_BYTES ??
+        env.FROND_EAR_ADAPTER_MAX_BYTES ??
+        64 * 1024,
+    ),
+  };
+}
 
 export interface WakeAdapter {
   readonly name: string;
@@ -145,7 +221,7 @@ export interface CopilotSdkSession {
   readonly sessionId: string;
   send(options: {
     prompt: string;
-    source: "system";
+    source: CopilotSendSource;
     mode: "enqueue";
   }): Promise<string>;
   disconnect(): Promise<void>;
@@ -170,25 +246,41 @@ export interface CopilotSdkFactory {
     sdkVersion: string;
     cliVersion: string;
     systemSource: boolean;
+    userSource: boolean;
     enqueueMode: boolean;
+    sourceMode: CopilotSendSource | "none";
     reason: string | null;
   };
   createClient(): CopilotSdkClient;
 }
 
 export class ReleasedCopilotSdkFactory implements CopilotSdkFactory {
-  public readonly capability = {
-    available: false,
-    sdkVersion: "1.0.13",
-    cliVersion: "1.0.83",
-    systemSource: false,
-    enqueueMode: true,
-    reason:
-      "@github/copilot-sdk@1.0.13 MessageOptions does not expose source; refusing unsupported system delivery",
-  } as const;
+  public readonly capability = (() => {
+    const canary = parseCanaryConfig();
+    const liveUserSource = canary.enabled && canary.allowlist.length > 0;
+    return {
+      available: liveUserSource,
+      sdkVersion: "1.0.13",
+      cliVersion: "1.0.83",
+      systemSource: false,
+      userSource: liveUserSource,
+      enqueueMode: true,
+      sourceMode: liveUserSource ? "user" : "none",
+      reason: liveUserSource
+        ? null
+        : "Live Copilot canary must be opt-in via FROND_EAR_CANARY_LIVE and explicit FROND_EAR_CANARY_SESSION_ALLOWLIST entries",
+    } as const;
+  })();
 
   public createClient(): CopilotSdkClient {
-    throw new Error(this.capability.reason);
+    if (!this.capability.available) {
+      throw new Error(
+        this.capability.reason ?? "Copilot SDK delivery is unavailable",
+      );
+    }
+    throw new Error(
+      "Live canary is opt-in only; attach a real Copilot SDK client in the dedicated test session runtime",
+    );
   }
 }
 
@@ -205,6 +297,9 @@ export class CopilotSdkAdapter implements WakeAdapter {
       factory: CopilotSdkFactory;
       timeoutMs: number;
       maxCachedSessions: number;
+      maxPayloadBytes?: number;
+      sourceMode?: CopilotSendSource | "none";
+      canary?: CopilotCanaryConfig;
       isLeaseActive: (
         claimToken: string,
         bindingId: number,
@@ -217,15 +312,48 @@ export class CopilotSdkAdapter implements WakeAdapter {
   public available(): boolean {
     const capability = this.options.factory.capability;
     return (
-      capability.available && capability.systemSource && capability.enqueueMode
+      capability.available &&
+      capability.enqueueMode &&
+      (capability.systemSource || capability.userSource)
     );
+  }
+
+  public resolveSessionId(binding: SessionBinding): string {
+    const canary = this.options.canary;
+    if (!canary || !canary.enabled) {
+      return binding.sessionId;
+    }
+    const denyPrimary =
+      binding.sessionId === "frond-scribe" ||
+      canary.primarySessionIds.includes(binding.sessionId);
+    if (denyPrimary) {
+      throw new DeliveryError(
+        `canary refused to target primary session ${binding.sessionId}`,
+        "dead_letter",
+      );
+    }
+    if (canary.allowlist.length > 0) {
+      const allowed =
+        canary.allowlist.includes(binding.sessionId) ||
+        canary.allowlist.includes(binding.conversation.key) ||
+        canary.allowlist.includes(
+          `${canary.sessionPrefix}:${binding.conversation.key}`,
+        );
+      if (!allowed) {
+        throw new DeliveryError(
+          `canary session ${binding.sessionId} is not in the explicit allowlist`,
+          "dead_letter",
+        );
+      }
+    }
+    return `${canary.sessionPrefix}:${binding.conversation.key}:${binding.generation}:${binding.sessionId}`;
   }
 
   public async deliver(batch: LeasedBatch): Promise<void> {
     if (!this.available()) {
       throw new DeliveryError(
         this.options.factory.capability.reason ??
-          "Copilot SDK system enqueue capability is unavailable",
+          "Copilot SDK enqueue capability is unavailable",
         "retry",
       );
     }
@@ -233,6 +361,12 @@ export class CopilotSdkAdapter implements WakeAdapter {
     let active = true;
     let sendStarted = false;
     const deadlineAt = Date.now() + this.options.timeoutMs;
+    const sourceMode =
+      this.options.sourceMode ?? this.options.factory.capability.sourceMode;
+    const effectiveSource: CopilotSendSource =
+      sourceMode === "system" && this.options.factory.capability.systemSource
+        ? "system"
+        : "user";
     const assertActive = (): void => {
       if (!active) {
         throw new DeliveryError(
@@ -257,10 +391,11 @@ export class CopilotSdkAdapter implements WakeAdapter {
           "retry",
         );
       }
+      const prompt = this.promptFor(batch, effectiveSource);
       sendStarted = true;
       return session.send({
-        prompt: batch.summary,
-        source: "system",
+        prompt,
+        source: effectiveSource,
         mode: "enqueue",
       });
     };
@@ -300,6 +435,22 @@ export class CopilotSdkAdapter implements WakeAdapter {
     }
   }
 
+  private promptFor(batch: LeasedBatch, source: CopilotSendSource): string {
+    const prefix =
+      source === "user"
+        ? "[UNTRUSTED DISCORD EVENT SUMMARY; provenance explicit and not trusted by the receiver]\n"
+        : "";
+    const prompt = `${prefix}${batch.summary}`;
+    const maxBytes = this.options.maxPayloadBytes ?? 64 * 1024;
+    if (Buffer.byteLength(prompt, "utf8") > maxBytes) {
+      throw new DeliveryError(
+        `Copilot SDK prompt exceeds the ${maxBytes} byte payload bound`,
+        "retry",
+      );
+    }
+    return prompt;
+  }
+
   private async sessionFor(
     batch: LeasedBatch,
     assertActive: () => void,
@@ -313,14 +464,15 @@ export class CopilotSdkAdapter implements WakeAdapter {
     }
     const client = await this.clientInstance(assertActive);
     assertActive();
-    const metadata = await client.getSessionMetadata(batch.binding.sessionId);
+    const sessionId = this.resolveSessionId(batch.binding);
+    const metadata = await client.getSessionMetadata(sessionId);
     assertActive();
     const session = metadata
-      ? await client.resumeSession(batch.binding.sessionId, {
+      ? await client.resumeSession(sessionId, {
           suppressResumeEvent: true,
           continuePendingWork: false,
         })
-      : await client.createSession({ sessionId: batch.binding.sessionId });
+      : await client.createSession({ sessionId });
     try {
       assertActive();
     } catch (error) {
