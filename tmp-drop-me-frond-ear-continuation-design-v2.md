@@ -188,3 +188,105 @@ index and reran without changing product source. Proof states that failure.
 No further substantive design/canary edits; remaining commits are receipts only.
 No prohibited resources used. Next: publish receipts, capture hashes, append
 declare-done, final local/tracking/server equality. Future D01–D11 gates remain.
+
+## 2026-09-13T04:26:53Z — Phase 7 declare-done
+
+**Lane: FROND-EAR-CONTINUATION-DESIGN-v2. Status: COMPLETE (design/evidence
+scope only), with disclosed execution deviations below.**
+
+Evidence-freeze HEAD `cd67f74a867be3c0bc4c232679f7b6b27e2ad473`;
+tree `53b110e872d3116cf1a8455601a2b998bd455f03`.
+Local HEAD, origin tracking and server branch all equal that full SHA;
+porcelain empty before this declaration. This final journal-only commit is the
+terminal declaration; its own commit/tree identities are resolved from git
+objects and returned in the dispatch receipt, not self-referential text.
+Final push must again verify local/tracking/server equality and clean worktree.
+
+Source `codeagent/frond-ear-copilot-sidecar-v1` remains
+`36fd00980eda5f89a8fd3d1ef7c963a9bf03550d`,
+source tree `8d9471005ba210b3bf2195c9b1b5ea1018803923`.
+Output branch `design/frond-ear-continuation-astra-v2`.
+Exact base→tip changed paths:
+
+1. `docs/frond-ear-continuation-design-v2.md`
+2. `docs/proofs/frond-ear-continuation-design-v2-offline.md`
+3. `docs/proofs/frond-ear-continuation-design-v2-live-canary-plan.md`
+4. `tmp-drop-me-frond-ear-continuation-design-v2.md`
+
+Final document SHA-256 values (unchanged by this journal-only declaration):
+
+| Document         | SHA-256                                                            |
+| ---------------- | ------------------------------------------------------------------ |
+| Design           | `b84340b996a76dc511ca9a12aabf81befdc579046beccbaccb6b64e4d9251e84` |
+| Offline proof    | `541fb10ec30d1ae8cb7d0d9664e224cb7c7c5c230f1acc159ae6881454dc58dd` |
+| Live-canary plan | `93a45c2983e72c76ec387591a78c414c60bf0176f083bbeadbda042be298ca67` |
+
+Checkpoint commit list, in order (this declaration adds the final commit):
+
+```text
+6d7c561d7a199a67f01e86297758dd6b79dc7cb0 phase 0/1 journal
+5909150145d3393822e29d081b2c86296a51bba4 phase 2 byte/SDK map
+829c17c1c47b9a147a71fc4f8ea18b1b556147f5 phase 3 state/trust
+65f1c1ea9f17160bb482d65d486d1031d41f777a phase 4 continuation
+e14e717dc2f3baaea5e3b80c66a56c5fe7e6daa9 phase 5 proof/rollout
+72ff2a2c43ab4a2c19b05fd146dded87b52ffd7e phase 6 review repair
+cd67f74a867be3c0bc4c232679f7b6b27e2ad473 amended review/check receipts
+```
+
+Phase summary: immutable source/unchanged-origin publication proved; all current
+source/tests and released SDK mapped; explicit state/data/tenant/trust design
+authored; finite untrusted heartbeat protocol defined; independent offline and
+live proof classes separated; Claude Sonnet 5 exact-diff review and follow-up
+passed after F1 repair; final artifact hashes and publication identities checked.
+
+Checks: existing 37 tests passed with no skips/failures; TypeScript build and
+noEmit passed using existing matching dependencies; repository Prettier,
+credential-pattern scanner, diff whitespace and document structure/scope checks
+passed. Exact commands, tested SHAs, output limitations and the intermediate
+generated-index formatting failure are in offline proof. No dependency mutation.
+Offline mechanical status: PASS for existing checks and design specification;
+the proposed v2 fake harness is not implemented or claimed executed.
+
+SDK: released `@github/copilot-sdk@1.0.13`, bundled CLI 1.0.83; tarball SHA-256
+`238147f38bb7597bdd6864445e27137475ec034c831efb555655f3db28d50b3b`;
+verified integrity
+`sha512-/j6/tGc9HOtcupuYFloOKk0fpScdpy65EVF1LKg2Z2VQOojCGPgBGkhgVGVDaqW7UB6TV2qbQZa9rKJimJ0wWQ==`.
+Public types/implementation support user-source sends; no installed live
+runtime was inspected. Acceptance identity ≠ completed turn ≠ durable
+exactly-once execution. Ambiguity remains fail-closed.
+
+Review: Claude Sonnet 5, two bounded exact-diff passes; amended review
+`72ff2a2c43ab4a2c19b05fd146dded87b52ffd7e`, checklist all 27 PASS after repair.
+Exact-worktree fork index matched that head; 56 Markdown section nodes across
+four changed files, zero changed code symbols/affected flows, low graph risk.
+Code impact/context N/A; graph is not architecture proof. Subsequent commits
+change only review/check/declaration receipts, not substantive design/canary.
+
+Live-canary status: **NOT RUN — REQUIRES SEPARATE OPT-IN**.
+No implementation/canary/production readiness implied.
+Unresolved future decisions: D01 acceptance durability; D02 runtime/suspension
+fence; D03 completion correlation; D04 disposition interface; D05 isolation
+settings; D06 tenant control auth; D07 Teams API; D08 priority/context merge;
+D09 bounds/retention; D10 legacy ownership migration; D11 live version
+compatibility. D12 exact-index/independent review is closed by offline receipt.
+Each future gate has owner/default/proof in the design. Any failure blocks the
+relevant implementation activation/canary/production stage, never fallback.
+
+Ordered future slices: (1) generic types/envelope, (2) tenant migration,
+(3) attempts/ambiguity ledger, (4) user-source SDK adapter, (5) ownership and
+primary exclusion, (6) continuation/HB, (7) deterministic lifecycle harness,
+(8) Discord migration, (9) Teams skeleton, (10) disposable canary command,
+(11) observability/reconciliation, (12) separately gated rollout/cutover.
+
+Execution deviations: three journal indentation lines normalized without
+word/history deletion (independent review accepted); estimated phase-heading
+time corrected by append-only observed-time receipt; one synchronous-review
+liveness gap about seven seconds beyond the 385-second ceiling. These remain
+visible in proof/journal; no claim of perfect procedural compliance.
+
+Confirmed: no product implementation, dependency mutation, deployment, PR,
+cutover, live Discord/Teams connection, credential-value/file read,
+primary-session access, issue/project/chat changes, force-push, rebase or squash.
+Only authorized source/public SDK reads and origin checkpoint publication.
+Sol branch/artifact never mutated. Final verification remains bounded to the
+lane refs/documents/checks; no new design work or external action.
