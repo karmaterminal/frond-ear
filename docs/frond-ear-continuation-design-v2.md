@@ -373,7 +373,142 @@ denial and storage boundaries provide enforcement.
 
 ## 7. Continuation pump and bounded heartbeat
 
-Detailed algorithm is completed in the continuation checkpoint below.
+Add explicit continuation while preserving priority, leases and honest
+unavailable reporting. The apparent “+1 turn” observation is not an SDK
+guarantee. The proposal is repeated supported sends; fake contract proof and
+separate live canary must establish follow-on behavior independently.
+
+### Pump algorithm and positive evidence
+
+1. Reconstruct unresolved attempts, deadlines and binding head from DB.
+   Acquire exclusive driver/runtime boundary (§4), then start isolated SDK.
+   Creation/resume/ownership validation and event subscription precede leasing
+   work for send. A ready socket alone is insufficient.
+2. Select real work by fair scheduling. Serialize setup/rotation and recheck
+   tenant policy, binding/head, pause, driver lifetime lock and lease budget.
+   Seal bounded envelope and commit send-started attempt.
+3. Invoke `send({prompt:renderedEnvelope,mode:"enqueue"})` exactly once for that
+   attempt. No `source` field is required. Bound setup plus acceptance by
+   monotonic deadline (initial 15s) below lease (initial 30s), with final margin
+   (at least 2s). If timing cannot be validated, do not initiate.
+4. A nonempty returned message ID is positive RPC acceptance/identity evidence
+   under the pinned adapter contract, not proof of persisted fsync or turn end.
+   Persist it and perform §8 acknowledgement. A malformed result or any
+   unresolved post-invocation error is ambiguous, never ordinary retry.
+5. Persist allowlisted lifecycle facts idempotently. `user.message.messageId`
+   links acceptance to optional `turnId`; `assistant.turn_end.turnId` proves a
+   terminal turn boundary. Successful completion requires no matching
+   error/abort and sufficient correlation. If message IDs/turn IDs are absent,
+   completion stays unknown. Global `session.idle` is a scheduling hint and
+   supports a completed correlated turn, not a substitute for correlation.
+6. If several enqueued messages are consumed in one turn, relate each proven
+   message to the common turn. Do not assume one message equals one turn.
+   Any per-work disposition must explicitly identify that work.
+7. Evaluate bounded continuation disposition only after correlated successful
+   terminal evidence. Missing/malformed/conflicting disposition → blocked,
+   not speculative heartbeat. Interrupted pending work on resume is not an
+   instruction to replay; reconcile first.
+
+While busy, default hold real work locally. A version-proven enqueue path may
+admit one additional real batch (at most two accepted outstanding batches total)
+under independent valid lease/attempt. Never enqueue a heartbeat while busy or
+while queued real work exists. Enqueue is for bounded real intake, not unlimited
+SDK-side buffering. Out-of-order events are persisted before interpretation.
+Late events update evidence for their original namespace/generation only.
+
+Do not use `sendAndWait` for delivery acknowledgement: it drops the acceptance
+ID and waits on session-level idle. Its timeout starts after awaiting send in
+the released implementation, so it is not a setup/send deadline and does not
+abort work. Completion waiting must never hold a lease open indefinitely.
+
+### What authorizes a heartbeat
+
+An authenticated local admission/control policy may preauthorize continuation
+for a logical work record with explicit finite limits. Ordinary external text
+cannot create or raise that authorization. Default per-event continuation
+budget is **zero** until a reviewed tenant rule enables it.
+
+Initial design uses no new custom tool. The isolated model may return a bounded
+JSON disposition in a final response with exactly:
+`schemaVersion, workId, disposition, progressRefs`, where disposition is
+`complete|continue|blocked|failed`, progressRefs is at most eight bounded opaque
+references and total response is at most 2 KiB. It is **untrusted model data**.
+The adapter accepts only one well-formed object correlated to the expected
+terminal turn/work; extra/conflicting objects block. Parsing source text or
+unrelated historical output as a disposition is forbidden.
+
+This is a request, not authority. Host policy and durable budget independently
+decide whether `continue` is allowed. `complete` means “model reported no
+additional continuation required”; it is not evidence of external side effects
+or objective completion. Record `reported-complete` separately from externally
+verified outcomes. Missing response blocks further turns. A future narrow
+checkpoint tool is an unresolved optional interface change, not assumed here.
+
+Schedule only if all are true:
+
+- valid host preauthorization remains, originating source delivery accepted;
+- correlated terminal turn succeeded and explicitly requested `continue`;
+- work is unresolved, generation current, enabled/unpaused, ownership proven;
+- no ambiguous attempt or interrupted work blocks that binding;
+- no real work pending/recently accepted, and finite limits below permit it.
+
+The heartbeat contains only fixed bounded untrusted control-envelope wording,
+opaque work references and predecessor accepted-message provenance. It does
+not repeat arbitrary source text, assert system authority, reset history, or
+grant tools. A model must recover relevant context from its own owned session;
+if compaction/history loss prevents that, mark blocked rather than resend all
+past content.
+
+### Initial finite schedule
+
+| Limit | Proposed initial value and persistence rule |
+|---|---|
+| quiet period after real acceptance | 30s; persist last real acceptance time |
+| minimum/maximum heartbeat spacing | 60s / 300s; reject invalid policy |
+| jitter | deterministic sampled 0–15s, stored once, clamp final interval to [60s,300s] |
+| consecutive heartbeats per logical work | at most 3; reserve before send; cancellation does not refund |
+| elapsed continuation window | 15min from originating real acceptance; no restart/pause extension |
+| generation lifetime budget | at most 12 reservations, including cancelled/suppressed ones; no time-based reset |
+| consecutive no-progress observations | at most 2; then exhausted |
+| scheduler tick | at most once per second, bounded tenant scan; no autonomous model tick |
+| acceptance timeout / completion observation | 15s / 120s; completion deadline means unknown, never resend |
+
+“Progress” here is observed disposition change plus a new bounded progress
+reference set, recorded as model-reported. Mere elapsed time, assistant tokens,
+heartbeat ordinal or repeated `continue` is not progress. A model can falsely
+claim novel progress; finite total/time budgets still bound amplification.
+Actual side-effect validation is outside this plugin.
+
+Before scheduling, reserve ordinal/budget/dueAt/work linkage in one transaction.
+Before leasing and again immediately before invocation, recheck real work.
+Real admission takes the same binding serialization boundary: if it wins,
+cancel/suppress unsent heartbeat; if heartbeat invocation already won, finish
+that attempt and prioritize real work next. No impossible retroactive
+supersession claim. Suppression leaves the logical work visible as superseded;
+new real work does not silently reset old budgets or imply completion.
+
+Busy or recently active sessions defer without sending or consuming a new
+ordinal. Reschedule the same unsent due record within its absolute deadline;
+do not create duplicate reservations. Pause, rotation, disable, tenant shutdown,
+lease loss, ownership failure and exclusion failure cancel unsent heartbeats.
+Already invoked heartbeats become accepted/ambiguous according to evidence;
+never hide them as harmless cancelled timers.
+
+On restart: confirm old runtime stopped; rebuild due records; reconcile earlier
+attempts; use persisted sampled jitter, ordinal and deadlines. At most one
+eligible due record is processed per binding, never a burst for missed time.
+
+Continuation stops exactly on: valid correlated `complete` (reported-complete),
+`blocked`/`failed`, invalid/missing disposition, conflicting evidence,
+no-progress threshold, any count/time budget exhaustion, revoked authorization,
+generation/tenant disable or unrecoverable ownership/isolation uncertainty.
+Successful scheduling completion means all authorized continuation work has a
+terminal recorded disposition, not that external goals succeeded.
+
+**Hard boundary:** if the pinned SDK cannot distinguish positive acceptance
+from rejection, cannot preserve identity on resume, or cannot expose enough
+correlation for the selected completion protocol, live delivery/continuation
+is blocked. Do not turn unknown into success to overcome the apparent +1 limit.
 
 ## 8. Queue, attempts, acknowledgement and reconciliation
 

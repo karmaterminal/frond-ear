@@ -106,3 +106,19 @@ retry edge; late evidence goes to reconciliation, not expired ack; every
 durable table has an owner. §7 is an explicitly pending next-phase section.
 Worktree changes confined to design and journal; no prohibited resource used.
 Next bounded action: continuation/HB budgets and completion evidence.
+
+## 2026-09-13T04:10Z — Phase 4: bounded continuation algorithm
+
+HEAD `829c17c1c47b9a147a71fc4f8ea18b1b556147f5`.
+Added §7 with independently authorized host budgets, untrusted model
+dispositions, user-source heartbeat envelopes, correlated terminal evidence,
+busy enqueue bounds, restart/cancellation and exact stop outcomes.
+Rejected mandatory new checkpoint-tool ecosystem; optional tool remains a
+future decision. Rejected idle-only completion, post-timeout resend and
+“progress” based only on elapsed time or tokens. Hard total/time budgets bound
+even falsely claimed model progress.
+Evidence: released session.js send/sendAndWait distinction and generated
+message/turn IDs; no live runtime instantiated. Fake/live independent proof
+still required for follow-on behavior; no claim the apparent +1 is solved live.
+All changes design/journal only. No prohibited resource accessed.
+Next gate: scenario matrix, threat model, rollout, available offline checks.
