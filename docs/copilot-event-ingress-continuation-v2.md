@@ -1,9 +1,13 @@
 # Copilot event-ingress and durable continuation v2
 
-Status: design only  
-Base of record: `origin/codeagent/frond-ear-copilot-sidecar-v1@36fd00980eda5f89a8fd3d1ef7c963a9bf03550d`  
-Audience: implementers and reviewers of a source-neutral Copilot continuation plugin  
-Initial source adapter: Discord  
+Status: design only
+
+Base of record: `origin/codeagent/frond-ear-copilot-sidecar-v1@36fd00980eda5f89a8fd3d1ef7c963a9bf03550d`
+
+Audience: implementers and reviewers of a source-neutral Copilot continuation plugin
+
+Initial source adapter: Discord
+
 Later source adapter: Microsoft Teams
 
 ## 1. Decision summary
