@@ -74,3 +74,18 @@ Phase 1; HEAD `36fd00980eda5f89a8fd3d1ef7c963a9bf03550d`.
 Clean before journal; journal now sole new file. Last action: unchanged branch
 identity verified on origin. Next: publish journal, map SDK and invariants.
 No prohibited resource accessed; no blocker at the design-only gate.
+
+## 2026-09-13T04:04Z — Phase 2: source and SDK contract map
+
+HEAD `6d7c561d7a199a67f01e86297758dd6b79dc7cb0`.
+Inspected references: all immutable files and released tarball declarations
+listed in offline proof; local GitNexus runbook operational indexing route.
+Decision: add durable acceptance attempts while preserving generation/queue
+strengths. Reject source-summary assumptions about pause/expiry/ownership.
+No SDK dependency exists in manifest/lock; public package was inspected in
+memory, not installed. Toolchain packages already available at matching pins.
+Auth public identity `scribe-dandelion-cult` confirmed without reading secrets.
+Alternative rejected: adopting Sol's retry-on-empty-history protocol.
+Uncertainty: runtime side-effect fencing needs exclusive process ownership,
+not a DB epoch; positive acceptance does not prove durable execution.
+Deviation: none in product scope. Next: state/data architecture checkpoint.
