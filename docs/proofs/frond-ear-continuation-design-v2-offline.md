@@ -358,3 +358,181 @@ Initial checklist: 26 PASS, heartbeat consistency CONDITIONAL. Reviewer's
 summary called F1 nonblocking but closing section called it a design blocker;
 the stricter reading is applied: repair and re-review, not waive. D12 remains
 open until exact amended review receipt. All D01–D11 future proof gates remain.
+
+### Amended exact review — D12 closed
+
+Amended reviewed HEAD:
+`72ff2a2c43ab4a2c19b05fd146dded87b52ffd7e`;
+tree `a1c96a6d4a8ff2b7c6a5dedc0be1b1fcfca83f31`.
+Local/tracking/server equality verified again at 2026-09-13T04:25:05Z.
+Fresh exact-worktree index: `lastCommit` equals this HEAD,
+`indexedAt=2026-09-13T04:21:47.530Z`; graph/FTS available,
+698 nodes, 1,901 edges, 34 clusters, 45 flows; lbug 53,178,368 bytes.
+Meta SHA-256 `8cf33ec7b542c6d71acdf1f930144d8594b89a8e4c94160c150631e2c9308867`.
+
+Installed fork command:
+`gitnexus detect-changes --scope compare --base-ref
+36fd00980eda5f89a8fd3d1ef7c963a9bf03550d --repo <exact-worktree>`
+returned **four files, 56 Markdown sections, zero affected flows, low risk**.
+No changed code symbols; impact/context remain N/A. A first attempt to parse
+human-readable CLI output as JSON failed in the output formatter, not graph
+analysis; the command was rerun in its supported text form and receipt read
+directly. No analysis result was invented from that parser failure.
+
+Claude Sonnet 5 performed a bounded second pass on the exact prior→amended diff
+and reconfirmed BASE→amended four-file scope, base tree, local/tracking HEAD and
+clean worktree. **F1 resolved; design-level PASS; no remaining design blocker.**
+It confirmed disjoint terminal real-work suppression versus same-reservation
+non-real idle deferral. Original 26 PASS judgments stand; heartbeat upgrades to
+PASS. D12's initial pending state in the design register is superseded by this
+completed exact-head review receipt. D01–D11 remain future activation/slice
+gates, not implied completed by this design.
+
+#### Final workorder §15 checklist
+
+| Item                                                       | Result                                                        |
+| ---------------------------------------------------------- | ------------------------------------------------------------- |
+| exact immutable base                                       | PASS                                                          |
+| exact pushed reviewed head                                 | PASS, independent local/tracking plus author server check     |
+| only four permitted files                                  | PASS                                                          |
+| bounded ingress plugin, not OpenClaw                       | PASS                                                          |
+| existing safety properties preserved                       | PASS; missing source guarantees explicitly distinguished      |
+| missing system-source setter non-blocking                  | PASS                                                          |
+| untrusted provenance-bearing user envelopes                | PASS                                                          |
+| lifecycle/acceptance/completion/idle distinct              | PASS                                                          |
+| no ambiguity→success/ordinary retry                        | PASS                                                          |
+| finite durable suppressible fenced heartbeats              | PASS after F1 repair                                          |
+| real work precedence                                       | PASS                                                          |
+| transactional owners/restart rules                         | PASS                                                          |
+| no silent event loss                                       | PASS as proposed contract; source gaps disclosed              |
+| poison/ambiguity visible                                   | PASS                                                          |
+| rotation fences all delivery phases                        | PASS                                                          |
+| primary exclusion mechanical/testable                      | PASS as required future boundary; runtime proof remains gated |
+| Discord/Teams identity separation                          | PASS                                                          |
+| tenant storage/scheduling/session/metrics/replay isolation | PASS                                                          |
+| before/during/after send crash points                      | PASS                                                          |
+| offline/live proof separate                                | PASS                                                          |
+| disposable opt-in non-production canary                    | PASS, NOT RUN                                                 |
+| no primary/foreign rollback fallback                       | PASS                                                          |
+| fake late-acceptance/duplication scenarios                 | PASS specification; not implemented                           |
+| content/token/raw-ID/path-safe observability               | PASS design                                                   |
+| explicit unresolved decisions/proof owners                 | PASS                                                          |
+| small ordered future slices                                | PASS                                                          |
+| no implied PR/deployment                                   | PASS                                                          |
+
+### Final available repository checks at reviewed HEAD
+
+At `72ff2a2c43ab4a2c19b05fd146dded87b52ffd7e`,
+2026-09-13T04:25:28Z, clean tracked worktree:
+
+| Command                                                                                                                                | Result                                                                                 |
+| -------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| `node <existing-product-node_modules>/prettier/bin/prettier.cjs --check .`                                                             | exit 0, all matched files formatted                                                    |
+| `node <existing-product-node_modules>/typescript/bin/tsc -p tsconfig.json --noEmit --typeRoots <existing-product-node_modules>/@types` | exit 0                                                                                 |
+| `node --test --test-concurrency=1 dist/test/*.test.js`                                                                                 | exit 0, 37 pass, 0 fail/skip/cancel                                                    |
+| `node scripts/scan-credentials.mjs`                                                                                                    | exit 0, 34-file scan; repository files only                                            |
+| `git diff --check`                                                                                                                     | exit 0                                                                                 |
+| inline document inventory assertions                                                                                                   | exit 0; 18 numbered sections, I01–I22, D01–D12, four-file diff, required canary labels |
+
+Tests use the earlier compiled output from byte-identical source at
+`65f1c1ea9f17160bb482d65d486d1031d41f777a`; only documentation changed since.
+Compiler/typecheck and tests retain the sanitized environment and project-local
+fixture/HOME roots described above. No dependency install/update was required.
+The repository credential-pattern scanner reads tracked/nonignored source
+documents, not credential files, and prints finding names only.
+
+One intermediate formatter check failed **only** on generated
+`.gitnexus/meta.json` and `.gitnexus/parse-cache/index.json`; the index is
+diagnostic output, not product content. Removed that lane index with installed
+`gitnexus clean --force`, reran the full formatter successfully, then rebuilt
+the exact index for review. After the amended review, cleaned the generated
+index again before final checks. No product file was reformatted to cure it.
+
+## Gate disposition and execution deviations
+
+| Named gate                            | Design-lane disposition                                                                   |
+| ------------------------------------- | ----------------------------------------------------------------------------------------- |
+| Source-identity                       | PASS; source/tree and initial unchanged publication verified                              |
+| Direct-byte-comprehension             | PASS; inventory/source/test reads and source corrections recorded                         |
+| SDK-contract-honesty                  | PASS for design; no runtime acceptance/durability claim beyond evidence                   |
+| Architecture-completeness             | PASS after F1 repair and independent follow-up                                            |
+| Offline-mechanical-proof              | PASS for existing checks and required harness specification, not new implementation proof |
+| Primary-and-tenant-safety             | PASS as mechanically testable design; actual isolation/fencing activation remains gated   |
+| Exact-diff-independent-review         | PASS on amended reviewed HEAD; code-symbol graph operations N/A with reason               |
+| Origin-first-publication-and-identity | checkpoint identities PASS; terminal declaration/ref verification in journal              |
+
+Disclosed execution deviations, not hidden as exact compliance:
+
+1. Three indentation-only journal lines normalized by repository formatter;
+   all reasoning/history retained. Independent reviewer accepted as disclosed.
+2. Phase-heading timestamps were minute estimates; an ahead-of-time 04:14Z
+   heading corrected by append-only exact observed-time entry.
+3. Synchronous independent review exceeded the 385-second liveness interval
+   by approximately seven seconds measured from index completion; disclosed
+   in journal. No two-interval no-progress condition or prohibited access.
+
+Final receipt-only commits append review/check/declaration evidence. The
+substantive design and live-canary document remain byte-identical to the
+amended reviewed HEAD; no architecture/invariant changes after review.
+Their SHA-256 hashes:
+
+- Design: `b84340b996a76dc511ca9a12aabf81befdc579046beccbaccb6b64e4d9251e84`
+- Canary plan: `93a45c2983e72c76ec387591a78c414c60bf0176f083bbeadbda042be298ca67`
+
+The final offline-proof hash and terminal commit/tree are captured by the
+journal/publication receipt rather than a self-referential hash inside this
+document. All four allowed paths are named in the inventory/declaration.
+
+## Exact executable test names at immutable source
+
+`test/copilot-sidecar.test.ts`:
+
+1. first binding persists and a restarted adapter resumes its dedicated session
+2. exact v0 queue rows migrate into durable generation-one bindings
+3. two Discord conversations use isolated Copilot sessions
+4. authorized new rotates once while unauthorized new remains untrusted content
+5. new command replay keeps its original disposition across policy changes
+6. rotation fences queued and leased predecessor events from successor delivery
+7. busy sessions accept enqueue mode and SDK rejection releases the lease
+8. ambiguous SDK timeout dead-letters rather than risking duplicate retry
+9. expired lease during SDK setup prevents the delayed session send
+10. SDK setup timeout cannot continue into send or cache mutation
+11. binding pause and unavailable SDK capability preserve pending queue rows
+12. delivery errors and untrusted content remain redacted in structured logs
+
+`test/gateway.test.ts`:
+
+1. disconnect/restart persists sequence and resumes the durable session
+2. fatal close codes stop reconnecting and surface failure
+3. heartbeat without an ACK closes the stale connection and schedules resume
+4. a stale socket close cannot schedule another connection
+5. non-resumable invalid session clears identity and waits before reconnect
+6. Gateway replay flows through service and remains idempotent
+7. failed event persistence does not advance the durable Gateway sequence
+
+`test/http-adapter.test.ts`:
+
+1. loopback binding accepts only explicit local addresses
+2. command adapter timeout must remain shorter than the queue lease
+3. command adapter writes bounded JSON to stdin without shell interpolation
+4. command adapter timeout rejects even when the child ignores SIGTERM
+5. loopback API leases, acknowledges, and releases through the store boundary
+
+`test/service.test.ts`:
+
+1. shutdown waits for in-flight delivery before the store can close
+2. automatic delivery reports a lease lost before ack
+
+`test/store-policy.test.ts`:
+
+1. duplicate Discord message replay remains idempotent across restart
+2. priority authors and direct mentions override suppressions inside allowlists
+3. policy requires bot identity and bounds coalescing latency
+4. ignored authors, patterns, event classes, guilds, channels, and self are rejected
+5. noisy burst coalesces while priority remains an independent first lease
+6. continuous channel traffic cannot postpone a burst beyond the coalesce bound
+7. overflow explicitly dead-letters noise and preserves admitted priority
+8. lease expiry recovers a crash before ack
+9. delivery failures release then dead-letter at the configured attempt bound
+10. Gateway kill switch rejects new ingestion and wake pause preserves queued work
+11. structured logs redact token values and content fields
