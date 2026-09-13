@@ -160,18 +160,19 @@ Fields: tenant, binding/generation, logical work and predecessor message,
 ordinal, unique authorization ID, dueAt, sampled jitter, expiry, budget
 reservation, attempt ID, state/reason. It is a delivery kind, not a timer loop.
 
-| From → to                                       | Scheduler/Pump guard                                               | Semantics                                                    |
-| ----------------------------------------------- | ------------------------------------------------------------------ | ------------------------------------------------------------ |
-| unscheduled → scheduled                         | valid §7 request, completed turn, host preauthorization and budget | T/R; unique `(binding,generation,work,ordinal)`              |
-| scheduled → due                                 | persisted due time reached, not beyond deadline                    | T/R                                                          |
-| scheduled/due → suppressed-by-real-work         | pending or recently accepted real work                             | T/R; no heartbeat send; consumed reservation remains bounded |
-| due → leased                                    | every normal tenant/head/pause/owner/lease check passes            | T/R; real queue rechecked                                    |
-| leased → accepted                               | attempt recorded, send succeeds with acceptance ID                 | X/Q + T/R, same ambiguity protocol as real work              |
-| accepted → satisfied                            | correlated successful terminal plus valid disposition              | T/R; not on mere idle                                        |
-| satisfied → rescheduled-with-budget → scheduled | explicit new request and remaining finite budget                   | T/R; next ordinal, no budget reset                           |
-| scheduled/due/leased-pre-send → cancelled       | pause/rotation/disable/shutdown/lease/ownership failure            | T/R; never send after cancellation                           |
-| satisfied/scheduled/due → exhausted             | count/time/no-progress/generation limit                            | T/R; terminal, no autonomous reset                           |
-| any unresolved → dead-lettered                  | poison or definite terminal failure                                | T/R; ambiguous remains quarantined instead                   |
+| From → to                                       | Scheduler/Pump guard                                                        | Semantics                                                       |
+| ----------------------------------------------- | --------------------------------------------------------------------------- | --------------------------------------------------------------- |
+| unscheduled → scheduled                         | valid §7 request, completed turn, host preauthorization and budget          | T/R; unique `(binding,generation,work,ordinal)`                 |
+| scheduled → due                                 | persisted due time reached, not beyond deadline                             | T/R                                                             |
+| scheduled/due → suppressed-by-real-work         | pending, accepted-outstanding or recently accepted real work                | T/R; terminal suppression; reservation retained, no rearming    |
+| due → scheduled                                 | session not provably idle for a non-real-work reason, still within deadline | T/R; defer same reservation/ordinal, no additional budget debit |
+| due → leased                                    | every normal tenant/head/pause/owner/lease check passes                     | T/R; real queue rechecked                                       |
+| leased → accepted                               | attempt recorded, send succeeds with acceptance ID                          | X/Q + T/R, same ambiguity protocol as real work                 |
+| accepted → satisfied                            | correlated successful terminal plus valid disposition                       | T/R; not on mere idle                                           |
+| satisfied → rescheduled-with-budget → scheduled | explicit new request and remaining finite budget                            | T/R; next ordinal, no budget reset                              |
+| scheduled/due/leased-pre-send → cancelled       | pause/rotation/disable/shutdown/lease/ownership failure                     | T/R; never send after cancellation                              |
+| satisfied/scheduled/due → exhausted             | count/time/no-progress/generation limit                                     | T/R; terminal, no autonomous reset                              |
+| any unresolved → dead-lettered                  | poison or definite terminal failure                                         | T/R; ambiguous remains quarantined instead                      |
 
 No other heartbeat edges exist. After crash, due timers are reconstructed from
 records; missed ticks are not replayed as multiple sends.
@@ -487,9 +488,12 @@ that attempt and prioritize real work next. No impossible retroactive
 supersession claim. Suppression leaves the logical work visible as superseded;
 new real work does not silently reset old budgets or imply completion.
 
-Busy or recently active sessions defer without sending or consuming a new
-ordinal. Reschedule the same unsent due record within its absolute deadline;
-do not create duplicate reservations. Pause, rotation, disable, tenant shutdown,
+Real work pending, accepted-outstanding or accepted within the quiet period
+terminally suppresses the unsent heartbeat; it is never rearmed and its
+reservation is not refunded. Only a non-real-work inability to prove idle
+defers `due → scheduled` using the same unsent record, ordinal and reservation
+within the original absolute deadline. Do not create duplicate reservations.
+Pause, rotation, disable, tenant shutdown,
 lease loss, ownership failure and exclusion failure cancel unsent heartbeats.
 Already invoked heartbeats become accepted/ambiguous according to evidence;
 never hide them as harmless cancelled timers.

@@ -316,3 +316,45 @@ receipts are appended at the final candidate. No claim `pnpm check` itself ran.
 No source/test/dependency/policy/deployment/workflow file changed. No network
 connection to Discord, Teams or a live Copilot session. No credential file,
 credential value or primary-session storage/transcript/process was accessed.
+
+## Exact-diff GitNexus and independent review
+
+Review freeze: `e14e717dc2f3baaea5e3b80c66a56c5fe7e6daa9`.
+Local HEAD, origin tracking and server `ls-remote` agree. Exact base is source.
+`git diff --name-only BASE HEAD` returns exactly four permitted files.
+
+Installed fork CLI 1.6.5, source checkout commit
+`3c1e686edfc1acaac882927cada121ddd7c47bcc`;
+wrapper SHA-256 `8309aeb6858023f5cb3ff4ae8416b64c1989e4fe04d82dd822964127ed1355ca`;
+compiled CLI SHA-256 `00f67e34c0ef3a7ea5f1665247699f47e7e2eab2dc233a504fe95d9aa11d8590`.
+No stock npm/npx tool used. Exact worktree invocation:
+`gitnexus analyze --index-only --skip-git --workers 0` — exit 0, 8.9s.
+
+Index meta recorded exact lane repoPath, lastCommit equal review freeze,
+indexedAt `2026-09-13T04:13:58.893Z`, graph and FTS available, no vectors.
+31 indexed files (not the 34-file tracked inventory; different indexing scope),
+696 nodes, 1,899 edges, 34 clusters, 45 flows; lbug 53,161,984 bytes.
+`detect_changes(scope:"compare",base_ref:BASE,repo:EXACT_WORKTREE,
+worktree:EXACT_WORKTREE)` returned four changed files, 54 Markdown Section
+nodes, **zero changed code symbols, zero affected processes, low graph risk**.
+Code-symbol impact/context are N/A, not fabricated. Limitation: graph mapping
+does not prove architecture correctness; checklist review does that separately.
+
+Independent model explicitly selected: **Claude Sonnet 5**, code-reviewer,
+distinct from requested Astra authoring pass. Reviewer read only workorder,
+exact four-file diff/documents and supplied evidence; no credentials/primary
+session/live services or broad rediscovery. It independently verified base tree,
+local/tracking head and clean worktree. SDK package citations were assessed
+from supplied evidence, **not independently re-fetched** by reviewer.
+
+| Finding                                                                                                         | Disposition                                                                                                                                                                      |
+| --------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| F1: heartbeat table treated suppression as terminal but §7 described recently active work as rearmable deferral | Correct before declaration: real pending/accepted-outstanding/recent work is terminal suppression; non-real busy deferral gets explicit due→scheduled edge with same reservation |
+| F2: three journal indentation lines and estimated timestamp correction                                          | Accepted-as-disclosed by reviewer; no deleted reasoning, original commits preserved                                                                                              |
+| F3: SDK citations not independently re-fetched                                                                  | Evidence limitation retained; author verified released tarball/hashes; no second verification falsely claimed                                                                    |
+| F4: busy/ambiguity induction may be unavailable in future canary                                                | Correct explicit NOT PROVEN/NOT RUN behavior, not converted to pass                                                                                                              |
+
+Initial checklist: 26 PASS, heartbeat consistency CONDITIONAL. Reviewer's
+summary called F1 nonblocking but closing section called it a design blocker;
+the stricter reading is applied: repair and re-review, not waive. D12 remains
+open until exact amended review receipt. All D01–D11 future proof gates remain.

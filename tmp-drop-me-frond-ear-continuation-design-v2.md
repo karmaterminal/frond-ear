@@ -154,3 +154,22 @@ no words or prior reasoning are removed. This is a disclosed mechanical
 deviation from byte-literal append-only, retaining semantic append-only history
 and every original committed entry in git. No broader journal rewrite.
 Next: publish proof/checkpoint and exact index. No prohibited resources used.
+
+## 2026-09-13T04:20:30Z — Phase 6: independent exact-diff review
+
+HEAD `e14e717dc2f3baaea5e3b80c66a56c5fe7e6daa9`; local/tracking/server equal;
+clean before review repair. Exact-worktree fork GitNexus has fresh matching
+meta, graph/FTS, nonempty lbug. detect_changes: 54 markdown sections, four
+files, zero changed code symbols/affected flows. No unrelated-index fallback.
+Claude Sonnet 5 reviewed exact diff: 26 PASS, heartbeat consistency conditional.
+F1 is repaired before declaration: terminal real-work suppression is distinct
+from same-reservation non-real idle deferral. F2 whitespace/timestamp deviation
+accepted as disclosed; F3 independent SDK re-fetch not claimed; F4 future
+canary unknowns remain explicitly unproved. Offline proof holds full receipt.
+Synchronous review occupied the interval after index (04:13:58Z) until
+04:20:30Z; this exceeded the 385-second in-agent liveness ceiling by about seven
+seconds using that evidence-action anchor. Disclosed watchdog cadence deviation;
+no prohibited action or two-interval stall occurred. Future review should return
+with a bounded cadence. No uncertainty laundered as successful runtime proof.
+Next bounded action: publish corrected diff, reindex and narrowly re-review F1
+plus exact amended checklist. No prohibited resources touched.
