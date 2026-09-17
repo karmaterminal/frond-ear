@@ -388,6 +388,43 @@ PASS. D12's initial pending state in the design register is superseded by this
 completed exact-head review receipt. D01–D11 remain future activation/slice
 gates, not implied completed by this design.
 
+### Repaired successor after detached high-risk review
+
+The first declared design object was
+`d949d3dd0521b3797155a2868173d6cc18c6f41f`, tree
+`2ad44bba4d7361ebacd7c5ee598e2562b29c4bf3`. Its direct checks remained green
+(`pnpm check`, 37/37), but Cael's later non-author exact-head review returned
+**REQUEST CHANGES — HIGH risk** on three design/evidence defects:
+
+1. the issue-required `silent`, `mentions` and `room` modes were described as a
+   source gap but not specified normatively;
+2. source-command authorization, rotation ownership and the atomic binding
+   between an ingress disposition and its control/rotation request were
+   underdetermined; and
+3. the terminal object deleted the required append-only journal while the
+   offline proof and final receipt continued to cite that journal as evidence.
+
+The isolated successor branch
+`cael/20260916/p92-frond-ear-design-successor` was created directly from that
+rejected object. It does not rewrite or relabel the reviewed branch. The repair:
+
+- freezes exact collection/wake semantics for all three delivery modes,
+  including priority, allowlist, typed-mention, debounce/max-delay, duplicate-
+  wake, restart, mode-reload and bounded ordinary-context outcomes;
+- makes `Control` the sole source-command authority and requires one atomic
+  admission transaction linking immutable ingress disposition to the exact
+  idempotent control/rotation request, followed by a separate atomic terminal
+  outcome transaction under the driver fence; and
+- restores the exact append-only journal bytes from the declaration commit,
+  appends rather than rewrites the successor receipt, and retains the journal
+  in the final tree.
+
+This remains documentation-only. No product implementation, credential access,
+live source, canary, deployment or cutover occurred. The repaired successor's
+final commit/tree/document hashes and non-author review disposition belong in
+the retained journal and the external successor-bound review receipt; they are
+not predicted inside this pre-freeze document.
+
 #### Final workorder §15 checklist
 
 | Item                                                       | Result                                                        |
@@ -471,17 +508,19 @@ Disclosed execution deviations, not hidden as exact compliance:
    by approximately seven seconds measured from index completion; disclosed
    in journal. No two-interval no-progress condition or prohibited access.
 
-Final receipt-only commits append review/check/declaration evidence. The
-substantive design and live-canary document remain byte-identical to the
-amended reviewed HEAD; no architecture/invariant changes after review.
-Their SHA-256 hashes:
+The original receipt-only commits appended review/check/declaration evidence.
+The repaired successor intentionally changes the substantive design and this
+offline proof only for the three later review findings above; the live-canary
+plan remains byte-identical. The original object hashes retained for provenance
+were:
 
 - Design: `b84340b996a76dc511ca9a12aabf81befdc579046beccbaccb6b64e4d9251e84`
 - Canary plan: `93a45c2983e72c76ec387591a78c414c60bf0176f083bbeadbda042be298ca67`
 
-The final offline-proof hash and terminal commit/tree are captured by the
-journal/publication receipt rather than a self-referential hash inside this
-document. All four allowed paths are named in the inventory/declaration.
+The repaired final hashes and terminal commit/tree are captured by the restored
+append-only journal/publication receipt rather than a self-referential hash
+inside this document. All four allowed paths remain present in the final tree
+and are named in the inventory/declaration.
 
 ## Exact executable test names at immutable source
 

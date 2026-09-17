@@ -205,6 +205,9 @@ Tests must query durable tables and ordered fake transcripts, not only call coun
 | I20 | Health never reports live-proven without version-bound separate canary and scoped rollout receipts                                     |
 | I21 | Completion-shaped model text never changes tenant authorization, budget, tools or session identity                                     |
 | I22 | Shutdown stops source admission/control claims/HB creation before draining, then closes runtime and finally DB                         |
+| I23 | Collection and wake scheduling are separate decisions; the committed per-channel delivery mode is `silent`, `mentions`, or `room`      |
+| I24 | Source adapters and message text never authorize control; only `Control` may admit an exact command from a configured principal        |
+| I25 | A source control admission and its immutable ingress disposition are committed in one transaction and share one request digest         |
 
 ## 4. Binding, ownership, fencing and rotation
 
@@ -220,6 +223,52 @@ FKs bind events, attempts, heads, heartbeats, rotations and ownership records.
 `UNIQUE(namespace,sessionId)`. Creation reason/actor and predecessor are required.
 Rotation request uniqueness is `(tenant,requestId)` with input hash: replay
 returns the original successor; different input with same ID is a conflict.
+
+### Source-control and rotation authority
+
+`Control`, not a source adapter, model response, message renderer or SDK
+session, is the sole owner of pause, resume, disable, reconciliation and
+rotation decisions. Trusted installation configuration maps native author IDs
+to tenant-scoped principals and allowed commands. The core accepts a source
+control candidate only when all of the following are true:
+
+1. the adapter supplied a verified native event identity and installation;
+2. the core resolved that installation and conversation to one internal tenant;
+3. the native author ID exactly matches a configured principal authorized for
+   the requested command and conversation scope;
+4. the content matches the versioned exact command grammar (for example an
+   exact `/new`, never a prefix, substring, quoted command or model output);
+5. the referenced binding/generation is the current head and the tenant driver
+   owns the current epoch; and
+6. no row exists for the command request ID, or the existing row has the exact
+   canonical input digest and is therefore an idempotent replay.
+
+One `BEGIN IMMEDIATE` transaction then commits both:
+
+- the immutable ingress disposition `control-admitted`, including native event
+  ID, tenant/conversation, actor principal class, policy version, request ID and
+  canonical command-input digest; and
+- the linked `control_request`/`rotation_request` row, including the same
+  request ID/digest, old binding/generation/head, requested operation and
+  initial `pending` outcome.
+
+The rows have reciprocal tenant-scoped foreign keys or one shared immutable
+control-receipt key; neither row may exist alone. Source ACK/cursor advancement
+occurs only after this transaction commits. A replay with the same request ID
+and digest returns the original admission and current outcome without a second
+operation. Same ID with a different digest is a terminal conflict. Unauthorized
+or malformed command-shaped text receives an immutable `control-denied` (or
+ordinary-data, under explicit policy) disposition and creates no control row.
+
+No SDK call occurs inside that transaction. Rotation executes later under the
+driver fence and per-binding mutex. Its terminal transaction atomically changes
+the current-head pointer, retires/fences the predecessor, records the successor
+or `failed`/`recovery-required` outcome, and appends a `control_outcome` tied to
+the original immutable disposition. The source disposition is never rewritten
+to imply that admission meant successful rotation. A returned receipt exposes
+both facts: `admission=control-admitted` and the separately versioned operation
+outcome. Crash recovery resumes or reconciles the one linked request; it never
+re-parses source text or invents a second request.
 
 **Driver fence:** single-host OS lifetime lock for each tenant runtime, held
 through shutdown and inherited/otherwise enforced for owned child lifetime.
@@ -294,6 +343,36 @@ link; command candidate; priority/redaction inputs; native cursor/checkpoint;
 adapter version and replay/health facts. Core validates every field, determines
 authorization and timestamps ingress itself. Candidate text is never an
 authorized control command merely because an adapter labels it so.
+
+### Normative per-channel delivery modes
+
+Trusted policy stores exactly one versioned delivery mode for every admitted
+channel/conversation: `silent`, `mentions`, or `room`. Collection policy is
+evaluated first; wake policy is evaluated only after an allowed observation and
+its immutable disposition are durable. The mode and policy version are frozen
+on each row at admission. Reloads do not retroactively reclassify queued rows;
+an operator must use a separately authorized migration/disposition operation.
+
+| Mode       | Collection and retention                                                                | Wake behavior                                                                                                                                                                                                                                                                                                                                                                                 |
+| ---------- | --------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `silent`   | Admit, deduplicate, suppress/coalesce and retain allowed events under normal bounds.    | Never create a wake/heartbeat reservation from those rows, including priority authors and mentions. Authorized control commands may change control state but are not model wakes.                                                                                                                                                                                                             |
+| `mentions` | Admit ordinary allowed traffic as bounded context with explicit pending/expiry outcome. | Wake immediately only for configured priority principals, a verified direct mention of the configured bot identity, or an admitted authorized control event. A qualifying wake may include bounded nearby allowed context from the same tenant/conversation/generation. Ordinary traffic alone never interrupts and eventually receives an included, expired or operator-visible disposition. |
+| `room`     | Admit all allowed room traffic and form deterministic bounded same-scope aggregates.    | Wake once after the configured quiet window or, even under continuous chatter, at the absolute maximum-delay deadline. Priority may preempt the quiet window, but merges eligible nearby context; the same sealed aggregate cannot create duplicate wakes.                                                                                                                                    |
+
+Priority never overrides guild/channel/tenant allowlists, self-message denial,
+binding/generation fences, pause/disable, lease ownership, byte/count limits or
+the `silent` no-wake rule. A “direct mention” is derived from the source's typed
+mention IDs and the trusted configured bot ID, never from matching display text.
+`mentions` and `room` wake eligibility is rechecked transactionally immediately
+before reservation and again before send. Mode changes, pause, rotation or
+disable revoke future initiation but cannot pretend an already invoked call was
+unsent; such attempts retain their original mode/policy evidence.
+
+Required deterministic tests cover every mode, priority inside/outside
+allowlists, typed mention versus textual lookalike, quiet-window and maximum-
+delay flush, continuous chatter, priority context merge, duplicate wake
+suppression, restart with pending rows, mode reload, pause/rotation races and
+bounded expiry/disposition of ordinary `mentions` traffic.
 
 Discord tuple examples:
 `["discord",installation,"guild",guildId,"channel",channelId]`,
@@ -823,20 +902,20 @@ incompatible v2 DB; keep v2 service disabled or use a validated export.
 Every row means **add X while preserving Y**. Each is separately reviewed,
 default-disabled and carries focused tests and its own stop conditions.
 
-| Lane | Inputs / dependencies                        | Add / subsystem                                | Focused proof                                                                | Stop / preserve                                                  |
-| ---: | -------------------------------------------- | ---------------------------------------------- | ---------------------------------------------------------------------------- | ---------------------------------------------------------------- |
-|    1 | this design + immutable source               | generic envelope/source-adapter types          | canonical tuples, escaping, byte bounds, Discord/Teams fixtures              | unclear native semantics; preserve allowlist/self/provenance     |
-|    2 | 1 + v1 fixture                               | tenant-aware schema migration                  | row/count/hash/FK equivalence; collision/rollback                            | missing tenant map; preserve lineage/replay                      |
-|    3 | 2                                            | attempt/ambiguity ledger                       | all send crash gaps, expiry/late evidence                                    | any unknown→retry; preserve bounded queue/lease                  |
-|    4 | 1,3 + pinned SDK contract                    | user-source SDK contract adapter, fake only    | valid/invalid ID, enqueue, events, errors                                    | unsupported positive acceptance; preserve unavailable reporting  |
-|    5 | 2,4                                          | ownership/primary exclusion guard              | foreign IDs, unsafe roots, runtime lifetime and suspension                   | unproved fence/isolation; preserve no primary/foreign access     |
-|    6 | 3–5                                          | continuation/HB scheduler                      | budgets, cancellation, no progress, busy/backlog and restart                 | any unbounded/unauthorized turn; preserve real-work priority     |
-|    7 | 1–6                                          | full deterministic lifecycle harness           | every scenario in offline matrix, snapshots not just mocks                   | missing negative controls; preserve no live dependencies         |
-|    8 | 1–3,7                                        | Discord migration to generic adapter           | cursor replay, suppression/new-command, nearby merge                         | source-native gap concealed; preserve gateway ACK/reconnect      |
-|    9 | 1,2,7                                        | Teams skeleton only, no network                | typed channel/chat/thread identities and auth fixtures                       | unchosen Teams API; preserve unchanged core trust                |
-|   10 | 4–7                                          | opt-in disposable canary command               | reject missing opt-in/foreign ID; runtime protocol under later authorization | any primary/live source dependency; preserve disabled default    |
-|   11 | 2,3,6,7                                      | redacted observability/reconciliation controls | tenant access, unknown outcome disposal, log poison                          | unauthenticated cross-tenant control; preserve no silent success |
-|   12 | all needed lanes + independent live receipts | rollout/cutover procedure                      | shadow, bounded enablement, rollback quarantine drill                        | red/unresolved safety gates; preserve queue/evidence             |
+| Lane | Inputs / dependencies                        | Add / subsystem                                                      | Focused proof                                                                                                     | Stop / preserve                                                  |
+| ---: | -------------------------------------------- | -------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+|    1 | this design + immutable source               | generic envelope/source-adapter types and exact delivery-mode policy | canonical tuples, escaping, byte bounds, Discord/Teams and silent/mentions/room fixtures                          | unclear native semantics; preserve allowlist/self/provenance     |
+|    2 | 1 + v1 fixture                               | tenant-aware schema migration                                        | row/count/hash/FK equivalence; collision/rollback                                                                 | missing tenant map; preserve lineage/replay                      |
+|    3 | 2                                            | attempt/ambiguity ledger                                             | all send crash gaps, expiry/late evidence                                                                         | any unknown→retry; preserve bounded queue/lease                  |
+|    4 | 1,3 + pinned SDK contract                    | user-source SDK contract adapter, fake only                          | valid/invalid ID, enqueue, events, errors                                                                         | unsupported positive acceptance; preserve unavailable reporting  |
+|    5 | 2,4                                          | ownership/primary exclusion guard                                    | foreign IDs, unsafe roots, runtime lifetime and suspension                                                        | unproved fence/isolation; preserve no primary/foreign access     |
+|    6 | 3–5                                          | continuation/HB scheduler                                            | budgets, cancellation, no progress, busy/backlog and restart                                                      | any unbounded/unauthorized turn; preserve real-work priority     |
+|    7 | 1–6                                          | full deterministic lifecycle harness                                 | every scenario in offline matrix, snapshots not just mocks                                                        | missing negative controls; preserve no live dependencies         |
+|    8 | 1–3,7                                        | Discord migration to generic adapter                                 | cursor replay, all three delivery modes, atomic control admission/rotation, suppression/new-command, nearby merge | source-native gap concealed; preserve gateway ACK/reconnect      |
+|    9 | 1,2,7                                        | Teams skeleton only, no network                                      | typed channel/chat/thread identities and auth fixtures                                                            | unchosen Teams API; preserve unchanged core trust                |
+|   10 | 4–7                                          | opt-in disposable canary command                                     | reject missing opt-in/foreign ID; runtime protocol under later authorization                                      | any primary/live source dependency; preserve disabled default    |
+|   11 | 2,3,6,7                                      | redacted observability/reconciliation controls                       | tenant access, unknown outcome disposal, log poison                                                               | unauthenticated cross-tenant control; preserve no silent success |
+|   12 | all needed lanes + independent live receipts | rollout/cutover procedure                                            | shadow, bounded enablement, rollback quarantine drill                                                             | red/unresolved safety gates; preserve queue/evidence             |
 
 Schema migration, SDK activation, live-source enablement and deployment never
 share one change. Lane 4 does not activate SDK before lane 5; lane 7 combines
@@ -847,20 +926,20 @@ No Teams network implementation is authorized by the skeleton lane.
 
 Owners are future role assignments, not requests sent to any external seat.
 
-| ID / question                        | Evidence and options                                                    | Safety/default                                                                 | Owner / proof required                                                  | Blocks                               |
-| ------------------------------------ | ----------------------------------------------------------------------- | ------------------------------------------------------------------------------ | ----------------------------------------------------------------------- | ------------------------------------ |
-| D01 positive acceptance durability   | released send returns assigned ID; no public fsync/exactly-once promise | accept positive identity only; quarantine crash gap, never retry absence       | SDK lane; fake negative controls + disposable multi-send/restart canary | live delivery, not documentation     |
-| D02 stale driver/suspension fence    | DB epochs not SDK fencing; spawned runtime ownership available          | one host exclusive lifetime lock; no takeover until exit proved                | ownership lane; process-suspend/death boundary proof                    | activation/production                |
-| D03 completion correlation           | messageId/turnId optional, idle session-level                           | require IDs; unknown otherwise                                                 | SDK/harness lanes; busy merged-message and interrupted-turn canary      | continuation activation              |
-| D04 disposition interface            | no product checkpoint protocol exists                                   | bounded untrusted final JSON; no mandatory custom tool                         | continuation lane; absent/conflicting/adversarial response tests        | scheduler implementation review      |
-| D05 service isolation settings       | released empty mode/baseDirectory; external URI ignores root            | spawned runtime only; explicit minimal environment/tools, no inherited plugins | ownership lane; fake filesystem/capability proof then canary            | canary/production                    |
-| D06 tenant control authorization     | current loopback trusts local callers                                   | authenticated service-account tenant context before multitenancy               | control lane; cross-tenant/forged caller tests                          | multi-tenant production              |
-| D07 Teams event identity/API         | source task specifies future Teams but no selected Graph/Bot API        | skeleton only; explicit revision/tenant/thread semantics later                 | Teams adapter lane; authoritative API/replay fixture proof              | Teams implementation beyond skeleton |
-| D08 priority nearby merge            | current priority leases alone; issue asks nearby context                | add bounded same-generation member accounting                                  | Discord/store lanes; preservation/merge/overflow tests                  | that migration slice                 |
-| D09 bounds/retention                 | present limits exclude all retained disk; proposed defaults §9          | hard cap + reserved dispositions; stop before disk full                        | storage lane; soak/fairness/cap tests                                   | production sizing                    |
-| D10 legacy ownership adoption        | v1 random IDs but no strong ownership marker                            | never adopt based on ID alone; explicit new generation/controlled migration    | migration lane; namespace provenance proof                              | cutover                              |
-| D11 live model/runtime compatibility | only package contracts and old tests examined                           | canary pending; no +1 solved claim                                             | canary lane; exact version/config receipt                               | live-proven status                   |
-| D12 local tooling/review             | existing packages available; exact GitNexus/second model pending        | do not substitute unrelated index or fake review                               | design lane; exact-diff receipts below                                  | design declaration until resolved    |
+| ID / question                        | Evidence and options                                                                               | Safety/default                                                                                        | Owner / proof required                                                        | Blocks                               |
+| ------------------------------------ | -------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- | ------------------------------------ |
+| D01 positive acceptance durability   | released send returns assigned ID; no public fsync/exactly-once promise                            | accept positive identity only; quarantine crash gap, never retry absence                              | SDK lane; fake negative controls + disposable multi-send/restart canary       | live delivery, not documentation     |
+| D02 stale driver/suspension fence    | DB epochs not SDK fencing; spawned runtime ownership available                                     | one host exclusive lifetime lock; no takeover until exit proved                                       | ownership lane; process-suspend/death boundary proof                          | activation/production                |
+| D03 completion correlation           | messageId/turnId optional, idle session-level                                                      | require IDs; unknown otherwise                                                                        | SDK/harness lanes; busy merged-message and interrupted-turn canary            | continuation activation              |
+| D04 disposition interface            | no product checkpoint protocol exists                                                              | bounded untrusted final JSON; no mandatory custom tool                                                | continuation lane; absent/conflicting/adversarial response tests              | scheduler implementation review      |
+| D05 service isolation settings       | released empty mode/baseDirectory; external URI ignores root                                       | spawned runtime only; explicit minimal environment/tools, no inherited plugins                        | ownership lane; fake filesystem/capability proof then canary                  | canary/production                    |
+| D06 tenant control authorization     | current loopback trusts local callers; source command authority is now specified but unimplemented | authenticated service-account tenant context plus exact principal/command mapping before multitenancy | control lane; cross-tenant/forged caller and atomic disposition/request tests | multi-tenant production              |
+| D07 Teams event identity/API         | source task specifies future Teams but no selected Graph/Bot API                                   | skeleton only; explicit revision/tenant/thread semantics later                                        | Teams adapter lane; authoritative API/replay fixture proof                    | Teams implementation beyond skeleton |
+| D08 priority nearby merge            | current priority leases alone; issue asks nearby context                                           | add bounded same-generation member accounting                                                         | Discord/store lanes; preservation/merge/overflow tests                        | that migration slice                 |
+| D09 bounds/retention                 | present limits exclude all retained disk; proposed defaults §9                                     | hard cap + reserved dispositions; stop before disk full                                               | storage lane; soak/fairness/cap tests                                         | production sizing                    |
+| D10 legacy ownership adoption        | v1 random IDs but no strong ownership marker                                                       | never adopt based on ID alone; explicit new generation/controlled migration                           | migration lane; namespace provenance proof                                    | cutover                              |
+| D11 live model/runtime compatibility | only package contracts and old tests examined                                                      | canary pending; no +1 solved claim                                                                    | canary lane; exact version/config receipt                                     | live-proven status                   |
+| D12 local tooling/review             | existing packages available; exact GitNexus/second model pending                                   | do not substitute unrelated index or fake review                                                      | design lane; exact-diff receipts below                                        | design declaration until resolved    |
 
 Design completion does not waive any future gate in this register. Defaults
 are fail-closed decisions, not success-shaped placeholders.
