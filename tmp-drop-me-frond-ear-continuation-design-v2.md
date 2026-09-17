@@ -339,3 +339,39 @@ Pre-freeze document SHA-256 values:
 Next: freeze the repair commit, re-run exact-head checks, publish the branch,
 then append a final journal-only identity declaration and request independent
 successor-bound review. No review acceptance is claimed by this author entry.
+
+## 2026-09-17T04:22:00Z — successor evidence freeze and declaration
+
+Status: COMPLETE for the bounded repaired-design authorship; **PENDING
+NON-AUTHOR EXACT-HEAD REVIEW** before any implementation decision.
+
+Substantive repair commit:
+`93af6ca502503d3502135f37081b3d1e0ede2cd0`, tree
+`a9dead6328506624bb3f047f91da9c9da4bf40ce`, parent rejected object
+`d949d3dd0521b3797155a2868173d6cc18c6f41f`.
+
+Exact substantive changed paths:
+
+1. `docs/frond-ear-continuation-design-v2.md`
+2. `docs/proofs/frond-ear-continuation-design-v2-offline.md`
+3. `tmp-drop-me-frond-ear-continuation-design-v2.md`
+
+The live-canary plan remains byte-identical. Exact substantive document hashes:
+
+| Document         | SHA-256                                                            |
+| ---------------- | ------------------------------------------------------------------ |
+| Design           | `6a17a1c0d1c75b9fb69b7a2622b72ee9fd0c396feeca8e2d585203c46a89c28b` |
+| Offline proof    | `61ac6769c70af8533da5fd4c812c274685b5d1f61cdb2c901f525e0118306b8a` |
+| Live-canary plan | `93a45c2983e72c76ec387591a78c414c60bf0176f083bbeadbda042be298ca67` |
+
+Exact-commit `pnpm check` passed: formatter, typecheck/build, 37/37 tests and
+credential-pattern scan. `git diff --check` passed. The restored journal prefix
+remained byte-identical before the successor entries. Worktree was clean after
+the repair commit and before this append-only declaration.
+
+This declaration commit changes only the journal. Its commit/tree and final
+server-ref equality are necessarily recorded in the external publication
+receipt, not self-referential prose. No existing review is treated as acceptance
+of this successor. No implementation, live source, credential access, canary,
+deployment or cutover occurred. The next admissible action is independent
+non-author review of the exact final successor SHA/tree.
