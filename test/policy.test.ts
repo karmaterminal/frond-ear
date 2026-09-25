@@ -102,7 +102,7 @@ test("every mention form wakes in mentions mode", () => {
   }
 });
 
-test("mentions mode: ambient chatter is context, principals wake without a mention", () => {
+test("mentions mode: trust grants command, not interruption: unaddressed principal messages are context", () => {
   const config = testConfig();
   const ambient = accepted(
     classify(config, message({ content: "just chatting" }), context()),
@@ -113,8 +113,17 @@ test("mentions mode: ambient chatter is context, principals wake without a menti
     classify(config, message({ author: { id: PRINCIPAL } }), context()),
   );
   assert.equal(principal.trust, "principal");
-  assert.equal(principal.state, "queued");
-  assert.equal(principal.priority, true);
+  assert.equal(principal.priority, false);
+  assert.equal(principal.state, "context");
+  const addressed = accepted(
+    classify(
+      config,
+      message({ author: { id: PRINCIPAL }, mentions: [{ id: BOT }] }),
+      context(),
+    ),
+  );
+  assert.equal(addressed.state, "queued");
+  assert.equal(addressed.priority, true);
 });
 
 test("room mode wakes on everything; silent mode never wakes, even for principals", () => {
@@ -257,9 +266,17 @@ test("ambient mention wakes are budgeted; principals and peers are not", () => {
   assert.equal(ambient.state, "context");
   assert.equal(ambient.reason, "ambient_wake_budget");
   const principal = accepted(
-    classify(config, message({ author: { id: PRINCIPAL } }), exhausted),
+    classify(
+      config,
+      message({ author: { id: PRINCIPAL }, mentions: [{ id: BOT }] }),
+      exhausted,
+    ),
   );
-  assert.equal(principal.wake, true);
+  assert.equal(
+    principal.wake,
+    true,
+    "the ambient budget never applies to principals",
+  );
   const peer = accepted(
     classify(
       config,

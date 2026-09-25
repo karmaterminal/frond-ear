@@ -7,7 +7,7 @@ frond-ear is a Discord Gateway daemon that pushes debounced, trust-classified ev
 
 ## Stack and conventions
 
-- **Runtime.** Node ≥ 22.18, target 24. TypeScript runs through Node's built-in type stripping, so there is **no build step**.
+- **Runtime.** Node ≥ 22.18. CI runs 22, 24 and 26; operators currently run 26. TypeScript runs through Node's built-in type stripping, so there is **no build step**.
   - Source imports use `.ts` extensions.
   - Only erasable syntax is allowed. No `enum`, no `namespace`, no constructor parameter properties. `tsc` enforces this with `erasableSyntaxOnly`.
 - **Dependencies.** The daemon and shim have **zero runtime dependencies**. They use `node:sqlite`, the global `WebSocket` and `fetch`, and `node:net`.

@@ -136,7 +136,11 @@ export function classify(
     return { accept: false, reason: "dm_sender_not_allowed" };
   }
   const mentioned = isMentioned(config, message);
-  let priority = mentioned || trust === "principal" || route.kind === "dm";
+  // Priority (the power to interrupt) comes only from addressing: a mention,
+  // a reply to the bot, or a DM. Trust decides who may command and who is
+  // admitted, not who may break into the session's attention; a principal's
+  // unaddressed room message is context like anyone else's.
+  let priority = mentioned || route.kind === "dm";
   let budgetReason: string | undefined;
   if (route.channel.mode !== "silent") {
     if (isBot && (priority || route.channel.mode === "room")) {

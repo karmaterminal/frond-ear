@@ -114,12 +114,17 @@ test("events wait while no shim is attached and flow on attach; silent channels 
   const h = harness();
   try {
     h.daemon.ingest(
-      message({ author: { id: PRINCIPAL }, content: "while you were away" }),
+      message({
+        author: { id: PRINCIPAL },
+        mentions: [{ id: BOT }],
+        content: "while you were away",
+      }),
     );
     h.daemon.ingest(
       message({
         channel_id: SILENT,
         author: { id: PRINCIPAL },
+        mentions: [{ id: BOT }],
         content: "silent",
       }),
     );
@@ -139,7 +144,11 @@ test("an unconfirmed batch reverts when the shim drops and is redelivered to the
   try {
     const first = h.attach("scribe");
     h.daemon.ingest(
-      message({ author: { id: PRINCIPAL }, content: "important" }),
+      message({
+        author: { id: PRINCIPAL },
+        mentions: [{ id: BOT }],
+        content: "important",
+      }),
     );
     h.timers.advance(1_000);
     assert.equal(first.connection.events().length, 1);
@@ -157,7 +166,11 @@ test("takeover detaches the old shim; offered-but-unseen work becomes one digest
   try {
     const first = h.attach("scribe", { sessionId: "session-a" });
     h.daemon.ingest(
-      message({ author: { id: PRINCIPAL }, content: "first secret plan" }),
+      message({
+        author: { id: PRINCIPAL },
+        mentions: [{ id: BOT }],
+        content: "first secret plan",
+      }),
     );
     h.timers.advance(1_000);
     const batch = first.connection.events()[0];
@@ -214,7 +227,11 @@ test("reply chunks long text, quotes only the first chunk, and marks the chat se
   try {
     const shim = h.attach("scribe");
     h.daemon.ingest(
-      message({ author: { id: PRINCIPAL }, content: "write me an essay" }),
+      message({
+        author: { id: PRINCIPAL },
+        mentions: [{ id: BOT }],
+        content: "write me an essay",
+      }),
     );
     h.timers.advance(1_000);
     await shim.send({
@@ -255,6 +272,7 @@ test("outbound is limited to bound channels, their threads and known DMs", async
     const { guild_id: _guild, ...dm } = message({
       channel_id: DM,
       author: { id: PRINCIPAL },
+      mentions: [{ id: BOT }],
     });
     h.daemon.ingest(dm);
     assert.equal(
@@ -275,7 +293,11 @@ test("a session without an ear gets tools but cannot mark the attached session's
     const welcome = toolsOnly.connection.received[0];
     assert.equal(welcome?.type === "welcome" && welcome.attached, false);
     h.daemon.ingest(
-      message({ author: { id: PRINCIPAL }, content: "for scribe" }),
+      message({
+        author: { id: PRINCIPAL },
+        mentions: [{ id: BOT }],
+        content: "for scribe",
+      }),
     );
     h.timers.advance(1_000);
     assert.equal(toolsOnly.connection.events().length, 0);
@@ -333,7 +355,10 @@ test("duplicates are ignored and survive a restart", () => {
   const path = join(h.directory, "restart.db");
   try {
     const first = harness(testConfig(), { path });
-    const event = message({ author: { id: PRINCIPAL } });
+    const event = message({
+      author: { id: PRINCIPAL },
+      mentions: [{ id: BOT }],
+    });
     assert.equal(first.daemon.ingest(event), "inserted");
     first.daemon.shutdown();
     first.store.close();
@@ -350,7 +375,9 @@ test("paused config keeps ingesting but pushes nothing", () => {
   const h = harness(testConfig({ paused: true }));
   try {
     const shim = h.attach("scribe");
-    h.daemon.ingest(message({ author: { id: PRINCIPAL } }));
+    h.daemon.ingest(
+      message({ author: { id: PRINCIPAL }, mentions: [{ id: BOT }] }),
+    );
     h.timers.advance(60_000);
     assert.equal(shim.connection.events().length, 0);
     assert.equal(h.store.stateCounts("scribe").queued, 1);
@@ -409,7 +436,11 @@ test("reload revokes queued events for a channel removed from its ear", () => {
   try {
     const shim = h.attach("scribe");
     h.daemon.ingest(
-      message({ author: { id: PRINCIPAL }, content: "for a revoked channel" }),
+      message({
+        author: { id: PRINCIPAL },
+        mentions: [{ id: BOT }],
+        content: "for a revoked channel",
+      }),
     );
     h.daemon.ingest(message({ channel_id: ROOM, content: "room stays bound" }));
     h.daemon.reloadConfig(
@@ -440,7 +471,11 @@ test("reload moving a channel to another ear never delivers its backlog to the o
   try {
     const old = h.attach("scribe");
     h.daemon.ingest(
-      message({ author: { id: PRINCIPAL }, content: "moved channel backlog" }),
+      message({
+        author: { id: PRINCIPAL },
+        mentions: [{ id: BOT }],
+        content: "moved channel backlog",
+      }),
     );
     h.daemon.reloadConfig(
       testConfig({
@@ -463,7 +498,11 @@ test("reload turning a channel silent keeps its pending events inbox-only", () =
   try {
     const shim = h.attach("scribe");
     h.daemon.ingest(
-      message({ author: { id: PRINCIPAL }, content: "now silent" }),
+      message({
+        author: { id: PRINCIPAL },
+        mentions: [{ id: BOT }],
+        content: "now silent",
+      }),
     );
     h.daemon.reloadConfig(
       testConfig({
@@ -494,7 +533,11 @@ test("an ambient user cannot hold the session awake: mention wakes are budgeted 
       );
     }
     h.daemon.ingest(
-      message({ author: { id: PRINCIPAL }, content: "principal still wakes" }),
+      message({
+        author: { id: PRINCIPAL },
+        mentions: [{ id: BOT }],
+        content: "principal still wakes",
+      }),
     );
     const counts = h.store.stateCounts("scribe");
     assert.equal(counts.queued, 3);
@@ -513,7 +556,11 @@ test("crash between insert and scheduling cannot strand a queued event", async (
   try {
     // Simulate an older build that crashed after the insert autocommitted.
     const before = harness(testConfig(), { path });
-    const event = message({ author: { id: PRINCIPAL }, content: "stranded?" });
+    const event = message({
+      author: { id: PRINCIPAL },
+      mentions: [{ id: BOT }],
+      content: "stranded?",
+    });
     before.store.insertEvent({
       messageId: event.id,
       ear: "scribe",
@@ -556,7 +603,10 @@ test("admission is one transaction: a failure mid-admission leaves no row behind
       throw new Error("disk full");
     };
     assert.throws(
-      () => h.daemon.ingest(message({ author: { id: PRINCIPAL } })),
+      () =>
+        h.daemon.ingest(
+          message({ author: { id: PRINCIPAL }, mentions: [{ id: BOT }] }),
+        ),
       /disk full/u,
     );
     h.store.scheduleChat = original;
@@ -638,7 +688,11 @@ test("offered events a session never acts on are still bounded by the per-ear ca
     const shim = h.attach("scribe");
     for (let index = 0; index < 6; index += 1) {
       h.daemon.ingest(
-        message({ author: { id: PRINCIPAL }, content: `unanswered ${index}` }),
+        message({
+          author: { id: PRINCIPAL },
+          mentions: [{ id: BOT }],
+          content: `unanswered ${index}`,
+        }),
       );
       h.timers.advance(1_000);
       const event = shim.connection.events().at(-1);
@@ -664,7 +718,13 @@ test("an action for batch A never marks a later batch B seen, even mid-request",
   try {
     const shim = h.attach("scribe");
     const offer = async (content: string) => {
-      h.daemon.ingest(message({ author: { id: PRINCIPAL }, content }));
+      h.daemon.ingest(
+        message({
+          author: { id: PRINCIPAL },
+          mentions: [{ id: BOT }],
+          content,
+        }),
+      );
       h.timers.advance(1_000);
       const event = shim.connection.events().at(-1);
       await shim.send({ type: "offered", batchId: event?.batchId as number });

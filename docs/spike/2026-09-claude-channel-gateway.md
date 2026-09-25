@@ -157,14 +157,14 @@ Claude Code TUI (its own login) ──stdio──▶ frond-ear shim (MCP, hand-r
 | Mode | What is stored | What wakes the session |
 |---|---|---|
 | `silent` | every allowed message | nothing; available through `inbox`/`fetch_messages` |
-| `mentions` (default) | every allowed message | @mention (`<@id>` or `<@!id>`), a reply to the bot, a `mentionPatterns` match, a **principal** author, or a DM. Other traffic becomes **context** attached to the next wake, capped by `historyLimit`. |
+| `mentions` (default) | every allowed message | @mention (`<@id>` or `<@!id>`), a reply to the bot, a `mentionPatterns` match, or a DM. A principal's unaddressed message is context: trust grants command authority, not interrupt authority. Other traffic becomes **context** attached to the next wake, capped by `historyLimit`. |
 | `room` | every allowed message | every message, debounced |
 
 **Debounce.** A channel with anything waiting to wake is flushed at the earlier of two times:
 - `quietWindowMs` after the most recent message;
 - `maxDelayMs` after the first pending message.
 
-Priority triggers (mentions, principals and DMs) use the shorter `priorityQuietMs`, so a quick follow-up still merges into the same batch, and nearby context rides along with it. One notification is sent per channel flush.
+Priority triggers (mentions and DMs) use the shorter `priorityQuietMs`, so a quick follow-up still merges into the same batch, and nearby context rides along with it. One notification is sent per channel flush.
 
 ### 4.3 Delivery ledger
 

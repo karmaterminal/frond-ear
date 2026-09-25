@@ -4,7 +4,7 @@ This runbook takes a Claude Code session from polling Discord to having Discord 
 
 ## 0. Prerequisites
 
-- **Node.js ≥ 22.18.** 24 is recommended. frond-ear runs its TypeScript directly, so there is no build step.
+- **Node.js ≥ 22.18.** CI covers 22, 24 and 26. frond-ear runs its TypeScript directly, so there is no build step.
 - **pnpm.** Only needed to install the dev tooling for tests. The daemon and shim have no runtime dependencies.
 - **Claude Code ≥ 2.1.128**, logged in with claude.ai (Pro/Max/Team/Enterprise) or a Console API key. Check with `claude --version` and `claude auth status`.
   - Channels don't work on Bedrock, Vertex or Foundry.
@@ -26,13 +26,13 @@ Copy `frond-ear.example.json` to `frond-ear.json`. That filename is git-ignored.
 
 **Identity and trust**
 
-| Field             | Meaning                                                                                                                          |
-| ----------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| `botUserId`       | The bot's own user ID. Its own messages are always ignored.                                                                      |
-| `principals`      | Your operators, e.g. figs. Their messages have `trust="principal"`, wake the session in `mentions` channels, and may DM the bot. |
-| `peerAgents`      | OpenClaw or other agent bots allowed through, with `trust="peer_agent"`. Any other bot is dropped.                               |
-| `labels`          | Optional friendly names for IDs, shown in headers and in the channel instructions.                                               |
-| `mentionPatterns` | Regexes that count as addressing the bot, e.g. `\bscribe\b`.                                                                     |
+| Field             | Meaning                                                                                                                                            |
+| ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `botUserId`       | The bot's own user ID. Its own messages are always ignored.                                                                                        |
+| `principals`      | Your operators, e.g. figs. Their messages have `trust="principal"` and they may DM the bot. Being a principal does not by itself wake the session. |
+| `peerAgents`      | OpenClaw or other agent bots allowed through, with `trust="peer_agent"`. Any other bot is dropped.                                                 |
+| `labels`          | Optional friendly names for IDs, shown in headers and in the channel instructions.                                                                 |
+| `mentionPatterns` | Regexes that count as addressing the bot, e.g. `\bscribe\b`.                                                                                       |
 
 **Ears**
 
@@ -48,7 +48,7 @@ Copy `frond-ear.example.json` to `frond-ear.json`. That filename is git-ignored.
 **Modes**
 
 - `silent`: store only. Claude reads these with `inbox` or `fetch_messages`.
-- `mentions`: wakes the session on an @mention, a reply to the bot, a `mentionPatterns` match, any principal message, or a DM. Other room messages are kept as context and delivered with the next wake.
+- `mentions`: wakes the session on an @mention, a reply to the bot, a `mentionPatterns` match, or a DM. Principal messages that do not address the bot are context too: trust decides who may command, not who may interrupt. Other room messages are kept as context and delivered with the next wake.
 - `room`: every message wakes the session, debounced.
 
 **Timing, loops and limits**
