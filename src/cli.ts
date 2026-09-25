@@ -162,10 +162,7 @@ async function runDaemon(argv: string[]): Promise<void> {
       }
     }, 250);
   });
-  const pruneTimer = setInterval(
-    () => store.prune(config.limits.retentionMs),
-    60 * 60 * 1_000,
-  );
+  const pruneTimer = setInterval(() => daemon.prune(), 60 * 60 * 1_000);
   pruneTimer.unref();
 
   let stopping = false;

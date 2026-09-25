@@ -203,6 +203,10 @@ export class Daemon {
     if (repaired > 0) {
       this.logger.log("warn", "ear.repaired_unscheduled", { repaired });
     }
+    // The config may have changed while the daemon was down: re-check every
+    // persisted queue against current routing and modes before any session
+    // can attach and flush.
+    this.reconcileRouting();
   }
 
   public reloadConfig(config: Config): void {
@@ -216,7 +220,13 @@ export class Daemon {
       }
     }
     this.reconcileRouting();
+    this.prune();
     this.tick();
+  }
+
+  /** Prunes against the *current* retention policy (it can change on reload). */
+  public prune(): number {
+    return this.store.prune(this.config.limits.retentionMs);
   }
 
   /**
@@ -235,8 +245,13 @@ export class Daemon {
           chatId,
           revoked,
         });
-      } else if (this.chatMode(chatId) === "silent") {
-        this.store.silenceChat(ear, chatId);
+      } else {
+        // Narrow waiting rows to the effective mode (configured, further
+        // narrowed by the session's own attention); never promote.
+        const effective = this.effectiveMode(ear, chatId);
+        if (effective && effective !== "room") {
+          this.store.narrowPending(ear, chatId, effective);
+        }
       }
     }
   }
@@ -539,7 +554,15 @@ export class Daemon {
         this.hello(client, message);
         return;
       case "offered":
-        this.store.confirmBatch(message.batchId);
+        // Only the currently attached session may confirm, and only a batch
+        // offered to its own ear and attach generation.
+        if (client.ear && this.isAttachedSession(client, client.ear)) {
+          this.store.confirmBatch(
+            message.batchId,
+            client.ear,
+            client.attachGeneration,
+          );
+        }
         return;
       case "session":
         if (client.ear && typeof message.sessionId === "string") {
@@ -708,6 +731,12 @@ export class Daemon {
   /** The ear a chat belongs to, or undefined when the chat is not routable. */
   private earForChat(chatId: string): string | undefined {
     if (this.store.isDmChannel(chatId)) {
+      // A DM stays routable only while its user is still a principal or peer
+      // agent under the current config.
+      const user = this.store.dmUser(chatId);
+      if (!user || trustOf(this.config, user) === "ambient") {
+        return undefined;
+      }
       return this.config.dmEar;
     }
     return routeFor(

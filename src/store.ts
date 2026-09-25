@@ -523,6 +523,13 @@ export class EventStore {
     );
   }
 
+  public dmUser(channelId: string): string | undefined {
+    const row = this.database
+      .prepare("SELECT user_id FROM dm_channels WHERE channel_id = ?")
+      .get(channelId) as { user_id: string } | undefined;
+    return row?.user_id;
+  }
+
   public isDmChannel(channelId: string): boolean {
     return (
       this.database
@@ -773,12 +780,18 @@ export class EventStore {
     });
   }
 
-  public confirmBatch(batchId: number): void {
-    this.database
+  public confirmBatch(
+    batchId: number,
+    ear: string,
+    attachGeneration: number,
+  ): boolean {
+    const result = this.database
       .prepare(
-        "UPDATE batches SET offered_at = ? WHERE id = ? AND offered_at IS NULL",
+        `UPDATE batches SET offered_at = ?
+         WHERE id = ? AND ear = ? AND attach_generation = ? AND offered_at IS NULL`,
       )
-      .run(this.clock.now(), batchId);
+      .run(this.clock.now(), batchId, ear, attachGeneration);
+    return result.changes === 1;
   }
 
   public revertUnconfirmed(ear: string): number {

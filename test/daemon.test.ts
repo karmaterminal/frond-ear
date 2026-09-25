@@ -1165,3 +1165,128 @@ test("a definitive Discord rejection is not ambiguous, and a deliberate repeat a
     h.dispose();
   }
 });
+
+// ---- Rune follow-up (5d5bbe1) ------------------------------------------------
+
+test("startup reconciles persisted queues against a config changed while the daemon was down", () => {
+  const h = harness();
+  const path = join(h.directory, "restart-silent.db");
+  try {
+    const before = harness(testConfig(), { path });
+    before.daemon.ingest(
+      message({
+        author: { id: PRINCIPAL },
+        mentions: [{ id: BOT }],
+        content: "must stay silent after restart",
+      }),
+    );
+    before.daemon.shutdown();
+    before.store.close();
+
+    const after = harness(
+      testConfig({
+        ears: {
+          scribe: { attachCanary: false, channels: { [CHANNEL]: "silent" } },
+        },
+      }),
+      { path },
+    );
+    const shim = after.attach("scribe");
+    after.timers.advance(60_000);
+    assert.equal(
+      shim.connection.events().length,
+      0,
+      "silent channels never push, even after a restart",
+    );
+    assert.equal(after.store.stateCounts("scribe").stored, 1);
+    after.daemon.shutdown();
+    after.store.close();
+  } finally {
+    h.dispose();
+  }
+});
+
+test("removing a principal revokes their DM: queued DMs are dropped and outbound is refused", async () => {
+  const h = harness();
+  try {
+    const shim = h.attach("scribe");
+    const { guild_id: _unused, ...dm } = message({
+      channel_id: DM,
+      author: { id: PRINCIPAL },
+      content: "private note",
+    });
+    h.daemon.ingest(dm);
+    h.daemon.reloadConfig(testConfig({ principals: [] }));
+    h.timers.advance(60_000);
+    assert.equal(shim.connection.events().length, 0);
+    assert.equal(h.store.stateCounts("scribe").dropped, 1);
+    const reply = await h.call(shim, "reply", {
+      chat_id: DM,
+      text: "still there?",
+    });
+    assert.equal(reply.ok, false);
+    assert.equal(h.rest.calls.length, 0);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("only the attached session can confirm a batch; a stale confirm cannot hide an undelivered event", async () => {
+  const h = harness();
+  try {
+    const old = h.attach("scribe");
+    const current = h.attach("scribe");
+    h.daemon.ingest(
+      message({
+        author: { id: PRINCIPAL },
+        mentions: [{ id: BOT }],
+        content: "for the current shim",
+      }),
+    );
+    h.timers.advance(1_000);
+    const batchId = current.connection.events().at(-1)?.batchId as number;
+    await old.send({ type: "offered", batchId }); // superseded shim tries to confirm
+    current.close(); // the real receiver drops before confirming
+    const next = h.attach("scribe");
+    const redelivered = next.connection
+      .events()
+      .find((event) => event.meta.kind === "mention");
+    assert.ok(
+      redelivered,
+      "the unconfirmed event is redelivered, not reduced to a digest",
+    );
+    assert.match(redelivered.content, /for the current shim/u);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("a reload that lowers retention prunes immediately against the new policy", async () => {
+  const h = harness();
+  try {
+    const shim = h.attach("scribe");
+    h.daemon.ingest(
+      message({
+        author: { id: PRINCIPAL },
+        mentions: [{ id: BOT }],
+        content: "old news",
+      }),
+    );
+    h.timers.advance(1_000);
+    await shim.send({
+      type: "offered",
+      batchId: shim.connection.events().at(-1)?.batchId as number,
+    });
+    await h.call(shim, "ack", {});
+    assert.equal(h.store.stateCounts("scribe").seen, 1);
+    h.clock.advance(10 * 60_000);
+    h.daemon.reloadConfig(testConfig({ limits: { retentionMs: 60_000 } }));
+    assert.equal(
+      h.store.stateCounts("scribe").seen,
+      0,
+      "pruned under the reloaded retention",
+    );
+  } finally {
+    h.dispose();
+  }
+});
