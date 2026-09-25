@@ -399,3 +399,79 @@ test("TCP clients must present the shared token", () => {
     h.dispose();
   }
 });
+
+test("reload revokes queued events for a channel removed from its ear", () => {
+  const h = harness();
+  try {
+    const shim = h.attach("scribe");
+    h.daemon.ingest(
+      message({ author: { id: PRINCIPAL }, content: "for a revoked channel" }),
+    );
+    h.daemon.ingest(message({ channel_id: ROOM, content: "room stays bound" }));
+    h.daemon.reloadConfig(
+      testConfig({
+        ears: {
+          scribe: {
+            attachCanary: false,
+            dms: true,
+            channels: { [ROOM]: "room" },
+          },
+        },
+      }),
+    );
+    h.timers.advance(60_000);
+    const events = shim.connection.events();
+    assert.equal(events.length, 1);
+    assert.equal(events[0]?.meta.chat_id, ROOM);
+    assert.doesNotMatch(events[0]?.content ?? "", /revoked channel/u);
+    assert.equal(h.store.counters().routing_revoked, 1);
+    assert.equal(h.store.unseen("scribe", CHANNEL, 10).length, 0);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("reload moving a channel to another ear never delivers its backlog to the old ear", () => {
+  const h = harness();
+  try {
+    const old = h.attach("scribe");
+    h.daemon.ingest(
+      message({ author: { id: PRINCIPAL }, content: "moved channel backlog" }),
+    );
+    h.daemon.reloadConfig(
+      testConfig({
+        ears: {
+          scribe: { attachCanary: false, channels: { [ROOM]: "room" } },
+          other: { attachCanary: false, channels: { [CHANNEL]: "mentions" } },
+        },
+      }),
+    );
+    h.timers.advance(60_000);
+    assert.equal(old.connection.events().length, 0);
+    assert.equal(h.store.stateCounts("scribe").dropped, 1);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("reload turning a channel silent keeps its pending events inbox-only", () => {
+  const h = harness();
+  try {
+    const shim = h.attach("scribe");
+    h.daemon.ingest(
+      message({ author: { id: PRINCIPAL }, content: "now silent" }),
+    );
+    h.daemon.reloadConfig(
+      testConfig({
+        ears: {
+          scribe: { attachCanary: false, channels: { [CHANNEL]: "silent" } },
+        },
+      }),
+    );
+    h.timers.advance(60_000);
+    assert.equal(shim.connection.events().length, 0);
+    assert.equal(h.store.stateCounts("scribe").stored, 1);
+  } finally {
+    h.dispose();
+  }
+});

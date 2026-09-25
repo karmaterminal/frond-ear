@@ -376,6 +376,43 @@ export class EventStore {
       .run(due, ear, chatId);
   }
 
+  /** Distinct (ear, chat) pairs that still hold undelivered events. */
+  public pendingChats(): Array<{ ear: string; chatId: string }> {
+    return this.database
+      .prepare(
+        `SELECT DISTINCT ear, chat_id AS chatId FROM events
+         WHERE state IN ${PENDING_STATES} ORDER BY ear, chat_id`,
+      )
+      .all() as Array<{ ear: string; chatId: string }>;
+  }
+
+  /**
+   * Routing for a chat was revoked (channel unbound or moved to another ear):
+   * its undelivered events are dropped so the old ear can never receive them.
+   */
+  public revokeChat(ear: string, chatId: string): number {
+    return Number(
+      this.database
+        .prepare(
+          `UPDATE events SET state = 'dropped', due_at = NULL, updated_at = ?
+           WHERE ear = ? AND chat_id = ? AND state IN ${PENDING_STATES}`,
+        )
+        .run(this.clock.now(), ear, chatId).changes,
+    );
+  }
+
+  /** A chat became silent: pending pushes turn into stored (inbox-only) rows. */
+  public silenceChat(ear: string, chatId: string): number {
+    return Number(
+      this.database
+        .prepare(
+          `UPDATE events SET state = 'stored', due_at = NULL, updated_at = ?
+           WHERE ear = ? AND chat_id = ? AND state IN ('queued', 'context')`,
+        )
+        .run(this.clock.now(), ear, chatId).changes,
+    );
+  }
+
   public dueChats(ear: string, now: number): string[] {
     return (
       this.database

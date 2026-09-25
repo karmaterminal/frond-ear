@@ -19,6 +19,7 @@ import type {
   BatchKind,
   Clock,
   DiscordMessage,
+  Mode,
   StoredEvent,
   Timers,
 } from "./types.ts";
@@ -165,7 +166,41 @@ export class Daemon {
         this.detach(client);
       }
     }
+    this.reconcileRouting();
     this.tick();
+  }
+
+  /**
+   * Re-validates undelivered events against the current routing. A chat that
+   * is no longer bound to the ear holding its events is revoked (dropped, never
+   * delivered to the old ear); a chat that became silent keeps its events as
+   * inbox-only. Other mode changes do not reclassify rows already admitted.
+   */
+  private reconcileRouting(): void {
+    for (const { ear, chatId } of this.store.pendingChats()) {
+      if (this.earForChat(chatId) !== ear) {
+        const revoked = this.store.revokeChat(ear, chatId);
+        this.store.increment("routing_revoked", revoked);
+        this.logger.log("warn", "ear.routing_revoked", {
+          ear,
+          chatId,
+          revoked,
+        });
+      } else if (this.chatMode(chatId) === "silent") {
+        this.store.silenceChat(ear, chatId);
+      }
+    }
+  }
+
+  private chatMode(chatId: string): Mode | undefined {
+    if (this.store.isDmChannel(chatId)) {
+      return "mentions";
+    }
+    return routeFor(
+      this.config,
+      { guild_id: "guild", channel_id: chatId },
+      (id) => this.store.threadParent(id),
+    )?.channel.mode;
   }
 
   // ---- ingest ------------------------------------------------------------------
@@ -272,6 +307,14 @@ export class Daemon {
       const now = this.clock.now();
       for (const [ear, client] of this.attached) {
         for (const chatId of this.store.dueChats(ear, now)) {
+          // Defence in depth: never flush a chat this ear no longer owns.
+          if (this.earForChat(chatId) !== ear) {
+            this.store.increment(
+              "routing_revoked",
+              this.store.revokeChat(ear, chatId),
+            );
+            continue;
+          }
           this.flush(ear, chatId, client);
         }
       }
