@@ -11,6 +11,7 @@
     "frond-scribe": {
       "target": "claude-channel",
       "dms": true,
+      "dmMode": "mentions",
       "attachCanary": true,
       "channels": {
         "700000000000000007": { "mode": "mentions" },
@@ -31,6 +32,7 @@
     "historyLimit": 20
   },
   "botLoop": { "maxEvents": 20, "windowMs": 60000, "cooldownMs": 60000 },
+  "ambientWake": { "maxEvents": 6, "windowMs": 60000, "cooldownMs": 300000 },
   "limits": {
     "maxMessageChars": 4000,
     "maxNotificationChars": 6000,

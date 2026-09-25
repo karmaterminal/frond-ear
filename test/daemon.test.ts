@@ -475,3 +475,28 @@ test("reload turning a channel silent keeps its pending events inbox-only", () =
     h.dispose();
   }
 });
+
+test("an ambient user cannot hold the session awake: mention wakes are budgeted per chat", () => {
+  const h = harness(
+    testConfig({
+      ambientWake: { maxEvents: 2, windowMs: 60_000, cooldownMs: 60_000 },
+    }),
+  );
+  try {
+    h.attach("scribe");
+    for (let index = 0; index < 5; index += 1) {
+      h.daemon.ingest(
+        message({ mentions: [{ id: BOT }], content: `wake up ${index}` }),
+      );
+    }
+    h.daemon.ingest(
+      message({ author: { id: PRINCIPAL }, content: "principal still wakes" }),
+    );
+    const counts = h.store.stateCounts("scribe");
+    assert.equal(counts.queued, 3);
+    assert.equal(counts.context, 3);
+    assert.equal(h.store.counters().ambient_wake_suppressed, 3);
+  } finally {
+    h.dispose();
+  }
+});

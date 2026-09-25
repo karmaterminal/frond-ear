@@ -41,6 +41,7 @@ Copy `frond-ear.example.json` to `frond-ear.json`. That filename is git-ignored.
 | `ears.<name>`              | One ear per Claude session. `target` must be `claude-channel`.                                                                                                                                  |
 | `ears.<name>.channels`     | Channel IDs to modes: `silent`, `mentions` (the default) or `room`. Per-channel `quietWindowMs`, `maxDelayMs` and `historyLimit` are optional. Threads inherit their parent channel's settings. |
 | `ears.<name>.dms`          | Whether this ear receives DMs from principals and peers.                                                                                                                                        |
+| `ears.<name>.dmMode`       | `mentions` (the default: every DM wakes the session) or `silent` (DMs are stored for `inbox` only).                                                                                             |
 | `ears.<name>.attachCanary` | Asks Claude to `ack` a nonce each time a session attaches. This proves the channel is actually registered, because a notification can otherwise be dropped with no error.                       |
 | `ears.<name>.instructions` | Extra text you write, appended to the channel instructions.                                                                                                                                     |
 
@@ -52,12 +53,13 @@ Copy `frond-ear.example.json` to `frond-ear.json`. That filename is git-ignored.
 
 **Timing, loops and limits**
 
-| Field      | Meaning                                                                                                                                                                                                                              |
-| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `defaults` | `quietWindowMs` sets how long the room must be quiet before a flush. `maxDelayMs` caps how long continuous chatter can delay one. `priorityQuietMs` is the short wait after a mention. `historyLimit` caps how much context is kept. |
-| `botLoop`  | If more than `maxEvents` bot messages arrive within `windowMs` in one chat, bot messages stop waking the session for `cooldownMs`.                                                                                                   |
-| `limits`   | Per-message and per-notification size caps, the per-ear pending cap, and retention time.                                                                                                                                             |
-| `paused`   | Kill switch. Messages are still ingested, but nothing is pushed.                                                                                                                                                                     |
+| Field         | Meaning                                                                                                                                                                                                                              |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `defaults`    | `quietWindowMs` sets how long the room must be quiet before a flush. `maxDelayMs` caps how long continuous chatter can delay one. `priorityQuietMs` is the short wait after a mention. `historyLimit` caps how much context is kept. |
+| `botLoop`     | If more than `maxEvents` bot messages arrive within `windowMs` in one chat, bot messages stop waking the session for `cooldownMs`.                                                                                                   |
+| `ambientWake` | If more than `maxEvents` mention- or reply-driven wakes from ambient (non-principal, non-peer) users arrive within `windowMs` in one chat, further ones stop waking the session for `cooldownMs`. They are kept as context.          |
+| `limits`      | Per-message and per-notification size caps, the per-ear pending cap, and retention time.                                                                                                                                             |
+| `paused`      | Kill switch. Messages are still ingested, but nothing is pushed.                                                                                                                                                                     |
 
 Changes to the config take effect without a restart.
 

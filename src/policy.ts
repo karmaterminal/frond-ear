@@ -1,4 +1,4 @@
-import type { ChannelConfig, Config } from "./config.ts";
+import type { ChannelConfig, Config, WakeBudget } from "./config.ts";
 import type { BatchKind, DiscordMessage, Trust } from "./types.ts";
 
 export interface Route {
@@ -28,8 +28,16 @@ export type Classification =
 
 export interface PolicyContext {
   threadParent(channelId: string): string | undefined;
-  /** Returns true when the bot-loop limiter says this bot event must not wake. */
-  botLoopLimited(chatId: string, now: number): boolean;
+  /**
+   * Records a would-be wake against the chat's budget for this class of
+   * author and returns true when the budget is exhausted (the event must not
+   * wake). Bots use the bot-loop budget; ambient humans the ambient budget.
+   */
+  wakeBudgetExhausted(
+    kind: "bot" | "ambient",
+    chatId: string,
+    now: number,
+  ): boolean;
   now: number;
 }
 
@@ -49,18 +57,19 @@ export function routeFor(
   threadParent: (channelId: string) => string | undefined,
 ): Route | undefined {
   if (!message.guild_id) {
-    for (const [ear, earConfig] of Object.entries(config.ears)) {
-      if (earConfig.dms) {
-        return {
-          ear,
-          chatId: message.channel_id,
-          boundChannelId: null,
-          channel: { mode: "mentions" },
-          kind: "dm",
-        };
-      }
+    // Config validation guarantees at most one DM ear, bound explicitly.
+    const ear = config.dmEar;
+    const earConfig = ear ? config.ears[ear] : undefined;
+    if (!ear || !earConfig) {
+      return undefined;
     }
-    return undefined;
+    return {
+      ear,
+      chatId: message.channel_id,
+      boundChannelId: null,
+      channel: { mode: earConfig.dmMode },
+      kind: "dm",
+    };
   }
   const candidates = [message.channel_id];
   const parent = threadParent(message.channel_id);
@@ -98,8 +107,8 @@ export function isMentioned(config: Config, message: DiscordMessage): boolean {
   if (message.referenced_message?.author.id === bot) {
     return true;
   }
-  return config.mentionPatterns.some((pattern) =>
-    new RegExp(pattern, "iu").test(message.content),
+  return config.mentionMatchers.some((matcher) =>
+    matcher.test(message.content),
   );
 }
 
@@ -127,7 +136,25 @@ export function classify(
     return { accept: false, reason: "dm_sender_not_allowed" };
   }
   const mentioned = isMentioned(config, message);
-  const priority = mentioned || trust === "principal" || route.kind === "dm";
+  let priority = mentioned || trust === "principal" || route.kind === "dm";
+  let budgetReason: string | undefined;
+  if (route.channel.mode !== "silent") {
+    if (isBot && (priority || route.channel.mode === "room")) {
+      if (context.wakeBudgetExhausted("bot", route.chatId, context.now)) {
+        budgetReason = "bot_loop_cooldown";
+      }
+    } else if (trust === "ambient" && priority) {
+      // Anyone can @mention or reply to the bot; without a budget an ambient
+      // user could force priority wakes indefinitely. Room chatter is already
+      // bounded by the debounce, so only mention-driven wakes are budgeted.
+      if (context.wakeBudgetExhausted("ambient", route.chatId, context.now)) {
+        budgetReason = "ambient_wake_budget";
+      }
+    }
+  }
+  if (budgetReason) {
+    priority = false;
+  }
 
   let wake: boolean;
   let reason: string;
@@ -137,17 +164,15 @@ export function classify(
       reason = "silent";
       break;
     case "room":
-      wake = true;
-      reason = priority ? "priority" : "room";
+      // Over budget, a room message loses its priority but is still ordinary,
+      // debounced room traffic; bots over budget stop waking entirely.
+      wake = budgetReason !== "bot_loop_cooldown";
+      reason = budgetReason ?? (priority ? "priority" : "room");
       break;
     default:
       wake = priority;
-      reason = priority ? "priority" : "context";
+      reason = budgetReason ?? (priority ? "priority" : "context");
       break;
-  }
-  if (wake && isBot && context.botLoopLimited(route.chatId, context.now)) {
-    wake = false;
-    reason = "bot_loop_cooldown";
   }
   const state =
     route.channel.mode === "silent" ? "stored" : wake ? "queued" : "context";
@@ -165,20 +190,21 @@ export function classify(
 }
 
 /**
- * OpenClaw-style bot-loop protection: more than `maxEvents` wake-worthy bot
- * events in `windowMs` puts the chat in cooldown, during which bot messages
- * are kept as context instead of waking the session.
+ * Sliding-window wake budget per chat (OpenClaw-style loop protection): more
+ * than `maxEvents` recorded wakes in `windowMs` puts the chat in cooldown,
+ * during which further wakes are demoted to context.
  */
-export class BotLoopLimiter {
+export class WakeLimiter {
   private readonly events = new Map<string, number[]>();
   private readonly cooldownUntil = new Map<string, number>();
-  private readonly settings: Config["botLoop"];
+  private readonly settings: WakeBudget;
 
-  public constructor(settings: Config["botLoop"]) {
+  public constructor(settings: WakeBudget) {
     this.settings = settings;
   }
 
-  public limited(chatId: string, now: number): boolean {
+  /** Records one wake for `chatId` and reports whether the budget is exhausted. */
+  public recordAndCheck(chatId: string, now: number): boolean {
     const until = this.cooldownUntil.get(chatId);
     if (until !== undefined) {
       if (now < until) {

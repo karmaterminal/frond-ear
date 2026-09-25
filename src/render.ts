@@ -1,19 +1,27 @@
 import type { Config } from "./config.ts";
 import type { BatchKind, StoredEvent } from "./types.ts";
 
-// Bidi overrides/isolates and other invisible format controls that can make
-// quoted text render as something else.
-const INVISIBLE_CONTROLS = /[​-‏‪-‮⁠-⁤⁦-⁩﻿]/gu;
+// Invisible format controls that can make quoted text render as something
+// else: zero-width and directional marks (U+200B-U+200F), bidi embeddings and
+// overrides (U+202A-U+202E), word joiner and invisible operators
+// (U+2060-U+2064), bidi isolates (U+2066-U+2069) and the BOM (U+FEFF).
+// Written as escapes so the class stays reviewable.
+const INVISIBLE_CONTROLS =
+  /[\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]/gu;
 // Everything below U+0020 except tab and newline.
 const C0_CONTROLS = /[\u0000-\u0008\u000b-\u001f\u007f]/gu;
 
 /**
- * Neutralises sequences that could close or open a channel frame. Claude sees
- * `<channel …>content</channel>`; text inside content must not be able to
- * fake either tag.
+ * Neutralises anything shaped like an XML/HTML tag opener or closer
+ * (`<name`, `</name` followed by whitespace, `>` or `/`). Claude sees
+ * `<channel …>content</channel>`, and the harness frames other material in
+ * tags such as `<system-reminder>`; message text must not be able to fake any
+ * of them, so this is a generic rule rather than a denylist that would drift.
+ * Discord's own `<@id>`, `<#id>`, `<:emoji:id>` and `<t:…>` forms are not
+ * tag-shaped and pass through.
  */
 export function neutraliseTags(text: string): string {
-  return text.replace(/<(\/?)(channel)/giu, "‹$1$2");
+  return text.replace(/<(\/?)([a-z][a-z0-9_-]*)(?=[\s>/]|$)/giu, "‹$1$2");
 }
 
 export function cleanText(text: string): string {
@@ -36,7 +44,7 @@ export function cleanName(name: string): string {
 
 function clockTime(timestamp: string): string {
   const match = /T(\d{2}:\d{2}:\d{2})/u.exec(timestamp);
-  return match?.[1] ? `${match[1]}Z` : timestamp;
+  return match?.[1] ? `${match[1]}Z` : cleanName(timestamp);
 }
 
 /**
@@ -64,7 +72,7 @@ export function renderEvent(event: StoredEvent, config: Config): string {
       `${event.attachments.length} attachment${event.attachments.length === 1 ? "" : "s"}: ${event.attachments
         .map(
           (file) =>
-            `${cleanName(file.name)} (${file.type}, ${Math.ceil(file.size / 1024)}KB)`,
+            `${cleanName(file.name)} (${cleanName(file.type)}, ${Math.ceil(file.size / 1024)}KB)`,
         )
         .join("; ")}`,
     );

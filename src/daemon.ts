@@ -2,7 +2,7 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 
 import type { Config } from "./config.ts";
 import type { StructuredLogger } from "./logger.ts";
-import { BotLoopLimiter, classify, routeFor, trustOf } from "./policy.ts";
+import { WakeLimiter, classify, routeFor, trustOf } from "./policy.ts";
 import type { ClientMessage, Connection } from "./protocol.ts";
 import { EAR_PROTOCOL_VERSION } from "./protocol.ts";
 import {
@@ -142,7 +142,8 @@ export class Daemon {
   private readonly options: DaemonOptions;
   private readonly clients = new Set<Client>();
   private readonly attached = new Map<string, Client>();
-  private limiter: BotLoopLimiter;
+  private botLimiter: WakeLimiter;
+  private ambientLimiter: WakeLimiter;
   private timer: unknown;
   private timerDue: number | undefined;
 
@@ -154,12 +155,14 @@ export class Daemon {
     this.logger = options.logger;
     this.clock = options.clock ?? systemClock;
     this.timers = options.timers ?? systemTimers;
-    this.limiter = new BotLoopLimiter(options.config.botLoop);
+    this.botLimiter = new WakeLimiter(options.config.botLoop);
+    this.ambientLimiter = new WakeLimiter(options.config.ambientWake);
   }
 
   public reloadConfig(config: Config): void {
     this.config = config;
-    this.limiter = new BotLoopLimiter(config.botLoop);
+    this.botLimiter = new WakeLimiter(config.botLoop);
+    this.ambientLimiter = new WakeLimiter(config.ambientWake);
     for (const [ear, client] of this.attached) {
       if (!config.ears[ear]) {
         client.connection.send({ type: "detached", reason: "ear_removed" });
@@ -194,7 +197,9 @@ export class Daemon {
 
   private chatMode(chatId: string): Mode | undefined {
     if (this.store.isDmChannel(chatId)) {
-      return "mentions";
+      return this.config.dmEar
+        ? this.config.ears[this.config.dmEar]?.dmMode
+        : undefined;
     }
     return routeFor(
       this.config,
@@ -217,7 +222,11 @@ export class Daemon {
     const now = this.clock.now();
     const classification = classify(this.config, message, {
       threadParent: (id) => this.store.threadParent(id),
-      botLoopLimited: (chatId, time) => this.limiter.limited(chatId, time),
+      wakeBudgetExhausted: (kind, chatId, time) =>
+        (kind === "bot" ? this.botLimiter : this.ambientLimiter).recordAndCheck(
+          chatId,
+          time,
+        ),
       now,
     });
     if (!classification.accept) {
@@ -259,6 +268,8 @@ export class Daemon {
     this.store.increment(`accepted_${classification.state}`);
     if (classification.reason === "bot_loop_cooldown") {
       this.store.increment("bot_loop_suppressed");
+    } else if (classification.reason === "ambient_wake_budget") {
+      this.store.increment("ambient_wake_suppressed");
     }
     const defaults = this.config.defaults;
     if (classification.state === "queued") {
@@ -602,7 +613,7 @@ export class Daemon {
   /** The ear a chat belongs to, or undefined when the chat is not routable. */
   private earForChat(chatId: string): string | undefined {
     if (this.store.isDmChannel(chatId)) {
-      return Object.entries(this.config.ears).find(([, ear]) => ear.dms)?.[0];
+      return this.config.dmEar;
     }
     return routeFor(
       this.config,
@@ -846,7 +857,8 @@ export class Daemon {
       paused: this.config.paused,
       gateway: this.options.gatewayStatus?.() ?? { state: "disabled" },
       ears,
-      botLoopCooling: this.limiter.cooling(this.clock.now()),
+      botLoopCooling: this.botLimiter.cooling(this.clock.now()),
+      ambientWakeCooling: this.ambientLimiter.cooling(this.clock.now()),
       counters: this.store.counters(),
     };
   }

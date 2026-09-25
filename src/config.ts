@@ -17,6 +17,8 @@ export interface EarConfig {
   channels: Record<string, ChannelConfig>;
   /** Whether DMs from principals and peer agents route to this ear. */
   dms: boolean;
+  /** Delivery mode for DMs routed to this ear (`mentions` wakes on every DM). */
+  dmMode: "mentions" | "silent";
   /** Ask Claude to ack a nonce on attach, proving the channel is registered. */
   attachCanary: boolean;
   /** Operator-authored text appended to the channel instructions. */
@@ -30,14 +32,20 @@ export interface Config {
   /** Optional human labels for author IDs, shown in instructions and headers. */
   labels: Record<string, string>;
   mentionPatterns: string[];
+  /** `mentionPatterns`, compiled once at load. */
+  mentionMatchers: RegExp[];
   ears: Record<string, EarConfig>;
+  /** The single ear that owns DMs, if any. */
+  dmEar: string | undefined;
   defaults: {
     quietWindowMs: number;
     maxDelayMs: number;
     priorityQuietMs: number;
     historyLimit: number;
   };
-  botLoop: { maxEvents: number; windowMs: number; cooldownMs: number };
+  botLoop: WakeBudget;
+  /** Per-chat budget for wakes caused by ambient (non-principal, non-peer) humans. */
+  ambientWake: WakeBudget;
   limits: {
     maxMessageChars: number;
     maxNotificationChars: number;
@@ -46,6 +54,12 @@ export interface Config {
   };
   /** Kill switch: keep ingesting, stop pushing. */
   paused: boolean;
+}
+
+export interface WakeBudget {
+  maxEvents: number;
+  windowMs: number;
+  cooldownMs: number;
 }
 
 const RESERVED_TARGETS = new Set(["copilot-sdk", "claude-monitor"]);
@@ -136,13 +150,13 @@ export function parseConfig(candidate: unknown): Config {
     candidate.mentionPatterns,
     "mentionPatterns",
   );
-  for (const pattern of mentionPatterns) {
+  const mentionMatchers = mentionPatterns.map((pattern) => {
     try {
-      new RegExp(pattern, "iu");
+      return new RegExp(pattern, "iu");
     } catch {
       throw new Error(`invalid mention pattern: ${pattern}`);
     }
-  }
+  });
 
   const defaultsInput = isObject(candidate.defaults) ? candidate.defaults : {};
   const defaults = {
@@ -229,16 +243,46 @@ export function parseConfig(candidate: unknown): Config {
     ) {
       throw new Error(`ears.${name}.instructions must be a string`);
     }
+    const dmMode = value.dmMode ?? "mentions";
+    if (dmMode !== "mentions" && dmMode !== "silent") {
+      throw new Error(`ears.${name}.dmMode must be mentions or silent`);
+    }
     ears[name] = {
       target,
       channels,
       dms,
+      dmMode,
       attachCanary: value.attachCanary !== false,
       instructions: (value.instructions as string | undefined) ?? "",
     };
   }
 
-  const loopInput = isObject(candidate.botLoop) ? candidate.botLoop : {};
+  const budget = (
+    input: unknown,
+    name: string,
+    fallback: WakeBudget,
+  ): WakeBudget => {
+    const values = isObject(input) ? input : {};
+    return {
+      maxEvents: integer(
+        values.maxEvents,
+        fallback.maxEvents,
+        `${name}.maxEvents`,
+        1,
+      ),
+      windowMs: integer(
+        values.windowMs,
+        fallback.windowMs,
+        `${name}.windowMs`,
+        1,
+      ),
+      cooldownMs: integer(
+        values.cooldownMs,
+        fallback.cooldownMs,
+        `${name}.cooldownMs`,
+      ),
+    };
+  };
   const limitsInput = isObject(candidate.limits) ? candidate.limits : {};
   return {
     botUserId: candidate.botUserId,
@@ -246,13 +290,20 @@ export function parseConfig(candidate: unknown): Config {
     peerAgents: snowflakes(candidate.peerAgents, "peerAgents"),
     labels,
     mentionPatterns,
+    mentionMatchers,
     ears,
+    dmEar: dmOwner,
     defaults,
-    botLoop: {
-      maxEvents: integer(loopInput.maxEvents, 20, "botLoop.maxEvents", 1),
-      windowMs: integer(loopInput.windowMs, 60_000, "botLoop.windowMs", 1),
-      cooldownMs: integer(loopInput.cooldownMs, 60_000, "botLoop.cooldownMs"),
-    },
+    botLoop: budget(candidate.botLoop, "botLoop", {
+      maxEvents: 20,
+      windowMs: 60_000,
+      cooldownMs: 60_000,
+    }),
+    ambientWake: budget(candidate.ambientWake, "ambientWake", {
+      maxEvents: 6,
+      windowMs: 60_000,
+      cooldownMs: 300_000,
+    }),
     limits: {
       maxMessageChars: integer(
         limitsInput.maxMessageChars,

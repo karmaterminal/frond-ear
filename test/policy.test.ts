@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { parseConfig } from "../src/config.ts";
-import { BotLoopLimiter, classify, type PolicyContext } from "../src/policy.ts";
+import { WakeLimiter, classify, type PolicyContext } from "../src/policy.ts";
 import {
   AMBIENT,
   BOT,
@@ -20,7 +20,7 @@ import {
 
 const context = (overrides: Partial<PolicyContext> = {}): PolicyContext => ({
   threadParent: () => undefined,
-  botLoopLimited: () => false,
+  wakeBudgetExhausted: () => false,
   now: 0,
   ...overrides,
 });
@@ -176,7 +176,7 @@ test("bot-loop cooldown demotes bot wakes to context", () => {
     classify(
       testConfig(),
       message({ author: { id: PEER_BOT, bot: true }, mentions: [{ id: BOT }] }),
-      context({ botLoopLimited: () => true }),
+      context({ wakeBudgetExhausted: (kind) => kind === "bot" }),
     ),
   );
   assert.equal(result.wake, false);
@@ -184,21 +184,21 @@ test("bot-loop cooldown demotes bot wakes to context", () => {
   assert.equal(result.reason, "bot_loop_cooldown");
 });
 
-test("BotLoopLimiter trips above maxEvents and recovers after cooldown", () => {
-  const limiter = new BotLoopLimiter({
+test("WakeLimiter trips above maxEvents and recovers after cooldown", () => {
+  const limiter = new WakeLimiter({
     maxEvents: 3,
     windowMs: 1_000,
     cooldownMs: 5_000,
   });
   assert.deepEqual(
-    [0, 10, 20].map((time) => limiter.limited("c", time)),
+    [0, 10, 20].map((time) => limiter.recordAndCheck("c", time)),
     [false, false, false],
   );
-  assert.equal(limiter.limited("c", 30), true);
-  assert.equal(limiter.limited("c", 4_000), true);
+  assert.equal(limiter.recordAndCheck("c", 30), true);
+  assert.equal(limiter.recordAndCheck("c", 4_000), true);
   assert.deepEqual(limiter.cooling(4_000), ["c"]);
-  assert.equal(limiter.limited("c", 5_100), false);
-  assert.equal(limiter.limited("other", 30), false);
+  assert.equal(limiter.recordAndCheck("c", 5_100), false);
+  assert.equal(limiter.recordAndCheck("other", 30), false);
 });
 
 test("config validation rejects ambiguous routing and reserved targets", () => {
@@ -243,4 +243,81 @@ test("config validation rejects ambiguous routing and reserved targets", () => {
       }),
     /mode/u,
   );
+});
+
+test("ambient mention wakes are budgeted; principals and peers are not", () => {
+  const config = testConfig();
+  const exhausted = context({
+    wakeBudgetExhausted: (kind) => kind === "ambient",
+  });
+  const ambient = accepted(
+    classify(config, message({ mentions: [{ id: BOT }] }), exhausted),
+  );
+  assert.equal(ambient.wake, false);
+  assert.equal(ambient.state, "context");
+  assert.equal(ambient.reason, "ambient_wake_budget");
+  const principal = accepted(
+    classify(config, message({ author: { id: PRINCIPAL } }), exhausted),
+  );
+  assert.equal(principal.wake, true);
+  const peer = accepted(
+    classify(
+      config,
+      message({ author: { id: PEER_BOT, bot: true }, mentions: [{ id: BOT }] }),
+      exhausted,
+    ),
+  );
+  assert.equal(peer.wake, true);
+});
+
+test("DMs bind to the single configured DM ear and honour dmMode", () => {
+  const config = testConfig({
+    ears: {
+      a: { channels: { [CHANNEL]: "mentions" } },
+      b: { dms: true, dmMode: "silent", channels: { [ROOM]: "room" } },
+    },
+  });
+  assert.equal(config.dmEar, "b");
+  const { guild_id: _unused, ...dm } = message({
+    channel_id: DM,
+    author: { id: PRINCIPAL },
+  });
+  const result = accepted(classify(config, dm, context()));
+  assert.equal(result.route.ear, "b");
+  assert.equal(result.state, "stored");
+  assert.throws(
+    () => testConfig({ ears: { a: { dms: true, dmMode: "loud" } } }),
+    /dmMode/u,
+  );
+});
+
+test("mention patterns are compiled once at config load", () => {
+  const config = testConfig();
+  assert.equal(config.mentionMatchers.length, 1);
+  assert.ok(config.mentionMatchers[0] instanceof RegExp);
+  assert.throws(
+    () => testConfig({ mentionPatterns: ["(unclosed"] }),
+    /invalid mention pattern/u,
+  );
+});
+
+test("in room mode an over-budget ambient mention loses priority but still flows as room traffic", () => {
+  const config = testConfig();
+  const exhausted = context({
+    wakeBudgetExhausted: (kind) => kind === "ambient",
+  });
+  const result = accepted(
+    classify(
+      config,
+      message({ channel_id: ROOM, mentions: [{ id: BOT }] }),
+      exhausted,
+    ),
+  );
+  assert.equal(result.wake, true);
+  assert.equal(result.priority, false);
+  assert.equal(result.reason, "ambient_wake_budget");
+  const plain = accepted(
+    classify(config, message({ channel_id: ROOM }), exhausted),
+  );
+  assert.equal(plain.reason, "room", "plain room chatter is not budgeted");
 });
