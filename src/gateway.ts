@@ -86,6 +86,7 @@ export class DiscordGateway {
   private generation = 0;
   private reconnectAttempt = 0;
   private awaitingHeartbeatAck = false;
+  private fenced = false;
   private statusValue: GatewayStatus = {
     state: "stopped",
     lastSequence: null,
@@ -125,6 +126,7 @@ export class DiscordGateway {
     }
     this.clearHeartbeat();
     this.awaitingHeartbeatAck = false;
+    this.fenced = false;
     const generation = ++this.generation;
     const persisted = this.options.store.gatewayState();
     const baseUrl = persisted.resumeGatewayUrl ?? this.options.gatewayUrl;
@@ -194,6 +196,13 @@ export class DiscordGateway {
   }
 
   public handlePayload(payload: GatewayPayload): void {
+    // After a non-durable dispatch the stream is fenced: nothing else from
+    // this connection may be processed (or advance the cursor) until we have
+    // reconnected and resumed from the last durable sequence, which makes
+    // Discord replay the failed event.
+    if (this.fenced) {
+      return;
+    }
     let durable = true;
     switch (payload.op) {
       case 0:
@@ -227,9 +236,15 @@ export class DiscordGateway {
       default:
         break;
     }
-    // The cursor only advances past payloads that were durably handled, so a
-    // failed ingest is replayed on resume instead of being skipped.
-    if (durable && typeof payload.s === "number") {
+    if (!durable) {
+      this.fenced = true;
+      this.options.logger.log("warn", "gateway.fenced_for_replay", {
+        durableSequence: this.options.store.gatewayState().sequence,
+      });
+      this.reconnectAfterFailure();
+      return;
+    }
+    if (typeof payload.s === "number") {
       const current = this.options.store.gatewayState();
       this.options.store.saveGatewayState({
         sessionId: current.sessionId,
@@ -387,6 +402,20 @@ export class DiscordGateway {
 
   private send(payload: GatewayPayload): void {
     this.socket?.send(JSON.stringify(payload));
+  }
+
+  /**
+   * Drops the connection and resumes with exponential backoff, so a failure
+   * that persists (e.g. storage trouble) does not hot-loop reconnects.
+   */
+  private reconnectAfterFailure(): void {
+    this.clearHeartbeat();
+    this.awaitingHeartbeatAck = false;
+    const socket = this.socket;
+    this.socket = undefined;
+    this.generation += 1;
+    socket?.close(4_000);
+    this.scheduleReconnect();
   }
 
   private reconnectNow(delayMs = 0): void {

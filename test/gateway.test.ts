@@ -212,31 +212,53 @@ test("non-resumable invalid session clears identity and waits before reconnect",
   store.close();
 });
 
-test("an ingest exception is contained and does not advance the cursor", () => {
+test("a failed ingest fences the stream and the event is replayed on resume", () => {
   const store = new EventStore(":memory:", new FakeClock());
   store.saveGatewayState({
     sessionId: "session",
     sequence: 20,
     resumeGatewayUrl: "wss://resume.example",
   });
-  const { gateway, sockets } = gatewayWith(store, {
-    onMessage: () => {
-      throw new Error("simulated persistence failure");
+  let failNext = true;
+  const ingested: string[] = [];
+  const { gateway, sockets, timers } = gatewayWith(store, {
+    onMessage: (event) => {
+      if (failNext) {
+        failNext = false;
+        throw new Error("simulated persistence failure");
+      }
+      ingested.push(event.id);
     },
   });
+  const lost = message();
   gateway.start();
   assert.doesNotThrow(() =>
-    sockets[0]?.emitMessage({
-      op: 0,
-      t: "MESSAGE_CREATE",
-      s: 21,
-      d: message(),
-    }),
+    sockets[0]?.emitMessage({ op: 0, t: "MESSAGE_CREATE", s: 21, d: lost }),
   );
   assert.equal(store.gatewayState().sequence, 20);
   assert.equal(gateway.status().lastError, "ingest_failed");
+  assert.equal(sockets[0]?.closed, true, "the connection is dropped");
+
+  // Later sequenced dispatches that were already in flight on the old
+  // socket, or handed in directly, cannot advance the cursor past 20.
   sockets[0]?.emitMessage({ op: 0, t: "TYPING_START", s: 22, d: {} });
-  assert.equal(store.gatewayState().sequence, 22);
+  gateway.handlePayload({ op: 0, t: "MESSAGE_CREATE", s: 23, d: message() });
+  assert.equal(store.gatewayState().sequence, 20);
+  assert.deepEqual(ingested, []);
+
+  // Reconnect resumes from the last durable sequence; Discord replays 21.
+  assert.equal(timers.length, 1);
+  timers.shift()?.callback();
+  gateway.handlePayload({ op: 10, d: { heartbeat_interval: 60_000 } });
+  assert.deepEqual(
+    sockets[1]?.sent.find((payload) => payload.op === 6),
+    { op: 6, d: { token: TOKEN, session_id: "session", seq: 20 } },
+  );
+  sockets[1]?.emitMessage({ op: 0, t: "MESSAGE_CREATE", s: 21, d: lost });
+  sockets[1]?.emitMessage({ op: 0, t: "TYPING_START", s: 22, d: {} });
+  sockets[1]?.emitMessage({ op: 0, t: "RESUMED", s: 23, d: {} });
+  assert.deepEqual(ingested, [lost.id]);
+  assert.equal(store.gatewayState().sequence, 23);
   gateway.stop();
   store.close();
 });
