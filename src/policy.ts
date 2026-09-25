@@ -1,5 +1,5 @@
 import type { ChannelConfig, Config, WakeBudget } from "./config.ts";
-import type { BatchKind, DiscordMessage, Trust } from "./types.ts";
+import type { BatchKind, DiscordMessage, Mode, Trust } from "./types.ts";
 
 export interface Route {
   ear: string;
@@ -38,7 +38,22 @@ export interface PolicyContext {
     chatId: string,
     now: number,
   ): boolean;
+  /**
+   * The attached session's own attention choice for this chat, if any.
+   * It can only narrow the operator's configured mode (see `narrower`).
+   */
+  attention?(ear: string, chatId: string, now: number): Mode | undefined;
   now: number;
+}
+
+const MODE_RANK: Record<Mode, number> = { silent: 0, mentions: 1, room: 2 };
+
+/** The quieter of two modes: operator config is a ceiling, never widened. */
+export function narrower(ceiling: Mode, requested: Mode | undefined): Mode {
+  if (requested === undefined) {
+    return ceiling;
+  }
+  return MODE_RANK[requested] < MODE_RANK[ceiling] ? requested : ceiling;
 }
 
 export function trustOf(config: Config, authorId: string): Trust {
@@ -135,6 +150,12 @@ export function classify(
   if (route.kind === "dm" && trust === "ambient") {
     return { accept: false, reason: "dm_sender_not_allowed" };
   }
+  // Effective mode: the operator's configured mode narrowed by whatever the
+  // attached session chose for itself. No trust level pierces that choice.
+  const mode = narrower(
+    route.channel.mode,
+    context.attention?.(route.ear, route.chatId, context.now),
+  );
   const mentioned = isMentioned(config, message);
   // Priority (the power to interrupt) comes only from addressing: a mention,
   // a reply to the bot, or a DM. Trust decides who may command and who is
@@ -142,8 +163,8 @@ export function classify(
   // unaddressed room message is context like anyone else's.
   let priority = mentioned || route.kind === "dm";
   let budgetReason: string | undefined;
-  if (route.channel.mode !== "silent") {
-    if (isBot && (priority || route.channel.mode === "room")) {
+  if (mode !== "silent") {
+    if (isBot && (priority || mode === "room")) {
       if (context.wakeBudgetExhausted("bot", route.chatId, context.now)) {
         budgetReason = "bot_loop_cooldown";
       }
@@ -162,7 +183,7 @@ export function classify(
 
   let wake: boolean;
   let reason: string;
-  switch (route.channel.mode) {
+  switch (mode) {
     case "silent":
       wake = false;
       reason = "silent";
@@ -178,8 +199,7 @@ export function classify(
       reason = budgetReason ?? (priority ? "priority" : "context");
       break;
   }
-  const state =
-    route.channel.mode === "silent" ? "stored" : wake ? "queued" : "context";
+  const state = mode === "silent" ? "stored" : wake ? "queued" : "context";
   return {
     accept: true,
     route,

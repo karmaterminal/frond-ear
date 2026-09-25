@@ -775,3 +775,182 @@ test("an action for batch A never marks a later batch B seen, even mid-request",
     h.dispose();
   }
 });
+
+// ---- session-chosen attention (#17) ----------------------------------------
+
+test("a session's silence is total: principal mentions and DMs are held, not pushed", async () => {
+  const h = harness();
+  try {
+    const shim = h.attach("scribe");
+    const set = await h.call(shim, "set_attention", { mode: "silent" });
+    assert.equal(set.ok, true, set.text);
+    h.daemon.ingest(
+      message({
+        author: { id: PRINCIPAL },
+        mentions: [{ id: BOT }],
+        content: "figs, delightful distraction",
+      }),
+    );
+    const { guild_id: _unused, ...dm } = message({
+      channel_id: DM,
+      author: { id: PRINCIPAL },
+      content: "dm too",
+    });
+    h.daemon.ingest(dm);
+    h.timers.advance(60_000);
+    assert.equal(
+      shim.connection.events().length,
+      0,
+      "nothing pierces a chosen silence",
+    );
+    assert.equal(h.store.stateCounts("scribe").stored, 2);
+    const inbox = await h.call(shim, "inbox", {});
+    assert.match(
+      inbox.text,
+      /delightful distraction[\s\S]*dm too/u,
+      "held messages stay readable",
+    );
+
+    // Lifting it is the session's call; later mentions wake again.
+    await h.call(shim, "set_attention", { mode: "configured" });
+    h.daemon.ingest(
+      message({
+        author: { id: PRINCIPAL },
+        mentions: [{ id: BOT }],
+        content: "after",
+      }),
+    );
+    h.timers.advance(2_000);
+    assert.equal(shim.connection.events().length, 1);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("set_attention is reduce-only: the operator's mode is a ceiling it cannot widen", async () => {
+  const h = harness();
+  try {
+    const shim = h.attach("scribe");
+    const result = await h.call(shim, "set_attention", {
+      chat_id: CHANNEL,
+      mode: "room",
+    });
+    assert.equal(result.ok, true);
+    const view = JSON.parse(result.text) as {
+      chats: Record<string, { ceiling: string; effective: string }>;
+      note?: string;
+    };
+    assert.deepEqual(view.chats[CHANNEL], {
+      ceiling: "mentions",
+      effective: "mentions",
+    });
+    assert.match(view.note ?? "", /exceeds the operator's ceiling/u);
+    h.daemon.ingest(message({ content: "ambient chatter" }));
+    assert.equal(
+      h.store.stateCounts("scribe").context,
+      1,
+      "still mentions-only",
+    );
+  } finally {
+    h.dispose();
+  }
+});
+
+test("narrowing a room to mentions demotes waiting chatter; an addressed message still wakes", async () => {
+  const h = harness();
+  try {
+    const shim = h.attach("scribe");
+    h.daemon.ingest(message({ channel_id: ROOM, content: "chatter one" }));
+    h.daemon.ingest(message({ channel_id: ROOM, content: "chatter two" }));
+    const result = await h.call(shim, "set_attention", {
+      chat_id: ROOM,
+      mode: "mentions",
+    });
+    assert.equal(
+      (JSON.parse(result.text) as { narrowedPending: number }).narrowedPending,
+      2,
+    );
+    h.timers.advance(60_000);
+    assert.equal(shim.connection.events().length, 0);
+    h.daemon.ingest(
+      message({
+        channel_id: ROOM,
+        mentions: [{ id: BOT }],
+        content: "hey scribe",
+      }),
+    );
+    h.timers.advance(2_000);
+    const [event] = shim.connection.events();
+    assert.match(
+      event?.content ?? "",
+      /chatter one[\s\S]*hey scribe/u,
+      "held chatter rides along as context",
+    );
+  } finally {
+    h.dispose();
+  }
+});
+
+test("an optional ttl lets a chosen quiet lapse on its own; without it the choice stands", async () => {
+  const h = harness();
+  try {
+    const shim = h.attach("scribe");
+    await h.call(shim, "set_attention", {
+      chat_id: CHANNEL,
+      mode: "silent",
+      ttl_seconds: 60,
+    });
+    await h.call(shim, "set_attention", { chat_id: ROOM, mode: "silent" });
+    h.clock.advance(61_000);
+    h.daemon.ingest(
+      message({
+        author: { id: PRINCIPAL },
+        mentions: [{ id: BOT }],
+        content: "ttl lapsed",
+      }),
+    );
+    h.daemon.ingest(
+      message({
+        channel_id: ROOM,
+        mentions: [{ id: BOT }],
+        content: "still quiet",
+      }),
+    );
+    h.timers.advance(2_000);
+    const contents = shim.connection
+      .events()
+      .map((event) => event.content)
+      .join("\n");
+    assert.match(contents, /ttl lapsed/u);
+    assert.doesNotMatch(contents, /still quiet/u);
+    const status = h.daemon.status("scribe") as {
+      ears: Array<{
+        attention: {
+          overrides: Array<{
+            scope: string;
+            mode: string;
+            expiresAt: number | null;
+          }>;
+        };
+      }>;
+    };
+    assert.deepEqual(status.ears[0]?.attention.overrides, [
+      { scope: ROOM, mode: "silent", expiresAt: null },
+    ]);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("only the attached session sets its attention", async () => {
+  const h = harness();
+  try {
+    h.attach("scribe");
+    const other = h.attach();
+    const result = await h.call(other, "set_attention", { mode: "silent" });
+    assert.equal(result.ok, false);
+    assert.match(result.text, /only the session attached/u);
+  } finally {
+    h.dispose();
+  }
+});

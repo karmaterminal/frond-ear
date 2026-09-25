@@ -2,7 +2,13 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 
 import type { Config } from "./config.ts";
 import type { StructuredLogger } from "./logger.ts";
-import { WakeLimiter, classify, routeFor, trustOf } from "./policy.ts";
+import {
+  WakeLimiter,
+  classify,
+  narrower,
+  routeFor,
+  trustOf,
+} from "./policy.ts";
 import type { ClientMessage, Connection } from "./protocol.ts";
 import { EAR_PROTOCOL_VERSION } from "./protocol.ts";
 import {
@@ -251,6 +257,8 @@ export class Daemon {
     const now = this.clock.now();
     const classification = classify(this.config, message, {
       threadParent: (id) => this.store.threadParent(id),
+      attention: (ear, chatId, time) =>
+        this.store.attentionFor(ear, chatId, time),
       wakeBudgetExhausted: (kind, chatId, time) =>
         (kind === "bot" ? this.botLimiter : this.ambientLimiter).recordAndCheck(
           chatId,
@@ -882,6 +890,8 @@ export class Daemon {
         );
         return `${marked} event${marked === 1 ? "" : "s"} marked seen`;
       }
+      case "set_attention":
+        return this.setAttention(client, args);
       case "ear_status":
         return JSON.stringify(
           this.status(client.ear ?? stringArg(args, "ear")),
@@ -891,6 +901,119 @@ export class Daemon {
       default:
         throw new Error(`unknown tool ${tool}`);
     }
+  }
+
+  /**
+   * The attached session chooses what it hears. The operator's configured
+   * mode is a ceiling the session can narrow (down to silence) but never
+   * widen; no trust level, principal included, pierces a narrowed mode.
+   */
+  private setAttention(client: Client, args: Record<string, unknown>): string {
+    const ear = client.ear;
+    if (!ear || !this.isAttachedSession(client, ear)) {
+      throw new Error(
+        "only the session attached to an ear can set its attention",
+      );
+    }
+    const requested = stringArg(args, "mode", true);
+    if (!["silent", "mentions", "room", "configured"].includes(requested)) {
+      throw new Error("mode must be silent, mentions, room or configured");
+    }
+    const chatId = snowflakeArg(args, "chat_id");
+    if (chatId && this.earForChat(chatId) !== ear) {
+      throw new Error(`chat ${chatId} is not bound to ear ${ear}`);
+    }
+    const scope = chatId ?? "*";
+    const now = this.clock.now();
+    if (requested === "configured") {
+      this.store.clearAttention(ear, chatId === undefined ? undefined : scope);
+    } else {
+      const ttl = args.ttl_seconds;
+      let expiresAt: number | null = null;
+      if (ttl !== undefined && ttl !== null) {
+        const seconds = Number(ttl);
+        if (!Number.isSafeInteger(seconds) || seconds < 1) {
+          throw new Error("ttl_seconds must be a positive integer");
+        }
+        expiresAt = now + seconds * 1_000;
+      }
+      this.store.setAttention(ear, scope, requested as Mode, expiresAt);
+    }
+    // Rows already waiting are narrowed too, so the choice takes effect now.
+    let narrowed = 0;
+    for (const pending of this.store.pendingChats()) {
+      if (pending.ear !== ear) {
+        continue;
+      }
+      const effective = this.effectiveMode(ear, pending.chatId);
+      if (effective) {
+        narrowed += this.store.narrowPending(ear, pending.chatId, effective);
+      }
+    }
+    this.store.increment("attention_changes");
+    this.logger.log("info", "ear.attention", { ear, scope, mode: requested });
+    this.tick();
+    const view = this.attentionView(ear);
+    const capped =
+      requested !== "configured" &&
+      chatId !== undefined &&
+      view.chats[chatId] !== undefined &&
+      view.chats[chatId].effective !== requested;
+    return JSON.stringify(
+      {
+        ...view,
+        note: capped
+          ? `requested ${requested} exceeds the operator's ceiling for ${chatId}; effective mode is ${view.chats[chatId]?.effective}`
+          : undefined,
+        narrowedPending: narrowed,
+      },
+      null,
+      2,
+    );
+  }
+
+  /** Configured ceiling narrowed by the session's own choice. */
+  private effectiveMode(ear: string, chatId: string): Mode | undefined {
+    const ceiling = this.chatMode(chatId);
+    return ceiling === undefined
+      ? undefined
+      : narrower(
+          ceiling,
+          this.store.attentionFor(ear, chatId, this.clock.now()),
+        );
+  }
+
+  private attentionView(ear: string): {
+    overrides: Array<{ scope: string; mode: Mode; expiresAt: number | null }>;
+    chats: Record<string, { ceiling: Mode; effective: Mode }>;
+  } {
+    const earConfig = this.config.ears[ear];
+    const now = this.clock.now();
+    const chats: Record<string, { ceiling: Mode; effective: Mode }> = {};
+    for (const [chatId, channel] of Object.entries(earConfig?.channels ?? {})) {
+      chats[chatId] = {
+        ceiling: channel.mode,
+        effective: narrower(
+          channel.mode,
+          this.store.attentionFor(ear, chatId, now),
+        ),
+      };
+    }
+    if (earConfig?.dms) {
+      const dmOverride = this.store
+        .attentionOverrides(ear, now)
+        .find((item) => item.scope === "*")?.mode;
+      chats.dms = {
+        ceiling: earConfig.dmMode,
+        effective: narrower(earConfig.dmMode, dmOverride),
+      };
+    }
+    return {
+      overrides: this.store
+        .attentionOverrides(ear, now)
+        .map(({ scope, mode, expiresAt }) => ({ scope, mode, expiresAt })),
+      chats,
+    };
   }
 
   private toDisplayEvent(message: DiscordMessage, ear: string): StoredEvent {
@@ -949,6 +1072,7 @@ export class Daemon {
           events: this.store.stateCounts(name),
           lastEventAt: this.store.lastEventAt(name),
           nextFlushAt: this.store.nextDue(name) ?? null,
+          attention: this.attentionView(name),
         };
       });
     return {

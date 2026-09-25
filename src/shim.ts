@@ -131,6 +131,23 @@ export const TOOLS = [
     },
   },
   {
+    name: "set_attention",
+    description:
+      "Choose what you hear. Narrow a chat (chat_id) or everything (omit chat_id) to room, mentions or silent; the operator's configured mode is the ceiling, so this can only reduce. Silence is total: nothing, principal included, breaks through. mode=configured clears your choice. ttl_seconds is optional; without it the choice lasts until you change it.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        mode: {
+          type: "string",
+          enum: ["silent", "mentions", "room", "configured"],
+        },
+        chat_id: { ...chatId, description: "Limit to one chat; omit for all" },
+        ttl_seconds: { type: "number", description: "Optional expiry" },
+      },
+      required: ["mode"],
+    },
+  },
+  {
     name: "ear_status",
     description: "frond-ear status: gateway, ear attachment, queue counts.",
     inputSchema: { type: "object", properties: {} },

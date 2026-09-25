@@ -6,6 +6,7 @@ import type {
   BatchKind,
   Clock,
   EventState,
+  Mode,
   StoredEvent,
   Trust,
 } from "./types.ts";
@@ -164,6 +165,14 @@ export class EventStore {
         thread_id TEXT PRIMARY KEY,
         parent_id TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS attention (
+        ear TEXT NOT NULL,
+        scope TEXT NOT NULL,
+        mode TEXT NOT NULL CHECK (mode IN ('silent', 'mentions', 'room')),
+        set_at INTEGER NOT NULL,
+        expires_at INTEGER,
+        PRIMARY KEY (ear, scope)
+      );
       CREATE TABLE IF NOT EXISTS sent_messages (
         message_id TEXT PRIMARY KEY,
         channel_id TEXT NOT NULL,
@@ -303,6 +312,98 @@ export class EventStore {
          ON CONFLICT(channel_id) DO UPDATE SET user_id = excluded.user_id`,
       )
       .run(channelId, userId);
+  }
+
+  // ---- session-chosen attention -------------------------------------------------
+
+  /** `scope` is a chat ID, or "*" for every chat of the ear. */
+  public setAttention(
+    ear: string,
+    scope: string,
+    mode: Mode,
+    expiresAt: number | null,
+  ): void {
+    this.database
+      .prepare(
+        `INSERT INTO attention (ear, scope, mode, set_at, expires_at) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(ear, scope) DO UPDATE SET mode = excluded.mode,
+           set_at = excluded.set_at, expires_at = excluded.expires_at`,
+      )
+      .run(ear, scope, mode, this.clock.now(), expiresAt);
+  }
+
+  /** Clears one scope, or every override of the ear when scope is omitted. */
+  public clearAttention(ear: string, scope?: string): number {
+    const result =
+      scope === undefined
+        ? this.database.prepare("DELETE FROM attention WHERE ear = ?").run(ear)
+        : this.database
+            .prepare("DELETE FROM attention WHERE ear = ? AND scope = ?")
+            .run(ear, scope);
+    return Number(result.changes);
+  }
+
+  /** Active overrides for an ear; expired ones are removed as they are read. */
+  public attentionOverrides(
+    ear: string,
+    now: number,
+  ): Array<{
+    scope: string;
+    mode: Mode;
+    setAt: number;
+    expiresAt: number | null;
+  }> {
+    this.database
+      .prepare(
+        "DELETE FROM attention WHERE ear = ? AND expires_at IS NOT NULL AND expires_at <= ?",
+      )
+      .run(ear, now);
+    return this.database
+      .prepare(
+        `SELECT scope, mode, set_at AS setAt, expires_at AS expiresAt FROM attention
+           WHERE ear = ? ORDER BY scope`,
+      )
+      .all(ear) as Array<{
+      scope: string;
+      mode: Mode;
+      setAt: number;
+      expiresAt: number | null;
+    }>;
+  }
+
+  /** The session's choice for a chat: a chat-specific override beats "*". */
+  public attentionFor(
+    ear: string,
+    chatId: string,
+    now: number,
+  ): Mode | undefined {
+    const overrides = this.attentionOverrides(ear, now);
+    return (
+      overrides.find((item) => item.scope === chatId) ??
+      overrides.find((item) => item.scope === "*")
+    )?.mode;
+  }
+
+  /**
+   * Applies a narrowed mode to rows already waiting in a chat: silent turns
+   * pending pushes into inbox-only rows; mentions demotes unaddressed queued
+   * rows to context. Nothing is ever promoted by this.
+   */
+  public narrowPending(ear: string, chatId: string, mode: Mode): number {
+    if (mode === "silent") {
+      return this.silenceChat(ear, chatId);
+    }
+    if (mode === "mentions") {
+      return Number(
+        this.database
+          .prepare(
+            `UPDATE events SET state = 'context', due_at = NULL, updated_at = ?
+             WHERE ear = ? AND chat_id = ? AND state = 'queued' AND priority = 0`,
+          )
+          .run(this.clock.now(), ear, chatId).changes,
+      );
+    }
+    return 0;
   }
 
   /** Remembers a message frond-ear itself sent, so edits can be authorised. */

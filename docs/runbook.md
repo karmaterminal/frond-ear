@@ -63,6 +63,16 @@ Copy `frond-ear.example.json` to `frond-ear.json`. That filename is git-ignored.
 
 Changes to the config take effect without a restart.
 
+**The session's own attention.** Configured modes are a _ceiling_. The attached session can narrow what it hears with the `set_attention` tool:
+
+- It can narrow one chat or everything, down to `silent`, with an optional `ttl_seconds`.
+- A silence it chooses holds against everyone, principals included. Held messages stay in `inbox`.
+- It can never widen past the configured mode.
+- `mode: "configured"` clears its choice.
+- The effective mode and any active choice for each chat appear in `ear_status` and `frond-ear status`.
+
+The operator's levers are unchanged: edit the config, stop the daemon, or talk to the session at its terminal.
+
 **Environment**
 
 | Variable                                | Default                                                                                                             |
