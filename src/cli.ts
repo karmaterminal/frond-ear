@@ -174,14 +174,18 @@ async function runDaemon(argv: string[]): Promise<void> {
       return;
     }
     stopping = true;
+    // Stop inputs first (no new Discord events, no new connections), then let
+    // in-flight tool calls finish recording their side effects, and only then
+    // close SQLite.
     watcher.close();
     gateway?.stop();
-    daemon.shutdown();
     server.close();
-    store.close();
-    logger.log("info", "daemon.stopped", { code });
-    process.exitCode = code;
-    setTimeout(() => process.exit(code), 500).unref();
+    void daemon.shutdown().then(({ drained }) => {
+      store.close();
+      logger.log("info", "daemon.stopped", { code, drained });
+      process.exitCode = code;
+      setTimeout(() => process.exit(code), 500).unref();
+    });
   }
   process.on("SIGINT", () => shutdown(0));
   process.on("SIGTERM", () => shutdown(0));

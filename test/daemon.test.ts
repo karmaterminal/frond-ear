@@ -954,3 +954,70 @@ test("only the attached session sets its attention", async () => {
     h.dispose();
   }
 });
+
+test("shutdown drains in-flight tool calls before the store can close", async () => {
+  const h = harness();
+  try {
+    const shim = h.attach("scribe");
+    h.daemon.ingest(
+      message({
+        author: { id: PRINCIPAL },
+        mentions: [{ id: BOT }],
+        content: "reply before you go",
+      }),
+    );
+    h.timers.advance(1_000);
+    await shim.send({
+      type: "offered",
+      batchId: shim.connection.events()[0]?.batchId as number,
+    });
+
+    let release: () => void = () => undefined;
+    const originalSend = h.rest.sendMessage.bind(h.rest);
+    h.rest.sendMessage = async (...args) => {
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return originalSend(...args);
+    };
+    const pending = shim.send({
+      type: "call",
+      id: 700,
+      tool: "reply",
+      args: { chat_id: CHANNEL, text: "on my way out" },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    // SIGTERM arrives while Discord is still answering.
+    let stopped = false;
+    const stopping = h.daemon.shutdown().then((result) => {
+      stopped = true;
+      return result;
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(stopped, false, "shutdown waits for the in-flight reply");
+
+    // New calls are refused without side effects while draining.
+    const refused = await h.call(shim, "reply", {
+      chat_id: CHANNEL,
+      text: "late",
+    });
+    assert.equal(refused.ok, false);
+    assert.match(refused.text, /shutting down; nothing was sent/u);
+
+    release();
+    await pending;
+    assert.deepEqual(await stopping, { drained: true });
+    // The side effect and its receipt were both recorded before any close.
+    const sent = h.rest.calls.filter((call) => call.method === "send");
+    assert.equal(sent.length, 1);
+    assert.equal(h.store.sentIn(sent[0]?.messageId as string, CHANNEL), true);
+    assert.equal(h.store.stateCounts("scribe").seen, 1);
+    assert.equal(
+      shim.connection.results().find((item) => item.id === 700)?.ok,
+      true,
+    );
+  } finally {
+    h.dispose();
+  }
+});

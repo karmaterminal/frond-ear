@@ -176,6 +176,9 @@ export class Daemon {
   private botLimiter: WakeLimiter;
   private ambientLimiter: WakeLimiter;
   private timer: unknown;
+  private closing = false;
+  /** Tool calls in flight; shutdown drains these before the store closes. */
+  private readonly inFlight = new Set<Promise<unknown>>();
   private timerDue: number | undefined;
 
   public constructor(options: DaemonOptions) {
@@ -541,7 +544,7 @@ export class Daemon {
         });
         return;
       case "inject":
-        if (!this.options.allowInject) {
+        if (!this.options.allowInject || this.closing) {
           client.connection.send({
             type: "result",
             id: message.id,
@@ -557,13 +560,22 @@ export class Daemon {
           text: this.ingest(message.message),
         });
         return;
-      case "call":
+      case "call": {
+        if (this.closing) {
+          client.connection.send({
+            type: "result",
+            id: message.id,
+            ok: false,
+            text: "frond-ear daemon is shutting down; nothing was sent, retry after it restarts",
+          });
+          return;
+        }
+        const work = this.callTool(client, message.tool, message.args ?? {});
+        this.inFlight.add(work);
+        const settled = () => this.inFlight.delete(work);
+        work.then(settled, settled);
         try {
-          const text = await this.callTool(
-            client,
-            message.tool,
-            message.args ?? {},
-          );
+          const text = await work;
           client.connection.send({
             type: "result",
             id: message.id,
@@ -579,6 +591,7 @@ export class Daemon {
           });
         }
         return;
+      }
       default:
         client.connection.close();
     }
@@ -1085,13 +1098,37 @@ export class Daemon {
     };
   }
 
-  public shutdown(): void {
+  /**
+   * Stops accepting tool calls, stops flushing, then waits (up to
+   * `drainMs`) for in-flight calls to settle so their Discord side effects
+   * are recorded before the caller closes the store. Only then are client
+   * connections closed.
+   */
+  public async shutdown(drainMs = 10_000): Promise<{ drained: boolean }> {
+    this.closing = true;
     if (this.timer !== undefined) {
       this.timers.clearTimeout(this.timer);
       this.timer = undefined;
     }
+    let drained = true;
+    if (this.inFlight.size > 0) {
+      let timeout: NodeJS.Timeout | undefined;
+      drained = await Promise.race([
+        Promise.allSettled([...this.inFlight]).then(() => true),
+        new Promise<boolean>((resolve) => {
+          timeout = setTimeout(() => resolve(false), drainMs);
+        }),
+      ]);
+      clearTimeout(timeout);
+      if (!drained) {
+        this.logger.log("warn", "daemon.drain_timeout", {
+          inFlight: this.inFlight.size,
+        });
+      }
+    }
     for (const client of this.clients) {
       client.connection.close();
     }
+    return { drained };
   }
 }
