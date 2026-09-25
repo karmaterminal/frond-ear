@@ -20,6 +20,7 @@ frond-ear is a Discord Gateway daemon that pushes debounced, trust-classified ev
   4. `scan:credentials`
 
   Run it before pushing. CI runs the same thing.
+
 - **Secrets.**
   - The bot token only ever comes from `DISCORD_BOT_TOKEN` or `DISCORD_BOT_TOKEN_FILE`.
   - Never log it or pass it to the shim.
