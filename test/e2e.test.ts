@@ -2,6 +2,7 @@
 // client standing in for Claude Code. Nothing touches Discord or Claude.
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
+import { connect } from "node:net";
 import {
   existsSync,
   mkdtempSync,
@@ -16,6 +17,7 @@ import test from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
+import { LineConnection } from "../src/protocol.ts";
 import { BOT, CHANNEL, GUILD, PRINCIPAL, ROOM } from "./helpers.ts";
 
 const CLI = join(import.meta.dirname, "..", "src", "cli.ts");
@@ -57,6 +59,43 @@ function run(
       stdout += chunk.toString();
     });
     child.on("close", (code) => resolve({ code, stdout }));
+  });
+}
+
+/** Sends several inject requests on a single CLI connection, in order. */
+function injectOverOneConnection(
+  socketPath: string,
+  messages: object[],
+): Promise<string[]> {
+  return new Promise((resolve, reject) => {
+    const results: string[] = [];
+    const socket = connect(socketPath);
+    const connection = new LineConnection(
+      socket,
+      (raw) => {
+        const reply = raw as { type: string; text?: string };
+        if (reply.type === "welcome") {
+          messages.forEach((message, index) =>
+            connection.send({ type: "inject", id: index + 1, message }),
+          );
+        } else if (reply.type === "result") {
+          results.push(reply.text ?? "");
+          if (results.length === messages.length) {
+            connection.close();
+            resolve(results);
+          }
+        }
+      },
+      () => {
+        if (results.length < messages.length) {
+          reject(new Error("daemon closed the inject connection early"));
+        }
+      },
+    );
+    socket.once("connect", () =>
+      connection.send({ type: "hello", role: "cli", protocol: 1 }),
+    );
+    socket.once("error", reject);
   });
 }
 
@@ -232,22 +271,21 @@ test("dry-run daemon + channel shim + MCP client: inject → <channel> notificat
     /inbox empty/u,
   );
 
-  // Room chatter is debounced into a single notification.
-  for (const text of ["one", "two", "three"]) {
-    await run(
-      [
-        "inject",
-        "--chat",
-        ROOM,
-        "--guild",
-        GUILD,
-        "--author",
-        "400000000000000004",
-        text,
-      ],
-      env,
-    );
-  }
+  // Room chatter is debounced into a single notification. The three messages
+  // are injected back-to-back over one daemon connection, so the assertion is
+  // about debounce semantics, not about how fast three CLI processes start.
+  const results = await injectOverOneConnection(
+    socket,
+    ["one", "two", "three"].map((text, index) => ({
+      id: String(1_500_000_000_000_000_000n + BigInt(index)),
+      channel_id: ROOM,
+      guild_id: GUILD,
+      author: { id: "400000000000000004", username: "ambient" },
+      content: text,
+      timestamp: new Date().toISOString(),
+    })),
+  );
+  assert.deepEqual(results, ["inserted", "inserted", "inserted"]);
   const room = await waitFor(
     () => notifications.find((item) => item.meta.kind === "room"),
     "room batch",
