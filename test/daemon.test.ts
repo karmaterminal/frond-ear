@@ -217,6 +217,10 @@ test("reply chunks long text, quotes only the first chunk, and marks the chat se
       message({ author: { id: PRINCIPAL }, content: "write me an essay" }),
     );
     h.timers.advance(1_000);
+    await shim.send({
+      type: "offered",
+      batchId: shim.connection.events()[0]?.batchId as number,
+    });
     const text = `${"a".repeat(1_500)}\n\n${"b".repeat(1_500)}`;
     const result = await h.call(shim, "reply", {
       chat_id: CHANNEL,
@@ -496,6 +500,217 @@ test("an ambient user cannot hold the session awake: mention wakes are budgeted 
     assert.equal(counts.queued, 3);
     assert.equal(counts.context, 3);
     assert.equal(h.store.counters().ambient_wake_suppressed, 3);
+  } finally {
+    h.dispose();
+  }
+});
+
+// ---- review round 3 regressions -------------------------------------------
+
+test("crash between insert and scheduling cannot strand a queued event", async () => {
+  const h = harness();
+  const path = join(h.directory, "crash.db");
+  try {
+    // Simulate an older build that crashed after the insert autocommitted.
+    const before = harness(testConfig(), { path });
+    const event = message({ author: { id: PRINCIPAL }, content: "stranded?" });
+    before.store.insertEvent({
+      messageId: event.id,
+      ear: "scribe",
+      chatId: CHANNEL,
+      guildId: event.guild_id ?? null,
+      authorId: PRINCIPAL,
+      authorName: "figs",
+      isBot: false,
+      trust: "principal",
+      wake: true,
+      priority: true,
+      content: event.content,
+      timestamp: event.timestamp,
+      replyTo: null,
+      attachments: [],
+      state: "queued",
+    });
+    assert.equal(before.store.nextDue("scribe"), undefined);
+    before.daemon.shutdown();
+    before.store.close();
+
+    // Restart repairs it; the gateway replay is then a harmless duplicate.
+    const after = harness(testConfig(), { path });
+    assert.equal(after.daemon.ingest(event), "duplicate");
+    const shim = after.attach("scribe");
+    after.timers.advance(1_000);
+    assert.match(shim.connection.events()[0]?.content ?? "", /stranded\?/u);
+    after.daemon.shutdown();
+    after.store.close();
+  } finally {
+    h.dispose();
+  }
+});
+
+test("admission is one transaction: a failure mid-admission leaves no row behind", () => {
+  const h = harness();
+  try {
+    const original = h.store.scheduleChat.bind(h.store);
+    h.store.scheduleChat = () => {
+      throw new Error("disk full");
+    };
+    assert.throws(
+      () => h.daemon.ingest(message({ author: { id: PRINCIPAL } })),
+      /disk full/u,
+    );
+    h.store.scheduleChat = original;
+    assert.equal(
+      h.store.stateCounts("scribe").queued,
+      0,
+      "rolled back, so the replay is admitted fresh",
+    );
+  } finally {
+    h.dispose();
+  }
+});
+
+test("tool IDs must be snowflakes, so crafted IDs cannot steer the REST path", async () => {
+  const h = harness();
+  try {
+    const shim = h.attach("scribe");
+    for (const [tool, args] of [
+      [
+        "react",
+        {
+          chat_id: CHANNEL,
+          message_id: "../../../channels/999/messages/888",
+          emoji: "👍",
+        },
+      ],
+      [
+        "edit_message",
+        { chat_id: CHANNEL, message_id: "1/../../999", text: "x" },
+      ],
+      ["reply", { chat_id: `${CHANNEL}/../999`, text: "x" }],
+      ["reply", { chat_id: CHANNEL, text: "x", reply_to: "1?x=1" }],
+      ["fetch_messages", { chat_id: CHANNEL, before: "../1" }],
+    ] as const) {
+      const result = await h.call(shim, tool, args);
+      assert.equal(result.ok, false, `${tool} ${JSON.stringify(args)}`);
+    }
+    assert.equal(h.rest.calls.length, 0);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("edit_message only edits messages frond-ear itself sent in that chat", async () => {
+  const h = harness();
+  try {
+    const shim = h.attach("scribe");
+    const foreign = await h.call(shim, "edit_message", {
+      chat_id: CHANNEL,
+      message_id: "123456789",
+      text: "x",
+    });
+    assert.equal(foreign.ok, false);
+    assert.match(foreign.text, /not sent by frond-ear/u);
+    await h.call(shim, "reply", { chat_id: CHANNEL, text: "progress 1" });
+    const sentId = h.rest.calls[0]?.messageId as string;
+    const elsewhere = await h.call(shim, "edit_message", {
+      chat_id: ROOM,
+      message_id: sentId,
+      text: "x",
+    });
+    assert.equal(elsewhere.ok, false, "an ID sent in another chat is refused");
+    const own = await h.call(shim, "edit_message", {
+      chat_id: CHANNEL,
+      message_id: sentId,
+      text: "progress 2",
+    });
+    assert.equal(own.ok, true);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("offered events a session never acts on are still bounded by the per-ear cap and retention", async () => {
+  const h = harness(
+    testConfig({ limits: { maxPendingPerEar: 3, retentionMs: 60_000 } }),
+  );
+  try {
+    const shim = h.attach("scribe");
+    for (let index = 0; index < 6; index += 1) {
+      h.daemon.ingest(
+        message({ author: { id: PRINCIPAL }, content: `unanswered ${index}` }),
+      );
+      h.timers.advance(1_000);
+      const event = shim.connection.events().at(-1);
+      await shim.send({ type: "offered", batchId: event?.batchId as number });
+    }
+    const counts = h.store.stateCounts("scribe");
+    assert.ok(counts.offered <= 3, `offered ${counts.offered}`);
+    assert.equal(counts.offered + counts.dropped, 6);
+    h.clock.advance(120_000);
+    h.store.prune(60_000);
+    assert.equal(
+      h.store.stateCounts("scribe").offered,
+      0,
+      "old offered rows are retained only for retentionMs",
+    );
+  } finally {
+    h.dispose();
+  }
+});
+
+test("an action for batch A never marks a later batch B seen, even mid-request", async () => {
+  const h = harness();
+  try {
+    const shim = h.attach("scribe");
+    const offer = async (content: string) => {
+      h.daemon.ingest(message({ author: { id: PRINCIPAL }, content }));
+      h.timers.advance(1_000);
+      const event = shim.connection.events().at(-1);
+      await shim.send({ type: "offered", batchId: event?.batchId as number });
+      return event?.batchId as number;
+    };
+    const batchA = await offer("question A");
+
+    // B arrives while the reply for A is still in flight.
+    let release: () => void = () => undefined;
+    const originalSend = h.rest.sendMessage.bind(h.rest);
+    h.rest.sendMessage = async (...args) => {
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return originalSend(...args);
+    };
+    const pending = shim.send({
+      type: "call",
+      id: 900,
+      tool: "reply",
+      args: { chat_id: CHANNEL, text: "answer A" },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    await offer("question B");
+    release();
+    await pending;
+    await new Promise((resolve) => setImmediate(resolve));
+    const unseen = h.store
+      .unseen("scribe", CHANNEL, 10)
+      .map((event) => event.content);
+    assert.deepEqual(unseen, ["question B"]);
+
+    // With an explicit batch_id, only that batch (and earlier) is acknowledged.
+    h.rest.sendMessage = originalSend;
+    const batchC = await offer("question C");
+    assert.ok(batchC > batchA);
+    await h.call(shim, "react", {
+      chat_id: CHANNEL,
+      message_id: "1",
+      emoji: "👀",
+      batch_id: batchA,
+    });
+    assert.deepEqual(
+      h.store.unseen("scribe", CHANNEL, 10).map((event) => event.content),
+      ["question B", "question C"],
+    );
   } finally {
     h.dispose();
   }

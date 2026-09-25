@@ -280,3 +280,22 @@ test("reactions URL-encode unicode and custom emoji", async () => {
   assert.match(requests[0]?.url ?? "", /reactions\/%F0%9F%91%8D\/@me$/u);
   assert.match(requests[1]?.url ?? "", /reactions\/frond%3A123\/@me$/u);
 });
+
+test("REST encodes every path segment, so traversal cannot normalise into another channel", async () => {
+  const { fetch, requests } = fakeFetch([{ status: 204 }, { status: 204 }]);
+  const rest = new HttpDiscordRest({
+    token: "t",
+    apiBase: "https://discord.example/api/v10",
+    fetch,
+  });
+  await rest.addReaction(CHANNEL, "../../../channels/999/messages/888", "👍");
+  await rest.editMessage(CHANNEL, "1/../../999", "x");
+  for (const request of requests) {
+    const url = new URL(request.url);
+    assert.ok(
+      url.pathname.startsWith(`/api/v10/channels/${CHANNEL}/messages/`),
+      url.pathname,
+    );
+    assert.doesNotMatch(url.pathname, /\/channels\/999\//u);
+  }
+});

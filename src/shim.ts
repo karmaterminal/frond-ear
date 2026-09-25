@@ -20,6 +20,12 @@ export const SUPPORTED_PROTOCOL_VERSIONS = [
 
 export const SHIM_VERSION = "0.1.0";
 
+const batchId = {
+  type: "number",
+  description:
+    "batch_id from the <channel> event you are acting on; only that batch and earlier ones in the chat are marked seen",
+};
+
 const chatId = {
   type: "string",
   description: "chat_id from the <channel> event (channel, thread or DM ID)",
@@ -34,6 +40,7 @@ export const TOOLS = [
       type: "object",
       properties: {
         chat_id: chatId,
+        batch_id: batchId,
         text: {
           type: "string",
           description: "Message text (Discord markdown)",
@@ -53,6 +60,7 @@ export const TOOLS = [
       type: "object",
       properties: {
         chat_id: chatId,
+        batch_id: batchId,
         message_id: { type: "string" },
         emoji: {
           type: "string",
@@ -69,6 +77,7 @@ export const TOOLS = [
       type: "object",
       properties: {
         chat_id: chatId,
+        batch_id: batchId,
         message_id: { type: "string" },
         text: { type: "string" },
       },
@@ -82,6 +91,7 @@ export const TOOLS = [
       type: "object",
       properties: {
         chat_id: chatId,
+        batch_id: batchId,
         limit: { type: "number", description: "1-100, default 20" },
         before: {
           type: "string",
@@ -116,6 +126,7 @@ export const TOOLS = [
       properties: {
         chat_id: chatId,
         nonce: { type: "string", description: "Nonce from the attach event" },
+        batch_id: batchId,
       },
     },
   },

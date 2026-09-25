@@ -71,6 +71,9 @@ export function chunkMessage(
   return chunks;
 }
 
+/** Every caller-influenced path segment is encoded, never interpolated raw. */
+const seg = (value: string): string => encodeURIComponent(value);
+
 function encodeEmoji(emoji: string): string {
   // Custom emoji are passed as name:id; unicode emoji as-is. Both URL-encoded.
   return encodeURIComponent(emoji.replace(/^<a?:/u, "").replace(/>$/u, ""));
@@ -164,7 +167,7 @@ export class HttpDiscordRest implements DiscordRest {
     }
     const result = (await this.request(
       "POST",
-      `/channels/${channelId}/messages`,
+      `/channels/${seg(channelId)}/messages`,
       body,
     )) as { id: string };
     return { id: result.id };
@@ -177,7 +180,7 @@ export class HttpDiscordRest implements DiscordRest {
   ): Promise<void> {
     await this.request(
       "PUT",
-      `/channels/${channelId}/messages/${messageId}/reactions/${encodeEmoji(emoji)}/@me`,
+      `/channels/${seg(channelId)}/messages/${seg(messageId)}/reactions/${encodeEmoji(emoji)}/@me`,
     );
   }
 
@@ -188,7 +191,7 @@ export class HttpDiscordRest implements DiscordRest {
   ): Promise<void> {
     await this.request(
       "PATCH",
-      `/channels/${channelId}/messages/${messageId}`,
+      `/channels/${seg(channelId)}/messages/${seg(messageId)}`,
       {
         content,
       },
@@ -205,7 +208,7 @@ export class HttpDiscordRest implements DiscordRest {
     }
     return (await this.request(
       "GET",
-      `/channels/${channelId}/messages?${query.toString()}`,
+      `/channels/${seg(channelId)}/messages?${query.toString()}`,
     )) as DiscordMessage[];
   }
 }
@@ -247,7 +250,8 @@ export class RecordingRest implements DiscordRest {
     content: string,
     replyTo?: string,
   ): Promise<{ id: string }> {
-    const id = `dry-${this.nextId++}`;
+    // Snowflake-shaped so dry-run replies can be edited like real ones.
+    const id = String(900_000_000_000_000_000n + BigInt(this.nextId++));
     this.record({
       method: "send",
       channelId,

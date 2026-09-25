@@ -164,6 +164,11 @@ export class EventStore {
         thread_id TEXT PRIMARY KEY,
         parent_id TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS sent_messages (
+        message_id TEXT PRIMARY KEY,
+        channel_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS dm_channels (
         channel_id TEXT PRIMARY KEY,
         user_id TEXT NOT NULL
@@ -181,6 +186,11 @@ export class EventStore {
 
   public close(): void {
     this.database.close();
+  }
+
+  /** Runs `work` in one IMMEDIATE transaction (not re-entrant). */
+  public atomically<T>(work: () => T): T {
+    return this.transaction(work);
   }
 
   private transaction<T>(work: () => T): T {
@@ -293,6 +303,26 @@ export class EventStore {
          ON CONFLICT(channel_id) DO UPDATE SET user_id = excluded.user_id`,
       )
       .run(channelId, userId);
+  }
+
+  /** Remembers a message frond-ear itself sent, so edits can be authorised. */
+  public recordSent(messageId: string, channelId: string): void {
+    this.database
+      .prepare(
+        `INSERT INTO sent_messages (message_id, channel_id, created_at) VALUES (?, ?, ?)
+         ON CONFLICT(message_id) DO NOTHING`,
+      )
+      .run(messageId, channelId, this.clock.now());
+  }
+
+  public sentIn(messageId: string, channelId: string): boolean {
+    return (
+      this.database
+        .prepare(
+          "SELECT 1 AS found FROM sent_messages WHERE message_id = ? AND channel_id = ?",
+        )
+        .get(messageId, channelId) !== undefined
+    );
   }
 
   public isDmChannel(channelId: string): boolean {
@@ -448,16 +478,18 @@ export class EventStore {
   }
 
   /**
-   * Per-ear pending cap. Oldest context goes first, then stored, then queued,
-   * so wake-worthy traffic is the last to be dropped.
+   * Per-ear bound on everything not yet acted on (pending and offered).
+   * Oldest context goes first, then offered rows the model already received
+   * but never acted on, then silent-channel rows, then queued, so wake-worthy
+   * traffic that has not been delivered is the last to be dropped.
    */
   public capPending(ear: string, max: number): number {
     let dropped = 0;
-    for (const state of ["context", "stored", "queued"] as const) {
+    for (const state of ["context", "offered", "stored", "queued"] as const) {
       const count = (
         this.database
           .prepare(
-            `SELECT COUNT(*) AS count FROM events WHERE ear = ? AND state IN ${PENDING_STATES}`,
+            `SELECT COUNT(*) AS count FROM events WHERE ear = ? AND state IN ${UNSEEN_STATES}`,
           )
           .get(ear) as { count: number }
       ).count;
@@ -467,7 +499,7 @@ export class EventStore {
       }
       const result = this.database
         .prepare(
-          `UPDATE events SET state = 'dropped', updated_at = ?
+          `UPDATE events SET state = 'dropped', due_at = NULL, updated_at = ?
            WHERE id IN (
              SELECT id FROM events WHERE ear = ? AND state = ?
              ORDER BY created_at, id LIMIT ?
@@ -477,6 +509,20 @@ export class EventStore {
       dropped += Number(result.changes);
     }
     return dropped;
+  }
+
+  /**
+   * Queued rows without a flush time can only exist if a crash interrupted
+   * admission; give them one so they are delivered rather than stranded.
+   */
+  public repairUnscheduled(now: number): number {
+    return Number(
+      this.database
+        .prepare(
+          "UPDATE events SET due_at = ? WHERE state = 'queued' AND due_at IS NULL",
+        )
+        .run(now).changes,
+    );
   }
 
   /**
@@ -604,6 +650,47 @@ export class EventStore {
     return Number(result.changes);
   }
 
+  /** Highest batch id the shim has confirmed for this ear (and chat). */
+  public latestConfirmedBatch(ear: string, chatId?: string): number {
+    const row = (
+      chatId === undefined
+        ? this.database
+            .prepare(
+              "SELECT MAX(id) AS id FROM batches WHERE ear = ? AND offered_at IS NOT NULL",
+            )
+            .get(ear)
+        : this.database
+            .prepare(
+              "SELECT MAX(id) AS id FROM batches WHERE ear = ? AND chat_id = ? AND offered_at IS NOT NULL",
+            )
+            .get(ear, chatId)
+    ) as { id: number | null };
+    return row.id ?? 0;
+  }
+
+  /**
+   * Marks offered events seen only up to (and including) `throughBatch`, and
+   * only from confirmed batches, so a batch delivered after the model acted
+   * is never acknowledged on its behalf.
+   */
+  public markSeenThrough(
+    ear: string,
+    chatId: string | undefined,
+    throughBatch: number,
+  ): number {
+    const now = this.clock.now();
+    const sql = `UPDATE events SET state = 'seen', updated_at = ?
+      WHERE ear = ? AND state = 'offered' AND batch_id <= ?
+        AND batch_id IN (SELECT id FROM batches WHERE offered_at IS NOT NULL)`;
+    const result =
+      chatId === undefined
+        ? this.database.prepare(sql).run(now, ear, throughBatch)
+        : this.database
+            .prepare(`${sql} AND chat_id = ?`)
+            .run(now, ear, throughBatch, chatId);
+    return Number(result.changes);
+  }
+
   /** Unseen events (pending or offered), newest last, for the inbox tool. */
   public unseen(
     ear: string,
@@ -669,7 +756,8 @@ export class EventStore {
       const events = Number(
         this.database
           .prepare(
-            `DELETE FROM events WHERE updated_at < ? AND state IN ('seen', 'expired', 'dropped')`,
+            `DELETE FROM events WHERE updated_at < ?
+             AND state IN ('seen', 'expired', 'dropped', 'offered')`,
           )
           .run(cutoff).changes,
       );

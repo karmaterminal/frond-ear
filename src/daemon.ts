@@ -80,6 +80,31 @@ function stringArg(
   return String(value);
 }
 
+const SNOWFLAKE = /^\d{1,25}$/u;
+
+/** Discord IDs must be snowflakes: anything else could steer a REST path. */
+function snowflakeArg(
+  args: Record<string, unknown>,
+  name: string,
+  required: true,
+): string;
+function snowflakeArg(
+  args: Record<string, unknown>,
+  name: string,
+  required?: false,
+): string | undefined;
+function snowflakeArg(
+  args: Record<string, unknown>,
+  name: string,
+  required = false,
+): string | undefined {
+  const value = required ? stringArg(args, name, true) : stringArg(args, name);
+  if (value !== undefined && !SNOWFLAKE.test(value)) {
+    throw new Error(`${name} must be a Discord ID (digits only)`);
+  }
+  return value;
+}
+
 function numberArg(
   args: Record<string, unknown>,
   name: string,
@@ -157,6 +182,10 @@ export class Daemon {
     this.timers = options.timers ?? systemTimers;
     this.botLimiter = new WakeLimiter(options.config.botLoop);
     this.ambientLimiter = new WakeLimiter(options.config.ambientWake);
+    const repaired = this.store.repairUnscheduled(this.clock.now());
+    if (repaired > 0) {
+      this.logger.log("warn", "ear.repaired_unscheduled", { repaired });
+    }
   }
 
   public reloadConfig(config: Config): void {
@@ -233,6 +262,31 @@ export class Daemon {
       this.store.increment(`rejected_${classification.reason}`);
       return "rejected";
     }
+    const outcome = this.store.atomically(() =>
+      this.admit(message, classification),
+    );
+    if (outcome === "duplicate") {
+      this.store.increment("duplicates");
+      // A crash between insert and scheduling is impossible now (one
+      // transaction), but repair any row stranded by an older build.
+      if (this.store.repairUnscheduled(this.clock.now()) > 0) {
+        this.armTimer();
+      }
+      return "duplicate";
+    }
+    this.armTimer();
+    return "inserted";
+  }
+
+  /**
+   * Inserts the event and applies its initial ledger transitions (schedule,
+   * history cap, pending cap) — the caller runs this in one transaction so a
+   * crash can never leave an admitted row unscheduled.
+   */
+  private admit(
+    message: DiscordMessage,
+    classification: Extract<ReturnType<typeof classify>, { accept: true }>,
+  ): "inserted" | "duplicate" {
     const { route } = classification;
     if (route.kind === "dm") {
       this.store.recordDmChannel(message.channel_id, message.author.id);
@@ -262,7 +316,6 @@ export class Daemon {
       state: classification.state,
     });
     if (outcome === "duplicate") {
-      this.store.increment("duplicates");
       return "duplicate";
     }
     this.store.increment(`accepted_${classification.state}`);
@@ -301,7 +354,6 @@ export class Daemon {
       this.store.increment("overflow_dropped", dropped);
       this.logger.log("warn", "ear.overflow", { ear: route.ear, dropped });
     }
-    this.armTimer();
     return "inserted";
   }
 
@@ -626,7 +678,7 @@ export class Daemon {
     chatId: string;
     ear: string;
   } {
-    const chatId = stringArg(args, "chat_id", true);
+    const chatId = snowflakeArg(args, "chat_id", true);
     const ear = this.earForChat(chatId);
     if (!ear) {
       throw new Error(
@@ -636,17 +688,54 @@ export class Daemon {
     return { chatId, ear };
   }
 
-  /** Marks events seen only for the session that is attached to the chat's ear. */
-  private markSeen(
+  private isAttachedSession(client: Client, ear: string): boolean {
+    return client.ear === ear && this.attached.get(ear) === client;
+  }
+
+  /**
+   * The batch an action acknowledges, fixed *before* any awaited Discord call:
+   * the batch_id the model passed (clamped to what was confirmed), else the
+   * latest confirmed batch at call start. Anything offered later stays unseen.
+   */
+  private seenHorizon(
     client: Client,
     ear: string,
-    chatId?: string,
-    ids?: number[],
+    chatId: string | undefined,
+    args: Record<string, unknown>,
+  ): number | undefined {
+    if (!this.isAttachedSession(client, ear)) {
+      return undefined;
+    }
+    const latest = this.store.latestConfirmedBatch(ear, chatId);
+    const requested = args.batch_id;
+    if (requested === undefined || requested === null || requested === "") {
+      return latest;
+    }
+    const batch = Number(requested);
+    if (!Number.isSafeInteger(batch) || batch < 1) {
+      throw new Error("batch_id must be the positive integer from the event");
+    }
+    return Math.min(batch, latest);
+  }
+
+  private markSeenThrough(
+    client: Client,
+    ear: string,
+    chatId: string | undefined,
+    horizon: number | undefined,
   ): number {
-    if (client.ear !== ear || this.attached.get(ear) !== client) {
+    if (horizon === undefined || !this.isAttachedSession(client, ear)) {
       return 0;
     }
-    return this.store.markSeen(ear, chatId, ids);
+    return this.store.markSeenThrough(ear, chatId, horizon);
+  }
+
+  /** Marks specific events seen, only for the ear's attached session. */
+  private markSeen(client: Client, ear: string, ids: number[]): number {
+    if (!this.isAttachedSession(client, ear)) {
+      return 0;
+    }
+    return this.store.markSeen(ear, undefined, ids);
   }
 
   private readableEar(client: Client, args: Record<string, unknown>): string {
@@ -678,7 +767,8 @@ export class Daemon {
       case "reply": {
         const { chatId, ear } = this.requireChat(args);
         const text = stringArg(args, "text", true);
-        const replyTo = stringArg(args, "reply_to");
+        const replyTo = snowflakeArg(args, "reply_to");
+        const horizon = this.seenHorizon(client, ear, chatId, args);
         const ids: string[] = [];
         for (const [index, chunk] of chunkMessage(text).entries()) {
           const sent = await this.rest.sendMessage(
@@ -686,20 +776,20 @@ export class Daemon {
             chunk,
             index === 0 ? replyTo : undefined,
           );
+          this.store.recordSent(sent.id, chatId);
           ids.push(sent.id);
         }
-        this.markSeen(client, ear, chatId);
+        this.markSeenThrough(client, ear, chatId, horizon);
         this.store.increment("replies_sent");
         return `sent ${ids.length} message${ids.length === 1 ? "" : "s"} to ${chatId} (id${ids.length === 1 ? "" : "s"} ${ids.join(", ")})`;
       }
       case "react": {
         const { chatId, ear } = this.requireChat(args);
-        await this.rest.addReaction(
-          chatId,
-          stringArg(args, "message_id", true),
-          stringArg(args, "emoji", true),
-        );
-        this.markSeen(client, ear, chatId);
+        const messageId = snowflakeArg(args, "message_id", true);
+        const emoji = stringArg(args, "emoji", true);
+        const horizon = this.seenHorizon(client, ear, chatId, args);
+        await this.rest.addReaction(chatId, messageId, emoji);
+        this.markSeenThrough(client, ear, chatId, horizon);
         return "reacted";
       }
       case "edit_message": {
@@ -708,23 +798,27 @@ export class Daemon {
         if (text.length > 2_000) {
           throw new Error("edited text must be 2000 characters or fewer");
         }
-        await this.rest.editMessage(
-          chatId,
-          stringArg(args, "message_id", true),
-          text,
-        );
-        this.markSeen(client, ear, chatId);
+        const messageId = snowflakeArg(args, "message_id", true);
+        if (!this.store.sentIn(messageId, chatId)) {
+          throw new Error(
+            `message ${messageId} was not sent by frond-ear in chat ${chatId}; only those can be edited`,
+          );
+        }
+        const horizon = this.seenHorizon(client, ear, chatId, args);
+        await this.rest.editMessage(chatId, messageId, text);
+        this.markSeenThrough(client, ear, chatId, horizon);
         return "edited";
       }
       case "fetch_messages": {
         const { chatId, ear } = this.requireChat(args);
         const limit = numberArg(args, "limit", 20, 100);
-        const before = stringArg(args, "before");
+        const before = snowflakeArg(args, "before");
+        const horizon = this.seenHorizon(client, ear, chatId, args);
         const messages = await this.rest.fetchMessages(
           chatId,
           before ? { limit, before } : { limit },
         );
-        this.markSeen(client, ear, chatId);
+        this.markSeenThrough(client, ear, chatId, horizon);
         if (messages.length === 0) {
           return "no messages";
         }
@@ -739,13 +833,12 @@ export class Daemon {
       }
       case "inbox": {
         const ear = this.readableEar(client, args);
-        const chatId = stringArg(args, "chat_id");
+        const chatId = snowflakeArg(args, "chat_id");
         const limit = numberArg(args, "limit", 30, 200);
         const events = this.store.unseen(ear, chatId, limit);
         const marked = this.markSeen(
           client,
           ear,
-          undefined,
           events.map((event) => event.id),
         );
         if (events.length === 0) {
@@ -777,11 +870,16 @@ export class Daemon {
           this.logger.log("info", "ear.registered", { ear: client.ear });
           return `ear ${client.ear} registered: channel delivery confirmed`;
         }
-        const chatId = stringArg(args, "chat_id");
+        const chatId = snowflakeArg(args, "chat_id");
         const ear = chatId
           ? this.requireChat(args).ear
           : this.readableEar(client, args);
-        const marked = this.markSeen(client, ear, chatId);
+        const marked = this.markSeenThrough(
+          client,
+          ear,
+          chatId,
+          this.seenHorizon(client, ear, chatId, args),
+        );
         return `${marked} event${marked === 1 ? "" : "s"} marked seen`;
       }
       case "ear_status":
