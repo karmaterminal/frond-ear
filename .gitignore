@@ -5,3 +5,4 @@ coverage
 *.db-wal
 .env
 frond-ear.json
+artifacts

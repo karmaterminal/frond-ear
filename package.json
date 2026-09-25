@@ -18,12 +18,15 @@
     "format:check": "prettier --check .",
     "scan:credentials": "node scripts/scan-credentials.mjs",
     "test": "node --test --test-concurrency=1 test/*.test.ts",
-    "typecheck": "tsc -p tsconfig.json"
+    "typecheck": "tsc -p tsconfig.json",
+    "chaos": "tools/chaos/run-proof.sh"
   },
   "devDependencies": {
     "@modelcontextprotocol/sdk": "1.20.2",
     "@types/node": "24.10.0",
+    "@types/ws": "8.18.1",
     "prettier": "3.6.2",
-    "typescript": "5.9.3"
+    "typescript": "5.9.3",
+    "ws": "8.18.3"
   }
 }
