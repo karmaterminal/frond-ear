@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
+import { rmSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
 
-import { chunkMessage } from "../src/rest.ts";
+import { chunkMessage, RestError } from "../src/rest.ts";
 import {
   AMBIENT,
   BOT,
@@ -1016,6 +1017,149 @@ test("shutdown drains in-flight tool calls before the store can close", async ()
     assert.equal(
       shim.connection.results().find((item) => item.id === 700)?.ok,
       true,
+    );
+  } finally {
+    h.dispose();
+  }
+});
+
+// ---- chaos-harness regressions (tools/chaos, R-FE-* rows) --------------------
+
+test("a connection closing after shutdown never touches the closed store (R-FE-SHUTDOWN-DRAIN)", async () => {
+  const h = harness();
+  try {
+    const shim = h.attach("scribe");
+    await h.daemon.shutdown();
+    h.store.close();
+    // The socket's close event arrives after the store was closed.
+    assert.doesNotThrow(() => shim.close());
+  } finally {
+    h.daemon.shutdown();
+    rmSync(h.directory, { recursive: true, force: true });
+  }
+});
+
+test("a lost Discord response is ambiguous, and an identical retry posts once (R-FE-DROP-AFTER-ACCEPT)", async () => {
+  const h = harness();
+  try {
+    const shim = h.attach("scribe");
+    const discordSend = h.rest.sendMessage.bind(h.rest);
+    let dropNext = true;
+    h.rest.sendMessage = async (...args) => {
+      const sent = await discordSend(...args); // Discord accepted it...
+      if (dropNext) {
+        dropNext = false;
+        throw new TypeError("fetch failed"); // ...but the response was lost
+      }
+      return sent;
+    };
+    const first = await h.call(shim, "reply", {
+      chat_id: CHANNEL,
+      text: "pong",
+    });
+    assert.equal(first.ok, false);
+    assert.match(first.text, /may already have been posted/u);
+    const status = h.daemon.status() as { ambiguousSends: unknown[] };
+    assert.equal(status.ambiguousSends.length, 1);
+    const retry = await h.call(shim, "reply", {
+      chat_id: CHANNEL,
+      text: "pong",
+    });
+    assert.equal(retry.ok, true, retry.text);
+    const sends = h.rest.calls.filter((call) => call.method === "send");
+    assert.equal(sends.length, 1, "Discord received exactly one message");
+    assert.equal(
+      (h.daemon.status() as { ambiguousSends: unknown[] }).ambiguousSends
+        .length,
+      0,
+    );
+    assert.equal(h.store.sentIn(sends[0]?.messageId as string, CHANNEL), true);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("a send killed mid-flight is surfaced after restart and an identical retry is de-duplicated (R-FE-KILL-MID-SEND)", async () => {
+  const h = harness();
+  const path = join(h.directory, "kill.db");
+  try {
+    const before = harness(testConfig(), { path });
+    const discordSend = before.rest.sendMessage.bind(before.rest);
+    before.rest.sendMessage = async (...args) => {
+      await discordSend(...args); // Discord accepts the post...
+      return new Promise<never>(() => undefined); // ...and the daemon dies before hearing back
+    };
+    const shimBefore = before.attach("scribe");
+    void shimBefore.send({
+      type: "call",
+      id: 1,
+      tool: "reply",
+      args: { chat_id: CHANNEL, text: "status: all green" },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    // SIGKILL: no shutdown, no store close, nothing else runs.
+
+    const after = harness(testConfig(), { path });
+    after.rest.sendMessage = discordSend; // same Discord on the other side
+    const shim = after.attach("scribe");
+    const notice = shim.connection
+      .events()
+      .find((event) => event.meta.kind === "send_check");
+    assert.ok(notice, "the reattached session is told the send is unconfirmed");
+    assert.match(notice.content, /status: all green/u);
+    const retry = await after.call(shim, "reply", {
+      chat_id: CHANNEL,
+      text: "status: all green",
+    });
+    assert.equal(retry.ok, true, retry.text);
+    const sends = before.rest.calls.filter((call) => call.method === "send");
+    assert.equal(sends.length, 1, "no duplicate Discord message");
+    assert.equal(
+      after.store.sentIn(sends[0]?.messageId as string, CHANNEL),
+      true,
+      "the post is receipted",
+    );
+    after.daemon.shutdown();
+    after.store.close();
+  } finally {
+    h.dispose();
+  }
+});
+
+test("a definitive Discord rejection is not ambiguous, and a deliberate repeat after success still posts", async () => {
+  const h = harness();
+  try {
+    const shim = h.attach("scribe");
+    const discordSend = h.rest.sendMessage.bind(h.rest);
+    let reject = true;
+    h.rest.sendMessage = async (...args) => {
+      if (reject) {
+        reject = false;
+        throw new RestError(403, 50013, "Missing Permissions");
+      }
+      return discordSend(...args);
+    };
+    assert.equal(
+      (await h.call(shim, "reply", { chat_id: CHANNEL, text: "ok" })).ok,
+      false,
+    );
+    assert.equal(
+      (h.daemon.status() as { ambiguousSends: unknown[] }).ambiguousSends
+        .length,
+      0,
+    );
+    assert.equal(
+      (await h.call(shim, "reply", { chat_id: CHANNEL, text: "ok" })).ok,
+      true,
+    );
+    assert.equal(
+      (await h.call(shim, "reply", { chat_id: CHANNEL, text: "ok" })).ok,
+      true,
+    );
+    assert.equal(
+      h.rest.calls.filter((call) => call.method === "send").length,
+      2,
+      "two confirmed, deliberate sends are two messages",
     );
   } finally {
     h.dispose();

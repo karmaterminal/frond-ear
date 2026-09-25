@@ -173,6 +173,18 @@ export class EventStore {
         expires_at INTEGER,
         PRIMARY KEY (ear, scope)
       );
+      CREATE TABLE IF NOT EXISTS outbound_intents (
+        nonce TEXT PRIMARY KEY,
+        intent_key TEXT NOT NULL,
+        chat_id TEXT NOT NULL,
+        preview TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('pending', 'sent', 'failed')),
+        message_id TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS outbound_intents_key
+        ON outbound_intents (intent_key, state, created_at);
       CREATE TABLE IF NOT EXISTS sent_messages (
         message_id TEXT PRIMARY KEY,
         channel_id TEXT NOT NULL,
@@ -404,6 +416,91 @@ export class EventStore {
       );
     }
     return 0;
+  }
+
+  // ---- outbound intents (write-ahead for sends) ------------------------------------
+
+  /**
+   * Records the intent to send one message *before* calling Discord. If an
+   * earlier attempt with the same key is still pending (its outcome unknown:
+   * crash, timeout, lost response) and within `reuseWindowMs`, its nonce is
+   * reused so Discord's enforce_nonce returns the original message instead of
+   * posting a duplicate. A completed send is never reused, so a deliberate
+   * repeat of the same text still posts.
+   */
+  public beginSend(
+    key: string,
+    chatId: string,
+    preview: string,
+    nonce: string,
+    reuseWindowMs: number,
+  ): { nonce: string; reused: boolean } {
+    const now = this.clock.now();
+    const pending = this.database
+      .prepare(
+        `SELECT nonce FROM outbound_intents
+         WHERE intent_key = ? AND state = 'pending' AND created_at >= ?
+         ORDER BY created_at DESC LIMIT 1`,
+      )
+      .get(key, now - reuseWindowMs) as { nonce: string } | undefined;
+    if (pending) {
+      this.database
+        .prepare("UPDATE outbound_intents SET updated_at = ? WHERE nonce = ?")
+        .run(now, pending.nonce);
+      return { nonce: pending.nonce, reused: true };
+    }
+    this.database
+      .prepare(
+        `INSERT INTO outbound_intents
+           (nonce, intent_key, chat_id, preview, state, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'pending', ?, ?)`,
+      )
+      .run(nonce, key, chatId, preview.slice(0, 80), now, now);
+    return { nonce, reused: false };
+  }
+
+  /** Discord confirmed the post: mark the intent sent and keep the receipt. */
+  public completeSend(nonce: string, messageId: string, chatId: string): void {
+    this.transaction(() => {
+      this.database
+        .prepare(
+          `UPDATE outbound_intents SET state = 'sent', message_id = ?, updated_at = ?
+           WHERE nonce = ?`,
+        )
+        .run(messageId, this.clock.now(), nonce);
+      this.recordSent(messageId, chatId);
+    });
+  }
+
+  /** Discord definitively rejected the post (a 4xx other than 429). */
+  public failSend(nonce: string): void {
+    this.database
+      .prepare(
+        "UPDATE outbound_intents SET state = 'failed', updated_at = ? WHERE nonce = ?",
+      )
+      .run(this.clock.now(), nonce);
+  }
+
+  /** Sends whose outcome is unknown (pending and not in flight right now). */
+  public ambiguousSends(exclude: ReadonlySet<string>): Array<{
+    nonce: string;
+    chatId: string;
+    preview: string;
+    createdAt: number;
+  }> {
+    return (
+      this.database
+        .prepare(
+          `SELECT nonce, chat_id AS chatId, preview, created_at AS createdAt
+           FROM outbound_intents WHERE state = 'pending' ORDER BY created_at`,
+        )
+        .all() as Array<{
+        nonce: string;
+        chatId: string;
+        preview: string;
+        createdAt: number;
+      }>
+    ).filter((row) => !exclude.has(row.nonce));
   }
 
   /** Remembers a message frond-ear itself sent, so edits can be authorised. */
@@ -862,6 +959,11 @@ export class EventStore {
           )
           .run(cutoff).changes,
       );
+      this.database
+        .prepare(
+          "DELETE FROM outbound_intents WHERE updated_at < ? AND state IN ('sent', 'failed')",
+        )
+        .run(cutoff);
       this.database
         .prepare(
           `DELETE FROM batches WHERE created_at < ?

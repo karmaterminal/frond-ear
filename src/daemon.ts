@@ -14,12 +14,13 @@ import { EAR_PROTOCOL_VERSION } from "./protocol.ts";
 import {
   channelInstructions,
   renderBatch,
+  renderAmbiguousSends,
   renderCanary,
   renderDigest,
   renderEvent,
 } from "./render.ts";
 import type { DiscordRest } from "./rest.ts";
-import { chunkMessage } from "./rest.ts";
+import { chunkMessage, RestError } from "./rest.ts";
 import type { EventStore } from "./store.ts";
 import type {
   BatchKind,
@@ -55,6 +56,9 @@ interface Client {
   sessionId: string | undefined;
   pid: number | undefined;
 }
+
+/** Discord's enforce_nonce window is "a few minutes"; stay inside it. */
+const SEND_DEDUPE_WINDOW_MS = 5 * 60 * 1_000;
 
 export type IngestOutcome = "inserted" | "duplicate" | "rejected";
 
@@ -179,6 +183,10 @@ export class Daemon {
   private closing = false;
   /** Tool calls in flight; shutdown drains these before the store closes. */
   private readonly inFlight = new Set<Promise<unknown>>();
+  /** Nonces of sends currently awaiting Discord (not yet ambiguous). */
+  private readonly sendsInFlight = new Set<string>();
+  /** After shutdown the store may be closed: no more ledger writes. */
+  private stopped = false;
   private timerDue: number | undefined;
 
   public constructor(options: DaemonOptions) {
@@ -502,8 +510,12 @@ export class Daemon {
     const ear = client.ear;
     if (ear && this.attached.get(ear) === client) {
       this.attached.delete(ear);
-      const reverted = this.store.revertUnconfirmed(ear);
-      this.logger.log("info", "ear.detached", { ear, reverted });
+      // Socket close events can arrive after shutdown has handed the store
+      // back to be closed; shutdown already reverted unconfirmed batches.
+      if (!this.stopped) {
+        const reverted = this.store.revertUnconfirmed(ear);
+        this.logger.log("info", "ear.detached", { ear, reverted });
+      }
     }
     client.ear = undefined;
   }
@@ -674,6 +686,16 @@ export class Daemon {
       const digest = renderDigest(unseen);
       client.connection.send({ type: "event", batchId: null, ...digest });
     }
+    const ambiguous = this.store
+      .ambiguousSends(this.sendsInFlight)
+      .filter((send) => this.earForChat(send.chatId) === ear);
+    if (ambiguous.length > 0) {
+      client.connection.send({
+        type: "event",
+        batchId: null,
+        ...renderAmbiguousSends(ambiguous),
+      });
+    }
     if (nonce) {
       const canary = renderCanary(ear, record.generation, nonce);
       client.connection.send({ type: "event", batchId: null, ...canary });
@@ -792,13 +814,14 @@ export class Daemon {
         const horizon = this.seenHorizon(client, ear, chatId, args);
         const ids: string[] = [];
         for (const [index, chunk] of chunkMessage(text).entries()) {
-          const sent = await this.rest.sendMessage(
-            chatId,
-            chunk,
-            index === 0 ? replyTo : undefined,
+          ids.push(
+            await this.sendOnce(
+              chatId,
+              chunk,
+              index === 0 ? replyTo : undefined,
+              index,
+            ),
           );
-          this.store.recordSent(sent.id, chatId);
-          ids.push(sent.id);
         }
         this.markSeenThrough(client, ear, chatId, horizon);
         this.store.increment("replies_sent");
@@ -1029,6 +1052,67 @@ export class Daemon {
     };
   }
 
+  /**
+   * One Discord send with a write-ahead intent. The intent (with its nonce)
+   * is durable before Discord is called; success records the receipt; a
+   * definitive 4xx marks it failed; anything else (timeout, lost response,
+   * crash) leaves it pending, i.e. ambiguous, and an identical retry reuses
+   * the nonce so Discord de-duplicates it.
+   */
+  private async sendOnce(
+    chatId: string,
+    content: string,
+    replyTo: string | undefined,
+    chunkIndex: number,
+  ): Promise<string> {
+    const key = createHash("sha256")
+      .update(`${chatId}\n${replyTo ?? ""}\n${chunkIndex}\n${content}`)
+      .digest("hex");
+    const intent = this.store.beginSend(
+      key,
+      chatId,
+      content,
+      randomBytes(10).toString("hex"),
+      SEND_DEDUPE_WINDOW_MS,
+    );
+    this.sendsInFlight.add(intent.nonce);
+    try {
+      const sent = await this.rest.sendMessage(
+        chatId,
+        content,
+        replyTo,
+        intent.nonce,
+      );
+      if (!this.stopped) {
+        this.store.completeSend(intent.nonce, sent.id, chatId);
+      }
+      if (intent.reused) {
+        this.store.increment("ambiguous_sends_resolved");
+      }
+      return sent.id;
+    } catch (error) {
+      if (
+        error instanceof RestError &&
+        error.status >= 400 &&
+        error.status < 500 &&
+        error.status !== 429
+      ) {
+        if (!this.stopped) {
+          this.store.failSend(intent.nonce);
+        }
+        throw error;
+      }
+      const reason = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `Discord did not confirm this send (${reason}). The message may already have been posted. ` +
+          `Retrying the identical text within ${SEND_DEDUPE_WINDOW_MS / 60_000} minutes is safe: ` +
+          `frond-ear reuses the same nonce, so Discord returns the original instead of posting twice.`,
+      );
+    } finally {
+      this.sendsInFlight.delete(intent.nonce);
+    }
+  }
+
   private toDisplayEvent(message: DiscordMessage, ear: string): StoredEvent {
     return {
       id: 0,
@@ -1092,6 +1176,7 @@ export class Daemon {
       paused: this.config.paused,
       gateway: this.options.gatewayStatus?.() ?? { state: "disabled" },
       ears,
+      ambiguousSends: this.store.ambiguousSends(this.sendsInFlight),
       botLoopCooling: this.botLimiter.cooling(this.clock.now()),
       ambientWakeCooling: this.ambientLimiter.cooling(this.clock.now()),
       counters: this.store.counters(),
@@ -1106,6 +1191,9 @@ export class Daemon {
    */
   public async shutdown(drainMs = 10_000): Promise<{ drained: boolean }> {
     this.closing = true;
+    this.logger.log("info", "daemon.draining", {
+      inFlight: this.inFlight.size,
+    });
     if (this.timer !== undefined) {
       this.timers.clearTimeout(this.timer);
       this.timer = undefined;
@@ -1126,6 +1214,13 @@ export class Daemon {
         });
       }
     }
+    // Return unconfirmed batches to the queue while the store is still open,
+    // then stop all further ledger writes before closing connections (their
+    // close events arrive asynchronously, after the store may be closed).
+    for (const ear of this.attached.keys()) {
+      this.store.revertUnconfirmed(ear);
+    }
+    this.stopped = true;
     for (const client of this.clients) {
       client.connection.close();
     }

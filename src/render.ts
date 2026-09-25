@@ -179,6 +179,18 @@ export function renderDigest(
   };
 }
 
+export function renderAmbiguousSends(
+  sends: Array<{ chatId: string; preview: string }>,
+): Notification {
+  const list = sends
+    .map((send) => `chat ${send.chatId}: "${cleanName(send.preview)}"`)
+    .join("; ");
+  return {
+    content: `frond-ear could not confirm that ${sends.length} earlier repl${sends.length === 1 ? "y" : "ies"} reached Discord (${list}); the daemon stopped or the response was lost after the send began. Check with fetch_messages before re-sending. Re-sending the identical text within 5 minutes is de-duplicated by Discord.`,
+    meta: { kind: "send_check", count: String(sends.length) },
+  };
+}
+
 export function renderCanary(
   ear: string,
   generation: number,

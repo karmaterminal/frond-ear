@@ -3,10 +3,16 @@ import type { DiscordMessage } from "./types.ts";
 export const DISCORD_MESSAGE_LIMIT = 2_000;
 
 export interface DiscordRest {
+  /**
+   * `nonce` is sent with `enforce_nonce`, so Discord returns the original
+   * message instead of creating a second one when the same nonce is retried
+   * within its dedupe window.
+   */
   sendMessage(
     channelId: string,
     content: string,
     replyTo?: string,
+    nonce?: string,
   ): Promise<{ id: string }>;
   addReaction(
     channelId: string,
@@ -154,11 +160,16 @@ export class HttpDiscordRest implements DiscordRest {
     channelId: string,
     content: string,
     replyTo?: string,
+    nonce?: string,
   ): Promise<{ id: string }> {
     const body: Record<string, unknown> = {
       content,
       allowed_mentions: { parse: ["users"], replied_user: false },
     };
+    if (nonce) {
+      body.nonce = nonce;
+      body.enforce_nonce = true;
+    }
     if (replyTo) {
       body.message_reference = {
         message_id: replyTo,
@@ -245,13 +256,26 @@ export class RecordingRest implements DiscordRest {
     this.onCall?.(call);
   }
 
+  private readonly byNonce = new Map<string, string>();
+
   public async sendMessage(
     channelId: string,
     content: string,
     replyTo?: string,
+    nonce?: string,
   ): Promise<{ id: string }> {
+    // Mirror Discord's enforce_nonce: a repeated nonce returns the original.
+    const existing = nonce
+      ? this.byNonce.get(`${channelId}:${nonce}`)
+      : undefined;
+    if (existing) {
+      return { id: existing };
+    }
     // Snowflake-shaped so dry-run replies can be edited like real ones.
     const id = String(900_000_000_000_000_000n + BigInt(this.nextId++));
+    if (nonce) {
+      this.byNonce.set(`${channelId}:${nonce}`, id);
+    }
     this.record({
       method: "send",
       channelId,
