@@ -1,0 +1,29 @@
+{
+  "name": "frond-ear",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Discord Gateway ear that pushes debounced, trust-classified events into a long-running Claude Code session via a channel shim.",
+  "license": "UNLICENSED",
+  "type": "module",
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "bin": {
+    "frond-ear": "src/cli.ts"
+  },
+  "scripts": {
+    "check": "pnpm format:check && pnpm typecheck && pnpm test && pnpm scan:credentials",
+    "daemon": "node src/cli.ts daemon",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "scan:credentials": "node scripts/scan-credentials.mjs",
+    "test": "node --test --test-concurrency=1 test/*.test.ts",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "1.20.2",
+    "@types/node": "24.10.0",
+    "prettier": "3.6.2",
+    "typescript": "5.9.3"
+  }
+}
