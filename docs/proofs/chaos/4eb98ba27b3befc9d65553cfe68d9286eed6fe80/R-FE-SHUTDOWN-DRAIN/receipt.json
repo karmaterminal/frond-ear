@@ -1,0 +1,44 @@
+{
+  "schema": "frond-ear.k6.proof-row-receipt.v1",
+  "row": "R-FE-SHUTDOWN-DRAIN",
+  "classification": "guaranteed",
+  "verdict": "PASS-candidate",
+  "candidateSha": "4eb98ba27b3befc9d65553cfe68d9286eed6fe80",
+  "checks": [
+    {
+      "name": "barrier: mention batch confirmed",
+      "passes": 1,
+      "fails": 0
+    },
+    {
+      "name": "barrier: reply is in flight, held at Discord",
+      "passes": 1,
+      "fails": 0
+    },
+    {
+      "name": "Discord answered only after the drain began",
+      "passes": 1,
+      "fails": 0
+    },
+    {
+      "name": "daemon exited cleanly after draining",
+      "passes": 1,
+      "fails": 0
+    },
+    {
+      "name": "exactly one post reached Discord",
+      "passes": 1,
+      "fails": 0
+    },
+    {
+      "name": "the post has a durable receipt",
+      "passes": 1,
+      "fails": 0
+    },
+    {
+      "name": "the answered event is seen",
+      "passes": 1,
+      "fails": 0
+    }
+  ]
+}

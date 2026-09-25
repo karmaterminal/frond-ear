@@ -1,0 +1,79 @@
+{
+  "schema": "frond-ear.k6.proof-row-receipt.v1",
+  "row": "R-FE-REPLAY",
+  "classification": "guaranteed",
+  "verdict": "PASS-candidate",
+  "candidateSha": "96cd44afe9561750e9123abad7aec8d665ffaf82",
+  "checks": [
+    {
+      "name": "canary delivered",
+      "passes": 1,
+      "fails": 0
+    },
+    {
+      "name": "mention \"one\" notified",
+      "passes": 1,
+      "fails": 0
+    },
+    {
+      "name": "barrier: \"one\" batch confirmed",
+      "passes": 1,
+      "fails": 0
+    },
+    {
+      "name": "mention \"two\" notified",
+      "passes": 1,
+      "fails": 0
+    },
+    {
+      "name": "barrier: \"two\" batch confirmed",
+      "passes": 1,
+      "fails": 0
+    },
+    {
+      "name": "mention \"three\" notified",
+      "passes": 1,
+      "fails": 0
+    },
+    {
+      "name": "barrier: \"three\" batch confirmed",
+      "passes": 1,
+      "fails": 0
+    },
+    {
+      "name": "barrier: replayed dispatches seen as duplicates",
+      "passes": 1,
+      "fails": 0
+    },
+    {
+      "name": "barrier: post-restart event delivered",
+      "passes": 1,
+      "fails": 0
+    },
+    {
+      "name": "barrier: quiescent",
+      "passes": 1,
+      "fails": 0
+    },
+    {
+      "name": "every inbound event accepted exactly once",
+      "passes": 1,
+      "fails": 0
+    },
+    {
+      "name": "no event notified twice",
+      "passes": 1,
+      "fails": 0
+    },
+    {
+      "name": "Discord replay actually happened",
+      "passes": 1,
+      "fails": 0
+    },
+    {
+      "name": "post-restart event accepted",
+      "passes": 1,
+      "fails": 0
+    }
+  ]
+}

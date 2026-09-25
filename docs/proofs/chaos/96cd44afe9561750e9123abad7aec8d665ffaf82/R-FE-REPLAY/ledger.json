@@ -1,0 +1,181 @@
+{
+  "inbound": [
+    {
+      "id": "1300000000000000000",
+      "acceptedRows": 1,
+      "state": "offered",
+      "batch": 1,
+      "notified": 1,
+      "notifiedIn": [
+        {
+          "kind": "mention",
+          "batch": "1"
+        }
+      ]
+    },
+    {
+      "id": "1300000000000000001",
+      "acceptedRows": 1,
+      "state": "offered",
+      "batch": 2,
+      "notified": 1,
+      "notifiedIn": [
+        {
+          "kind": "mention",
+          "batch": "2"
+        }
+      ]
+    },
+    {
+      "id": "1300000000000000002",
+      "acceptedRows": 1,
+      "state": "offered",
+      "batch": 3,
+      "notified": 1,
+      "notifiedIn": [
+        {
+          "kind": "mention",
+          "batch": "3"
+        }
+      ]
+    },
+    {
+      "id": "1300000000000000003",
+      "acceptedRows": 1,
+      "state": "offered",
+      "batch": 4,
+      "notified": 1,
+      "notifiedIn": [
+        {
+          "kind": "mention",
+          "batch": "4"
+        }
+      ]
+    }
+  ],
+  "notifications": [
+    {
+      "at": 1790371372754,
+      "meta": {
+        "kind": "attach",
+        "ear": "scribe",
+        "nonce": "d1cfadccdc13"
+      },
+      "messageIds": []
+    },
+    {
+      "at": 1790371373062,
+      "meta": {
+        "chat_id": "700000000000000007",
+        "kind": "mention",
+        "batch_id": "1",
+        "count": "1",
+        "message_id": "1300000000000000000",
+        "user": "user-002",
+        "user_id": "200000000000000002",
+        "trust": "principal",
+        "ts": "2026-09-25T21:22:52.756Z",
+        "guild_id": "600000000000000006"
+      },
+      "messageIds": ["1300000000000000000"]
+    },
+    {
+      "at": 1790371373370,
+      "meta": {
+        "chat_id": "700000000000000007",
+        "kind": "mention",
+        "batch_id": "2",
+        "count": "1",
+        "message_id": "1300000000000000001",
+        "user": "user-002",
+        "user_id": "200000000000000002",
+        "trust": "principal",
+        "ts": "2026-09-25T21:22:53.066Z",
+        "guild_id": "600000000000000006"
+      },
+      "messageIds": ["1300000000000000001"]
+    },
+    {
+      "at": 1790371373678,
+      "meta": {
+        "chat_id": "700000000000000007",
+        "kind": "mention",
+        "batch_id": "3",
+        "count": "1",
+        "message_id": "1300000000000000002",
+        "user": "user-002",
+        "user_id": "200000000000000002",
+        "trust": "principal",
+        "ts": "2026-09-25T21:22:53.374Z",
+        "guild_id": "600000000000000006"
+      },
+      "messageIds": ["1300000000000000002"]
+    },
+    {
+      "at": 1790371375716,
+      "meta": {
+        "kind": "digest",
+        "count": "3"
+      },
+      "messageIds": []
+    },
+    {
+      "at": 1790371375717,
+      "meta": {
+        "kind": "attach",
+        "ear": "scribe",
+        "nonce": "2b7b84f1182c"
+      },
+      "messageIds": []
+    },
+    {
+      "at": 1790371375719,
+      "meta": {
+        "chat_id": "700000000000000007",
+        "kind": "mention",
+        "batch_id": "4",
+        "count": "1",
+        "message_id": "1300000000000000003",
+        "user": "user-002",
+        "user_id": "200000000000000002",
+        "trust": "principal",
+        "ts": "2026-09-25T21:22:53.925Z",
+        "guild_id": "600000000000000006"
+      },
+      "messageIds": ["1300000000000000003"]
+    }
+  ],
+  "outbound": {
+    "posts": [],
+    "receipts": [],
+    "intents": [],
+    "reactions": []
+  },
+  "counters": {
+    "accepted_queued": 4,
+    "batches_sent": 4,
+    "duplicates": 3
+  },
+  "gateway": {
+    "connections": 3,
+    "resumes": [3, 3],
+    "seq": 4
+  },
+  "daemon": {
+    "running": true,
+    "exits": [
+      {
+        "code": null,
+        "signal": "SIGKILL"
+      }
+    ]
+  },
+  "summary": {
+    "acceptedUnique": true,
+    "maxNotificationsPerEvent": 1,
+    "posts": 0,
+    "receipted": 0,
+    "ambiguous": 0,
+    "duplicatePosts": 0
+  }
+}

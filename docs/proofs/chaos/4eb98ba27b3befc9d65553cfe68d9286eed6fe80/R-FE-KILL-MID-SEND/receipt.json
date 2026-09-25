@@ -1,0 +1,44 @@
+{
+  "schema": "frond-ear.k6.proof-row-receipt.v1",
+  "row": "R-FE-KILL-MID-SEND",
+  "classification": "ambiguous-external-send",
+  "verdict": "PASS-candidate",
+  "candidateSha": "4eb98ba27b3befc9d65553cfe68d9286eed6fe80",
+  "checks": [
+    {
+      "name": "barrier: reply is in flight, held at Discord",
+      "passes": 1,
+      "fails": 0
+    },
+    {
+      "name": "barrier: Discord recorded the orphaned post",
+      "passes": 1,
+      "fails": 0
+    },
+    {
+      "name": "Discord holds the post from the killed daemon",
+      "passes": 1,
+      "fails": 0
+    },
+    {
+      "name": "restarted daemon surfaces the ambiguous send",
+      "passes": 1,
+      "fails": 0
+    },
+    {
+      "name": "retry succeeds",
+      "passes": 1,
+      "fails": 0
+    },
+    {
+      "name": "identical retry does not duplicate the Discord message",
+      "passes": 1,
+      "fails": 0
+    },
+    {
+      "name": "the surviving post is receipted after the retry",
+      "passes": 1,
+      "fails": 0
+    }
+  ]
+}

@@ -1,0 +1,34 @@
+{
+  "schema": "frond-ear.k6.proof-row-receipt.v1",
+  "row": "R-FE-DROP-AFTER-ACCEPT",
+  "classification": "ambiguous-external-send",
+  "verdict": "PASS-candidate",
+  "candidateSha": "4eb98ba27b3befc9d65553cfe68d9286eed6fe80",
+  "checks": [
+    {
+      "name": "first attempt reports an error",
+      "passes": 1,
+      "fails": 0
+    },
+    {
+      "name": "the error says the send may have happened",
+      "passes": 1,
+      "fails": 0
+    },
+    {
+      "name": "retry succeeds",
+      "passes": 1,
+      "fails": 0
+    },
+    {
+      "name": "no duplicate Discord message",
+      "passes": 1,
+      "fails": 0
+    },
+    {
+      "name": "the post is receipted",
+      "passes": 1,
+      "fails": 0
+    }
+  ]
+}
