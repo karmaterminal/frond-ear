@@ -256,6 +256,87 @@ test("delivery: an unacked canary is reported as a deaf session, with the relaun
   }
 });
 
+test("tap: mirrors exactly the batch pushed to the attached session, at the same moment", async () => {
+  const h = harness();
+  try {
+    const shim = h.attach("scribe");
+    const tap = h.attach("scribe", { role: "tap" });
+    h.daemon.ingest(message({ content: "context one" }));
+    h.daemon.ingest(
+      message({
+        author: { id: AMBIENT, username: "ana" },
+        content: `<@${BOT}> are you there?`,
+      }),
+    );
+    h.timers.advance(999);
+    assert.equal(
+      tap.connection.events().length,
+      0,
+      "the tap never runs ahead of the push",
+    );
+    h.timers.advance(1);
+    const [pushed] = shim.connection.events();
+    const [tapped] = tap.connection.events();
+    assert.ok(pushed && pushed.batchId !== null);
+    assert.deepEqual(tapped, pushed);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("tap: observing changes nothing about the attachment or event state", async () => {
+  const run = (withTap: boolean) => {
+    const h = harness();
+    try {
+      const shim = h.attach("scribe");
+      if (withTap) {
+        h.attach("scribe", { role: "tap" });
+      }
+      h.daemon.ingest(message({ content: `<@${BOT}> ping` }));
+      h.timers.advance(5_000);
+      const status = h.daemon.status("scribe") as {
+        ears: Array<{
+          attached: boolean;
+          generation: number;
+          sessionId: string | null;
+        }>;
+      };
+      return {
+        ear: status.ears[0],
+        counts: h.store.stateCounts("scribe"),
+        pushed: shim.connection.events().length,
+      };
+    } finally {
+      h.dispose();
+    }
+  };
+  assert.deepEqual(run(true), run(false));
+});
+
+test("tap: an unknown ear is refused, and a closed tap stops receiving", async () => {
+  const h = harness();
+  try {
+    const stray = h.attach("nope", { role: "tap" });
+    const [welcome] = stray.connection.received;
+    assert.equal(welcome?.type, "welcome");
+    assert.match(
+      (welcome as { error?: string }).error ?? "",
+      /unknown ear nope/u,
+    );
+    assert.equal(stray.connection.closed, true);
+
+    const shim = h.attach("scribe");
+    const tap = h.attach("scribe", { role: "tap" });
+    tap.close();
+    h.daemon.ingest(message({ content: `<@${BOT}> after close` }));
+    h.timers.advance(5_000);
+    assert.equal(shim.connection.events().length, 1);
+    assert.equal(tap.connection.events().length, 0);
+  } finally {
+    h.dispose();
+  }
+});
+
 test("reply chunks long text, quotes only the first chunk, and marks the chat seen", async () => {
   const h = harness();
   try {

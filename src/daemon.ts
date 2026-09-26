@@ -50,7 +50,7 @@ interface Client {
   connection: Connection;
   requireToken: boolean;
   hello: boolean;
-  role: "shim" | "cli" | undefined;
+  role: "shim" | "cli" | "tap" | undefined;
   ear: string | undefined;
   attachGeneration: number;
   /** Set once the deaf-session warning has been logged for this attachment. */
@@ -185,6 +185,13 @@ export class Daemon {
   private readonly options: DaemonOptions;
   private readonly clients = new Set<Client>();
   private readonly attached = new Map<string, Client>();
+  /**
+   * Read-only observers of an ear's pushed batches (`frond-ear tap`). A tap sees exactly
+   * what the attached session is sent, when it is sent, but never attaches, confirms,
+   * acks or marks anything: it lets a session that cannot receive channel pushes be
+   * woken by the same push without polling.
+   */
+  private readonly taps = new Map<string, Set<Client>>();
   private botLimiter: WakeLimiter;
   private ambientLimiter: WakeLimiter;
   private timer: unknown;
@@ -481,12 +488,16 @@ export class Daemon {
       return;
     }
     const notification = renderBatch(batch, this.config);
-    client.connection.send({
+    const event = {
       type: "event",
       batchId: batch.id,
       content: notification.content,
       meta: notification.meta,
-    });
+    } as const;
+    client.connection.send(event);
+    for (const tap of this.taps.get(ear) ?? []) {
+      tap.connection.send(event);
+    }
     this.store.increment("batches_sent");
     this.logger.log("info", "ear.batch_sent", {
       ear,
@@ -524,6 +535,9 @@ export class Daemon {
       },
       onClose: () => {
         this.clients.delete(client);
+        for (const taps of this.taps.values()) {
+          taps.delete(client);
+        }
         this.detach(client);
       },
     };
@@ -666,6 +680,32 @@ export class Daemon {
     client.role = message.role;
     client.pid = message.pid;
     client.sessionId = message.sessionId;
+    if (message.role === "tap") {
+      const ear = message.ear;
+      if (!ear || !this.config.ears[ear]) {
+        client.connection.send({
+          type: "welcome",
+          protocol: EAR_PROTOCOL_VERSION,
+          attached: false,
+          instructions: "",
+          error: `unknown ear ${ear ?? "(none)"}`,
+        });
+        client.connection.close();
+        return;
+      }
+      const taps = this.taps.get(ear) ?? new Set<Client>();
+      taps.add(client);
+      this.taps.set(ear, taps);
+      this.logger.log("info", "ear.tap_opened", { ear });
+      client.connection.send({
+        type: "welcome",
+        protocol: EAR_PROTOCOL_VERSION,
+        attached: false,
+        ear,
+        instructions: "",
+      });
+      return;
+    }
     if (message.role === "cli" || !message.ear) {
       client.connection.send({
         type: "welcome",

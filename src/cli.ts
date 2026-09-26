@@ -26,6 +26,7 @@ usage:
   frond-ear daemon [--dry-run]        run the gateway daemon (config: FROND_EAR_CONFIG, default ./frond-ear.json)
   frond-ear shim                      run the Claude Code channel shim (stdio MCP; launched by Claude Code)
   frond-ear status                    print daemon status as JSON
+  frond-ear tap --ear <name>          stream the batches pushed to an ear (read-only; for sessions without channel push)
   frond-ear inject --chat <id> --author <id> [--guild <id>] [--name <n>] [--bot] [--mention] <text…>
                                       push a synthetic MESSAGE_CREATE (dry-run or FROND_EAR_ALLOW_INJECT=1)
 
@@ -286,6 +287,67 @@ async function runInject(argv: string[]): Promise<void> {
   process.exitCode = result.ok ? 0 : 1;
 }
 
+/**
+ * Stream an ear's pushed batches to stdout as they are sent to the attached session.
+ * Read-only: a tap never attaches, confirms or marks anything. Reconnects with backoff
+ * across daemon restarts and says so, so a watcher is never silently dead.
+ */
+function runTap(argv: string[]): void {
+  const index = argv.indexOf("--ear");
+  const ear = index >= 0 ? argv[index + 1] : process.env.FROND_EAR_EAR;
+  if (!ear) {
+    process.stderr.write("frond-ear tap: --ear <name> is required\n");
+    process.exitCode = 2;
+    return;
+  }
+  const env = process.env;
+  let delay = 1_000;
+  const connect = (): void => {
+    const socket = connectToDaemon(env)();
+    let open = false;
+    const connection = new LineConnection(
+      socket,
+      (raw) => {
+        const message = raw as DaemonMessage;
+        if (message.type === "welcome") {
+          if (message.error) {
+            process.stderr.write(`frond-ear tap: ${message.error}\n`);
+            process.exit(2);
+          }
+          open = true;
+          delay = 1_000;
+          return;
+        }
+        if (message.type === "event" && message.batchId !== null) {
+          const chat = message.meta.chat_id ?? "?";
+          process.stdout.write(
+            `[frond-ear] ear=${ear} batch_id=${message.batchId} chat_id=${chat}\n${message.content}\n`,
+          );
+        }
+      },
+      () => {
+        process.stdout.write(
+          `[frond-ear] tap ${open ? "lost the daemon" : "could not reach the daemon"}; retrying in ${delay / 1_000}s\n`,
+        );
+        setTimeout(connect, delay);
+        delay = Math.min(delay * 2, 30_000);
+      },
+    );
+    socket.once("connect", () => {
+      const token = tcpTarget(env) ? tcpToken(env) : undefined;
+      connection.send({
+        type: "hello",
+        role: "tap",
+        protocol: EAR_PROTOCOL_VERSION,
+        ear,
+        ...(token ? { token } : {}),
+      });
+    });
+    socket.on("error", () => undefined);
+  };
+  connect();
+}
+
 async function main(): Promise<void> {
   const [command, ...rest] = process.argv.slice(2);
   switch (command) {
@@ -302,6 +364,9 @@ async function main(): Promise<void> {
     }
     case "inject":
       await runInject(rest);
+      return;
+    case "tap":
+      runTap(rest);
       return;
     case undefined:
     case "help":

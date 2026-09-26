@@ -7,7 +7,7 @@ const MAX_LINE_BYTES = 4 * 1024 * 1024;
 export type ClientMessage =
   | {
       type: "hello";
-      role: "shim" | "cli";
+      role: "shim" | "cli" | "tap";
       protocol: number;
       ear?: string;
       pid?: number;
