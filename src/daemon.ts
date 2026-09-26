@@ -53,12 +53,20 @@ interface Client {
   role: "shim" | "cli" | undefined;
   ear: string | undefined;
   attachGeneration: number;
+  /** Set once the deaf-session warning has been logged for this attachment. */
+  deliveryWarned?: boolean;
   sessionId: string | undefined;
   pid: number | undefined;
 }
 
 /** Discord's enforce_nonce window is "a few minutes"; stay inside it. */
 const SEND_DEDUPE_WINDOW_MS = 5 * 60 * 1_000;
+/**
+ * How long an attached session may leave the attach canary unacked before the ear
+ * reports it as deaf. A session that never acks is almost always a Claude process
+ * started without the development-channels flag: tools still work, pushes are dropped.
+ */
+const DELIVERY_CONFIRM_GRACE_MS = 2 * 60 * 1_000;
 
 export type IngestOutcome = "inserted" | "duplicate" | "rejected";
 
@@ -854,7 +862,10 @@ export class Daemon {
         }
         this.markSeenThrough(client, ear, chatId, horizon);
         this.store.increment("replies_sent");
-        return `sent ${ids.length} message${ids.length === 1 ? "" : "s"} to ${chatId} (id${ids.length === 1 ? "" : "s"} ${ids.join(", ")})`;
+        return this.withDeliveryWarning(
+          client,
+          `sent ${ids.length} message${ids.length === 1 ? "" : "s"} to ${chatId} (id${ids.length === 1 ? "" : "s"} ${ids.join(", ")})`,
+        );
       }
       case "react": {
         const { chatId, ear } = this.requireChat(args);
@@ -915,7 +926,10 @@ export class Daemon {
           events.map((event) => event.id),
         );
         if (events.length === 0) {
-          return "inbox empty: nothing unseen";
+          return this.withDeliveryWarning(
+            client,
+            "inbox empty: nothing unseen",
+          );
         }
         const byChat = new Map<string, StoredEvent[]>();
         for (const event of events) {
@@ -932,7 +946,10 @@ export class Daemon {
           marked > 0
             ? `(${marked} marked seen)`
             : "(read-only: this session is not the ear's attached session)";
-        return `${sections.join("\n\n---\n\n")}\n\n${note}`;
+        return this.withDeliveryWarning(
+          client,
+          `${sections.join("\n\n---\n\n")}\n\n${note}`,
+        );
       }
       case "ack": {
         const nonce = stringArg(args, "nonce");
@@ -1172,6 +1189,53 @@ export class Daemon {
     };
   }
 
+  // ---- delivery confirmation ---------------------------------------------------------------
+
+  /**
+   * Whether the attached session has proven it receives pushed events. Only the
+   * attach canary proves it: the session can ack the nonce only after seeing it.
+   */
+  private delivery(
+    name: string,
+  ):
+    | { delivery: "confirmed" | "pending" | "detached" }
+    | { delivery: "unconfirmed"; hint: string } {
+    const client = this.attached.get(name);
+    const record = this.store.ear(name);
+    if (!client || !record) {
+      return { delivery: "detached" };
+    }
+    if (record.registered) {
+      return { delivery: "confirmed" };
+    }
+    const attachedAt = record.attachedAt ?? this.clock.now();
+    if (this.clock.now() - attachedAt < DELIVERY_CONFIRM_GRACE_MS) {
+      return { delivery: "pending" };
+    }
+    const resume = client.sessionId ?? record.sessionId ?? "<session-id>";
+    return {
+      delivery: "unconfirmed",
+      hint:
+        "this session never acked frond-ear's attach canary, so it is not receiving pushed " +
+        "Discord events (tools still work). Claude Code only delivers channel events to " +
+        "sessions launched with --dangerously-load-development-channels server:frond-ear; " +
+        `relaunch with: claude --resume ${resume} --dangerously-load-development-channels ` +
+        "server:frond-ear. Until then, read new messages with inbox.",
+    };
+  }
+
+  private withDeliveryWarning(client: Client, text: string): string {
+    const state = client.ear ? this.delivery(client.ear) : undefined;
+    if (state?.delivery !== "unconfirmed") {
+      return text;
+    }
+    if (!client.deliveryWarned) {
+      client.deliveryWarned = true;
+      this.logger.log("warn", "ear.delivery_unconfirmed", { ear: client.ear });
+    }
+    return `${text}\n\n⚠️ frond-ear: ${state.hint}`;
+  }
+
   // ---- status --------------------------------------------------------------------------
 
   public status(onlyEar?: string): object {
@@ -1185,6 +1249,7 @@ export class Daemon {
           target: ear.target,
           attached: client !== undefined,
           registered: client !== undefined && record?.registered === true,
+          ...this.delivery(name),
           generation: record?.generation ?? 0,
           sessionId: client?.sessionId ?? record?.sessionId ?? null,
           shimPid: client?.pid ?? null,

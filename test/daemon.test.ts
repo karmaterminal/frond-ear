@@ -223,6 +223,39 @@ test("attach canary: registered only after ack(nonce)", async () => {
   }
 });
 
+test("delivery: an unacked canary is reported as a deaf session, with the relaunch hint", async () => {
+  const config = testConfig({
+    ears: {
+      scribe: { attachCanary: true, channels: { [CHANNEL]: "mentions" } },
+    },
+  });
+  const h = harness(config, { nonce: "c0ffee" });
+  try {
+    const shim = h.attach("scribe");
+    const status = () =>
+      h.daemon.status("scribe") as {
+        ears: Array<{ delivery: string; hint?: string }>;
+      };
+    assert.equal(status().ears[0]?.delivery, "pending");
+
+    h.clock.advance(2 * 60 * 1_000);
+    assert.equal(status().ears[0]?.delivery, "unconfirmed");
+    assert.match(
+      status().ears[0]?.hint ?? "",
+      /--dangerously-load-development-channels server:frond-ear/u,
+    );
+    const deaf = await h.call(shim, "inbox", { chat_id: CHANNEL });
+    assert.match(deaf.text, /⚠️ frond-ear: this session never acked/u);
+
+    assert.equal((await h.call(shim, "ack", { nonce: "c0ffee" })).ok, true);
+    assert.equal(status().ears[0]?.delivery, "confirmed");
+    const heard = await h.call(shim, "inbox", { chat_id: CHANNEL });
+    assert.doesNotMatch(heard.text, /⚠️ frond-ear/u);
+  } finally {
+    h.dispose();
+  }
+});
+
 test("reply chunks long text, quotes only the first chunk, and marks the chat seen", async () => {
   const h = harness();
   try {
