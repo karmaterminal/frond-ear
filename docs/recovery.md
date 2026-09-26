@@ -1,20 +1,20 @@
 # Recovery
 
-The question this answers: *the session is gone, the box rebooted — how does the ear come back?*
+The question this answers: _the session is gone, the box rebooted — how does the ear come back?_
 
 Recovery is tiered. Most of the time the answer is "it already did", and the useful skill is
 knowing which tier you are actually in before you start reinstalling things.
 
 ## What is durable, and what is not
 
-| Thing | Where it lives | Survives a reboot? |
-| --- | --- | --- |
-| Held and delivered messages | `$XDG_STATE_HOME/frond-ear/frond-ear.db` | yes |
-| The daemon process | systemd `--user` unit | yes, if installed and linger is on |
-| Config | `~/.config/frond-ear/frond-ear.json` | yes, but it is yours to back up |
-| Bot token | `~/.config/frond-ear/token` (0600) | yes, but it is yours to back up |
-| The socket | `$XDG_RUNTIME_DIR/frond-ear/daemon.sock` | no, and it should not — it is recreated |
-| The attached Claude session | the session itself | **no** — always a deliberate relaunch |
+| Thing                       | Where it lives                           | Survives a reboot?                      |
+| --------------------------- | ---------------------------------------- | --------------------------------------- |
+| Held and delivered messages | `$XDG_STATE_HOME/frond-ear/frond-ear.db` | yes                                     |
+| The daemon process          | systemd `--user` unit                    | yes, if installed and linger is on      |
+| Config                      | `~/.config/frond-ear/frond-ear.json`     | yes, but it is yours to back up         |
+| Bot token                   | `~/.config/frond-ear/token` (0600)       | yes, but it is yours to back up         |
+| The socket                  | `$XDG_RUNTIME_DIR/frond-ear/daemon.sock` | no, and it should not — it is recreated |
+| The attached Claude session | the session itself                       | **no** — always a deliberate relaunch   |
 
 Two consequences worth internalising. First, the queue outlives the daemon: stopping the service
 does not drop what the ear is holding for you, and neither does a reboot. Second, nothing can
