@@ -1,0 +1,105 @@
+{
+  "inbound": [
+    {
+      "id": "1300000000000000000",
+      "acceptedRows": 1,
+      "state": "seen",
+      "batch": 1,
+      "notified": 1,
+      "notifiedIn": [
+        {
+          "kind": "mention",
+          "batch": "1"
+        }
+      ]
+    }
+  ],
+  "notifications": [
+    {
+      "at": 1790371402841,
+      "meta": {
+        "kind": "attach",
+        "ear": "scribe",
+        "nonce": "6b2e7b316f01"
+      },
+      "messageIds": []
+    },
+    {
+      "at": 1790371403149,
+      "meta": {
+        "chat_id": "700000000000000007",
+        "kind": "mention",
+        "batch_id": "1",
+        "count": "1",
+        "message_id": "1300000000000000000",
+        "user": "user-002",
+        "user_id": "200000000000000002",
+        "trust": "principal",
+        "ts": "2026-09-25T21:23:22.842Z",
+        "guild_id": "600000000000000006"
+      },
+      "messageIds": ["1300000000000000000"]
+    }
+  ],
+  "outbound": {
+    "posts": [
+      {
+        "id": "1300000000000000001",
+        "channelId": "700000000000000007",
+        "content": "drained reply",
+        "replyTo": null,
+        "nonce": "94ca36af15c12fd23128",
+        "acceptedAt": 1790371403223,
+        "receipted": true,
+        "classification": "receipted",
+        "duplicates": 0
+      }
+    ],
+    "receipts": [
+      {
+        "message_id": "1300000000000000001",
+        "channel_id": "700000000000000007"
+      }
+    ],
+    "intents": [
+      {
+        "nonce": "94ca36af15c12fd23128",
+        "intent_key": "ba31146f564248321f0888806a41665313e8e0f1b0d57343fd6fed1340d47de9",
+        "chat_id": "700000000000000007",
+        "preview": "drained reply",
+        "state": "sent",
+        "message_id": "1300000000000000001",
+        "created_at": 1790371403175,
+        "updated_at": 1790371403227
+      }
+    ],
+    "reactions": []
+  },
+  "counters": {
+    "accepted_queued": 1,
+    "batches_sent": 1,
+    "replies_sent": 1
+  },
+  "gateway": {
+    "connections": 2,
+    "resumes": [1],
+    "seq": 1
+  },
+  "daemon": {
+    "running": true,
+    "exits": [
+      {
+        "code": 0,
+        "signal": null
+      }
+    ]
+  },
+  "summary": {
+    "acceptedUnique": true,
+    "maxNotificationsPerEvent": 1,
+    "posts": 1,
+    "receipted": 1,
+    "ambiguous": 0,
+    "duplicatePosts": 0
+  }
+}

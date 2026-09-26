@@ -1,0 +1,131 @@
+{
+  "inbound": [
+    {
+      "id": "1300000000000000000",
+      "acceptedRows": 1,
+      "state": "seen",
+      "batch": 1,
+      "notified": 1,
+      "notifiedIn": [
+        {
+          "kind": "mention",
+          "batch": "1"
+        }
+      ]
+    }
+  ],
+  "notifications": [
+    {
+      "at": 1790371405245,
+      "meta": {
+        "kind": "attach",
+        "ear": "scribe",
+        "nonce": "edda340cbeaf"
+      },
+      "messageIds": []
+    },
+    {
+      "at": 1790371405554,
+      "meta": {
+        "chat_id": "700000000000000007",
+        "kind": "mention",
+        "batch_id": "1",
+        "count": "1",
+        "message_id": "1300000000000000000",
+        "user": "user-002",
+        "user_id": "200000000000000002",
+        "trust": "principal",
+        "ts": "2026-09-25T21:23:25.247Z",
+        "guild_id": "600000000000000006"
+      },
+      "messageIds": ["1300000000000000000"]
+    },
+    {
+      "at": 1790371405992,
+      "meta": {
+        "kind": "digest",
+        "count": "1"
+      },
+      "messageIds": []
+    },
+    {
+      "at": 1790371405992,
+      "meta": {
+        "kind": "send_check",
+        "count": "1"
+      },
+      "messageIds": []
+    },
+    {
+      "at": 1790371405992,
+      "meta": {
+        "kind": "attach",
+        "ear": "scribe",
+        "nonce": "ae4751d5eb0b"
+      },
+      "messageIds": []
+    }
+  ],
+  "outbound": {
+    "posts": [
+      {
+        "id": "1300000000000000001",
+        "channelId": "700000000000000007",
+        "content": "status: all green",
+        "replyTo": null,
+        "nonce": "d1c3c8033fd4bc3adcee",
+        "acceptedAt": 1790371405605,
+        "receipted": true,
+        "classification": "receipted",
+        "duplicates": 0
+      }
+    ],
+    "receipts": [
+      {
+        "message_id": "1300000000000000001",
+        "channel_id": "700000000000000007"
+      }
+    ],
+    "intents": [
+      {
+        "nonce": "d1c3c8033fd4bc3adcee",
+        "intent_key": "0d359a231f5b27e1adc3da3f8b4f57ac16f6e620ffde42faab793afccd4b4476",
+        "chat_id": "700000000000000007",
+        "preview": "status: all green",
+        "state": "sent",
+        "message_id": "1300000000000000001",
+        "created_at": 1790371405576,
+        "updated_at": 1790371406031
+      }
+    ],
+    "reactions": []
+  },
+  "counters": {
+    "accepted_queued": 1,
+    "batches_sent": 1,
+    "ambiguous_sends_resolved": 1,
+    "replies_sent": 1
+  },
+  "gateway": {
+    "connections": 2,
+    "resumes": [1],
+    "seq": 1
+  },
+  "daemon": {
+    "running": true,
+    "exits": [
+      {
+        "code": null,
+        "signal": "SIGKILL"
+      }
+    ]
+  },
+  "summary": {
+    "acceptedUnique": true,
+    "maxNotificationsPerEvent": 1,
+    "posts": 1,
+    "receipted": 1,
+    "ambiguous": 0,
+    "duplicatePosts": 0
+  }
+}

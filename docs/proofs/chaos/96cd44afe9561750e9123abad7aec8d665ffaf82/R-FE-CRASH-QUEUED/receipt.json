@@ -1,0 +1,39 @@
+{
+  "schema": "frond-ear.k6.proof-row-receipt.v1",
+  "row": "R-FE-CRASH-QUEUED",
+  "classification": "guaranteed",
+  "verdict": "PASS-candidate",
+  "candidateSha": "96cd44afe9561750e9123abad7aec8d665ffaf82",
+  "checks": [
+    {
+      "name": "barrier: both rows durably queued",
+      "passes": 1,
+      "fails": 0
+    },
+    {
+      "name": "nothing was flushed before the kill",
+      "passes": 1,
+      "fails": 0
+    },
+    {
+      "name": "queued chatter delivered after crash",
+      "passes": 1,
+      "fails": 0
+    },
+    {
+      "name": "both queued messages in the batch",
+      "passes": 1,
+      "fails": 0
+    },
+    {
+      "name": "barrier: quiescent",
+      "passes": 1,
+      "fails": 0
+    },
+    {
+      "name": "no event notified twice",
+      "passes": 1,
+      "fails": 0
+    }
+  ]
+}

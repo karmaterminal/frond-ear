@@ -1,0 +1,105 @@
+{
+  "inbound": [
+    {
+      "id": "1300000000000000000",
+      "acceptedRows": 1,
+      "state": "offered",
+      "batch": 1,
+      "notified": 1,
+      "notifiedIn": [
+        {
+          "kind": "mention",
+          "batch": "1"
+        }
+      ]
+    }
+  ],
+  "notifications": [
+    {
+      "at": 1790371392529,
+      "meta": {
+        "kind": "attach",
+        "ear": "scribe",
+        "nonce": "4691ccd6f3ce"
+      },
+      "messageIds": []
+    },
+    {
+      "at": 1790371392838,
+      "meta": {
+        "chat_id": "700000000000000007",
+        "kind": "mention",
+        "batch_id": "1",
+        "count": "1",
+        "message_id": "1300000000000000000",
+        "user": "user-002",
+        "user_id": "200000000000000002",
+        "trust": "principal",
+        "ts": "2026-09-25T21:23:12.531Z",
+        "guild_id": "600000000000000006"
+      },
+      "messageIds": ["1300000000000000000"]
+    },
+    {
+      "at": 1790371393250,
+      "meta": {
+        "kind": "digest",
+        "count": "1"
+      },
+      "messageIds": []
+    },
+    {
+      "at": 1790371393250,
+      "meta": {
+        "kind": "attach",
+        "ear": "scribe",
+        "nonce": "f5b774864e6d"
+      },
+      "messageIds": []
+    }
+  ],
+  "outbound": {
+    "posts": [
+      {
+        "id": "1300000000000000001",
+        "channelId": "700000000000000007",
+        "content": "status: all green",
+        "replyTo": null,
+        "nonce": null,
+        "acceptedAt": 1790371392893,
+        "receipted": false,
+        "classification": "ambiguous-unreceipted",
+        "duplicates": 0
+      }
+    ],
+    "receipts": [],
+    "intents": [],
+    "reactions": []
+  },
+  "counters": {
+    "accepted_queued": 1,
+    "batches_sent": 1
+  },
+  "gateway": {
+    "connections": 2,
+    "resumes": [1],
+    "seq": 1
+  },
+  "daemon": {
+    "running": true,
+    "exits": [
+      {
+        "code": null,
+        "signal": "SIGKILL"
+      }
+    ]
+  },
+  "summary": {
+    "acceptedUnique": true,
+    "maxNotificationsPerEvent": 1,
+    "posts": 1,
+    "receipted": 0,
+    "ambiguous": 1,
+    "duplicatePosts": 0
+  }
+}
