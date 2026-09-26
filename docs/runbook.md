@@ -160,6 +160,22 @@ claude --resume <frond-scribe session id> --dangerously-load-development-channel
 | Read what Claude missed | Claude calls `inbox`; everything stays in SQLite until the retention window expires |
 | Logs                    | JSON lines on the daemon's stderr. Message text and tokens are redacted.            |
 
+## 7. Survive a reboot
+
+Run the daemon under systemd so the ear is not tied to whichever terminal started it:
+
+```sh
+ops/install-systemd.sh
+```
+
+It writes a `--user` unit pointing at this checkout, enables it, and waits for the gateway to
+report `connected` before claiming success. Lingering must be on (`loginctl enable-linger $USER`)
+or user units will not start until someone logs in — the script warns if it is off.
+
+The SQLite state lives outside the checkout, so a restart keeps everything the ear is holding for
+a detached session. `docs/recovery.md` covers the rest: what is durable, what you have to back up
+yourself, and how to get back from a lost checkout, a lost home directory, or a lost session.
+
 ## Troubleshooting
 
 | Symptom                                       | Likely cause                                                                                                                                                                                                      |
