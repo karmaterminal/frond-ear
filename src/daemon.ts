@@ -234,6 +234,14 @@ export class Daemon {
         this.detach(client);
       }
     }
+    for (const [ear, taps] of this.taps) {
+      if (!config.ears[ear]) {
+        for (const tap of taps) {
+          tap.connection.close();
+        }
+        this.taps.delete(ear);
+      }
+    }
     this.reconcileRouting();
     this.prune();
     this.tick();
@@ -535,8 +543,12 @@ export class Daemon {
       },
       onClose: () => {
         this.clients.delete(client);
-        for (const taps of this.taps.values()) {
-          taps.delete(client);
+        if (client.role === "tap") {
+          for (const [ear, taps] of this.taps) {
+            if (taps.delete(client)) {
+              this.logger.log("info", "ear.tap_closed", { ear });
+            }
+          }
         }
         this.detach(client);
       },
@@ -658,6 +670,11 @@ export class Daemon {
     client: Client,
     message: Extract<ClientMessage, { type: "hello" }>,
   ): void {
+    if (client.role === "tap") {
+      // A tap is read-only for its whole connection; it cannot become a shim.
+      client.connection.close();
+      return;
+    }
     if (message.protocol !== EAR_PROTOCOL_VERSION) {
       client.connection.send({
         type: "welcome",
@@ -1290,6 +1307,7 @@ export class Daemon {
           attached: client !== undefined,
           registered: client !== undefined && record?.registered === true,
           ...this.delivery(name),
+          taps: this.taps.get(name)?.size ?? 0,
           generation: record?.generation ?? 0,
           sessionId: client?.sessionId ?? record?.sessionId ?? null,
           shimPid: client?.pid ?? null,

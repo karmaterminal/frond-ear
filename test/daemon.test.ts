@@ -284,33 +284,93 @@ test("tap: mirrors exactly the batch pushed to the attached session, at the same
   }
 });
 
-test("tap: observing changes nothing about the attachment or event state", async () => {
-  const run = (withTap: boolean) => {
-    const h = harness();
+test("tap: with or without a tap, attachment, canary and confirmed batches are identical", async () => {
+  const run = (tap: "none" | "before" | "after") => {
+    const config = testConfig({
+      ears: {
+        scribe: { attachCanary: true, channels: { [CHANNEL]: "mentions" } },
+      },
+    });
+    const h = harness(config, { nonce: "c0ffee" });
     try {
-      const shim = h.attach("scribe");
-      if (withTap) {
+      if (tap === "before") {
+        h.attach("scribe", { role: "tap" });
+      }
+      const shim = h.attach("scribe", { sessionId: "session-1" });
+      if (tap === "after") {
         h.attach("scribe", { role: "tap" });
       }
       h.daemon.ingest(message({ content: `<@${BOT}> ping` }));
       h.timers.advance(5_000);
+      for (const event of shim.connection.events()) {
+        if (event.batchId !== null) {
+          void shim.send({ type: "offered", batchId: event.batchId });
+        }
+      }
       const status = h.daemon.status("scribe") as {
-        ears: Array<{
-          attached: boolean;
-          generation: number;
-          sessionId: string | null;
-        }>;
+        ears: Array<Record<string, unknown>>;
       };
+      const { taps: _taps, ...ear } = status.ears[0] ?? {};
       return {
-        ear: status.ears[0],
+        ear,
         counts: h.store.stateCounts("scribe"),
-        pushed: shim.connection.events().length,
+        pushed: shim.connection.events().map((event) => event.meta.kind),
       };
     } finally {
       h.dispose();
     }
   };
-  assert.deepEqual(run(true), run(false));
+  const baseline = run("none");
+  assert.deepEqual(run("before"), baseline);
+  assert.deepEqual(run("after"), baseline);
+});
+
+test("tap: every message a tap can send leaves ear state untouched", async () => {
+  const config = testConfig({
+    ears: {
+      scribe: { attachCanary: true, channels: { [CHANNEL]: "mentions" } },
+    },
+  });
+  const h = harness(config, { nonce: "c0ffee" });
+  try {
+    h.attach("scribe", { sessionId: "session-1" });
+    const tap = h.attach("scribe", { role: "tap" });
+    h.daemon.ingest(message({ content: `<@${BOT}> ping` }));
+    h.timers.advance(5_000);
+    const [event] = tap.connection.events();
+    assert.ok(event && event.batchId !== null);
+    const snapshot = () => ({
+      status: h.daemon.status("scribe"),
+      counts: h.store.stateCounts("scribe"),
+    });
+    const before = snapshot();
+    await tap.send({ type: "offered", batchId: event.batchId });
+    await tap.send({ type: "session", sessionId: "intruder" });
+    await h.call(tap, "ack", { chat_id: CHANNEL, batch_id: event.batchId });
+    await h.call(tap, "ack", { nonce: "c0ffee" }).catch(() => undefined);
+    await h
+      .call(tap, "set_attention", { mode: "silent" })
+      .catch(() => undefined);
+    await h.call(tap, "inbox", { chat_id: CHANNEL });
+    assert.deepEqual(snapshot(), before);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("tap: a tap cannot re-hello into a shim", async () => {
+  const h = harness();
+  try {
+    const tap = h.attach("scribe", { role: "tap" });
+    await tap.send({ type: "hello", role: "shim", protocol: 1, ear: "scribe" });
+    assert.equal(tap.connection.closed, true);
+    const status = h.daemon.status("scribe") as {
+      ears: Array<{ attached: boolean }>;
+    };
+    assert.equal(status.ears[0]?.attached, false);
+  } finally {
+    h.dispose();
+  }
 });
 
 test("tap: an unknown ear is refused, and a closed tap stops receiving", async () => {

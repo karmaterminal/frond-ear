@@ -26,7 +26,7 @@ usage:
   frond-ear daemon [--dry-run]        run the gateway daemon (config: FROND_EAR_CONFIG, default ./frond-ear.json)
   frond-ear shim                      run the Claude Code channel shim (stdio MCP; launched by Claude Code)
   frond-ear status                    print daemon status as JSON
-  frond-ear tap --ear <name>          stream the batches pushed to an ear (read-only; for sessions without channel push)
+  frond-ear tap --ear <name>          stream the batches pushed to an ear's attached session (read-only;\n                                      wakes a session without channel push; a shim must be attached)
   frond-ear inject --chat <id> --author <id> [--guild <id>] [--name <n>] [--bot] [--mention] <text…>
                                       push a synthetic MESSAGE_CREATE (dry-run or FROND_EAR_ALLOW_INJECT=1)
 
@@ -301,21 +301,31 @@ function runTap(argv: string[]): void {
     return;
   }
   const env = process.env;
+  // stdout is the watcher's wake signal: only batches and state changes worth waking for go
+  // there. Retry chatter goes to stderr.
+  const MAX_UNWELCOMED = 10;
   let delay = 1_000;
+  let unwelcomed = 0;
+  let lost = false;
   const connect = (): void => {
     const socket = connectToDaemon(env)();
-    let open = false;
+    let welcomed = false;
     const connection = new LineConnection(
       socket,
       (raw) => {
         const message = raw as DaemonMessage;
         if (message.type === "welcome") {
           if (message.error) {
-            process.stderr.write(`frond-ear tap: ${message.error}\n`);
+            process.stdout.write(`[frond-ear] tap refused: ${message.error}\n`);
             process.exit(2);
           }
-          open = true;
+          welcomed = true;
+          unwelcomed = 0;
           delay = 1_000;
+          if (lost) {
+            lost = false;
+            process.stdout.write(`[frond-ear] tap reconnected to ear=${ear}\n`);
+          }
           return;
         }
         if (message.type === "event" && message.batchId !== null) {
@@ -326,9 +336,21 @@ function runTap(argv: string[]): void {
         }
       },
       () => {
-        process.stdout.write(
-          `[frond-ear] tap ${open ? "lost the daemon" : "could not reach the daemon"}; retrying in ${delay / 1_000}s\n`,
-        );
+        if (!welcomed) {
+          unwelcomed += 1;
+          if (unwelcomed >= MAX_UNWELCOMED) {
+            process.stdout.write(
+              `[frond-ear] tap giving up: the daemon closed ${MAX_UNWELCOMED} connections without a welcome (down, or a bad token)\n`,
+            );
+            process.exit(1);
+          }
+        } else if (!lost) {
+          lost = true;
+          process.stdout.write(
+            `[frond-ear] tap lost the daemon; reconnecting\n`,
+          );
+        }
+        process.stderr.write(`frond-ear tap: retrying in ${delay / 1_000}s\n`);
         setTimeout(connect, delay);
         delay = Math.min(delay * 2, 30_000);
       },
