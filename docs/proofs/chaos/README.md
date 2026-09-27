@@ -16,6 +16,7 @@ Every run had zero modified tracked files.
 | ------------------------------------------------------------------------------------------------- | --------------------------------------------------- | ------------------------- |
 | [`96cd44afe9561750e9123abad7aec8d665ffaf82`](96cd44afe9561750e9123abad7aec8d665ffaf82/RESULTS.md) | identical to `5d5bbe1` (harness only)               | 4 / 7 rows PASS-candidate |
 | [`4eb98ba27b3befc9d65553cfe68d9286eed6fe80`](4eb98ba27b3befc9d65553cfe68d9286eed6fe80/RESULTS.md) | crash-safe shutdown plus idempotent ambiguous sends | 7 / 7 rows PASS-candidate |
+| [`8215213d519ab83ec4b5ad89700beaebb4972946`](8215213d519ab83ec4b5ad89700beaebb4972946/RESULTS.md) | identity binding and re-entry (#21); regression run | 7 / 7 rows PASS-candidate |
 
 ## What the baseline run proved
 

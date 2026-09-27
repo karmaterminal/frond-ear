@@ -1,0 +1,98 @@
+{
+  "inbound": [
+    {
+      "id": "1300000000000000000",
+      "acceptedRows": 1,
+      "state": "offered",
+      "batch": 1,
+      "notified": 1,
+      "notifiedIn": [
+        {
+          "kind": "room",
+          "batch": "1"
+        }
+      ]
+    },
+    {
+      "id": "1300000000000000001",
+      "acceptedRows": 1,
+      "state": "offered",
+      "batch": 1,
+      "notified": 1,
+      "notifiedIn": [
+        {
+          "kind": "room",
+          "batch": "1"
+        }
+      ]
+    }
+  ],
+  "notifications": [
+    {
+      "at": 1790535127464,
+      "meta": {
+        "kind": "attach",
+        "ear": "scribe",
+        "nonce": "289e8b473933"
+      },
+      "messageIds": []
+    },
+    {
+      "at": 1790535127919,
+      "meta": {
+        "kind": "attach",
+        "ear": "scribe",
+        "nonce": "eaa514e834c7"
+      },
+      "messageIds": []
+    },
+    {
+      "at": 1790535128976,
+      "meta": {
+        "chat_id": "700000000000000008",
+        "kind": "room",
+        "batch_id": "1",
+        "count": "2",
+        "message_id": "1300000000000000001",
+        "user": "user-004",
+        "user_id": "400000000000000004",
+        "trust": "ambient",
+        "ts": "2026-09-27T18:52:07.467Z",
+        "guild_id": "600000000000000006"
+      },
+      "messageIds": ["1300000000000000000", "1300000000000000001"]
+    }
+  ],
+  "outbound": {
+    "posts": [],
+    "receipts": [],
+    "intents": [],
+    "reactions": []
+  },
+  "counters": {
+    "accepted_queued": 2,
+    "batches_sent": 1
+  },
+  "gateway": {
+    "connections": 2,
+    "resumes": [2],
+    "seq": 2
+  },
+  "daemon": {
+    "running": true,
+    "exits": [
+      {
+        "code": null,
+        "signal": "SIGKILL"
+      }
+    ]
+  },
+  "summary": {
+    "acceptedUnique": true,
+    "maxNotificationsPerEvent": 1,
+    "posts": 0,
+    "receipted": 0,
+    "ambiguous": 0,
+    "duplicatePosts": 0
+  }
+}

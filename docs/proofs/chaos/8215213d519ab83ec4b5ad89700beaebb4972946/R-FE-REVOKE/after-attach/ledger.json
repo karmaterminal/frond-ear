@@ -1,0 +1,50 @@
+{
+  "inbound": [
+    {
+      "id": "1300000000000000000",
+      "acceptedRows": 1,
+      "state": "dropped",
+      "batch": null,
+      "notified": 0,
+      "notifiedIn": []
+    }
+  ],
+  "notifications": [
+    {
+      "at": 1790535132805,
+      "meta": {
+        "kind": "attach",
+        "ear": "scribe",
+        "nonce": "053131f14eed"
+      },
+      "messageIds": []
+    }
+  ],
+  "outbound": {
+    "posts": [],
+    "receipts": [],
+    "intents": [],
+    "reactions": []
+  },
+  "counters": {
+    "accepted_queued": 1,
+    "routing_revoked": 1
+  },
+  "gateway": {
+    "connections": 1,
+    "resumes": [],
+    "seq": 1
+  },
+  "daemon": {
+    "running": true,
+    "exits": []
+  },
+  "summary": {
+    "acceptedUnique": true,
+    "maxNotificationsPerEvent": 0,
+    "posts": 0,
+    "receipted": 0,
+    "ambiguous": 0,
+    "duplicatePosts": 0
+  }
+}

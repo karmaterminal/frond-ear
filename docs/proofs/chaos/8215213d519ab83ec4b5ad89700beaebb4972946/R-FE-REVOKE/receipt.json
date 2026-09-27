@@ -1,0 +1,49 @@
+{
+  "schema": "frond-ear.k6.proof-row-receipt.v1",
+  "row": "R-FE-REVOKE",
+  "classification": "guaranteed",
+  "verdict": "PASS-candidate",
+  "candidateSha": "8215213d519ab83ec4b5ad89700beaebb4972946",
+  "checks": [
+    {
+      "name": "barrier: event durably queued (no session attached)",
+      "passes": 1,
+      "fails": 0
+    },
+    {
+      "name": "barrier: reload revoked the queued event",
+      "passes": 1,
+      "fails": 0
+    },
+    {
+      "name": "canary delivered",
+      "passes": 1,
+      "fails": 0
+    },
+    {
+      "name": "barrier: quiescent",
+      "passes": 1,
+      "fails": 0
+    },
+    {
+      "name": "revoked chat is never delivered",
+      "passes": 1,
+      "fails": 0
+    },
+    {
+      "name": "outbound to the revoked chat is refused",
+      "passes": 1,
+      "fails": 0
+    },
+    {
+      "name": "queued event dropped, not delivered",
+      "passes": 1,
+      "fails": 0
+    },
+    {
+      "name": "nothing posted to Discord",
+      "passes": 1,
+      "fails": 0
+    }
+  ]
+}
