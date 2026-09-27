@@ -6,9 +6,16 @@
 # those come from if you no longer have them.
 set -euo pipefail
 
-EAR_NAME="${FROND_EAR_UNIT:-frond-ear}"
+# FROND_EAR_INSTANCE runs a second (third…) daemon for this Unix user, one per bot:
+# its own unit, config dir, database and socket, with nothing to hand-edit.
+INSTANCE="${FROND_EAR_INSTANCE:-}"
+if [ -n "$INSTANCE" ]; then
+  case "$INSTANCE" in *[!a-z0-9_-]*|[!a-z0-9]*) echo "frond-ear: FROND_EAR_INSTANCE must be lowercase letters, digits, - or _" >&2; exit 1 ;; esac
+  export FROND_EAR_INSTANCE="$INSTANCE"
+fi
+EAR_NAME="${FROND_EAR_UNIT:-frond-ear${INSTANCE:+-$INSTANCE}}"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CONF_DIR="${FROND_EAR_CONF_DIR:-$HOME/.config/frond-ear}"
+CONF_DIR="${FROND_EAR_CONF_DIR:-$HOME/.config/frond-ear${INSTANCE:+/$INSTANCE}}"
 CONFIG="${FROND_EAR_CONFIG:-$CONF_DIR/frond-ear.json}"
 TOKEN="${DISCORD_BOT_TOKEN_FILE:-$CONF_DIR/token}"
 UNIT_DIR="$HOME/.config/systemd/user"
@@ -45,7 +52,8 @@ Type=simple
 WorkingDirectory=$REPO_DIR
 Environment=FROND_EAR_CONFIG=$CONFIG
 Environment=DISCORD_BOT_TOKEN_FILE=$TOKEN
-# Fail loudly in the journal rather than crash-loop on a missing credential.
+${INSTANCE:+Environment=FROND_EAR_INSTANCE=$INSTANCE
+}# Fail loudly in the journal rather than crash-loop on a missing credential.
 ExecStartPre=/usr/bin/test -s $TOKEN
 ExecStart=$NODE_BIN src/cli.ts daemon
 Restart=always

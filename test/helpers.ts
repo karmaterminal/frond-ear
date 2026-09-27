@@ -233,6 +233,11 @@ export function harness(
         role: "shim",
         protocol: 1,
         ...(ear ? { ear } : {}),
+        // One Claude session unless a test says otherwise: re-attaching is the
+        // same session re-entering; a different sessionId is another session.
+        ...(extra.role === undefined || extra.role === "shim"
+          ? { sessionId: "session-test" }
+          : {}),
         ...extra,
       });
       return { connection, send, close: () => handlers.onClose() };

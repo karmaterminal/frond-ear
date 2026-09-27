@@ -357,7 +357,26 @@ export function defaultSocketPath(
   const base = env.XDG_RUNTIME_DIR
     ? join(env.XDG_RUNTIME_DIR, "frond-ear")
     : join(homedir(), ".frond-ear");
-  return join(base, "daemon.sock");
+  const instance = instanceName(env);
+  return join(base, instance ? `${instance}.sock` : "daemon.sock");
+}
+
+/**
+ * FROND_EAR_INSTANCE names one of several daemons run by the same Unix user
+ * (one per bot). It only changes defaults: socket, database and config paths.
+ * Unset keeps the single-daemon paths unchanged.
+ */
+export function instanceName(env: NodeJS.ProcessEnv): string | undefined {
+  const value = env.FROND_EAR_INSTANCE;
+  if (!value) {
+    return undefined;
+  }
+  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/u.test(value)) {
+    throw new Error(
+      "FROND_EAR_INSTANCE must be lowercase letters, digits, - or _",
+    );
+  }
+  return value;
 }
 
 export function runtimeOptions(
@@ -366,10 +385,17 @@ export function runtimeOptions(
 ): RuntimeOptions {
   const stateHome = env.XDG_STATE_HOME ?? join(homedir(), ".local", "state");
   const dryRun = flags.dryRun || env.FROND_EAR_DRY_RUN === "1";
+  const instance = instanceName(env);
+  const configHome = env.XDG_CONFIG_HOME ?? join(homedir(), ".config");
   return {
-    configPath: env.FROND_EAR_CONFIG ?? "frond-ear.json",
+    configPath:
+      env.FROND_EAR_CONFIG ??
+      (instance
+        ? join(configHome, "frond-ear", instance, "frond-ear.json")
+        : "frond-ear.json"),
     databasePath:
-      env.FROND_EAR_DATABASE ?? join(stateHome, "frond-ear", "frond-ear.db"),
+      env.FROND_EAR_DATABASE ??
+      join(stateHome, "frond-ear", `${instance ?? "frond-ear"}.db`),
     socketPath: defaultSocketPath(env),
     gatewayUrl: env.DISCORD_GATEWAY_URL ?? "wss://gateway.discord.gg",
     apiBase: env.DISCORD_API_BASE ?? "https://discord.com/api/v10",

@@ -14,12 +14,13 @@ knowing which tier you are actually in before you start reinstalling things.
 | Config                      | `~/.config/frond-ear/frond-ear.json`     | yes, but it is yours to back up         |
 | Bot token                   | `~/.config/frond-ear/token` (0600)       | yes, but it is yours to back up         |
 | The socket                  | `$XDG_RUNTIME_DIR/frond-ear/daemon.sock` | no, and it should not — it is recreated |
-| The attached Claude session | the session itself                       | **no** — always a deliberate relaunch   |
+| Which session owns the ear  | the `bindings` table in the same SQLite  | yes                                     |
+| The attached Claude session | tmux, under `frond-ear-rez-<ear>`        | yes, if `ops/install-rez.sh` was run    |
 
 Two consequences worth internalising. First, the queue outlives the daemon: stopping the service
-does not drop what the ear is holding for you, and neither does a reboot. Second, nothing can
-reattach your Claude session for you, because the development-channel flag is only read at launch.
-Every tier below ends at the same last step.
+does not drop what the ear is holding for you, and neither does a reboot. Second, the development-
+channel flag is only read at launch, so the session comes back hearing only if something launches
+it with the flag: `frond-ear rez`, which the rez unit runs for you. Every tier below ends there.
 
 ## Tier 1 — the box rebooted
 
@@ -76,6 +77,17 @@ during an outage: try fetching your own token on a machine that has never seen y
 The ear keeps ingesting while nothing is attached; that is the point of it. Whatever arrived while
 you were away is delivered on reattach, and anything already delivered but never acted on arrives
 as one digest rather than a replay.
+
+With the rez unit installed, the timer does this within five minutes. By hand, it is one command,
+which knows the session id and working directory from the binding:
+
+```sh
+node src/cli.ts rez --ear frond-scribe
+```
+
+It does nothing if the session is already live, and refuses rather than start a second copy. If it
+reports a prompt it could not answer, `tmux attach -t frond-frond-scribe`. The by-hand fallback,
+if the daemon itself is gone, is still:
 
 ```sh
 cd <the session's working directory>

@@ -162,7 +162,7 @@ test("an unconfirmed batch reverts when the shim drops and is redelivered to the
   }
 });
 
-test("takeover detaches the old shim; offered-but-unseen work becomes one digest, not a replay", async () => {
+test("re-entry by the same session detaches its old shim; offered-but-unseen work becomes one digest, not a replay", async () => {
   const h = harness();
   try {
     const first = h.attach("scribe", { sessionId: "session-a" });
@@ -177,7 +177,8 @@ test("takeover detaches the old shim; offered-but-unseen work becomes one digest
     const batch = first.connection.events()[0];
     await first.send({ type: "offered", batchId: batch?.batchId as number });
 
-    const second = h.attach("scribe", { sessionId: "session-b" });
+    // The same session coming back (resume, crash, /mcp reconnect): a new shim.
+    const second = h.attach("scribe", { sessionId: "session-a" });
     assert.deepEqual(first.connection.received.at(-1), {
       type: "detached",
       reason: "superseded",
@@ -190,7 +191,8 @@ test("takeover detaches the old shim; offered-but-unseen work becomes one digest
     assert.doesNotMatch(digest?.content ?? "", /secret plan/u);
     // The superseded shim can no longer mark anything seen.
     const stale = await h.call(first, "ack", {});
-    assert.match(stale.text, /^0 events/u);
+    assert.equal(stale.ok, false);
+    assert.match(stale.text, /^refused: this connection was superseded/u);
     const inbox = await h.call(second, "inbox", {});
     assert.match(inbox.text, /first secret plan/u);
     assert.match(inbox.text, /1 marked seen/u);

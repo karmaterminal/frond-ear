@@ -48,14 +48,18 @@ async function waitFor<T>(
 function run(
   args: string[],
   env: NodeJS.ProcessEnv,
+  stdin?: unknown,
 ): Promise<{ code: number | null; stdout: string }> {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [CLI, ...args], {
       env,
-      stdio: ["ignore", "pipe", "inherit"],
+      stdio: [stdin === undefined ? "ignore" : "pipe", "pipe", "inherit"],
     });
+    if (stdin !== undefined) {
+      child.stdin?.end(JSON.stringify(stdin));
+    }
     let stdout = "";
-    child.stdout.on("data", (chunk: Buffer) => {
+    child.stdout?.on("data", (chunk: Buffer) => {
       stdout += chunk.toString();
     });
     child.on("close", (code) => resolve({ code, stdout }));
@@ -128,6 +132,8 @@ test("dry-run daemon + channel shim + MCP client: inject → <channel> notificat
     FROND_EAR_DATABASE: join(directory, "state", "ear.db"),
     FROND_EAR_SOCKET: socket,
     FROND_EAR_BOT_USER_ID: BOT,
+    // These tests may themselves run inside a Claude session; its flags are not under test.
+    FROND_EAR_LAUNCH_DETECT: "off",
   };
   delete env.DISCORD_BOT_TOKEN;
   delete env.DISCORD_BOT_TOKEN_FILE;
@@ -297,4 +303,49 @@ test("dry-run daemon + channel shim + MCP client: inject → <channel> notificat
     notifications.filter((item) => item.meta.kind === "room").length,
     1,
   );
+
+  // Re-entry hook (#21): the owner is told where it stands after compaction; a
+  // session that asks about the ear is told whose it is; hooks print JSON only.
+  const ownerHook = await run(["hook", "session-start"], env, {
+    session_id: "session-e2e",
+    source: "compact",
+  });
+  assert.equal(ownerHook.code, 0);
+  const ownerContext = JSON.parse(ownerHook.stdout) as {
+    hookSpecificOutput: { hookEventName: string; additionalContext: string };
+  };
+  assert.equal(ownerContext.hookSpecificOutput.hookEventName, "SessionStart");
+  assert.match(
+    ownerContext.hookSpecificOutput.additionalContext,
+    /this session owns ear "scribe" \(compact\)/u,
+  );
+  const otherHook = await run(
+    ["hook", "session-start"],
+    { ...env, FROND_EAR_EAR: "scribe" },
+    { session_id: "session-other", source: "startup" },
+  );
+  assert.match(otherHook.stdout, /belongs to session session-e2e/u);
+  const quietHook = await run(["hook", "session-start"], env, {
+    session_id: "session-other",
+    source: "startup",
+  });
+  assert.equal(quietHook.stdout, "", "unrelated sessions get nothing");
+
+  // Moving the ear is one explicit command; the old owner is told.
+  const bound = await run(
+    ["bind", "--ear", "scribe", "--session", "session-other"],
+    env,
+  );
+  assert.equal(bound.code, 0, bound.stdout);
+  assert.match(bound.stdout, /bound to session-other/u);
+  const detached = await waitFor(
+    () => notifications.find((item) => item.meta.kind === "detached"),
+    "detached notice",
+  );
+  assert.match(detached.content, /rebound to session session-other/u);
+  const refused = await client.callTool({
+    name: "reply",
+    arguments: { chat_id: CHANNEL, text: "still me?" },
+  });
+  assert.equal(refused.isError, true);
 });
