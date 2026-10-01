@@ -15,6 +15,7 @@ import { systemClock, systemTimers } from "../types.ts";
 import { CLASSES, SCOPE_NAMES } from "./ids.ts";
 import { Listener, type ListenerEvent, type SafetyState } from "./listener.ts";
 import type { Manifest } from "./manifest.ts";
+import type { Identity } from "./wire.ts";
 
 const STATE_KEY = "canticle.listener_state";
 const TICK_MS = 1_000;
@@ -50,6 +51,10 @@ export interface LiveItem {
   /** Bytes, for a body that isn't shown (non-text ctype). */
   bodyBytes: number | undefined;
   stateKey: string | undefined;
+  /** The station's principal, from the manifest or the record; never from the frame. */
+  principal?: string | undefined;
+  /** Lineage root as `key:epoch:stream:seq` (§14.11); undefined when not known. */
+  root?: string | undefined;
   text: string | undefined;
   ctype: number | string | undefined;
   bodyRef: { url: string; sha256: string; size: string } | undefined;
@@ -93,6 +98,16 @@ function tuned(
     const s = p.slice(0, at);
     return (s === "*" || s === station) && p.slice(at + 1) === stream;
   });
+}
+
+/** §14.13 `root=`: the declared lineage root, or the item itself when it has none. */
+function rootOf(
+  root: Identity | undefined,
+  kid: string,
+  self: { epoch: number; stream: number; seq: bigint },
+): string {
+  const r = root ?? { keyId: Buffer.from(kid, "hex"), ...self };
+  return `${Buffer.from(r.keyId).toString("hex").slice(0, 16)}:${r.epoch}:${r.stream.toString(16).padStart(8, "0")}:${r.seq}`;
 }
 
 export class CanticleReceptor {
@@ -297,6 +312,7 @@ export class CanticleReceptor {
         bodyBytes:
           it.ctype !== 1 && it.body !== undefined ? it.body.length : undefined,
         stateKey: it.stateKey,
+        root: rootOf(it.root, h.kid, it),
         text:
           it.ctype === 1 && it.body !== undefined
             ? Buffer.from(it.body).toString("utf8")
