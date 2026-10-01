@@ -96,7 +96,14 @@ These are recorded in the #6 checklist:
 4. **The channel dialog.** The exact text of the development-channel confirmation. `rez` answers it
    only when the pane says "development channel" and the highlighted choice is an accepting one;
    otherwise it leaves it for a human, and says so.
-5. **tmux under systemd.** tmux started by the rez oneshot (`KillMode=process`) survives the unit
+5. **Permission mode on resume.** A resumed session came back in auto mode despite
+   `permissions.defaultMode: bypassPermissions`, behind a "make auto mode your default?" prompt
+   (#21, 2026-09-27). `rez` now passes `--permission-mode` explicitly: the `--permission-mode`
+   given to it, else the `defaultMode` the session's settings name (local project, project, user),
+   else none. Still to see on a real seat: that the explicit mode suppresses that prompt, and that
+   `bypassPermissions` raises no acceptance dialog on a seat that has already accepted it. `rez`
+   answers neither; a session stuck there shows up as exit 5.
+6. **tmux under systemd.** tmux started by the rez oneshot (`KillMode=process`) survives the unit
    finishing, and the resumed session inherits a usable environment. The unit sets `PATH`, and
    `claude` finds its credentials under `$HOME`.
 

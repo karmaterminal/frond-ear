@@ -9,7 +9,11 @@ import {
   isClaude,
 } from "../src/launch.ts";
 import type { ProcessReader } from "../src/launch.ts";
-import { channelPromptAwaitingYes, rez } from "../src/rez.ts";
+import {
+  channelPromptAwaitingYes,
+  rez,
+  settingsPermissionMode,
+} from "../src/rez.ts";
 import type { EarView, RezDeps, RezOptions } from "../src/rez.ts";
 
 // ---- launch detection -------------------------------------------------------------------
@@ -140,6 +144,7 @@ function fakeDeps(
     tmuxExists?: boolean;
     processes?: Array<{ pid: number; argv: string[] }>;
     pane?: string;
+    settingsMode?: string;
   } = {},
 ): RezDeps & { commands: string[][]; logs: string[] } {
   let clock = 0;
@@ -170,6 +175,7 @@ function fakeDeps(
     },
     now: () => clock,
     log: (line) => logs.push(line),
+    settingsPermissionMode: () => options.settingsMode,
   };
 }
 
@@ -290,4 +296,73 @@ test("rez reports a session that never attaches, pointing at the tmux session", 
   const result = await rez({ ...OPTIONS, timeoutMs: 3_000 }, deps);
   assert.equal(result.code, 5);
   assert.match(result.message, /tmux attach -t frond-scribe/u);
+});
+
+test("rez re-applies the permission mode the session's settings name, since --resume drops it", async () => {
+  const fromSettings = fakeDeps([bound(), bound({ attached: true })], {
+    settingsMode: "bypassPermissions",
+  });
+  assert.equal((await rez(OPTIONS, fromSettings)).code, 0);
+  const started = fromSettings.commands.find(
+    (command) => command[1] === "new-session",
+  );
+  assert.deepEqual(started?.slice(-2), [
+    "--permission-mode",
+    "bypassPermissions",
+  ]);
+  assert.match(
+    fromSettings.logs.join("\n"),
+    /permission mode bypassPermissions/u,
+  );
+
+  const explicit = fakeDeps([bound(), bound({ attached: true })], {
+    settingsMode: "bypassPermissions",
+  });
+  await rez({ ...OPTIONS, permissionMode: "acceptEdits" }, explicit);
+  assert.deepEqual(
+    explicit.commands
+      .find((command) => command[1] === "new-session")
+      ?.slice(-2),
+    ["--permission-mode", "acceptEdits"],
+    "an explicit --permission-mode wins over settings",
+  );
+
+  const none = fakeDeps([bound(), bound({ attached: true })]);
+  await rez(OPTIONS, none);
+  assert.equal(
+    none.commands
+      .find((command) => command[1] === "new-session")
+      ?.includes("--permission-mode"),
+    false,
+    "no mode named anywhere: rez picks none",
+  );
+});
+
+test("settingsPermissionMode layers local project, project, then user settings, and ignores junk", () => {
+  const files: Record<string, string> = {
+    "/w/.claude/settings.json": '{"permissions":{"defaultMode":"acceptEdits"}}',
+    "/home/u/.claude/settings.json":
+      '{"permissions":{"defaultMode":"bypassPermissions"}}',
+  };
+  const read = (path: string) => files[path];
+  assert.equal(
+    settingsPermissionMode("/w", "/home/u/.claude", read),
+    "acceptEdits",
+  );
+  files["/w/.claude/settings.local.json"] =
+    '{"permissions":{"defaultMode":"plan"}}';
+  assert.equal(settingsPermissionMode("/w", "/home/u/.claude", read), "plan");
+  assert.equal(
+    settingsPermissionMode("/elsewhere", "/home/u/.claude", read),
+    "bypassPermissions",
+  );
+  files["/x/.claude/settings.local.json"] = "{not json";
+  files["/x/.claude/settings.json"] =
+    '{"permissions":{"defaultMode":"--dangerously-anything"}}';
+  assert.equal(
+    settingsPermissionMode("/x", "/home/u/.claude", read),
+    "bypassPermissions",
+    "malformed files and unknown modes fall through to the next layer",
+  );
+  assert.equal(settingsPermissionMode("/x", "/nowhere", read), undefined);
 });

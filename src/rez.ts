@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import { isClaude } from "./launch.ts";
 
 /**
@@ -23,6 +24,8 @@ export interface RezOptions {
   timeoutMs: number;
   /** Answer Claude Code's development-channel confirmation, and nothing else. */
   confirmChannelPrompt: boolean;
+  /** `--permission-mode` for the resumed session; unset = the mode its settings name. */
+  permissionMode?: string;
 }
 
 export interface RezDeps {
@@ -32,12 +35,58 @@ export interface RezDeps {
   sleep(ms: number): Promise<void>;
   now(): number;
   log(line: string): void;
+  /** `permissions.defaultMode` from the settings a session in `cwd` would load. */
+  settingsPermissionMode(cwd: string): string | undefined;
 }
 
 export interface RezResult {
   /** 0 live or brought back; 2 unknown ear; 3 nothing to resume; 4 refused; 5 failed. */
   code: number;
   message: string;
+}
+
+/** The modes `claude --permission-mode` accepts. */
+export const PERMISSION_MODES: readonly string[] = [
+  "default",
+  "acceptEdits",
+  "plan",
+  "auto",
+  "dontAsk",
+  "bypassPermissions",
+];
+
+/**
+ * The `permissions.defaultMode` a session started in `cwd` would get from its settings files,
+ * layered as Claude Code layers them: local project, then shared project, then user. A resumed
+ * session does not apply it on its own (seen live, #21), so rez passes it back explicitly. This
+ * is the operator's own choice, re-applied; rez never picks a mode the settings do not name.
+ */
+export function settingsPermissionMode(
+  cwd: string,
+  configDir: string,
+  read: (path: string) => string | undefined,
+): string | undefined {
+  for (const path of [
+    join(cwd, ".claude", "settings.local.json"),
+    join(cwd, ".claude", "settings.json"),
+    join(configDir, "settings.json"),
+  ]) {
+    const text = read(path);
+    if (text === undefined) {
+      continue;
+    }
+    try {
+      const mode = (
+        JSON.parse(text) as { permissions?: { defaultMode?: unknown } }
+      )?.permissions?.defaultMode;
+      if (typeof mode === "string" && PERMISSION_MODES.includes(mode)) {
+        return mode;
+      }
+    } catch {
+      // A file Claude Code itself would reject names no mode; the next layer may.
+    }
+  }
+  return undefined;
 }
 
 /** True when the pane shows the development-channel dialog with an accepting choice selected. */
@@ -107,6 +156,15 @@ export async function rez(
       message: `ear ${ear}'s binding has no working directory, and claude --resume needs one; set it with: frond-ear bind --ear ${ear} --session ${binding.sessionId} --cwd <dir>`,
     };
   }
+  const permissionMode =
+    options.permissionMode ?? deps.settingsPermissionMode(binding.cwd);
+  const claudeArgs = [
+    "--resume",
+    binding.sessionId,
+    "--dangerously-load-development-channels",
+    `server:${options.serverName}`,
+    ...(permissionMode ? ["--permission-mode", permissionMode] : []),
+  ];
   const started = deps.run("tmux", [
     "new-session",
     "-d",
@@ -116,10 +174,7 @@ export async function rez(
     binding.cwd,
     "--",
     options.claudeBin,
-    "--resume",
-    binding.sessionId,
-    "--dangerously-load-development-channels",
-    `server:${options.serverName}`,
+    ...claudeArgs,
   ]);
   if (started.code !== 0) {
     return {
@@ -128,7 +183,7 @@ export async function rez(
     };
   }
   deps.log(
-    `resuming session ${binding.sessionId} in tmux session ${tmuxSession} (${binding.cwd})`,
+    `resuming session ${binding.sessionId} in tmux session ${tmuxSession} (${binding.cwd}), permission mode ${permissionMode ?? "unset (Claude Code's default)"}`,
   );
   const deadline = deps.now() + options.timeoutMs;
   let confirmed = false;
@@ -144,7 +199,7 @@ export async function rez(
     if (deps.run("tmux", ["has-session", "-t", `=${tmuxSession}`]).code !== 0) {
       return {
         code: 5,
-        message: `claude exited before attaching; try by hand: cd ${binding.cwd} && ${options.claudeBin} --resume ${binding.sessionId} --dangerously-load-development-channels server:${options.serverName}`,
+        message: `claude exited before attaching; try by hand: cd ${binding.cwd} && ${options.claudeBin} ${claudeArgs.join(" ")}`,
       };
     }
     if (options.confirmChannelPrompt && !confirmed) {
@@ -163,6 +218,6 @@ export async function rez(
   }
   return {
     code: 5,
-    message: `started tmux session ${tmuxSession}, but ear ${ear} did not attach within ${Math.round(options.timeoutMs / 1_000)}s; it may be waiting at a prompt: tmux attach -t ${tmuxSession}`,
+    message: `started tmux session ${tmuxSession}, but ear ${ear} did not attach within ${Math.round(options.timeoutMs / 1_000)}s; it may be waiting at a prompt rez does not answer: tmux attach -t ${tmuxSession}`,
   };
 }

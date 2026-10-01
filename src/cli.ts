@@ -2,6 +2,8 @@
 import { spawnSync } from "node:child_process";
 import { readFileSync, readdirSync, readlinkSync, watch } from "node:fs";
 import { connect, type Socket } from "node:net";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { parseArgs } from "node:util";
 
 import {
@@ -18,7 +20,7 @@ import type { ClientMessage, DaemonMessage } from "./protocol.ts";
 import { EAR_PROTOCOL_VERSION, LineConnection } from "./protocol.ts";
 import { HttpDiscordRest, RecordingRest } from "./rest.ts";
 import type { EarView } from "./rez.ts";
-import { rez } from "./rez.ts";
+import { PERMISSION_MODES, rez, settingsPermissionMode } from "./rez.ts";
 import { listenTcp, listenUnix } from "./server.ts";
 import { ChannelShim } from "./shim.ts";
 import { EventStore } from "./store.ts";
@@ -34,8 +36,9 @@ usage:
   frond-ear bind --ear <name> [--session <id>] [--cwd <dir>] | --release
                                       move an ear to a session on purpose (default session: the
                                       CLAUDE_CODE_SESSION_ID of the calling session), or unbind it
-  frond-ear rez --ear <name> [--tmux <name>] [--timeout <s>] [--no-confirm]
+  frond-ear rez --ear <name> [--tmux <name>] [--timeout <s>] [--no-confirm] [--permission-mode <m>]
                                       resume the ear's bound session, hearing, in tmux; no-op if live
+                                      (permission mode default: permissions.defaultMode from its settings)
   frond-ear hook session-start        SessionStart hook: tells a (re-)entering session where it stands
   frond-ear inject --chat <id> --author <id> [--guild <id>] [--name <n>] [--bot] [--mention] <text…>
                                       push a synthetic MESSAGE_CREATE (dry-run or FROND_EAR_ALLOW_INJECT=1)
@@ -503,6 +506,16 @@ async function runRez(argv: string[]): Promise<void> {
     throw new Error("rez needs --ear <name>");
   }
   const timeout = Number(flag(argv, "--timeout") ?? "90");
+  const permissionMode = flag(argv, "--permission-mode");
+  if (
+    permissionMode !== undefined &&
+    !PERMISSION_MODES.includes(permissionMode)
+  ) {
+    throw new Error(
+      `--permission-mode must be one of: ${PERMISSION_MODES.join(", ")}`,
+    );
+  }
+  const configDir = env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
   const result = await rez(
     {
       ear,
@@ -512,6 +525,7 @@ async function runRez(argv: string[]): Promise<void> {
       timeoutMs:
         (Number.isFinite(timeout) && timeout > 0 ? timeout : 90) * 1_000,
       confirmChannelPrompt: !argv.includes("--no-confirm"),
+      ...(permissionMode ? { permissionMode } : {}),
     },
     {
       ear: async (name) => {
@@ -530,6 +544,14 @@ async function runRez(argv: string[]): Promise<void> {
       sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
       now: () => Date.now(),
       log: (line) => process.stderr.write(`frond-ear rez: ${line}\n`),
+      settingsPermissionMode: (cwd) =>
+        settingsPermissionMode(cwd, configDir, (path) => {
+          try {
+            return readFileSync(path, "utf8");
+          } catch {
+            return undefined;
+          }
+        }),
     },
   );
   process.stdout.write(`${result.message}\n`);

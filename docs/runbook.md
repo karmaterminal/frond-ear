@@ -220,8 +220,10 @@ ops/install-rez.sh frond-scribe
 It installs `frond-ear-rez-frond-scribe.service` and a timer that runs it at boot and every five
 minutes. Each run is `frond-ear rez --ear frond-scribe`: a no-op while the bound session is live;
 otherwise it resumes that session with the channel flag in tmux session `frond-frond-scribe` and
-waits for the ear to attach. It refuses, and says why in the journal, rather than start a second
-copy. `tmux attach -t frond-frond-scribe` to look at it; `systemctl --user disable --now
+waits for the ear to attach. `--resume` does not re-apply `permissions.defaultMode`, so `rez`
+passes the mode your settings name as `--permission-mode` (override with `frond-ear rez
+--permission-mode <mode>`); with no mode in settings it passes none. It refuses, and says why in
+the journal, rather than start a second copy. `tmux attach -t frond-frond-scribe` to look at it; `systemctl --user disable --now
 frond-ear-rez-frond-scribe.timer` to stop resurrecting it.
 
 A second bot on the same seat is a second instance, with its own unit, config directory, database
