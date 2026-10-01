@@ -220,3 +220,56 @@ test("receptor: hearView is sighted after a datagram, then blind (unknown, not o
   );
   receptor.stop();
 });
+
+test("receptor: a plain admission defers its save to the tick; a failing store never throws", () => {
+  const store = new MemoryStore();
+  let tick: (() => void) | undefined;
+  const timers = {
+    setTimeout: (fn: () => void) => ((tick = fn), 1),
+    clearTimeout: () => {},
+  };
+  const fakeSocket = () =>
+    ({ on: () => {}, bind: () => {}, close: () => {} }) as never;
+  const receptor = new CanticleReceptor({
+    config: config(),
+    manifest,
+    store,
+    logger,
+    clock,
+    timers,
+    socket: fakeSocket,
+  });
+  receptor.start();
+  receptor.receive(vec("valid-item-named-stream"));
+  assert.equal(receptor.live("gloss").length, 1);
+  assert.equal(store.values.size, 0, "no synchronous snapshot for an item");
+  tick!();
+  assert.ok(store.values.has("canticle.listener_state"), "saved on the tick");
+
+  const broken = new CanticleReceptor({
+    config: config(),
+    manifest,
+    store: {
+      runtimeState: () => undefined,
+      setRuntimeState: () => {
+        throw new Error("disk full");
+      },
+    },
+    logger,
+    clock,
+    timers,
+    socket: fakeSocket,
+  });
+  const seq = vectors.sequences.find(
+    (s) => s.name === "pluck-before-original",
+  )!;
+  assert.doesNotThrow(() =>
+    broken.receive(Buffer.from(seq.datagrams_hex[0]!, "hex")),
+  );
+  assert.equal(
+    (broken.status() as { counts: { saveFailures: number } }).counts
+      .saveFailures,
+    1,
+  );
+  receptor.stop();
+});
