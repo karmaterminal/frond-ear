@@ -18,6 +18,8 @@ import type { Manifest } from "./manifest.ts";
 
 const STATE_KEY = "canticle.listener_state";
 const TICK_MS = 1_000;
+/** Listener events whose state may wait for the next tick's save. */
+const DEFERRABLE: ReadonlySet<string> = new Set(["item", "presence"]);
 const RETRY_MIN_MS = 1_000;
 const RETRY_MAX_MS = 30_000;
 
@@ -85,6 +87,7 @@ export class CanticleReceptor {
     superseded: 0,
     expired: 0,
     evidence: 0,
+    saveFailures: 0,
   };
 
   constructor(options: ReceptorOptions) {
@@ -177,8 +180,12 @@ export class CanticleReceptor {
   #scheduleTick(): void {
     this.#tickHandle = this.#timers.setTimeout(() => {
       if (this.#state === "stopped") return;
-      this.#apply(this.#listener.tick(this.#clock.now()));
-      this.#save();
+      try {
+        this.#apply(this.#listener.tick(this.#clock.now()));
+        this.#save();
+      } catch (error) {
+        this.#saveFailed(error);
+      }
       this.#scheduleTick();
     }, TICK_MS);
   }
@@ -186,8 +193,26 @@ export class CanticleReceptor {
   /** One datagram in. Public as the test seam; never throws. */
   receive(datagram: Uint8Array): void {
     this.#counts.datagrams += 1;
-    this.#apply(this.#listener.hear(datagram, this.#clock.now()));
-    this.#save();
+    const events = this.#listener.hear(datagram, this.#clock.now());
+    this.#apply(events);
+    // A plain admission can wait for the next tick (at most TICK_MS): after a crash
+    // the item is only re-heard as resurfaced. Anything else (a pluck, with or
+    // without a held target, a supersession, a quarantine) is safety state that
+    // must outlive a crash (§7.7), so it is written now. Duplicates aren't dirty.
+    if (events.length > 0 && events.every((e) => DEFERRABLE.has(e.event)))
+      return;
+    try {
+      this.#save();
+    } catch (error) {
+      this.#saveFailed(error);
+    }
+  }
+
+  #saveFailed(error: unknown): void {
+    this.#counts.saveFailures += 1;
+    this.#options.logger.log("error", "canticle.save_failed", {
+      reason: error instanceof Error ? error.message : String(error),
+    });
   }
 
   #apply(events: ListenerEvent[]): void {
