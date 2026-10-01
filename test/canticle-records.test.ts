@@ -464,3 +464,23 @@ test("record client: a partial line from the last connection doesn't eat the nex
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("records: principal and lineage root reach the banner; absent reads unavailable", () => {
+  const c = started();
+  c.feed(
+    frame(1, {
+      station: { name: "ops", principal: "ops-east" },
+      lineage: {
+        derived_from: [],
+        root: { key_id: "f6eecf2f43082a97", epoch: 7, stream_id: 26, seq: 1 },
+      },
+    }),
+    NOW,
+  );
+  c.feed(frame(2), NOW);
+  const [a, b] = items(c).sort((x, y) => Number(x.seq) - Number(y.seq));
+  assert.equal(a!.principal, "ops-east");
+  assert.equal(a!.root, "f6eecf2f43082a97:7:0000001a:1");
+  assert.equal(b!.principal, undefined);
+  assert.equal(b!.root, undefined);
+});

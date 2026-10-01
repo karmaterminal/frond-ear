@@ -97,6 +97,26 @@ const strOrNull = (v: unknown) => v === null || str(v);
 const reasonToken = (v: unknown) =>
   str(v) && /^[a-z0-9_]{1,40}$/u.test(v) ? v : "other";
 
+/** §14.11 lineage root from a record, as `key:epoch:stream:seq`; undefined if absent. */
+function rootOf(lineage: Json | undefined): string | undefined {
+  if (!isObj(lineage)) return undefined;
+  const r = lineage.root;
+  if (str(r)) return r;
+  if (
+    isObj(r) &&
+    str(r.key_id) &&
+    int(r.epoch) &&
+    (int(r.stream_id) || str(r.stream_id)) &&
+    (int(r.seq) || str(r.seq))
+  ) {
+    const stream = int(r.stream_id)
+      ? r.stream_id.toString(16).padStart(8, "0")
+      : r.stream_id;
+    return `${r.key_id.slice(0, 16)}:${r.epoch}:${stream}:${r.seq}`;
+  }
+  return undefined;
+}
+
 export class RecordConsumer {
   health: ReceiveHealth = "starting";
   healthReasons: string[] = [];
@@ -319,6 +339,8 @@ export class RecordConsumer {
       bodyBytes:
         text === undefined && body && int(body.size) ? body.size : undefined,
       stateKey: str(rec.state_key) ? rec.state_key : undefined,
+      principal: str(station.principal) ? station.principal : undefined,
+      root: rootOf(rec.lineage),
       text,
       ctype:
         body && (str(body.ctype) || int(body.ctype))
