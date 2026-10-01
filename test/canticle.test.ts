@@ -16,6 +16,9 @@ interface Vectors {
   manifest: unknown;
   parse: Array<{ name: string; datagram_hex: string; expect: string }>;
   sequences: Array<{
+    at_ms?: number[];
+    per_key_quota?: number;
+    per_key_mark_quota?: number;
     name: string;
     datagrams_hex: string[];
     now_ms: number;
@@ -65,11 +68,23 @@ for (const c of vectors.parse) {
 
 for (const s of vectors.sequences) {
   test(`sequence vector: ${s.name} → [${s.expect.join(", ")}]`, () => {
-    // As in the spike's runner: wire semantics at one instant, so the warm-up hold is off.
-    const listener = new Listener(manifest, { warmup: false, ephemeral: true });
+    // As in the spike's runner: wire semantics, so the warm-up hold is off. With at_ms, time
+    // advances to at_ms[i] (tick first, its events not listed) before datagram i is heard.
+    const listener = new Listener(manifest, {
+      warmup: false,
+      ephemeral: true,
+      ...(s.per_key_quota !== undefined
+        ? { perKeyQuota: s.per_key_quota }
+        : {}),
+      ...(s.per_key_mark_quota !== undefined
+        ? { perKeyMarkQuota: s.per_key_mark_quota }
+        : {}),
+    });
     const out: string[] = [];
-    for (const d of s.datagrams_hex) {
-      for (const ev of listener.hear(bytes(d), s.now_ms)) {
+    s.datagrams_hex.forEach((d, i) => {
+      const at = s.at_ms?.[i] ?? s.now_ms;
+      if (s.at_ms) listener.tick(at);
+      for (const ev of listener.hear(bytes(d), at)) {
         if (ev.event === "presence") continue;
         out.push(
           ev.event === "evidence"
@@ -77,7 +92,7 @@ for (const s of vectors.sequences) {
             : ev.event,
         );
       }
-    }
+    });
     assert.deepEqual(out, s.expect);
   });
 }

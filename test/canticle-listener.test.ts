@@ -130,8 +130,13 @@ test("dedup over-quota refuses new tuples, and the refusal moves no state", () =
   assert.equal(l.dedup.size, 2);
 });
 
-test("hwm counts against the per-key budget once dedup slots free (#60 item 3)", () => {
-  const l = listener(6); // quota 2
+test("supersession marks have their own per-key limit, apart from dedup (#60 item 3)", () => {
+  const l = new Listener(manifest, {
+    ephemeral: true,
+    warmup: false,
+    perKeyQuota: 2,
+    perKeyMarkQuota: 2,
+  });
   const live = (seq: number, sk: string, at: number) =>
     l.hear(
       item({
@@ -146,11 +151,12 @@ test("hwm counts against the per-key budget once dedup slots free (#60 item 3)",
     );
   assert.deepEqual(kinds(live(1, "a", T0)), ["item"]);
   assert.deepEqual(kinds(live(2, "b", T0)), ["item"]);
-  const later = T0 + 60_000 + SKEW_MS + 2_000; // dedup slots purged, hwm kept for the class max TTL
+  const later = T0 + 60_000 + SKEW_MS + 2_000; // dedup slots purged, marks kept for the class max TTL
   l.tick(later);
   assert.equal(l.dedup.size, 0);
   assert.equal(l.hwm.size, 2);
   assert.deepEqual(kinds(live(3, "c", later)), ["evidence:over-quota"]);
+  assert.equal(l.dedup.size, 0, "a mark refusal takes no dedup slot");
   assert.deepEqual(
     kinds(live(4, "a", later)),
     ["item"],
@@ -158,14 +164,57 @@ test("hwm counts against the per-key budget once dedup slots free (#60 item 3)",
   );
 });
 
-test("lastStreamItem only tracks named streams (#60 item 1)", () => {
-  const l = listener();
+test("the default mark limit lets an honest key churn state_keys within its share", () => {
+  // quota 2; live-state factor ⌈((180 + 900) s + 5 s) / 180 s⌉ = 7, so 14 marks
+  const l = new Listener(manifest, {
+    ephemeral: true,
+    warmup: false,
+    perKeyQuota: 2,
+  });
+  let at = T0;
+  for (let i = 0; i < 14; i++) {
+    const out = kinds(
+      l.hear(
+        item({
+          seq: i + 1,
+          cls: 3,
+          stateKey: `k${i}`,
+          stream: THREAT,
+          issued: at,
+          ttlMs: 60_000,
+        }),
+        at,
+      ),
+    );
+    assert.deepEqual(out, ["item"], `state_key k${i}`);
+    at += 70_000; // past the previous dedup slot
+    l.tick(at);
+  }
+});
+
+test("a mark's horizon never shrinks when a shorter-lived newer value arrives", () => {
+  const l = new Listener(manifest, { ephemeral: true, warmup: false });
+  const hkey = `${kid.toString("hex")}:${THREAT}:s`;
+  const live = (seq: number, issued: number, ttlMs: number) =>
+    l.hear(
+      item({ seq, cls: 3, stateKey: "s", stream: THREAT, issued, ttlMs }),
+      issued,
+    );
+  live(1, T0, 600_000);
+  const before = l.hwm.get(hkey)!.retain;
+  live(2, T0 + 1_000, 10_000);
+  assert.ok(l.hwm.get(hkey)!.retain >= before);
+});
+
+test("stream hearing times are capped at the key's share (#60 item 1)", () => {
+  const l = new Listener(manifest, {
+    ephemeral: true,
+    warmup: false,
+    perKeyQuota: 10,
+  });
   for (let i = 0; i < 50; i++)
     l.hear(item({ seq: i + 1, stream: 1000 + i }), T0);
-  const st = l.stations.get(kid.toString("hex"))!;
-  assert.equal(st.lastStreamItem.size, 0);
-  l.hear(item({ seq: 100 }), T0);
-  assert.equal(st.lastStreamItem.size, 1);
+  assert.equal(l.stations.get(kid.toString("hex"))!.lastStreamItem.size, 10);
 });
 
 test("beacon loop maps are capped and reset on epoch advance (#60 item 2)", () => {
@@ -184,10 +233,12 @@ test("beacon loop maps are capped and reset on epoch advance (#60 item 2)", () =
     l.hear(beacon(1, b, entries), T0 + b);
   }
   const st = l.stations.get(kid.toString("hex"))!;
-  assert.ok(
-    st.streamLoops.size <= 256 && st.streamLoopMax.size <= 256,
-    `${st.streamLoops.size}`,
+  assert.equal(
+    st.streamLoops.size,
+    32,
+    "one advertised catalog: the latest page 0 of 1",
   );
+  assert.equal(st.streamLoopMax.size, 32);
   l.hear(
     beacon(2, 1, [[CHATTER, 1, 1, 10_000, 10_000, 60, 300, 4_000]]),
     T0 + 100,
@@ -364,4 +415,34 @@ test("restart: a snapshot from another version is refused", () => {
       }),
     /unsupported version/,
   );
+});
+
+test("restart: the §9.7 PLUCK check survives (state v2 keeps expires_at and scope)", () => {
+  const l = new Listener(manifest, { warmup: false, restore: null });
+  l.hear(item({ seq: 1 }), T0); // expires T0 + 60 s, scope lan
+  const r = restarted(l);
+  const wrong = frame(KIND_PLUCK, {
+    1: 1,
+    2: CHATTER,
+    3: 2,
+    4: T0,
+    5: T0 + 30_000,
+    13: 1,
+    20: 1,
+  });
+  assert.deepEqual(kinds(r.hear(wrong, T0 + 1_000)), [
+    "evidence:pluck-mismatch",
+  ]);
+});
+
+test("restart: a v1 snapshot (no PLUCK metadata) still loads", () => {
+  const v1 = {
+    version: 1,
+    epochs: {},
+    dedup: [["x:1:1:1", "00", T0 + 60_000]],
+    stickyPluck: [],
+    hwm: [],
+  };
+  const r = new Listener(manifest, { warmup: false, restore: v1 as never });
+  assert.equal(r.dedup.size, 1);
 });

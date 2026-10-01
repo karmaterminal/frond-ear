@@ -1,21 +1,21 @@
 // A listener: verify, dedup, pluck, supersede and track presence (RFC-0001 §7.4–§7.8, §8).
-// A port of the spike's `canticle/listener.py`.
+// A port of the spike's `canticle/listener.py` at binary-canticle `a15fb9f0d2` (#62),
+// which bounds every per-key structure (#60).
 //
 // It surfaces events (a new item, a withdrawal, a supersession, an expiry, a
 // presence change, evidence) and never actuates anything. Landing into a
 // session (§14) is the ear's job, not this module's.
 //
 // Restart safety: the state that must survive a restart (epoch maxima, dedup
-// digests, sticky PLUCKs, supersession high-water marks; §5.2, §7.4, §7.7, §7.8)
-// round-trips through `snapshot()` / `restore`. The caller persists it whenever
-// `dirty` is set. An item accepted before a restart is surfaced once more after
-// it, through the same checks, the first time it's heard again (as the spike does).
+// digests with each ITEM's (expires_at, scope), sticky PLUCKs, supersession
+// marks; §5.2, §7.4, §7.7, §7.8) round-trips through `snapshot()` / `restore`.
+// The caller persists it whenever `dirty` is set. An item accepted before a
+// restart is surfaced once more, through the same checks, when next heard.
 //
-// Bounded state (binary-canticle#60, fixed here ahead of the spike): every
-// per-key structure counts against the same per-key budget as dedup; stream
-// bookkeeping only tracks manifest- or beacon-named streams; beacon loop maps
-// are capped and reset on epoch advance; refusals happen before any state
-// changes; PLUCK expiry is clamped (wire.ts).
+// Bounds (§7.4, #60): dedup entries have a per-key share; supersession marks
+// have their own per-key limit (they outlive dedup entries); stream hearing
+// times are capped at the share; beacon maps hold one advertised catalog.
+// Refusals never change state, and the epoch is adopted only on admission.
 
 import { createHash } from "node:crypto";
 
@@ -38,12 +38,11 @@ import {
   parse,
   type Frame,
   type Item,
+  type StreamEntry,
 } from "./wire.ts";
 
 export const SKEW_MS = 5_000;
 const OFFSET_SAMPLES = 16;
-const MAX_ADVERTISED_STREAMS = 8 * 32;
-const PURGE_INTERVAL_MS = 1_000;
 const LIVE_STATE = CLASS_BY_NAME.get("live-state")!.code;
 
 export type EventKind =
@@ -81,16 +80,20 @@ interface StationState {
   periodMs: number;
   signedOff: boolean;
   offsets: number[];
-  /** stream_id → advertised loop_ms. */
+  /** stream_id → advertised loop_ms (rebuilt from `catalogPages`). */
   streamLoops: Map<number, number>;
-  /** stream_id → last time a copy was heard. */
+  /** stream_id → last admitted copy, oldest first; capped at the key's share (#60). */
   lastStreamItem: Map<number, number>;
   /** Nothing reported yet. */
   presence: string;
   /** First beacon heard since this listener started (warm-up, §7.8). */
   firstBeaconAt: number | undefined;
-  /** stream_id → advertised loop_max_ms. */
+  /** stream_id → advertised loop_max_ms (rebuilt from `catalogPages`). */
   streamLoopMax: Map<number, number>;
+  /** stream_id → latest beacon entry (rebuilt from `catalogPages`). */
+  streamEntries: Map<number, StreamEntry>;
+  /** page index → (bseq heard at, that page's entries): one catalog, at most 8 pages (§8.4). */
+  catalogPages: Map<number, { bseq: bigint; streams: StreamEntry[] }>;
 }
 
 function newStation(): StationState {
@@ -107,6 +110,8 @@ function newStation(): StationState {
     presence: "",
     firstBeaconAt: undefined,
     streamLoopMax: new Map(),
+    streamEntries: new Map(),
+    catalogPages: new Map(),
   };
 }
 
@@ -123,6 +128,8 @@ function identKey(
   return `${kid}:${epoch}:${stream}:${seq}`;
 }
 
+const kidOf = (key: string) => key.slice(0, key.indexOf(":"));
+
 /** (issued_at, epoch, seq) ordering for supersession (§7.7). */
 type Order = [number, number, bigint];
 
@@ -130,6 +137,66 @@ function compareOrder(a: Order, b: Order): number {
   if (a[0] !== b[0]) return a[0] < b[0] ? -1 : 1;
   if (a[1] !== b[1]) return a[1] < b[1] ? -1 : 1;
   return a[2] === b[2] ? 0 : a[2] < b[2] ? -1 : 1;
+}
+
+/**
+ * Min-heap of (time, key) over one table whose entries expire. Purging pops
+ * only what is due rather than scanning the table. Deletion is lazy: the
+ * table is the truth, and a popped entry whose row has gone or moved later
+ * is skipped.
+ */
+class Expiries {
+  #heap: Array<[number, string]> = [];
+
+  push(t: number, key: string): void {
+    const h = this.#heap;
+    h.push([t, key]);
+    let i = h.length - 1;
+    while (i > 0) {
+      const p = (i - 1) >> 1;
+      if (h[p]![0] <= h[i]![0]) break;
+      [h[p], h[i]] = [h[i]!, h[p]!];
+      i = p;
+    }
+  }
+
+  *due(nowMs: number): Generator<string> {
+    const h = this.#heap;
+    while (h.length > 0 && h[0]![0] <= nowMs) {
+      const top = h[0]!;
+      const last = h.pop()!;
+      if (h.length > 0) {
+        h[0] = last;
+        let i = 0;
+        for (;;) {
+          const l = 2 * i + 1;
+          const r = l + 1;
+          let m = i;
+          if (l < h.length && h[l]![0] < h[m]![0]) m = l;
+          if (r < h.length && h[r]![0] < h[m]![0]) m = r;
+          if (m === i) break;
+          [h[m], h[i]] = [h[i]!, h[m]!];
+          i = m;
+        }
+      }
+      yield top[1];
+    }
+  }
+
+  /** Rebuild from the live rows once stale entries outnumber them. */
+  compact(live: number, rows: () => Iterable<[number, string]>): void {
+    if (this.#heap.length > 2 * live + 1024) {
+      this.#heap = [];
+      for (const [t, k] of rows()) this.push(t, k);
+    }
+  }
+}
+
+interface DedupEntry {
+  digest: string;
+  retain: number;
+  /** An ITEM's (expires_at, scope), which a later PLUCK must match (§9.7). */
+  meta: [number, number] | undefined;
 }
 
 interface Held {
@@ -143,6 +210,10 @@ export interface ListenerOptions {
   /** Stream names to surface; undefined = every named stream. */
   tuned?: ReadonlySet<string>;
   dedupCapacity?: number;
+  /** Fixed per-key dedup share; default an equal share of `dedupCapacity`. */
+  perKeyQuota?: number;
+  /** Fixed per-key mark limit; default derived from the key's granted classes. */
+  perKeyMarkQuota?: number;
   /** Where frames reach this listener (§4.3, §10.9). */
   binding?: string;
   /** Hold live-state keys until warm-up completes (§7.8 rule 4). */
@@ -156,15 +227,19 @@ export interface ListenerOptions {
   ephemeral?: true;
 }
 
-export const SAFETY_STATE_VERSION = 1;
+/** 2: dedup rows carry the ITEM's (expires_at, scope) for the §9.7 PLUCK check. 1 still loads. */
+export const SAFETY_STATE_VERSION = 2;
 
 /** The state that must survive a restart, as JSON (bigints as decimal strings). */
 export interface SafetyState {
   version: number;
   /** key-id → [epoch high-water mark, when it was first seen]. */
   epochs: Record<string, [number, number]>;
-  /** [identity, sha256(frame) hex, retain_until]. */
-  dedup: Array<[string, string, number]>;
+  /** [identity, sha256(frame) hex, retain_until, expires_at | null, scope | null]; v1 rows stop at retain. */
+  dedup: Array<
+    | [string, string, number]
+    | [string, string, number, number | null, number | null]
+  >;
   /** [target identity, retain_until]. */
   stickyPluck: Array<[string, number]>;
   /** [hkey, issued_at, epoch, seq, retain_until]. */
@@ -175,23 +250,27 @@ export class Listener {
   readonly manifest: Manifest;
   readonly tuned: ReadonlySet<string> | undefined;
   readonly dedupCapacity: number;
+  readonly perKeyQuota: number | undefined;
+  readonly perKeyMarkQuota: number | undefined;
   readonly binding: string;
   readonly warmup: boolean;
-  readonly dedup = new Map<string, { digest: string; retain: number }>();
+  readonly dedup = new Map<string, DedupEntry>();
   readonly dedupPerKey = new Map<string, number>();
   readonly stickyPluck = new Map<string, number>();
-  /** `${kid}:${stream}:${stateKey}` → order + retain_until. */
+  /** `${kid}:${stream}:${stateKey}` → order + horizon. */
   readonly hwm = new Map<string, { order: Order; retain: number }>();
   readonly hwmPerKey = new Map<string, number>();
-  #lastPurge = Number.NEGATIVE_INFINITY;
-  /** Identities loaded from a snapshot that this process hasn't surfaced yet. */
-  readonly #restored = new Set<string>();
-  #dirty = false;
+  readonly #dedupDue = new Expiries();
+  readonly #stickyDue = new Expiries();
+  readonly #hwmDue = new Expiries();
   /** identity → heard item (on air, from this listener's view). */
   readonly current = new Map<string, Heard>();
   readonly stations = new Map<string, StationState>();
   readonly held = new Map<string, Held>();
   readonly evidenceCounts = new Map<string, number>();
+  /** Identities loaded from a snapshot that this process hasn't surfaced yet. */
+  readonly #restored = new Set<string>();
+  #dirty = false;
 
   constructor(manifest: Manifest, options: ListenerOptions) {
     if (options.ephemeral !== true && options.restore === undefined) {
@@ -200,11 +279,14 @@ export class Listener {
       );
     }
     const binding = options.binding ?? "lan";
-    if (!SCOPES.has(binding))
+    if (!SCOPES.has(binding)) {
       throw new Error(`unknown binding ${JSON.stringify(binding)}`);
+    }
     this.manifest = manifest;
     this.tuned = options.tuned;
     this.dedupCapacity = options.dedupCapacity ?? 100_000;
+    this.perKeyQuota = options.perKeyQuota;
+    this.perKeyMarkQuota = options.perKeyMarkQuota;
     this.binding = binding;
     this.warmup = options.warmup ?? true;
     if (options.restore) this.#load(options.restore);
@@ -229,7 +311,13 @@ export class Listener {
     return {
       version: SAFETY_STATE_VERSION,
       epochs,
-      dedup: [...this.dedup].map(([ident, v]) => [ident, v.digest, v.retain]),
+      dedup: [...this.dedup].map(([ident, v]) => [
+        ident,
+        v.digest,
+        v.retain,
+        v.meta?.[0] ?? null,
+        v.meta?.[1] ?? null,
+      ]),
       stickyPluck: [...this.stickyPluck],
       hwm: [...this.hwm].map(([hkey, v]) => [
         hkey,
@@ -242,7 +330,7 @@ export class Listener {
   }
 
   #load(state: SafetyState): void {
-    if (state.version !== SAFETY_STATE_VERSION) {
+    if (state.version !== 1 && state.version !== SAFETY_STATE_VERSION) {
       throw new Error(
         `listener state: unsupported version ${String(state.version)}`,
       );
@@ -252,17 +340,27 @@ export class Listener {
       st.epochHwm = epoch;
       st.epochSeenAt = seenAt;
     }
-    for (const [ident, digest, retain] of state.dedup) {
-      const kid = ident.slice(0, ident.indexOf(":"));
-      this.dedup.set(ident, { digest, retain });
+    for (const row of state.dedup) {
+      const [ident, digest, retain] = row;
+      // v1 rows carry no (expires_at, scope): those targets skip the §9.7 PLUCK check.
+      const meta: [number, number] | undefined =
+        row.length >= 5 && row[3] != null && row[4] != null
+          ? [row[3], row[4]]
+          : undefined;
+      this.dedup.set(ident, { digest, retain, meta });
+      const kid = kidOf(ident);
       this.dedupPerKey.set(kid, (this.dedupPerKey.get(kid) ?? 0) + 1);
+      this.#dedupDue.push(retain, ident);
       this.#restored.add(ident);
     }
-    for (const [ident, retain] of state.stickyPluck)
+    for (const [ident, retain] of state.stickyPluck) {
       this.stickyPluck.set(ident, retain);
+      this.#stickyDue.push(retain, ident);
+    }
     for (const [hkey, issuedAt, epoch, seq, retain] of state.hwm) {
-      const kid = hkey.slice(0, hkey.indexOf(":"));
       this.hwm.set(hkey, { order: [issuedAt, epoch, BigInt(seq)], retain });
+      this.#hwmDue.push(retain, hkey);
+      const kid = kidOf(hkey);
       this.hwmPerKey.set(kid, (this.hwmPerKey.get(kid) ?? 0) + 1);
     }
   }
@@ -341,6 +439,7 @@ export class Listener {
     epoch: number,
     nowMs: number,
     events: ListenerEvent[],
+    advance = true,
   ): boolean {
     const st = this.#st(kid);
     if (epoch < st.epochHwm) {
@@ -349,15 +448,18 @@ export class Listener {
       );
       return false;
     }
-    if (epoch > st.epochHwm) {
+    if (advance && epoch > st.epochHwm) {
       st.epochHwm = epoch;
-      this.#dirty = true;
       st.epochSeenAt = nowMs;
-      // bseq and the advertised loops belong to the previous epoch (§9.8): a restarted
-      // station counts beacons from 1 again and may loop different streams.
+      this.#dirty = true;
+      // bseq, the advertised catalog and the per-stream hearing times belong to the previous
+      // epoch (§9.8): a restarted station counts beacons from 1 again and may loop different streams.
       st.bseq = 0n;
+      st.catalogPages.clear();
       st.streamLoops.clear();
       st.streamLoopMax.clear();
+      st.streamEntries.clear();
+      st.lastStreamItem.clear();
     }
     return true;
   }
@@ -385,15 +487,27 @@ export class Listener {
     st.signedOff = b.nextBeaconMs === 0;
     st.periodMs = b.nextBeaconMs || st.periodMs;
     st.firstBeaconAt ??= nowMs;
-    for (const e of b.streams) {
-      st.streamLoops.set(e.streamId, e.loopMs);
-      st.streamLoopMax.set(e.streamId, e.loopMaxMs);
+    // A beacon carries one page of the station's catalog (§8.4): it replaces that page and drops
+    // pages past the advertised count. Rebuilding the stream maps from the pages bounds them by
+    // what one catalog can advertise, however many beacons (or stream ids) a key sends (#60).
+    const [index, count] = b.page ?? [0, 1];
+    for (const p of [...st.catalogPages.keys()]) {
+      if (p >= count) st.catalogPages.delete(p);
     }
-    // Bounded: a beacon has at most 8 pages of 32 entries (§9.8); keep the newest.
-    for (const m of [st.streamLoops, st.streamLoopMax]) {
-      for (const k of m.keys()) {
-        if (m.size <= MAX_ADVERTISED_STREAMS) break;
-        m.delete(k);
+    st.catalogPages.set(index, { bseq: b.bseq, streams: b.streams });
+    st.streamLoops.clear();
+    st.streamLoopMax.clear();
+    st.streamEntries.clear();
+    // bseq order, so the newest copy wins: §8.4 lets a changed stream ride the next beacon, whatever
+    // its page. bseq only rises within an epoch, and an epoch advance clears the pages.
+    const pages = [...st.catalogPages.values()].sort((x, y) =>
+      x.bseq < y.bseq ? -1 : x.bseq > y.bseq ? 1 : 0,
+    );
+    for (const page of pages) {
+      for (const e of page.streams) {
+        st.streamLoops.set(e.streamId, e.loopMs);
+        st.streamLoopMax.set(e.streamId, e.loopMaxMs);
+        st.streamEntries.set(e.streamId, e);
       }
     }
     events.push(...this.#presence(kid, nowMs));
@@ -461,24 +575,15 @@ export class Listener {
         return events;
       }
     }
+    // Regression is checked now; a higher epoch is adopted only once the frame is admitted, so an
+    // over-quota or mismatched frame cannot advance it (§10.9: refusals are state-neutral).
+    if (!this.#epochOk(kid, body.epoch, nowMs, events, false)) return events;
     const ident = identKey(kid, body.epoch, body.stream, body.seq);
     const digest = createHash("sha256").update(f.raw).digest("hex");
     const seen = this.dedup.get(ident);
     const st = this.#st(kid);
-    // Every refusal below happens before any state changes (§10.9): epoch, dedup,
-    // presence and high-water marks only move once the frame is admitted.
-    if (body.epoch < st.epochHwm) {
-      events.push(
-        this.#evidence(
-          "epoch-regression",
-          kid,
-          `${body.epoch} < ${st.epochHwm}`,
-        ),
-      );
-      return events;
-    }
     let resurface = false;
-    let retain = 0;
+    let retain: number;
     if (seen !== undefined) {
       if (seen.digest !== digest) {
         events.push(
@@ -496,15 +601,43 @@ export class Listener {
         h.copies += 1;
         h.lastHeard = nowMs;
       }
-      this.#heardOn(st, entry.streamNames, body.stream, nowMs);
-      if (!this.#restored.has(ident)) return events; // a repeat is a benign no-op (§7.4)
-      // Accepted before a restart: its dedup, pluck and supersession state was kept, but
-      // this process hasn't surfaced it yet. Surface it once, through the same checks.
+      if (!this.#restored.has(ident)) {
+        this.#heardOn(st, body.stream, nowMs);
+        return events; // a repeat is a benign no-op (§7.4)
+      }
+      // Accepted before a restart: its dedup, pluck and supersession state was kept, but this
+      // process hasn't surfaced it yet. Surface it once, through the same checks.
+      if (this.#needsMark(f) && !this.#markRoom(kid, nowMs)) {
+        events.push(this.#markRefusal(kid, at));
+        return events;
+      }
+      this.#heardOn(st, body.stream, nowMs);
       this.#restored.delete(ident);
       resurface = true;
       retain = seen.retain;
-    }
-    if (!resurface) {
+    } else {
+      if (f.kind === KIND_PLUCK) {
+        // §9.7: a PLUCK carries its target's expires_at and scope. Checkable while the target's
+        // dedup entry is held; a PLUCK for a target never heard is still recorded (§7.7).
+        const p = f.body;
+        const target = this.dedup.get(
+          identKey(kid, p.epoch, p.stream, p.targetSeq),
+        );
+        if (
+          target?.meta !== undefined &&
+          (target.meta[0] !== p.expiresAt || target.meta[1] !== p.scope)
+        ) {
+          events.push(
+            this.#evidence(
+              "pluck-mismatch",
+              kid,
+              "expires_at or scope differs from the target's (§9.7)",
+              at,
+            ),
+          );
+          return events;
+        }
+      }
       if (!this.#roomFor(kid, nowMs)) {
         events.push(
           this.#evidence(
@@ -516,35 +649,27 @@ export class Listener {
         );
         return events;
       }
-      if (
-        f.kind === KIND_ITEM &&
-        f.body.stateKey !== undefined &&
-        !this.#hwmRoomFor(
-          kid,
-          `${kid}:${f.body.stream}:${f.body.stateKey}`,
-          nowMs,
-        )
-      ) {
-        events.push(
-          this.#evidence(
-            "over-quota",
-            kid,
-            "per-key state_key quota full; live entries kept",
-            at,
-          ),
-        );
+      if (this.#needsMark(f) && !this.#markRoom(kid, nowMs)) {
+        events.push(this.#markRefusal(kid, at));
         return events;
       }
-      this.#epochOk(kid, body.epoch, nowMs, events); // admitted: cannot regress here
-      this.#heardOn(st, entry.streamNames, body.stream, nowMs);
+      this.#epochOk(kid, body.epoch, nowMs, events);
       retain = localExpiryMs(f, offsetMs(st), nowMs) + SKEW_MS;
-      this.#remember(ident, kid, digest, retain);
+      this.#remember(
+        ident,
+        kid,
+        digest,
+        retain,
+        f.kind === KIND_ITEM ? [f.body.expiresAt, f.body.scope] : undefined,
+      );
+      this.#heardOn(st, body.stream, nowMs);
     }
     if (f.kind === KIND_PLUCK) {
       if (resurface) return events; // its sticky mark was kept across the restart
       const p = f.body;
       const target = identKey(kid, p.epoch, p.stream, p.targetSeq);
       this.stickyPluck.set(target, retain);
+      this.#stickyDue.push(retain, target);
       this.#dirty = true;
       for (const [k, h] of this.held) {
         if (h.ident === target) this.held.delete(k);
@@ -562,13 +687,16 @@ export class Listener {
       return events;
     }
     const it = f.body;
-    if (this.stickyPluck.has(ident)) {
+    // A keyed item that arrives after its own PLUCK still superseded what came before it at the
+    // station (§7.8, whatever the arrival order), so it moves the mark before it is dropped.
+    const spec = CLASSES.get(it.cls);
+    const plucked = this.stickyPluck.has(ident);
+    if (plucked && (it.stateKey === undefined || spec === undefined)) {
       events.push(
         this.#evidence("plucked", kid, "item arrived after its pluck", at),
       );
       return events;
     }
-    const spec = CLASSES.get(it.cls);
     if (spec === undefined) {
       events.push(this.#evidence("unknown-class", kid, String(it.cls), at));
       return events; // ringbuffer_only: kept for dedup, never surfaced (§6.2)
@@ -576,21 +704,44 @@ export class Listener {
     if (it.stateKey !== undefined) {
       const hkey = `${kid}:${it.stream}:${it.stateKey}`;
       const order: Order = [it.issuedAt, it.epoch, it.seq];
-      const prev = this.hwm.get(hkey);
+      let prev = this.hwm.get(hkey);
+      // A mark must outlive every older item for its key (§7.8). Its horizon is the latest
+      // (local expiry + skew + class max TTL) over the items admitted for the key while it is
+      // held, so it never goes down: a newer value of a shorter-lived class must not shorten it.
+      // A mark whose horizon has passed is dropped first, as tick() would, so the outcome
+      // doesn't depend on tick cadence.
+      if (prev !== undefined && prev.retain <= nowMs) {
+        this.hwm.delete(hkey);
+        this.hwmPerKey.set(kid, (this.hwmPerKey.get(kid) ?? 1) - 1);
+        this.#dirty = true;
+        prev = undefined;
+      }
       // Equal order is only possible for the same identity, i.e. a re-surface after a restart.
       const cmp = prev === undefined ? 1 : compareOrder(order, prev.order);
       if (cmp < 0 || (cmp === 0 && !resurface)) {
         events.push(
-          this.#evidence(
-            "superseded",
-            kid,
-            "older than the high-water mark",
-            at,
-          ),
+          plucked
+            ? this.#evidence("plucked", kid, "item arrived after its pluck", at)
+            : this.#evidence(
+                "superseded",
+                kid,
+                "older than the high-water mark",
+                at,
+              ),
         );
         return events;
       }
-      if (cmp > 0) this.#setHwm(kid, hkey, order, retain + spec.maxTtlS * 1000);
+      if (cmp > 0) {
+        let until = retain + spec.maxTtlS * 1000;
+        if (prev === undefined) {
+          this.hwmPerKey.set(kid, (this.hwmPerKey.get(kid) ?? 0) + 1);
+        } else {
+          until = Math.max(until, prev.retain);
+        }
+        this.hwm.set(hkey, { order, retain: until });
+        this.#hwmDue.push(until, hkey);
+        this.#dirty = true;
+      }
       for (const [otherIdent, h] of this.current) {
         if (
           h.kid === kid &&
@@ -608,6 +759,12 @@ export class Listener {
           });
         }
       }
+    }
+    if (plucked) {
+      events.push(
+        this.#evidence("plucked", kid, "item arrived after its pluck", at),
+      );
+      return events;
     }
     if (
       sname === undefined ||
@@ -683,8 +840,11 @@ export class Listener {
     return d;
   }
 
-  /** Per-key share of the dedup store (§7.4). A key that floods only fills its own share. */
+  // ------------------------------------------------------------ bounds (§7.4, #60)
+
+  /** Per-key share of the dedup store. A key that floods only fills its own share. */
   #quota(): number {
+    if (this.perKeyQuota !== undefined) return Math.max(1, this.perKeyQuota);
     return Math.max(
       1,
       Math.floor(this.dedupCapacity / Math.max(1, this.manifest.size)),
@@ -695,6 +855,73 @@ export class Listener {
     if ((this.dedupPerKey.get(kid) ?? 0) < this.#quota()) return true;
     this.#purgeDedup(nowMs);
     return (this.dedupPerKey.get(kid) ?? 0) < this.#quota();
+  }
+
+  /** Would admitting this frame add a supersession mark? (the conditions of the mark step) */
+  #needsMark(f: Exclude<Frame, { kind: typeof KIND_BEACON }>): boolean {
+    if (f.kind !== KIND_ITEM) return false;
+    const it = f.body;
+    return (
+      it.stateKey !== undefined &&
+      CLASSES.has(it.cls) &&
+      !this.hwm.has(`${hex(f.keyId)}:${it.stream}:${it.stateKey}`)
+    );
+  }
+
+  /**
+   * Per-key limit on supersession marks, counted apart from dedup entries. A dedup
+   * entry lasts about one TTL; a mark lasts that TTL + skew + the class max TTL
+   * (§7.8). So the limit is the dedup share scaled by the largest
+   * ⌈(default TTL + max TTL + skew) / default TTL⌉ among the key's granted classes.
+   */
+  #markQuota(kid: string): number {
+    if (this.perKeyMarkQuota !== undefined) {
+      return Math.max(1, this.perKeyMarkQuota);
+    }
+    const entry = this.manifest.entry(Buffer.from(kid, "hex"));
+    const granted = [...(entry?.classes ?? [])]
+      .map((c) => CLASSES.get(c))
+      .filter((c) => c !== undefined);
+    const specs = granted.length > 0 ? granted : [...CLASSES.values()];
+    const factor = Math.max(
+      ...specs.map((c) =>
+        Math.ceil(
+          ((c.defaultTtlS + c.maxTtlS) * 1000 + SKEW_MS) /
+            (c.defaultTtlS * 1000),
+        ),
+      ),
+    );
+    return this.#quota() * factor;
+  }
+
+  /** Checked at admission and never met by evicting a live mark (§7.4). */
+  #markRoom(kid: string, nowMs: number): boolean {
+    if ((this.hwmPerKey.get(kid) ?? 0) < this.#markQuota(kid)) return true;
+    this.#purgeHwm(nowMs);
+    return (this.hwmPerKey.get(kid) ?? 0) < this.#markQuota(kid);
+  }
+
+  #markRefusal(kid: string, at: Record<string, unknown>): ListenerEvent {
+    return this.#evidence(
+      "over-quota",
+      kid,
+      "per-key supersession mark limit full; live marks kept",
+      at,
+    );
+  }
+
+  /**
+   * Note an admitted copy on a stream, for presence (§8.6). Capped at the key's
+   * share, oldest dropped first: presence only asks whether some stream was
+   * heard within its loops.
+   */
+  #heardOn(st: StationState, stream: number, nowMs: number): void {
+    st.lastStreamItem.delete(stream);
+    st.lastStreamItem.set(stream, nowMs);
+    for (const k of st.lastStreamItem.keys()) {
+      if (st.lastStreamItem.size <= this.#quota()) break;
+      st.lastStreamItem.delete(k);
+    }
   }
 
   /**
@@ -749,66 +976,62 @@ export class Listener {
     return events;
   }
 
-  /** Note a copy heard on a stream, but only for streams the manifest or a beacon names (bounded). */
-  #heardOn(
-    st: StationState,
-    named: ReadonlyMap<number, string>,
-    stream: number,
-    nowMs: number,
+  #remember(
+    ident: string,
+    kid: string,
+    digest: string,
+    retain: number,
+    meta: [number, number] | undefined,
   ): void {
-    if (named.has(stream) || st.streamLoops.has(stream)) {
-      st.lastStreamItem.set(stream, nowMs);
-    }
-  }
-
-  /** Room for one more supersession high-water mark for this key (same per-key budget as dedup). */
-  #hwmRoomFor(kid: string, hkey: string, nowMs: number): boolean {
-    if (this.hwm.has(hkey)) return true;
-    if ((this.hwmPerKey.get(kid) ?? 0) < this.#quota()) return true;
-    this.#purgeHwm(nowMs);
-    return (this.hwmPerKey.get(kid) ?? 0) < this.#quota();
-  }
-
-  #setHwm(kid: string, hkey: string, order: Order, retain: number): void {
-    if (!this.hwm.has(hkey)) {
-      this.hwmPerKey.set(kid, (this.hwmPerKey.get(kid) ?? 0) + 1);
-    }
-    this.hwm.set(hkey, { order, retain });
+    // Live entries are never evicted: they hold the equivocation evidence (§10.8) and stop a
+    // repeat from counting as new. New tuples are refused per key instead (#roomFor).
+    this.dedup.set(ident, { digest, retain, meta });
+    this.dedupPerKey.set(kid, (this.dedupPerKey.get(kid) ?? 0) + 1);
+    this.#dedupDue.push(retain, ident);
     this.#dirty = true;
+  }
+
+  #purgeDedup(nowMs: number): void {
+    for (const k of this.#dedupDue.due(nowMs)) {
+      const v = this.dedup.get(k);
+      if (v !== undefined && v.retain <= nowMs) {
+        this.dedup.delete(k);
+        const kid = kidOf(k);
+        this.dedupPerKey.set(kid, (this.dedupPerKey.get(kid) ?? 1) - 1);
+        this.#restored.delete(k);
+        this.#dirty = true;
+      }
+    }
+    // A sticky-pluck mark has its PLUCK's retention (§7.7): purging them together keeps the
+    // marks within the dedup quota between ticks too.
+    for (const k of this.#stickyDue.due(nowMs)) {
+      const v = this.stickyPluck.get(k);
+      if (v !== undefined && v <= nowMs) {
+        this.stickyPluck.delete(k);
+        this.#dirty = true;
+      }
+    }
+    this.#dedupDue.compact(this.dedup.size, () =>
+      [...this.dedup].map(([k, v]): [number, string] => [v.retain, k]),
+    );
+    this.#stickyDue.compact(this.stickyPluck.size, () =>
+      [...this.stickyPluck].map(([k, v]): [number, string] => [v, k]),
+    );
   }
 
   #purgeHwm(nowMs: number): void {
-    for (const [k, v] of this.hwm) {
-      if (v.retain <= nowMs) {
+    for (const k of this.#hwmDue.due(nowMs)) {
+      const v = this.hwm.get(k);
+      if (v !== undefined && v.retain <= nowMs) {
         this.hwm.delete(k);
-        this.#dirty = true;
-        const kid = k.slice(0, k.indexOf(":"));
+        const kid = kidOf(k);
         this.hwmPerKey.set(kid, (this.hwmPerKey.get(kid) ?? 1) - 1);
-      }
-    }
-  }
-
-  #remember(ident: string, kid: string, digest: string, retain: number): void {
-    // Live entries are never evicted: they hold the equivocation evidence (§10.8) and stop a
-    // repeat from counting as new. New tuples are refused per key instead (#roomFor).
-    this.dedup.set(ident, { digest, retain });
-    this.#dirty = true;
-    this.dedupPerKey.set(kid, (this.dedupPerKey.get(kid) ?? 0) + 1);
-  }
-
-  #purgeDedup(nowMs: number, force = false): void {
-    // A full scan; at quota a flood would otherwise pay it on every frame.
-    if (!force && nowMs - this.#lastPurge < PURGE_INTERVAL_MS) return;
-    this.#lastPurge = nowMs;
-    for (const [k, v] of this.dedup) {
-      if (v.retain <= nowMs) {
-        this.dedup.delete(k);
-        this.#restored.delete(k);
         this.#dirty = true;
-        const kid = k.slice(0, k.indexOf(":"));
-        this.dedupPerKey.set(kid, (this.dedupPerKey.get(kid) ?? 1) - 1);
       }
     }
+    this.#hwmDue.compact(this.hwm.size, () =>
+      [...this.hwm].map(([k, v]): [number, string] => [v.retain, k]),
+    );
   }
 
   // ------------------------------------------------------------ time
@@ -828,16 +1051,12 @@ export class Listener {
         });
       }
     }
-    this.#purgeDedup(nowMs, true);
-    for (const [k, v] of this.stickyPluck)
-      if (v <= nowMs) {
-        this.stickyPluck.delete(k);
-        this.#dirty = true;
-      }
+    this.#purgeDedup(nowMs);
     this.#purgeHwm(nowMs);
     events.push(...this.#releaseHeld(nowMs));
-    for (const kid of this.stations.keys())
+    for (const kid of this.stations.keys()) {
       events.push(...this.#presence(kid, nowMs));
+    }
     return events;
   }
 
