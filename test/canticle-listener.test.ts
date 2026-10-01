@@ -446,3 +446,54 @@ test("restart: a v1 snapshot (no PLUCK metadata) still loads", () => {
   const r = new Listener(manifest, { warmup: false, restore: v1 as never });
   assert.equal(r.dedup.size, 1);
 });
+
+test("q21: a class change for a state_key in the mark's epoch is dropped; the mark keeps its class", () => {
+  const l = new Listener(manifest, { ephemeral: true, warmup: false });
+  const hkey = `${kid.toString("hex")}:${THREAT}:s`;
+  assert.deepEqual(
+    kinds(l.hear(item({ seq: 1, cls: 3, stateKey: "s", stream: THREAT }), T0)),
+    ["item"],
+  );
+  assert.deepEqual(
+    kinds(
+      l.hear(
+        item({
+          seq: 2,
+          cls: 4,
+          stateKey: "s",
+          stream: THREAT,
+          issued: T0 + 1_000,
+        }),
+        T0 + 1_000,
+      ),
+    ),
+    ["evidence:class-change"],
+  );
+  assert.equal(l.hwm.get(hkey)!.cls, 3);
+  assert.equal(l.hwm.get(hkey)!.order[2], 1n, "the mark did not move");
+});
+
+test("q21: state v3 keeps a mark's class; a v2 mark learns it when its own item resurfaces", () => {
+  const l = new Listener(manifest, { warmup: false, restore: null });
+  l.hear(
+    item({ seq: 1, cls: 3, stateKey: "s", stream: THREAT, ttlMs: 120_000 }),
+    T0,
+  );
+  const snap = l.snapshot();
+  assert.equal(snap.version, 3);
+  assert.equal(snap.hwm[0]![5], 3);
+  // Downgrade the snapshot to v2 (marks without a class).
+  const v2 = {
+    ...snap,
+    version: 2,
+    hwm: snap.hwm.map((r) => r.slice(0, 5)),
+  } as never;
+  const r = new Listener(manifest, { warmup: false, restore: v2 });
+  const hkey = `${kid.toString("hex")}:${THREAT}:s`;
+  assert.equal(r.hwm.get(hkey)!.cls, undefined);
+  r.hear(
+    item({ seq: 1, cls: 3, stateKey: "s", stream: THREAT, ttlMs: 120_000 }),
+    T0 + 1_000,
+  );
+  assert.equal(r.hwm.get(hkey)!.cls, 3, "learned on resurface");
+});
