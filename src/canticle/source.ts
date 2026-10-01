@@ -54,6 +54,7 @@ export class GuardedEmbedded implements CanticleSource {
   readonly #probe: (path: string) => Promise<boolean>;
   #refused = false;
   #started = false;
+  #stopped = false;
 
   constructor(
     receptor: CanticleReceptor,
@@ -69,7 +70,9 @@ export class GuardedEmbedded implements CanticleSource {
 
   /** Resolves once decided; start() calls it without awaiting. */
   async decide(): Promise<void> {
-    if (await this.#probe(this.#config.hostSocket)) {
+    const present = await this.#probe(this.#config.hostSocket);
+    if (this.#stopped) return; // stop() during the probe: never bind afterwards
+    if (present) {
       this.#refused = true;
       this.#logger.log("warn", "canticle.embedded_refused", {
         hostSocket: this.#config.hostSocket,
@@ -85,6 +88,7 @@ export class GuardedEmbedded implements CanticleSource {
   }
 
   stop(): void {
+    this.#stopped = true;
     if (this.#started) this.#receptor.stop();
   }
 

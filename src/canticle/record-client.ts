@@ -56,6 +56,10 @@ export class RecordClient {
 
   #connect(): void {
     this.#state = "connecting";
+    // Line state belongs to one connection: a partial or over-long line from the
+    // last one must not swallow this one's first record.
+    this.#buffer = "";
+    this.#discarding = false;
     const socket = (this.#options.connect ?? ((p) => connect(p)))(
       this.#options.socketPath,
     );
@@ -64,6 +68,7 @@ export class RecordClient {
     socket.on("connect", () => {
       this.#state = "connected";
       this.#attempt = 0;
+      this.consumer.reconnected();
       this.#lastError = undefined;
       this.#options.logger.log("info", "canticle.host_daemon_connected", {
         socket: this.#options.socketPath,

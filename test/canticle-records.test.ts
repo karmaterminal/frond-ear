@@ -8,6 +8,8 @@ import test from "node:test";
 import { RecordClient } from "../src/canticle/record-client.ts";
 import {
   MAX_DEPTH,
+  MAX_LIVE,
+  MAX_STATIONS,
   RECORD_V,
   RecordConsumer,
   jsonDepth,
@@ -55,6 +57,8 @@ const frame = (n: number, extra: Record<string, unknown> = {}) =>
     },
     admission: "verified",
     disposition: "surface",
+    dedup: "first",
+    versions: { manifest_sha256: "00", manifest_label: "test" },
     body: { ctype: 1, text: `deploy.started ${n}`, size: 16 },
     ...extra,
   });
@@ -96,7 +100,7 @@ test("records: nothing from a run is delivered before its first landing_state", 
   c.feed(rec("hello"), NOW);
   c.feed(frame(1), NOW);
   assert.equal(items(c).length, 0);
-  c.feed(rec("landing_state", { mute: null }), NOW);
+  c.feed(rec("landing_state", { mute: null, breaker: "closed" }), NOW);
   assert.equal(items(c).length, 1);
 });
 
@@ -104,11 +108,14 @@ test("records: an active mute withdraws everything", () => {
   const c = started();
   c.feed(frame(1), NOW);
   c.feed(
-    rec("landing_state", { mute: { until: NOW + 60_000, by: "ops" } }),
+    rec("landing_state", {
+      mute: { until: NOW + 60_000, by: "ops" },
+      breaker: "closed",
+    }),
     NOW,
   );
   assert.equal(items(c).length, 0);
-  c.feed(rec("landing_state", { mute: null }), NOW);
+  c.feed(rec("landing_state", { mute: null, breaker: "closed" }), NOW);
   assert.equal(items(c).length, 1);
 });
 
@@ -229,7 +236,7 @@ test("record client: reads split lines over a unix socket, drops an over-long li
   seq = 0;
   const lines = [
     rec("hello"),
-    rec("landing_state", { mute: null }),
+    rec("landing_state", { mute: null, breaker: "closed" }),
     rec("health", { last_datagram_at: NOW, reasons: [] }),
     frame(1),
   ]
@@ -291,4 +298,169 @@ test("embedded guard: refuses to bind while a host daemon answers; binds when no
   );
   await ok.decide();
   assert.deepEqual(okLog, ["start"]);
+  // stop() while the probe is still out: the receptor never starts afterwards.
+  const lateLog: string[] = [];
+  let answer!: (present: boolean) => void;
+  const late = new GuardedEmbedded(
+    fakeReceptor(lateLog),
+    cfg,
+    logger,
+    () => new Promise<boolean>((r) => (answer = r)),
+  );
+  const deciding = late.decide();
+  late.stop();
+  answer(false);
+  await deciding;
+  assert.deepEqual(lateLog, []);
+});
+
+// ---- review hardening (frond-ear#34 web-lane review)
+
+test("records: a missing or mistyped mute is dropped, never read as unmuted", () => {
+  seq = 0;
+  const c = new RecordConsumer();
+  c.feed(rec("hello"), NOW);
+  c.feed(rec("landing_state", { mute: "active", breaker: "closed" }), NOW);
+  c.feed(rec("landing_state", { breaker: "closed" }), NOW);
+  c.feed(
+    rec("landing_state", { mute: { until: "soon" }, breaker: "closed" }),
+    NOW,
+  );
+  c.feed(rec("health", { last_datagram_at: NOW - 500, reasons: [] }), NOW);
+  c.feed(frame(1), NOW);
+  assert.equal(items(c).length, 0);
+  assert.equal(c.counts.malformed_record, 3);
+  // A good mute, then a mistyped "unmute": the mute holds.
+  c.feed(
+    rec("landing_state", {
+      mute: { until: null, by: "ops" },
+      breaker: "closed",
+    }),
+    NOW,
+  );
+  c.feed(rec("landing_state", { mute: 0, breaker: "closed" }), NOW);
+  assert.deepEqual(c.mute, { until: null, by: "ops" });
+  assert.equal(items(c).length, 0);
+});
+
+test("records: a new run's hello recovers a failed receive", () => {
+  const c = started();
+  c.closed();
+  assert.equal(c.health, "failed");
+  c.feed(rec("hello", {}, "c3d4"), NOW);
+  c.feed(rec("landing_state", { mute: null, breaker: "closed" }, "c3d4"), NOW);
+  c.feed(frame(1, { run: "c3d4" }), NOW);
+  assert.equal(c.health, "ok");
+  assert.equal(items(c).length, 1);
+});
+
+test("records: a rec_seq gap clears the live set (it may have held a retract)", () => {
+  const c = started();
+  c.feed(frame(1), NOW);
+  assert.equal(items(c).length, 1);
+  seq += 3; // records lost
+  c.feed(frame(2), NOW);
+  assert.deepEqual(
+    items(c).map((i) => i.seq),
+    ["2"],
+  );
+  assert.equal(c.health, "degraded");
+});
+
+test("records: required frame fields are enforced; a pluck frame is never live", () => {
+  const c = started();
+  const withFrame = (n: number, change: Record<string, unknown>) => {
+    const r = frame(n) as unknown as Record<string, unknown> & {
+      frame: Record<string, unknown>;
+    };
+    Object.assign(r.frame, change);
+    return r;
+  };
+  const noSha = withFrame(1, {});
+  delete noSha.frame.sha256;
+  c.feed(noSha, NOW);
+  c.feed(frame(2, { dedup: undefined }), NOW);
+  c.feed(frame(3, { station: { name: "ops" } }), NOW);
+  c.feed(withFrame(4, { seq: "4 x" }), NOW);
+  assert.equal(c.counts.malformed_record, 4);
+  c.feed(withFrame(5, { kind: "pluck" }), NOW);
+  assert.equal(c.counts.not_deliverable_verified, 1);
+  assert.equal(items(c).length, 0);
+  assert.equal(c.health, "ok"); // no rec_seq gap along the way
+});
+
+test("records: sender-chosen values never grow a map without bound", () => {
+  const c = started();
+  for (let i = 0; i < 300; i++) {
+    c.feed(frame(i, { admission: `x${i}` }), NOW);
+    c.feed(
+      rec("presence", { station: { name: `s${i}` }, state: "SPEAKING" }),
+      NOW,
+    );
+    c.feed(rec("fatal", { reason: `r${i} with spaces` }), NOW);
+  }
+  assert.equal(c.counts.not_deliverable_other, 300);
+  assert.equal(
+    Object.keys(c.counts).filter((k) => k.startsWith("not_")).length,
+    1,
+  );
+  assert.equal(c.presence.size, MAX_STATIONS);
+  assert.ok(c.healthReasons.length <= 16);
+  const d = started();
+  for (let i = 0; i < MAX_LIVE + 10; i++) {
+    d.feed(
+      frame(i, {
+        times: {
+          issued_at: NOW,
+          expires_at: NOW + 1e12,
+          local_expiry_at: NOW + 1e12,
+        },
+      }),
+      NOW,
+    );
+  }
+  assert.equal(d.counts.live_overflow, 10);
+  // local_expiry_at can't outlive the longest class TTL.
+  assert.equal(items(d, NOW + 400 * 86_400_000).length, 0);
+});
+
+test("record client: a partial line from the last connection doesn't eat the next one's first record", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "canticle-sock-"));
+  const path = join(dir, "daemon.sock");
+  const peers: Socket[] = [];
+  const server = createServer((s) => peers.push(s));
+  await new Promise<void>((r) => server.listen(path, r));
+  const client = new RecordClient({
+    socketPath: path,
+    tune: { gloss: TUNE },
+    logger,
+    clock: { now: () => NOW },
+    timers: {
+      setTimeout: (fn: () => void) => setTimeout(fn, 1),
+      clearTimeout: (t: unknown) => clearTimeout(t as NodeJS.Timeout),
+    } as never,
+  });
+  try {
+    client.start();
+    while (peers.length < 1) await new Promise((r) => setTimeout(r, 5));
+    peers[0]!.write('{"v":"canticle-receptor-record/1","type":"hel');
+    await new Promise((r) => setTimeout(r, 20));
+    peers[0]!.destroy();
+    while (peers.length < 2) await new Promise((r) => setTimeout(r, 5));
+    seq = 0;
+    const lines = [
+      rec("hello", {}, "e5f6"),
+      rec("landing_state", { mute: null, breaker: "closed" }, "e5f6"),
+      rec("health", { last_datagram_at: NOW, reasons: [] }, "e5f6"),
+      frame(1, { run: "e5f6" }),
+    ];
+    peers[1]!.write(`${lines.map((r) => JSON.stringify(r)).join("\n")}\n`);
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(client.consumer.counts.malformed_record ?? 0, 0);
+    assert.equal(client.hearView("gloss").items.length, 1);
+  } finally {
+    client.stop();
+    server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
