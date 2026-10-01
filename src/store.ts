@@ -244,6 +244,13 @@ export class EventStore {
     return Object.fromEntries(rows.map((row) => [row.name, row.value]));
   }
 
+  public runtimeState(name: string): string | undefined {
+    const row = this.database
+      .prepare("SELECT value FROM runtime_state WHERE name = ?")
+      .get(name) as { value: string } | undefined;
+    return row?.value;
+  }
+
   public setRuntimeState(name: string, value: string): void {
     this.database
       .prepare(

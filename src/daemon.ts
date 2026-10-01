@@ -44,6 +44,8 @@ export interface DaemonOptions {
   token?: string;
   nonce?: () => string;
   gatewayStatus?: () => object;
+  /** The binary-canticle receptor's status, when one is running. */
+  canticleStatus?: () => object;
 }
 
 interface Client {
@@ -1327,6 +1329,7 @@ export class Daemon {
     return {
       paused: this.config.paused,
       gateway: this.options.gatewayStatus?.() ?? { state: "disabled" },
+      canticle: this.options.canticleStatus?.() ?? { state: "disabled" },
       ears,
       ambiguousSends: this.store.ambiguousSends(this.sendsInFlight),
       botLoopCooling: this.botLimiter.cooling(this.clock.now()),

@@ -9,6 +9,8 @@ import {
   readBotToken,
   runtimeOptions,
 } from "./config.ts";
+import { CanticleReceptor } from "./canticle/receptor.ts";
+import { Manifest } from "./canticle/manifest.ts";
 import { Daemon } from "./daemon.ts";
 import { DiscordGateway } from "./gateway.ts";
 import { StructuredLogger } from "./logger.ts";
@@ -81,6 +83,17 @@ async function runDaemon(argv: string[]): Promise<void> {
   const pruned = store.prune(config.limits.retentionMs);
 
   let gateway: DiscordGateway | undefined;
+  let canticle: CanticleReceptor | undefined;
+  if (config.canticle?.enabled && !runtime.dryRun) {
+    canticle = new CanticleReceptor({
+      config: config.canticle,
+      manifest: Manifest.fromJson(
+        JSON.parse(readFileSync(config.canticle.manifestPath, "utf8")),
+      ),
+      store,
+      logger,
+    });
+  }
   const rest = runtime.dryRun
     ? new RecordingRest(
         (channelId, limit) =>
@@ -120,6 +133,7 @@ async function runDaemon(argv: string[]): Promise<void> {
     ...(sharedToken ? { token: sharedToken } : {}),
     gatewayStatus: () =>
       gateway?.status() ?? { state: runtime.dryRun ? "dry-run" : "disabled" },
+    canticleStatus: () => canticle?.status() ?? { state: "disabled" },
   });
   const server = tcp
     ? await listenTcp(daemon, tcp.host, tcp.port)
@@ -148,6 +162,9 @@ async function runDaemon(argv: string[]): Promise<void> {
     });
     gateway.start();
   }
+  // Listen-only and silent: heard items stay in the receptor's live set; nothing
+  // reaches a session until P3's `hear` tool. Canticle config changes need a restart.
+  canticle?.start();
 
   let reloadTimer: NodeJS.Timeout | undefined;
   const watcher = watch(runtime.configPath, () => {
@@ -177,6 +194,7 @@ async function runDaemon(argv: string[]): Promise<void> {
     // close SQLite.
     watcher.close();
     gateway?.stop();
+    canticle?.stop();
     server.close();
     void daemon.shutdown().then(({ drained }) => {
       store.close();
