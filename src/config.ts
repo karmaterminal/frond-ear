@@ -12,8 +12,12 @@ export interface ChannelConfig {
 }
 
 export interface EarConfig {
-  /** Only `claude-channel` is implemented; other targets are reserved. */
-  target: "claude-channel";
+  /**
+   * How the attached session hears: `claude-channel` (Claude Code channel shim) or
+   * `copilot-extension` (a Copilot CLI extension, copilot-extension/). Both speak the
+   * same ear protocol; the daemon treats them alike. Other targets are reserved.
+   */
+  target: EarTarget;
   channels: Record<string, ChannelConfig>;
   /** Whether DMs from principals and peer agents route to this ear. */
   dms: boolean;
@@ -62,6 +66,11 @@ export interface WakeBudget {
   cooldownMs: number;
 }
 
+export type EarTarget = "claude-channel" | "copilot-extension";
+const TARGETS: ReadonlySet<string> = new Set([
+  "claude-channel",
+  "copilot-extension",
+]);
 const RESERVED_TARGETS = new Set(["copilot-sdk", "claude-monitor"]);
 const EAR_NAME = /^[A-Za-z0-9_-]{1,64}$/u;
 const SNOWFLAKE = /^\d{1,25}$/u;
@@ -206,8 +215,10 @@ export function parseConfig(candidate: unknown): Config {
         `ears.${name}.target ${target} is reserved, not built yet`,
       );
     }
-    if (target !== "claude-channel") {
-      throw new Error(`ears.${name}.target must be claude-channel`);
+    if (typeof target !== "string" || !TARGETS.has(target)) {
+      throw new Error(
+        `ears.${name}.target must be claude-channel or copilot-extension`,
+      );
     }
     const channels: Record<string, ChannelConfig> = {};
     const channelInput = value.channels ?? {};
@@ -248,7 +259,7 @@ export function parseConfig(candidate: unknown): Config {
       throw new Error(`ears.${name}.dmMode must be mentions or silent`);
     }
     ears[name] = {
-      target,
+      target: target as EarTarget,
       channels,
       dms,
       dmMode,

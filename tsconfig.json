@@ -6,6 +6,7 @@
     "lib": ["ES2023"],
     "types": ["node"],
     "noEmit": true,
+    "allowJs": true,
     "allowImportingTsExtensions": true,
     "erasableSyntaxOnly": true,
     "verbatimModuleSyntax": true,
@@ -18,5 +19,10 @@
     "noUnusedParameters": true,
     "skipLibCheck": true
   },
-  "include": ["src/**/*.ts", "test/**/*.ts", "tools/**/*.ts"]
+  "include": [
+    "src/**/*.ts",
+    "test/**/*.ts",
+    "tools/**/*.ts",
+    "copilot-extension/core.mjs"
+  ]
 }

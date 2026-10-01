@@ -36,6 +36,16 @@ Then follow [`docs/runbook.md`](docs/runbook.md) to:
 3. connect Discord
 4. hand the ear to your long-running session
 
+## GitHub Copilot CLI
+
+An ear can serve a Copilot CLI session instead of a Claude Code one (`target: "copilot-extension"`, #13). A Copilot CLI **extension** is the Copilot-side shim. It joins the live interactive session, speaks the same ear protocol, and pushes each event as a `<channel>` element through `session.send({ source: "system", mode: "enqueue" })`, so events wait for the next turn instead of interrupting. It exposes the same tools, generated from the shim's own definitions.
+
+1. In the daemon config, set `ears.<name>.target` to `"copilot-extension"`.
+2. Install the extension: `node src/cli.ts copilot-extension --ear <name>`. It writes to `$COPILOT_HOME/extensions/frond-ear/`, with `config.json` at 0600.
+3. Start Copilot with extensions enabled: `copilot --experimental`. The attach canary works the same way: `ack` its nonce.
+
+Copilot extensions are experimental. An extension reloads on `/clear`, which is just a re-attach. A `source: "system"` message is still a user-message event tagged as system, not a separate channel type, and the trust model is unchanged: trust comes from verified author IDs in the element's attributes, never from text.
+
 ## Docs
 
 - [`docs/spike/2026-09-claude-channel-gateway.md`](docs/spike/2026-09-claude-channel-gateway.md) explains the design: an assessment of prior work, Claude Code channels, the OpenClaw patterns it borrows, and the trust model and its limits.

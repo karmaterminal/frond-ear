@@ -1,6 +1,14 @@
 #!/usr/bin/env node
-import { readFileSync, watch } from "node:fs";
+import {
+  copyFileSync,
+  mkdirSync,
+  readFileSync,
+  watch,
+  writeFileSync,
+} from "node:fs";
 import { connect, type Socket } from "node:net";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { parseArgs } from "node:util";
 
 import {
@@ -16,7 +24,7 @@ import type { DaemonMessage } from "./protocol.ts";
 import { EAR_PROTOCOL_VERSION, LineConnection } from "./protocol.ts";
 import { HttpDiscordRest, RecordingRest } from "./rest.ts";
 import { listenTcp, listenUnix } from "./server.ts";
-import { ChannelShim } from "./shim.ts";
+import { ChannelShim, TOOLS } from "./shim.ts";
 import { EventStore } from "./store.ts";
 import type { DiscordMessage } from "./types.ts";
 
@@ -26,6 +34,9 @@ usage:
   frond-ear daemon [--dry-run]        run the gateway daemon (config: FROND_EAR_CONFIG, default ./frond-ear.json)
   frond-ear shim                      run the Claude Code channel shim (stdio MCP; launched by Claude Code)
   frond-ear status                    print daemon status as JSON
+  frond-ear copilot-extension --ear <name> [--dir <path>]
+                                      install the Copilot CLI extension for an ear
+                                      (default dir $COPILOT_HOME/extensions/frond-ear; run copilot --experimental)
   frond-ear tap --ear <name>          stream the batches pushed to an ear's attached session (read-only;\n                                      wakes a session without channel push; a shim must be attached)
   frond-ear inject --chat <id> --author <id> [--guild <id>] [--name <n>] [--bot] [--mention] <text…>
                                       push a synthetic MESSAGE_CREATE (dry-run or FROND_EAR_ALLOW_INJECT=1)
@@ -370,6 +381,61 @@ function runTap(argv: string[]): void {
   connect();
 }
 
+/**
+ * Installs the Copilot CLI extension (copilot-extension/) for one ear: the two .mjs files
+ * plus a config.json carrying the daemon address and the shim's own TOOLS, so the Claude
+ * and Copilot targets expose the same tools from one definition.
+ */
+function runCopilotExtension(argv: string[]): void {
+  const { values } = parseArgs({
+    args: argv,
+    options: { ear: { type: "string" }, dir: { type: "string" } },
+  });
+  const env = process.env;
+  const ear = values.ear ?? env.FROND_EAR_EAR;
+  if (!ear) {
+    process.stderr.write(
+      "frond-ear copilot-extension: --ear <name> is required\n",
+    );
+    process.exitCode = 2;
+    return;
+  }
+  const dir =
+    values.dir ??
+    join(
+      env.COPILOT_HOME ?? join(homedir(), ".copilot"),
+      "extensions",
+      "frond-ear",
+    );
+  const source = join(import.meta.dirname, "..", "copilot-extension");
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  for (const file of ["core.mjs", "extension.mjs"]) {
+    copyFileSync(join(source, file), join(dir, file));
+  }
+  const tcp = tcpTarget(env);
+  const config = {
+    ear,
+    tools: TOOLS,
+    ...(tcp
+      ? {
+          tcp,
+          ...(env.FROND_EAR_TOKEN_FILE
+            ? { tokenFile: env.FROND_EAR_TOKEN_FILE }
+            : {}),
+        }
+      : { socket: defaultSocketPath(env) }),
+  };
+  writeFileSync(
+    join(dir, "config.json"),
+    `${JSON.stringify(config, null, 2)}\n`,
+    { mode: 0o600 },
+  );
+  process.stdout.write(
+    `installed frond-ear Copilot extension for ear "${ear}" in ${dir}\n` +
+      `set ears.${ear}.target to "copilot-extension" in the daemon config, then start: copilot --experimental\n`,
+  );
+}
+
 async function main(): Promise<void> {
   const [command, ...rest] = process.argv.slice(2);
   switch (command) {
@@ -389,6 +455,9 @@ async function main(): Promise<void> {
       return;
     case "tap":
       runTap(rest);
+      return;
+    case "copilot-extension":
+      runCopilotExtension(rest);
       return;
     case undefined:
     case "help":
