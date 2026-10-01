@@ -10,12 +10,11 @@
 // so `Listener` currently refuses to start without `ephemeral: true`, the
 // same guard the spike uses.
 //
-// Known growth issues inherited from the spike, to fix before P2 binds a real
-// socket (frond-ear#25 review, items 3–6): `lastStreamItem` is set before the
-// quota and equivocation refusals and never pruned; beacon stream-loop maps grow
-// per beacon and `streamLoopMax` survives an epoch advance; `hwm` outlives the
-// dedup slot, so distinct state_keys escape the per-key quota; and PLUCK expiry
-// isn't clamped. All four need a granted signing key to exploit.
+// Bounded state (binary-canticle#60, fixed here ahead of the spike): every
+// per-key structure counts against the same per-key budget as dedup; stream
+// bookkeeping only tracks manifest- or beacon-named streams; beacon loop maps
+// are capped and reset on epoch advance; refusals happen before any state
+// changes; PLUCK expiry is clamped (wire.ts).
 
 import { createHash } from "node:crypto";
 
@@ -42,6 +41,8 @@ import {
 
 export const SKEW_MS = 5_000;
 const OFFSET_SAMPLES = 16;
+const MAX_ADVERTISED_STREAMS = 8 * 32;
+const PURGE_INTERVAL_MS = 1_000;
 const LIVE_STATE = CLASS_BY_NAME.get("live-state")!.code;
 
 export type EventKind =
@@ -160,6 +161,8 @@ export class Listener {
   readonly stickyPluck = new Map<string, number>();
   /** `${kid}:${stream}:${stateKey}` → order + retain_until. */
   readonly hwm = new Map<string, { order: Order; retain: number }>();
+  readonly hwmPerKey = new Map<string, number>();
+  #lastPurge = Number.NEGATIVE_INFINITY;
   /** identity → heard item (on air, from this listener's view). */
   readonly current = new Map<string, Heard>();
   readonly stations = new Map<string, StationState>();
@@ -271,6 +274,7 @@ export class Listener {
       // station counts beacons from 1 again and may loop different streams.
       st.bseq = 0n;
       st.streamLoops.clear();
+      st.streamLoopMax.clear();
     }
     return true;
   }
@@ -301,6 +305,13 @@ export class Listener {
     for (const e of b.streams) {
       st.streamLoops.set(e.streamId, e.loopMs);
       st.streamLoopMax.set(e.streamId, e.loopMaxMs);
+    }
+    // Bounded: a beacon has at most 8 pages of 32 entries (§9.8); keep the newest.
+    for (const m of [st.streamLoops, st.streamLoopMax]) {
+      for (const k of m.keys()) {
+        if (m.size <= MAX_ADVERTISED_STREAMS) break;
+        m.delete(k);
+      }
     }
     events.push(...this.#presence(kid, nowMs));
     return events;
@@ -367,13 +378,22 @@ export class Listener {
         return events;
       }
     }
-    if (!this.#epochOk(kid, body.epoch, nowMs, events)) return events;
     const ident = identKey(kid, body.epoch, body.stream, body.seq);
     const digest = createHash("sha256").update(f.raw).digest("hex");
     const seen = this.dedup.get(ident);
     const st = this.#st(kid);
-    st.lastStreamItem.set(body.stream, nowMs);
-    let retain: number;
+    // Every refusal below happens before any state changes (§10.9): epoch, dedup,
+    // presence and high-water marks only move once the frame is admitted.
+    if (body.epoch < st.epochHwm) {
+      events.push(
+        this.#evidence(
+          "epoch-regression",
+          kid,
+          `${body.epoch} < ${st.epochHwm}`,
+        ),
+      );
+      return events;
+    }
     if (seen !== undefined) {
       if (seen.digest !== digest) {
         events.push(
@@ -391,22 +411,43 @@ export class Listener {
         h.copies += 1;
         h.lastHeard = nowMs;
       }
+      this.#heardOn(st, entry.streamNames, body.stream, nowMs);
       return events; // a repeat is a benign no-op (§7.4)
-    } else {
-      if (!this.#roomFor(kid, nowMs)) {
-        events.push(
-          this.#evidence(
-            "over-quota",
-            kid,
-            "per-key dedup quota full; live entries kept",
-            at,
-          ),
-        );
-        return events;
-      }
-      retain = localExpiryMs(f, offsetMs(st), nowMs) + SKEW_MS;
-      this.#remember(ident, kid, digest, retain);
     }
+    if (!this.#roomFor(kid, nowMs)) {
+      events.push(
+        this.#evidence(
+          "over-quota",
+          kid,
+          "per-key dedup quota full; live entries kept",
+          at,
+        ),
+      );
+      return events;
+    }
+    if (
+      f.kind === KIND_ITEM &&
+      f.body.stateKey !== undefined &&
+      !this.#hwmRoomFor(
+        kid,
+        `${kid}:${f.body.stream}:${f.body.stateKey}`,
+        nowMs,
+      )
+    ) {
+      events.push(
+        this.#evidence(
+          "over-quota",
+          kid,
+          "per-key state_key quota full; live entries kept",
+          at,
+        ),
+      );
+      return events;
+    }
+    this.#epochOk(kid, body.epoch, nowMs, events); // admitted: cannot regress here
+    this.#heardOn(st, entry.streamNames, body.stream, nowMs);
+    const retain = localExpiryMs(f, offsetMs(st), nowMs) + SKEW_MS;
+    this.#remember(ident, kid, digest, retain);
     if (f.kind === KIND_PLUCK) {
       const p = f.body;
       const target = identKey(kid, p.epoch, p.stream, p.targetSeq);
@@ -454,7 +495,7 @@ export class Listener {
         );
         return events;
       }
-      this.hwm.set(hkey, { order, retain: retain + spec.maxTtlS * 1000 });
+      this.#setHwm(kid, hkey, order, retain + spec.maxTtlS * 1000);
       for (const [otherIdent, h] of this.current) {
         if (
           h.kid === kid &&
@@ -613,6 +654,43 @@ export class Listener {
     return events;
   }
 
+  /** Note a copy heard on a stream, but only for streams the manifest or a beacon names (bounded). */
+  #heardOn(
+    st: StationState,
+    named: ReadonlyMap<number, string>,
+    stream: number,
+    nowMs: number,
+  ): void {
+    if (named.has(stream) || st.streamLoops.has(stream)) {
+      st.lastStreamItem.set(stream, nowMs);
+    }
+  }
+
+  /** Room for one more supersession high-water mark for this key (same per-key budget as dedup). */
+  #hwmRoomFor(kid: string, hkey: string, nowMs: number): boolean {
+    if (this.hwm.has(hkey)) return true;
+    if ((this.hwmPerKey.get(kid) ?? 0) < this.#quota()) return true;
+    this.#purgeHwm(nowMs);
+    return (this.hwmPerKey.get(kid) ?? 0) < this.#quota();
+  }
+
+  #setHwm(kid: string, hkey: string, order: Order, retain: number): void {
+    if (!this.hwm.has(hkey)) {
+      this.hwmPerKey.set(kid, (this.hwmPerKey.get(kid) ?? 0) + 1);
+    }
+    this.hwm.set(hkey, { order, retain });
+  }
+
+  #purgeHwm(nowMs: number): void {
+    for (const [k, v] of this.hwm) {
+      if (v.retain <= nowMs) {
+        this.hwm.delete(k);
+        const kid = k.slice(0, k.indexOf(":"));
+        this.hwmPerKey.set(kid, (this.hwmPerKey.get(kid) ?? 1) - 1);
+      }
+    }
+  }
+
   #remember(ident: string, kid: string, digest: string, retain: number): void {
     // Live entries are never evicted: they hold the equivocation evidence (§10.8) and stop a
     // repeat from counting as new. New tuples are refused per key instead (#roomFor).
@@ -620,7 +698,10 @@ export class Listener {
     this.dedupPerKey.set(kid, (this.dedupPerKey.get(kid) ?? 0) + 1);
   }
 
-  #purgeDedup(nowMs: number): void {
+  #purgeDedup(nowMs: number, force = false): void {
+    // A full scan; at quota a flood would otherwise pay it on every frame.
+    if (!force && nowMs - this.#lastPurge < PURGE_INTERVAL_MS) return;
+    this.#lastPurge = nowMs;
     for (const [k, v] of this.dedup) {
       if (v.retain <= nowMs) {
         this.dedup.delete(k);
@@ -647,10 +728,10 @@ export class Listener {
         });
       }
     }
-    this.#purgeDedup(nowMs);
+    this.#purgeDedup(nowMs, true);
     for (const [k, v] of this.stickyPluck)
       if (v <= nowMs) this.stickyPluck.delete(k);
-    for (const [k, v] of this.hwm) if (v.retain <= nowMs) this.hwm.delete(k);
+    this.#purgeHwm(nowMs);
     events.push(...this.#releaseHeld(nowMs));
     for (const kid of this.stations.keys())
       events.push(...this.#presence(kid, nowMs));

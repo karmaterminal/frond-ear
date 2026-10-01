@@ -72,6 +72,20 @@ function fromHex(text: unknown, what: string): Uint8Array {
   return new Uint8Array(Buffer.from(text, "hex"));
 }
 
+// Canonical encodings of the eight small-order Ed25519 points (orders 1, 2, 4 and 8; the
+// same blocklist libsodium uses). A station key that is one of these makes signatures
+// meaningless, so the manifest refuses it (RFC-0001 §9.3 SHOULD).
+const SMALL_ORDER_KEYS = new Set([
+  "0100000000000000000000000000000000000000000000000000000000000000",
+  "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+  "0000000000000000000000000000000000000000000000000000000000000000",
+  "0000000000000000000000000000000000000000000000000000000000000080",
+  "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05",
+  "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85",
+  "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
+  "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa",
+]);
+
 export class Manifest {
   readonly #byKid = new Map<string, StationEntry>();
   readonly #keys = new Map<string, KeyObject>();
@@ -81,6 +95,11 @@ export class Manifest {
   }
 
   add(e: StationEntry): void {
+    if (SMALL_ORDER_KEYS.has(hex(e.publicKey))) {
+      throw new Error(
+        `manifest: ${e.name}: small-order public key refused (§9.3)`,
+      );
+    }
     if (this.#byKid.has(e.keyIdHex)) {
       throw new Error(
         `two keys share key-id ${e.keyIdHex}; the manifest is invalid (§5.1)`,
