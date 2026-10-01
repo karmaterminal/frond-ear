@@ -23,6 +23,32 @@ export interface RezOptions {
   timeoutMs: number;
   /** Answer Claude Code's development-channel confirmation, and nothing else. */
   confirmChannelPrompt: boolean;
+  /**
+   * The seat's launcher, used in place of `claudeBin`: an executable that sets the
+   * seat's environment (CLAUDE_CONFIG_DIR, GH_CONFIG_DIR, …) and execs claude with
+   * the arguments it is given. Without one, a scribe with its own CLAUDE_CONFIG_DIR
+   * would be resumed under the default config, where its session doesn't exist.
+   */
+  launcher?: string | undefined;
+  /** `--permission-mode` for the resumed session: `--resume` ignores the settings' defaultMode. */
+  permissionMode?: string | undefined;
+}
+
+/** The command rez runs in tmux (and suggests by hand). */
+export function resumeCommand(
+  options: RezOptions,
+  sessionId: string,
+): string[] {
+  return [
+    options.launcher ?? options.claudeBin,
+    "--resume",
+    sessionId,
+    "--dangerously-load-development-channels",
+    `server:${options.serverName}`,
+    ...(options.permissionMode
+      ? ["--permission-mode", options.permissionMode]
+      : []),
+  ];
 }
 
 export interface RezDeps {
@@ -115,11 +141,7 @@ export async function rez(
     "-c",
     binding.cwd,
     "--",
-    options.claudeBin,
-    "--resume",
-    binding.sessionId,
-    "--dangerously-load-development-channels",
-    `server:${options.serverName}`,
+    ...resumeCommand(options, binding.sessionId),
   ]);
   if (started.code !== 0) {
     return {
@@ -144,7 +166,7 @@ export async function rez(
     if (deps.run("tmux", ["has-session", "-t", `=${tmuxSession}`]).code !== 0) {
       return {
         code: 5,
-        message: `claude exited before attaching; try by hand: cd ${binding.cwd} && ${options.claudeBin} --resume ${binding.sessionId} --dangerously-load-development-channels server:${options.serverName}`,
+        message: `claude exited before attaching; try by hand: cd ${binding.cwd} && ${resumeCommand(options, binding.sessionId).join(" ")}`,
       };
     }
     if (options.confirmChannelPrompt && !confirmed) {

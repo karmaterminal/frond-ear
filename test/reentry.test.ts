@@ -9,7 +9,7 @@ import {
   isClaude,
 } from "../src/launch.ts";
 import type { ProcessReader } from "../src/launch.ts";
-import { channelPromptAwaitingYes, rez } from "../src/rez.ts";
+import { channelPromptAwaitingYes, resumeCommand, rez } from "../src/rez.ts";
 import type { EarView, RezDeps, RezOptions } from "../src/rez.ts";
 
 // ---- launch detection -------------------------------------------------------------------
@@ -290,4 +290,37 @@ test("rez reports a session that never attaches, pointing at the tmux session", 
   const result = await rez({ ...OPTIONS, timeoutMs: 3_000 }, deps);
   assert.equal(result.code, 5);
   assert.match(result.message, /tmux attach -t frond-scribe/u);
+});
+
+test("rez with a seat launcher runs the launcher (it sets the seat env and execs claude), plus the permission mode", async () => {
+  const deps = fakeDeps([bound(), bound(), bound({ attached: true })]);
+  const result = await rez(
+    {
+      ...OPTIONS,
+      launcher: "/home/figs/frond-gloss/scripts/claude-seat.sh",
+      permissionMode: "bypassPermissions",
+    },
+    deps,
+  );
+  assert.equal(result.code, 0, result.message);
+  const started = deps.commands.find((command) => command[1] === "new-session");
+  assert.deepEqual(started?.slice(started.indexOf("--") + 1), [
+    "/home/figs/frond-gloss/scripts/claude-seat.sh",
+    "--resume",
+    "s-123",
+    "--dangerously-load-development-channels",
+    "server:frond-ear",
+    "--permission-mode",
+    "bypassPermissions",
+  ]);
+});
+
+test("resumeCommand: no launcher and no permission mode is the bare claude command", () => {
+  assert.deepEqual(resumeCommand(OPTIONS, "s-9"), [
+    "/usr/local/bin/claude",
+    "--resume",
+    "s-9",
+    "--dangerously-load-development-channels",
+    "server:frond-ear",
+  ]);
 });

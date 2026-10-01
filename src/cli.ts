@@ -35,6 +35,7 @@ usage:
                                       move an ear to a session on purpose (default session: the
                                       CLAUDE_CODE_SESSION_ID of the calling session), or unbind it
   frond-ear rez --ear <name> [--tmux <name>] [--timeout <s>] [--no-confirm]
+                [--launcher <seat-launcher>] [--permission-mode <mode>|none]
                                       resume the ear's bound session, hearing, in tmux; no-op if live
   frond-ear hook session-start        SessionStart hook: tells a (re-)entering session where it stands
   frond-ear inject --chat <id> --author <id> [--guild <id>] [--name <n>] [--bot] [--mention] <text…>
@@ -48,6 +49,8 @@ environment:
   FROND_EAR_INSTANCE      name of one of several daemons for this user (changes default paths)
   FROND_EAR_SERVER_NAME   name frond-ear is registered under in Claude Code (default frond-ear)
   CLAUDE_BIN              (rez) absolute path to claude (default: claude on PATH)
+  FROND_EAR_LAUNCHER      (rez) seat launcher used instead of claude: sets the seat env, then execs claude "$@"
+  FROND_EAR_PERMISSION_MODE (rez) --permission-mode for the resumed session (default bypassPermissions; none = omit)
   FROND_EAR_LAUNCH_DETECT off = do not read the Claude command line (the canary alone decides)
   FROND_EAR_DATABASE      SQLite path (default $XDG_STATE_HOME/frond-ear/frond-ear.db)
   DISCORD_BOT_TOKEN_FILE  bot token file (or DISCORD_BOT_TOKEN)
@@ -496,6 +499,18 @@ function listProcesses(): Array<{ pid: number; argv: string[] }> {
     }));
 }
 
+/** Default bypassPermissions (the fleet's seats run that way); "none" omits the flag. */
+function permissionModeFlag(value: string | undefined): string | undefined {
+  if (value === "none") return undefined;
+  const mode = value ?? "bypassPermissions";
+  if (!/^[A-Za-z]+$/u.test(mode)) {
+    throw new Error(
+      `--permission-mode must be a mode name or none, not ${JSON.stringify(mode)}`,
+    );
+  }
+  return mode;
+}
+
 async function runRez(argv: string[]): Promise<void> {
   const env = process.env;
   const ear = flag(argv, "--ear") ?? env.FROND_EAR_EAR;
@@ -512,6 +527,11 @@ async function runRez(argv: string[]): Promise<void> {
       timeoutMs:
         (Number.isFinite(timeout) && timeout > 0 ? timeout : 90) * 1_000,
       confirmChannelPrompt: !argv.includes("--no-confirm"),
+      launcher:
+        flag(argv, "--launcher") ?? (env.FROND_EAR_LAUNCHER || undefined),
+      permissionMode: permissionModeFlag(
+        flag(argv, "--permission-mode") ?? env.FROND_EAR_PERMISSION_MODE,
+      ),
     },
     {
       ear: async (name) => {
