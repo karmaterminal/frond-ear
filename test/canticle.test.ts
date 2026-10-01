@@ -193,8 +193,8 @@ test("stream ids match the spike (vector beacon advertises chatter)", () => {
 });
 
 test("cbor keeps a leading U+FEFF in text, as the spike does", () => {
-  assert.equal(cbor.decode(bytes("64efbbbf61")), "﻿a");
-  assert.equal(hex(cbor.encode("﻿a")), "64efbbbf61");
+  assert.equal(cbor.decode(bytes("64efbbbf61")), "\uFEFFa");
+  assert.equal(hex(cbor.encode("\uFEFFa")), "64efbbbf61");
 });
 
 test("parse copies: frame bytes never alias a Buffer datagram", () => {
