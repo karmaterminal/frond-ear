@@ -9,7 +9,10 @@ import {
   readBotToken,
   runtimeOptions,
 } from "./config.ts";
-import { CanticleReceptor } from "./canticle/receptor.ts";
+import {
+  createCanticleSource,
+  type CanticleSource,
+} from "./canticle/source.ts";
 import { Manifest } from "./canticle/manifest.ts";
 import { Daemon } from "./daemon.ts";
 import { DiscordGateway } from "./gateway.ts";
@@ -83,13 +86,14 @@ async function runDaemon(argv: string[]): Promise<void> {
   const pruned = store.prune(config.limits.retentionMs);
 
   let gateway: DiscordGateway | undefined;
-  let canticle: CanticleReceptor | undefined;
+  let canticle: CanticleSource | undefined;
   if (config.canticle?.enabled && !runtime.dryRun) {
-    canticle = new CanticleReceptor({
-      config: config.canticle,
-      manifest: Manifest.fromJson(
-        JSON.parse(readFileSync(config.canticle.manifestPath, "utf8")),
-      ),
+    const canticleConfig = config.canticle;
+    canticle = createCanticleSource(canticleConfig, {
+      manifest: () =>
+        Manifest.fromJson(
+          JSON.parse(readFileSync(canticleConfig.manifestPath, "utf8")),
+        ),
       store,
       logger,
     });
