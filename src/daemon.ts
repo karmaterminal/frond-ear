@@ -852,6 +852,7 @@ export class Daemon {
     if (!Number.isSafeInteger(batch) || batch < 1) {
       throw new Error("batch_id must be the positive integer from the event");
     }
+    this.provenByUse(client, ear, batch);
     return Math.min(batch, latest);
   }
 
@@ -1249,8 +1250,9 @@ export class Daemon {
   // ---- delivery confirmation ---------------------------------------------------------------
 
   /**
-   * Whether the attached session has proven it receives pushed events. Only the
-   * attach canary proves it: the session can ack the nonce only after seeing it.
+   * Whether the attached session has proven it receives pushed events: by acking the
+   * attach canary's nonce, or by acting on a pushed batch by its batch_id (#21).
+   * Both are only possible after seeing a push.
    */
   private delivery(
     name: string,
@@ -1279,6 +1281,27 @@ export class Daemon {
         `relaunch with: claude --resume ${resume} --dangerously-load-development-channels ` +
         "server:frond-ear. Until then, read new messages with inbox.",
     };
+  }
+
+  /**
+   * A batch_id reaches the session only inside a pushed `<channel>` event (inbox
+   * and fetch_messages never show one). So a session that acts on a batch offered
+   * to its own attach generation has proved it receives pushes, which is stronger
+   * evidence than the canary, and the canary can be lost before the session can
+   * take it (#21). Register the ear rather than keep calling a working session deaf.
+   */
+  private provenByUse(client: Client, ear: string, batch: number): void {
+    if (
+      !this.store.ear(ear)?.registered &&
+      this.store.offeredTo(batch, ear, client.attachGeneration) &&
+      this.store.registerEarByUse(ear)
+    ) {
+      this.logger.log("info", "ear.registered", {
+        ear,
+        by: "batch_use",
+        batch,
+      });
+    }
   }
 
   private withDeliveryWarning(client: Client, text: string): string {
