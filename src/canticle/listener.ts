@@ -1119,6 +1119,11 @@ export class Listener {
     ];
   }
 
+  /** δ̂ for a station: receiver clock minus station clock, from its beacons (§8.2); 0 if none heard. */
+  clockOffset(kid: string): number {
+    return offsetMs(this.stations.get(kid));
+  }
+
   /** What this listener currently holds as live (its view, not the station's). */
   onAir(): Array<{
     station: string;

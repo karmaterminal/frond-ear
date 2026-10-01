@@ -187,3 +187,36 @@ test("config: canticle defaults and validation", () => {
   assert.throws(bad({ binding: "galaxy" }), /binding must be/);
   assert.throws(bad({ port: 70_000 }), /at most 65535/);
 });
+
+test("receptor: hearView is sighted after a datagram, then blind (unknown, not offline) after 30 s of total silence", async () => {
+  let now = vectors.now_ms;
+  let bound: Socket | undefined;
+  const receptor = new CanticleReceptor({
+    config: config(),
+    manifest,
+    store: new MemoryStore(),
+    logger,
+    clock: { now: () => now },
+    socket: () => (bound = createSocket("udp4")),
+  });
+  assert.equal(receptor.hearView("gloss").blind, true, "not bound yet");
+  receptor.start();
+  await new Promise((r) => bound!.once("listening", r));
+  assert.equal(
+    receptor.hearView("gloss").blind,
+    true,
+    "bound, but nothing heard yet",
+  );
+  receptor.receive(vec("valid-item-named-stream"));
+  const sighted = receptor.hearView("gloss");
+  assert.equal(sighted.blind, false);
+  assert.equal(sighted.items.length, 1);
+  now += 31_000;
+  const blind = receptor.hearView("gloss");
+  assert.equal(blind.blind, true);
+  assert.ok(
+    blind.stations.length > 0 &&
+      blind.stations.every((st) => st.presence === "unknown"),
+  );
+  receptor.stop();
+});

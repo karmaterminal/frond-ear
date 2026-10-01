@@ -12,7 +12,7 @@ import type { CanticleConfig } from "../config.ts";
 import type { StructuredLogger } from "../logger.ts";
 import type { Clock, Timers } from "../types.ts";
 import { systemClock, systemTimers } from "../types.ts";
-import { CLASSES } from "./ids.ts";
+import { CLASSES, SCOPE_NAMES } from "./ids.ts";
 import { Listener, type ListenerEvent, type SafetyState } from "./listener.ts";
 import type { Manifest } from "./manifest.ts";
 
@@ -20,6 +20,8 @@ const STATE_KEY = "canticle.listener_state";
 const TICK_MS = 1_000;
 const RETRY_MIN_MS = 1_000;
 const RETRY_MAX_MS = 30_000;
+/** No datagram from anyone for this long: render stations `unknown`, not `offline`. */
+const BLIND_AFTER_MS = 30_000;
 
 /** Where the restart-safety snapshot lives (the event store's runtime_state). */
 export interface StateStore {
@@ -29,9 +31,22 @@ export interface StateStore {
 
 export interface LiveItem {
   station: string;
+  /** Key-id hex: the station's identity as the manifest pins it. */
+  key: string;
   stream: string;
   seq: string;
+  epoch: number;
   class: string;
+  scope: string;
+  hop: number;
+  /** Declared by the station; context, not authority (§14.13). */
+  purpose: string | undefined;
+  issuedAt: number;
+  /** When this listener first heard it (receiver clock). */
+  heardAt: number;
+  expiresAt: number;
+  /** Bytes, for a body that isn't shown (non-text ctype). */
+  bodyBytes: number | undefined;
   stateKey: string | undefined;
   text: string | undefined;
   ctype: number | string | undefined;
@@ -39,6 +54,17 @@ export interface LiveItem {
   ageMs: number;
   expiresInMs: number;
   copies: number;
+}
+
+export interface HearView {
+  now: number;
+  /** Whether this ear tunes any station:stream at all. */
+  tuned: boolean;
+  listening: boolean;
+  blind: boolean;
+  lastDatagramAt: number | undefined;
+  stations: Array<{ name: string; presence: string }>;
+  items: LiveItem[];
 }
 
 export interface ReceptorOptions {
@@ -78,6 +104,7 @@ export class CanticleReceptor {
   #attempt = 0;
   #tickHandle: unknown;
   #retryHandle: unknown;
+  #lastDatagramAt: number | undefined;
   readonly #counts = {
     datagrams: 0,
     items: 0,
@@ -186,6 +213,7 @@ export class CanticleReceptor {
   /** One datagram in. Public as the test seam; never throws. */
   receive(datagram: Uint8Array): void {
     this.#counts.datagrams += 1;
+    this.#lastDatagramAt = this.#clock.now();
     this.#apply(this.#listener.hear(datagram, this.#clock.now()));
     this.#save();
   }
@@ -230,9 +258,19 @@ export class CanticleReceptor {
       const it = h.item;
       out.push({
         station,
+        key: h.kid,
         stream,
         seq: it.seq.toString(),
+        epoch: it.epoch,
         class: CLASSES.get(it.cls)?.name ?? String(it.cls),
+        scope: SCOPE_NAMES.get(it.scope) ?? String(it.scope),
+        hop: it.hop,
+        purpose: it.purpose,
+        issuedAt: it.issuedAt,
+        heardAt: h.firstHeard,
+        expiresAt: it.expiresAt,
+        bodyBytes:
+          it.ctype !== 1 && it.body !== undefined ? it.body.length : undefined,
         stateKey: it.stateKey,
         text:
           it.ctype === 1 && it.body !== undefined
@@ -244,12 +282,51 @@ export class CanticleReceptor {
           sha256: Buffer.from(it.bodyRef.sha256).toString("hex"),
           size: it.bodyRef.size.toString(),
         },
-        ageMs: Math.max(0, now - h.firstHeard),
+        ageMs: Math.max(
+          0,
+          now - it.issuedAt - this.#listener.clockOffset(h.kid),
+        ),
         expiresInMs: Math.max(0, h.localExpiry - now),
         copies: h.copies,
       });
     }
     return out;
+  }
+
+  /**
+   * What one ear hears now, plus who's on air. If this listener has heard no
+   * datagram at all for `BLIND_AFTER_MS`, every station reads `unknown`: silence
+   * from everyone at once is more likely our own socket or network than every
+   * station going quiet together (station silence ≠ transport blindness).
+   */
+  hearView(ear: string): HearView {
+    const now = this.#clock.now();
+    const blind =
+      this.#state !== "listening" ||
+      this.#lastDatagramAt === undefined ||
+      now - this.#lastDatagramAt > BLIND_AFTER_MS;
+    const patterns = this.#options.config.tune[ear] ?? [];
+    const stations = [...this.#listener.stations.keys()]
+      .map((kid) => {
+        const name =
+          this.#options.manifest.entry(Buffer.from(kid, "hex"))?.name ?? kid;
+        return {
+          name,
+          presence: blind ? "unknown" : this.#listener.presenceState(kid, now),
+        };
+      })
+      .filter((s) =>
+        patterns.some((p) => p.startsWith("*:") || p.startsWith(`${s.name}:`)),
+      );
+    return {
+      now,
+      tuned: patterns.length > 0,
+      listening: this.#state === "listening",
+      blind,
+      lastDatagramAt: this.#lastDatagramAt,
+      stations,
+      items: this.live(ear),
+    };
   }
 
   status(): object {
