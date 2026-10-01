@@ -279,3 +279,89 @@ test("a manifest refuses small-order station keys", () => {
     /small-order/,
   );
 });
+
+// ---- restart safety: snapshot → JSON → restore (§5.2, §7.4, §7.7, §7.8)
+
+function restarted(l: Listener): Listener {
+  const json = JSON.parse(JSON.stringify(l.snapshot()));
+  return new Listener(manifest, { warmup: false, restore: json });
+}
+
+test("restart: an item accepted before is surfaced once more, then repeats are no-ops", () => {
+  const l = new Listener(manifest, { warmup: false, restore: null });
+  const it = item({ seq: 1 });
+  assert.deepEqual(kinds(l.hear(it, T0)), ["item"]);
+  assert.equal(l.dirty, true);
+  const r = restarted(l);
+  assert.equal(r.dirty, false);
+  assert.deepEqual(kinds(r.hear(it, T0 + 1_000)), ["item"]);
+  assert.deepEqual(kinds(r.hear(it, T0 + 2_000)), []);
+});
+
+test("restart: a PLUCK survives, so the original can't come back", () => {
+  const l = new Listener(manifest, { warmup: false, restore: null });
+  l.hear(
+    frame(KIND_PLUCK, {
+      1: 1,
+      2: CHATTER,
+      3: 2,
+      4: T0,
+      5: T0 + 60_000,
+      13: 1,
+      20: 1,
+    }),
+    T0,
+  );
+  const r = restarted(l);
+  assert.deepEqual(kinds(r.hear(item({ seq: 1 }), T0 + 1_000)), [
+    "evidence:plucked",
+  ]);
+});
+
+test("restart: supersession survives, so an older value is refused", () => {
+  const l = new Listener(manifest, { warmup: false, restore: null });
+  const live = (seq: number, issued: number) =>
+    item({
+      seq,
+      cls: 3,
+      stateKey: "threat",
+      stream: THREAT,
+      issued,
+      ttlMs: 120_000,
+    });
+  assert.deepEqual(kinds(l.hear(live(2, T0 + 5_000), T0 + 5_000)), ["item"]);
+  const r = restarted(l);
+  assert.deepEqual(kinds(r.hear(live(1, T0), T0 + 6_000)), [
+    "evidence:superseded",
+  ]);
+  assert.deepEqual(
+    kinds(r.hear(live(2, T0 + 5_000), T0 + 6_000)),
+    ["item"],
+    "the newest value resurfaces once",
+  );
+});
+
+test("restart: the epoch high-water mark survives", () => {
+  const l = new Listener(manifest, { warmup: false, restore: null });
+  l.hear(item({ seq: 1, epoch: 3 }), T0);
+  const r = restarted(l);
+  assert.deepEqual(kinds(r.hear(item({ seq: 9, epoch: 2 }), T0 + 1_000)), [
+    "evidence:epoch-regression",
+  ]);
+});
+
+test("restart: a snapshot from another version is refused", () => {
+  assert.throws(
+    () =>
+      new Listener(manifest, {
+        restore: {
+          version: 99,
+          epochs: {},
+          dedup: [],
+          stickyPluck: [],
+          hwm: [],
+        },
+      }),
+    /unsupported version/,
+  );
+});

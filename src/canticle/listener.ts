@@ -5,10 +5,11 @@
 // presence change, evidence) and never actuates anything. Landing into a
 // session (§14) is the ear's job, not this module's.
 //
-// P1 scope: in-memory state only. Persisting the restart-safety state (epoch
-// maxima, dedup digests, sticky PLUCKs, supersession high-water marks) is P2,
-// so `Listener` currently refuses to start without `ephemeral: true`, the
-// same guard the spike uses.
+// Restart safety: the state that must survive a restart (epoch maxima, dedup
+// digests, sticky PLUCKs, supersession high-water marks; §5.2, §7.4, §7.7, §7.8)
+// round-trips through `snapshot()` / `restore`. The caller persists it whenever
+// `dirty` is set. An item accepted before a restart is surfaced once more after
+// it, through the same checks, the first time it's heard again (as the spike does).
 //
 // Bounded state (binary-canticle#60, fixed here ahead of the spike): every
 // per-key structure counts against the same per-key budget as dedup; stream
@@ -146,8 +147,28 @@ export interface ListenerOptions {
   binding?: string;
   /** Hold live-state keys until warm-up completes (§7.8 rule 4). */
   warmup?: boolean;
-  /** Required until P2 persists the safety state: a restarted ephemeral listener can resurface stale items. */
-  ephemeral: true;
+  /**
+   * Restart safety (§5.2, §7.4, §7.7, §7.8): either pass the last saved snapshot
+   * (`null` on first run) and save `snapshot()` whenever `dirty` is set, or opt out
+   * with `ephemeral: true` where restarts aren't under test.
+   */
+  restore?: SafetyState | null;
+  ephemeral?: true;
+}
+
+export const SAFETY_STATE_VERSION = 1;
+
+/** The state that must survive a restart, as JSON (bigints as decimal strings). */
+export interface SafetyState {
+  version: number;
+  /** key-id → [epoch high-water mark, when it was first seen]. */
+  epochs: Record<string, [number, number]>;
+  /** [identity, sha256(frame) hex, retain_until]. */
+  dedup: Array<[string, string, number]>;
+  /** [target identity, retain_until]. */
+  stickyPluck: Array<[string, number]>;
+  /** [hkey, issued_at, epoch, seq, retain_until]. */
+  hwm: Array<[string, number, number, string, number]>;
 }
 
 export class Listener {
@@ -163,6 +184,9 @@ export class Listener {
   readonly hwm = new Map<string, { order: Order; retain: number }>();
   readonly hwmPerKey = new Map<string, number>();
   #lastPurge = Number.NEGATIVE_INFINITY;
+  /** Identities loaded from a snapshot that this process hasn't surfaced yet. */
+  readonly #restored = new Set<string>();
+  #dirty = false;
   /** identity → heard item (on air, from this listener's view). */
   readonly current = new Map<string, Heard>();
   readonly stations = new Map<string, StationState>();
@@ -170,9 +194,9 @@ export class Listener {
   readonly evidenceCounts = new Map<string, number>();
 
   constructor(manifest: Manifest, options: ListenerOptions) {
-    if (options.ephemeral !== true) {
+    if (options.ephemeral !== true && options.restore === undefined) {
       throw new Error(
-        "a listener needs persisted state for restart safety (§7.4–§7.8); pass ephemeral: true",
+        "a listener needs persisted state for restart safety (§7.4–§7.8): pass restore (null on first run) or ephemeral: true",
       );
     }
     const binding = options.binding ?? "lan";
@@ -183,6 +207,64 @@ export class Listener {
     this.dedupCapacity = options.dedupCapacity ?? 100_000;
     this.binding = binding;
     this.warmup = options.warmup ?? true;
+    if (options.restore) this.#load(options.restore);
+  }
+
+  // ------------------------------------------------------------ persisted safety state
+
+  /** True when the safety state changed since the last `markSaved()`. */
+  get dirty(): boolean {
+    return this.#dirty;
+  }
+
+  markSaved(): void {
+    this.#dirty = false;
+  }
+
+  snapshot(): SafetyState {
+    const epochs: Record<string, [number, number]> = {};
+    for (const [kid, st] of this.stations) {
+      if (st.epochHwm) epochs[kid] = [st.epochHwm, st.epochSeenAt];
+    }
+    return {
+      version: SAFETY_STATE_VERSION,
+      epochs,
+      dedup: [...this.dedup].map(([ident, v]) => [ident, v.digest, v.retain]),
+      stickyPluck: [...this.stickyPluck],
+      hwm: [...this.hwm].map(([hkey, v]) => [
+        hkey,
+        v.order[0],
+        v.order[1],
+        v.order[2].toString(),
+        v.retain,
+      ]),
+    };
+  }
+
+  #load(state: SafetyState): void {
+    if (state.version !== SAFETY_STATE_VERSION) {
+      throw new Error(
+        `listener state: unsupported version ${String(state.version)}`,
+      );
+    }
+    for (const [kid, [epoch, seenAt]] of Object.entries(state.epochs)) {
+      const st = this.#st(kid);
+      st.epochHwm = epoch;
+      st.epochSeenAt = seenAt;
+    }
+    for (const [ident, digest, retain] of state.dedup) {
+      const kid = ident.slice(0, ident.indexOf(":"));
+      this.dedup.set(ident, { digest, retain });
+      this.dedupPerKey.set(kid, (this.dedupPerKey.get(kid) ?? 0) + 1);
+      this.#restored.add(ident);
+    }
+    for (const [ident, retain] of state.stickyPluck)
+      this.stickyPluck.set(ident, retain);
+    for (const [hkey, issuedAt, epoch, seq, retain] of state.hwm) {
+      const kid = hkey.slice(0, hkey.indexOf(":"));
+      this.hwm.set(hkey, { order: [issuedAt, epoch, BigInt(seq)], retain });
+      this.hwmPerKey.set(kid, (this.hwmPerKey.get(kid) ?? 0) + 1);
+    }
   }
 
   // ------------------------------------------------------------ helpers
@@ -269,6 +351,7 @@ export class Listener {
     }
     if (epoch > st.epochHwm) {
       st.epochHwm = epoch;
+      this.#dirty = true;
       st.epochSeenAt = nowMs;
       // bseq and the advertised loops belong to the previous epoch (§9.8): a restarted
       // station counts beacons from 1 again and may loop different streams.
@@ -394,6 +477,8 @@ export class Listener {
       );
       return events;
     }
+    let resurface = false;
+    let retain = 0;
     if (seen !== undefined) {
       if (seen.digest !== digest) {
         events.push(
@@ -412,46 +497,55 @@ export class Listener {
         h.lastHeard = nowMs;
       }
       this.#heardOn(st, entry.streamNames, body.stream, nowMs);
-      return events; // a repeat is a benign no-op (§7.4)
+      if (!this.#restored.has(ident)) return events; // a repeat is a benign no-op (§7.4)
+      // Accepted before a restart: its dedup, pluck and supersession state was kept, but
+      // this process hasn't surfaced it yet. Surface it once, through the same checks.
+      this.#restored.delete(ident);
+      resurface = true;
+      retain = seen.retain;
     }
-    if (!this.#roomFor(kid, nowMs)) {
-      events.push(
-        this.#evidence(
-          "over-quota",
+    if (!resurface) {
+      if (!this.#roomFor(kid, nowMs)) {
+        events.push(
+          this.#evidence(
+            "over-quota",
+            kid,
+            "per-key dedup quota full; live entries kept",
+            at,
+          ),
+        );
+        return events;
+      }
+      if (
+        f.kind === KIND_ITEM &&
+        f.body.stateKey !== undefined &&
+        !this.#hwmRoomFor(
           kid,
-          "per-key dedup quota full; live entries kept",
-          at,
-        ),
-      );
-      return events;
+          `${kid}:${f.body.stream}:${f.body.stateKey}`,
+          nowMs,
+        )
+      ) {
+        events.push(
+          this.#evidence(
+            "over-quota",
+            kid,
+            "per-key state_key quota full; live entries kept",
+            at,
+          ),
+        );
+        return events;
+      }
+      this.#epochOk(kid, body.epoch, nowMs, events); // admitted: cannot regress here
+      this.#heardOn(st, entry.streamNames, body.stream, nowMs);
+      retain = localExpiryMs(f, offsetMs(st), nowMs) + SKEW_MS;
+      this.#remember(ident, kid, digest, retain);
     }
-    if (
-      f.kind === KIND_ITEM &&
-      f.body.stateKey !== undefined &&
-      !this.#hwmRoomFor(
-        kid,
-        `${kid}:${f.body.stream}:${f.body.stateKey}`,
-        nowMs,
-      )
-    ) {
-      events.push(
-        this.#evidence(
-          "over-quota",
-          kid,
-          "per-key state_key quota full; live entries kept",
-          at,
-        ),
-      );
-      return events;
-    }
-    this.#epochOk(kid, body.epoch, nowMs, events); // admitted: cannot regress here
-    this.#heardOn(st, entry.streamNames, body.stream, nowMs);
-    const retain = localExpiryMs(f, offsetMs(st), nowMs) + SKEW_MS;
-    this.#remember(ident, kid, digest, retain);
     if (f.kind === KIND_PLUCK) {
+      if (resurface) return events; // its sticky mark was kept across the restart
       const p = f.body;
       const target = identKey(kid, p.epoch, p.stream, p.targetSeq);
       this.stickyPluck.set(target, retain);
+      this.#dirty = true;
       for (const [k, h] of this.held) {
         if (h.ident === target) this.held.delete(k);
       }
@@ -483,8 +577,9 @@ export class Listener {
       const hkey = `${kid}:${it.stream}:${it.stateKey}`;
       const order: Order = [it.issuedAt, it.epoch, it.seq];
       const prev = this.hwm.get(hkey);
-      // Equal order is only possible for the same identity, i.e. a re-surface after a restart (P2).
-      if (prev !== undefined && compareOrder(order, prev.order) <= 0) {
+      // Equal order is only possible for the same identity, i.e. a re-surface after a restart.
+      const cmp = prev === undefined ? 1 : compareOrder(order, prev.order);
+      if (cmp < 0 || (cmp === 0 && !resurface)) {
         events.push(
           this.#evidence(
             "superseded",
@@ -495,7 +590,7 @@ export class Listener {
         );
         return events;
       }
-      this.#setHwm(kid, hkey, order, retain + spec.maxTtlS * 1000);
+      if (cmp > 0) this.#setHwm(kid, hkey, order, retain + spec.maxTtlS * 1000);
       for (const [otherIdent, h] of this.current) {
         if (
           h.kid === kid &&
@@ -679,12 +774,14 @@ export class Listener {
       this.hwmPerKey.set(kid, (this.hwmPerKey.get(kid) ?? 0) + 1);
     }
     this.hwm.set(hkey, { order, retain });
+    this.#dirty = true;
   }
 
   #purgeHwm(nowMs: number): void {
     for (const [k, v] of this.hwm) {
       if (v.retain <= nowMs) {
         this.hwm.delete(k);
+        this.#dirty = true;
         const kid = k.slice(0, k.indexOf(":"));
         this.hwmPerKey.set(kid, (this.hwmPerKey.get(kid) ?? 1) - 1);
       }
@@ -695,6 +792,7 @@ export class Listener {
     // Live entries are never evicted: they hold the equivocation evidence (§10.8) and stop a
     // repeat from counting as new. New tuples are refused per key instead (#roomFor).
     this.dedup.set(ident, { digest, retain });
+    this.#dirty = true;
     this.dedupPerKey.set(kid, (this.dedupPerKey.get(kid) ?? 0) + 1);
   }
 
@@ -705,6 +803,8 @@ export class Listener {
     for (const [k, v] of this.dedup) {
       if (v.retain <= nowMs) {
         this.dedup.delete(k);
+        this.#restored.delete(k);
+        this.#dirty = true;
         const kid = k.slice(0, k.indexOf(":"));
         this.dedupPerKey.set(kid, (this.dedupPerKey.get(kid) ?? 1) - 1);
       }
@@ -730,7 +830,10 @@ export class Listener {
     }
     this.#purgeDedup(nowMs, true);
     for (const [k, v] of this.stickyPluck)
-      if (v <= nowMs) this.stickyPluck.delete(k);
+      if (v <= nowMs) {
+        this.stickyPluck.delete(k);
+        this.#dirty = true;
+      }
     this.#purgeHwm(nowMs);
     events.push(...this.#releaseHeld(nowMs));
     for (const kid of this.stations.keys())
