@@ -167,6 +167,8 @@ export interface ShimOptions {
   connect: () => Socket;
   ear?: string | undefined;
   sessionId?: string | undefined;
+  /** Send takeover in hello (FROND_EAR_TAKEOVER=1). */
+  takeover?: boolean;
   token?: string | undefined;
   log?: (line: string) => void;
   reconnectMs?: number;
@@ -245,6 +247,7 @@ export class ChannelShim {
         pid: process.pid,
         client: { name: "frond-ear-shim", version: SHIM_VERSION },
         ...(this.options.ear ? { ear: this.options.ear } : {}),
+        ...(this.options.takeover ? { takeover: true } : {}),
         ...(this.options.sessionId
           ? { sessionId: this.options.sessionId }
           : {}),

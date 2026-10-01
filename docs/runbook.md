@@ -178,6 +178,13 @@ yourself, and how to get back from a lost checkout, a lost home directory, or a 
 
 ## Troubleshooting
 
+- **"ear … is held by session …, which has proven it receives Discord events"** (#21). Once an ear's
+  session has acked its attach canary, a new shim from a _different_ session doesn't take the ear: not a
+  `claude mcp list` health check, a second `claude` in the same directory, or a headless run. The same
+  session reconnecting (resume, compaction, a restarted shim) still takes it. To move the ear to a new
+  session on purpose, start that session with `FROND_EAR_TAKEOVER=1`. A holder that never proved delivery
+  can always be replaced, which is how a deaf session is recovered.
+
 | Symptom                                       | Likely cause                                                                                                                                                                                                      |
 | --------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `registered: false`, no events in the session | Claude Code was started without `--dangerously-load-development-channels server:frond-ear`; or org policy blocks channels; or `MCP_PROTOCOL_NEGOTIATION=auto` on the v2 runtime (unset it or set it to `legacy`). |

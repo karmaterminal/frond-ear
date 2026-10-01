@@ -12,6 +12,8 @@ export type ClientMessage =
       ear?: string;
       pid?: number;
       sessionId?: string;
+      /** Take the ear even from a session that has proven delivery (explicit, #21 R1). */
+      takeover?: boolean;
       client?: { name: string; version: string };
       token?: string;
     }

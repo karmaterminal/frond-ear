@@ -197,6 +197,7 @@ function runShim(): void {
     connect: connectToDaemon(env),
     ear: env.FROND_EAR_EAR || undefined,
     sessionId: env.CLAUDE_CODE_SESSION_ID || undefined,
+    takeover: env.FROND_EAR_TAKEOVER === "1",
     token: tcpTarget(env) ? tcpToken(env) : undefined,
   });
   shim.start();

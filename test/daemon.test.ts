@@ -256,6 +256,116 @@ test("delivery: an unacked canary is reported as a deaf session, with the relaun
   }
 });
 
+test("no silent steals (#21 R1): a proven holder keeps the ear against stray shims", async () => {
+  const config = testConfig({
+    ears: {
+      scribe: { attachCanary: true, channels: { [CHANNEL]: "mentions" } },
+    },
+  });
+  const h = harness(config, { nonce: "c0ffee" });
+  try {
+    const owner = h.attach("scribe", { sessionId: "owner", pid: 100 });
+    assert.equal((await h.call(owner, "ack", { nonce: "c0ffee" })).ok, true);
+    const held = () =>
+      (h.daemon.status("scribe") as { ears: Array<{ shimPid?: number }> })
+        .ears[0]?.shimPid;
+
+    // `claude mcp list` health check: no session id.
+    const stray = h.attach("scribe", { pid: 200 });
+    const refused = stray.connection.received[0];
+    assert.equal(refused?.type === "welcome" && refused.attached, false);
+    assert.match(
+      refused?.type === "welcome" ? (refused.error ?? "") : "",
+      /held by session owner .*FROND_EAR_TAKEOVER=1/u,
+    );
+    assert.equal(
+      owner.connection.received.some((m) => m.type === "detached"),
+      false,
+      "the owner was not told it lost the ear",
+    );
+    // A second `claude` in the same directory: another session id.
+    const second = h.attach("scribe", { sessionId: "someone-else", pid: 300 });
+    assert.equal(
+      second.connection.received[0]?.type === "welcome" &&
+        second.connection.received[0].attached,
+      false,
+    );
+    assert.equal(held(), 100);
+    // The stray shim's tools still work, but it can't mark the owner's events seen.
+    const ack = await h.call(stray, "ack", {});
+    assert.match(ack.text, /^0 events/u);
+    assert.equal(
+      (h.daemon.status() as { counters: Record<string, number> }).counters
+        .attach_refused,
+      2,
+    );
+  } finally {
+    h.dispose();
+  }
+});
+
+test("no silent steals: the same session reconnecting, or an explicit takeover, does take the ear", async () => {
+  const config = testConfig({
+    ears: {
+      scribe: { attachCanary: true, channels: { [CHANNEL]: "mentions" } },
+    },
+  });
+  const h = harness(config, { nonce: "c0ffee" });
+  try {
+    const owner = h.attach("scribe", { sessionId: "owner", pid: 100 });
+    await h.call(owner, "ack", { nonce: "c0ffee" });
+    // Resume / compaction / restarted shim: same session id.
+    const resumed = h.attach("scribe", { sessionId: "owner", pid: 101 });
+    assert.equal(
+      resumed.connection.received[0]?.type === "welcome" &&
+        resumed.connection.received[0].attached,
+      true,
+    );
+    assert.deepEqual(owner.connection.received.at(-1), {
+      type: "detached",
+      reason: "superseded",
+    });
+    // A human relaunching on purpose.
+    await h.call(resumed, "ack", { nonce: "c0ffee" });
+    const takeover = h.attach("scribe", {
+      sessionId: "new-owner",
+      pid: 400,
+      takeover: true,
+    });
+    assert.equal(
+      takeover.connection.received[0]?.type === "welcome" &&
+        takeover.connection.received[0].attached,
+      true,
+    );
+  } finally {
+    h.dispose();
+  }
+});
+
+test("no silent steals: an unproven (deaf) holder can still be replaced — that's how it recovers", () => {
+  const config = testConfig({
+    ears: {
+      scribe: { attachCanary: true, channels: { [CHANNEL]: "mentions" } },
+    },
+  });
+  const h = harness(config, { nonce: "c0ffee" });
+  try {
+    const deaf = h.attach("scribe", { sessionId: "deaf" });
+    const fresh = h.attach("scribe", { sessionId: "fresh" });
+    assert.equal(
+      fresh.connection.received[0]?.type === "welcome" &&
+        fresh.connection.received[0].attached,
+      true,
+    );
+    assert.deepEqual(deaf.connection.received.at(-1), {
+      type: "detached",
+      reason: "superseded",
+    });
+  } finally {
+    h.dispose();
+  }
+});
+
 test("tap: mirrors exactly the batch pushed to the attached session, at the same moment", async () => {
   const h = harness();
   try {

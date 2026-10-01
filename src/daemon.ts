@@ -745,6 +745,43 @@ export class Daemon {
     }
     const previous = this.attached.get(ear);
     if (previous && previous !== client) {
+      // No silent steals (#21 R1). Once the holder has proven it receives pushes,
+      // only the same session reconnecting (resume, compaction, a restarted shim)
+      // or an explicit takeover may displace it. A stray shim — `claude mcp list`,
+      // a second `claude` in the same directory, a headless run — stays unattached
+      // and is told why; its tools still work. An unproven holder can still be
+      // replaced, because that's how a deaf session gets recovered.
+      // Proof needs the canary (or delivery proven by use): with attachCanary off an
+      // ear counts as registered on attach, which proves nothing, so it keeps the
+      // old newest-wins behaviour.
+      const proven =
+        this.config.ears[ear]?.attachCanary === true &&
+        this.store.ear(ear)?.registered === true;
+      const sameSession =
+        message.sessionId !== undefined &&
+        message.sessionId === previous.sessionId;
+      if (proven && !sameSession && message.takeover !== true) {
+        this.store.increment("attach_refused");
+        this.logger.log("warn", "ear.attach_refused", {
+          ear,
+          holder: previous.sessionId ?? null,
+          holderPid: previous.pid ?? null,
+          sessionId: message.sessionId ?? null,
+          pid: message.pid ?? null,
+        });
+        client.connection.send({
+          type: "welcome",
+          protocol: EAR_PROTOCOL_VERSION,
+          attached: false,
+          instructions: channelInstructions(this.config, undefined),
+          error:
+            `ear ${ear} is held by session ${previous.sessionId ?? "(unknown)"} ` +
+            `(shim pid ${previous.pid ?? "?"}), which has proven it receives Discord events, ` +
+            "so this shim did not take it. Tools still work; this session gets no pushed events. " +
+            "To take the ear on purpose, start the session with FROND_EAR_TAKEOVER=1.",
+        });
+        return;
+      }
       previous.connection.send({ type: "detached", reason: "superseded" });
       this.detach(previous);
     }
