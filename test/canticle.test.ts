@@ -176,3 +176,54 @@ test("stream ids match the spike (vector beacon advertises chatter)", () => {
   assert.equal(streamId("chatter"), 0x1ab3c589);
   assert.throws(() => streamId("Bad.Name"), /invalid stream name/);
 });
+
+test("cbor keeps a leading U+FEFF in text, as the spike does", () => {
+  assert.equal(cbor.decode(bytes("64efbbbf61")), "﻿a");
+  assert.equal(hex(cbor.encode("﻿a")), "64efbbbf61");
+});
+
+test("parse copies: frame bytes never alias a Buffer datagram", () => {
+  const c = vectors.parse.find((v) => v.name === "rfc-vector-1-item")!;
+  const input = Buffer.from(c.datagram_hex, "hex");
+  const frame = parse(input, manifest.resolve, vectors.now_ms);
+  assert.equal(frame.kind, 1);
+  const body = frame.kind === 1 ? frame.body.body! : new Uint8Array();
+  const before = [hex(frame.keyId), hex(body), hex(frame.raw)];
+  input.fill(0);
+  assert.deepEqual([hex(frame.keyId), hex(body), hex(frame.raw)], before);
+});
+
+test("a listener accepts a Buffer datagram (what dgram delivers)", () => {
+  const listener = new Listener(manifest, { warmup: false, ephemeral: true });
+  const named = vectors.parse.find(
+    (c) => c.name === "valid-item-named-stream",
+  )!;
+  const [ev] = listener.hear(
+    Buffer.from(named.datagram_hex, "hex"),
+    vectors.now_ms,
+  );
+  assert.equal(ev?.event, "item");
+});
+
+test("prototype keys are not scopes", () => {
+  for (const binding of ["toString", "__proto__", "constructor"]) {
+    assert.throws(
+      () => new Listener(manifest, { ephemeral: true, binding }),
+      /unknown binding/,
+    );
+  }
+  assert.throws(
+    () =>
+      Manifest.fromJson({
+        stations: [
+          {
+            name: "x",
+            public_key: vectors.keys.test1!.public,
+            classes: [],
+            scopes: ["toString"],
+          },
+        ],
+      }),
+    /unknown scope/,
+  );
+});

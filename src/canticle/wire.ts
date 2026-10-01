@@ -9,6 +9,9 @@
 // numbers, so a timestamp above Number.MAX_SAFE_INTEGER (about year 287 000)
 // is rejected as `bad-field` instead of being accepted. Sequence numbers keep
 // the full uint64 range as bigint.
+//
+// Unknown extension keys (an ITEM's `extra`) and a BEACON's `capsid` and `relay`
+// maps are validated but not kept: nothing in a listen-only receiver reads them.
 
 import { createPublicKey, verify, type KeyObject } from "node:crypto";
 
@@ -412,7 +415,14 @@ export function parse(
   clockOffsetMs = 0,
 ): Frame {
   try {
-    return parseStrict(datagram, resolve, nowMs, clockOffsetMs);
+    // Copy once: the frame's byte fields (key-id, body, raw, …) must never alias the caller's
+    // datagram, which a dgram socket may reuse or the caller may mutate (wire.py: bytes(datagram)).
+    return parseStrict(
+      Uint8Array.from(datagram),
+      resolve,
+      nowMs,
+      clockOffsetMs,
+    );
   } catch (e) {
     if (e instanceof Reject) throw e;
     // Defence in depth: nothing else may escape.

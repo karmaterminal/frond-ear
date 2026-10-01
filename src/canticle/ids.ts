@@ -104,15 +104,15 @@ export const CLASS_BY_NAME: ReadonlyMap<string, ClassSpec> = new Map(
   [...CLASSES.values()].map((c) => [c.name, c]),
 );
 
-export const SCOPES: Readonly<Record<string, number>> = {
-  host: 0,
-  lan: 1,
-  fleet: 2,
-  public: 3,
-};
+export const SCOPES: ReadonlyMap<string, number> = new Map([
+  ["host", 0],
+  ["lan", 1],
+  ["fleet", 2],
+  ["public", 3],
+]);
 
 export const SCOPE_NAMES: ReadonlyMap<number, string> = new Map(
-  Object.entries(SCOPES).map(([name, code]) => [code, name]),
+  [...SCOPES].map(([name, code]) => [code, name]),
 );
 
 /** Content-type registry (§9.9). */

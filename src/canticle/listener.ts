@@ -9,6 +9,13 @@
 // maxima, dedup digests, sticky PLUCKs, supersession high-water marks) is P2,
 // so `Listener` currently refuses to start without `ephemeral: true`, the
 // same guard the spike uses.
+//
+// Known growth issues inherited from the spike, to fix before P2 binds a real
+// socket (frond-ear#25 review, items 3–6): `lastStreamItem` is set before the
+// quota and equivocation refusals and never pruned; beacon stream-loop maps grow
+// per beacon and `streamLoopMax` survives an epoch advance; `hwm` outlives the
+// dedup slot, so distinct state_keys escape the per-key quota; and PLUCK expiry
+// isn't clamped. All four need a granted signing key to exploit.
 
 import { createHash } from "node:crypto";
 
@@ -166,7 +173,7 @@ export class Listener {
       );
     }
     const binding = options.binding ?? "lan";
-    if (!(binding in SCOPES))
+    if (!SCOPES.has(binding))
       throw new Error(`unknown binding ${JSON.stringify(binding)}`);
     this.manifest = manifest;
     this.tuned = options.tuned;
@@ -211,7 +218,18 @@ export class Listener {
 
   // ------------------------------------------------------------ hearing
 
+  /** Never throws: anything unexpected becomes `internal` evidence, so one datagram can't stop a receiver. */
   hear(datagram: Uint8Array, nowMs: number): ListenerEvent[] {
+    try {
+      return this.#hear(datagram, nowMs);
+    } catch (e) {
+      return [
+        this.#evidence("internal", "", e instanceof Error ? e.name : typeof e),
+      ];
+    }
+  }
+
+  #hear(datagram: Uint8Array, nowMs: number): ListenerEvent[] {
     const kid = datagram.length >= 12 ? hex(datagram.subarray(4, 12)) : "";
     let f: Frame;
     try {
@@ -311,7 +329,7 @@ export class Listener {
       );
       return events;
     }
-    if (body.scope < SCOPES[this.binding]!) {
+    if (body.scope < SCOPES.get(this.binding)!) {
       const scope = SCOPE_NAMES.get(body.scope) ?? body.scope;
       events.push(
         this.#evidence(

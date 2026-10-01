@@ -142,7 +142,9 @@ class Reader {
   }
 }
 
-const utf8 = new TextDecoder("utf-8", { fatal: true });
+// ignoreBOM: keep a leading U+FEFF in the string, as Python does; stripping it would make the
+// re-encode check reject a correctly signed frame.
+const utf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 function length(value: bigint): number {
   if (value > BigInt(Number.MAX_SAFE_INTEGER)) throw new CborError("truncated");
@@ -157,7 +159,8 @@ function decodeItem(r: Reader, depth: number): CborValue {
     case 1:
       return -1n - value;
     case 2:
-      return r.take(length(value)).slice();
+      // A copy, never a view: Buffer#slice aliases, Uint8Array#slice copies.
+      return new Uint8Array(r.take(length(value)));
     case 3:
       try {
         return utf8.decode(r.take(length(value)));

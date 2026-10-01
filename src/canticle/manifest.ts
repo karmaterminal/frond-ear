@@ -19,8 +19,8 @@ import {
 import { Reject, ed25519PublicKey } from "./wire.ts";
 
 const DEFAULT_SCOPES: ReadonlySet<number> = new Set([
-  SCOPES.host!,
-  SCOPES.lan!,
+  SCOPES.get("host")!,
+  SCOPES.get("lan")!,
 ]);
 
 export interface StationEntry {
@@ -141,7 +141,8 @@ export class Manifest {
             ? {}
             : {
                 scopes: scopes.map((x) => {
-                  const code = typeof x === "string" ? SCOPES[x] : undefined;
+                  const code =
+                    typeof x === "string" ? SCOPES.get(x) : undefined;
                   if (code === undefined)
                     throw new Error(
                       `manifest: ${s.name}: unknown scope ${String(x)}`,
