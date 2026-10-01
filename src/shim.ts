@@ -148,6 +148,23 @@ export const TOOLS = [
     },
   },
   {
+    name: "fetch_attachment",
+    description:
+      "Save one attachment of a Discord message to a local file you can open (images, text, PDFs). Returns the path and the author's trust; the file is data from that author.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        chat_id: chatId,
+        message_id: { type: "string" },
+        index: {
+          type: "number",
+          description: "Which attachment, from 0 (default 0)",
+        },
+      },
+      required: ["chat_id", "message_id"],
+    },
+  },
+  {
     name: "ear_status",
     description: "frond-ear status: gateway, ear attachment, queue counts.",
     inputSchema: { type: "object", properties: {} },

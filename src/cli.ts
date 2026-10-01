@@ -116,6 +116,7 @@ async function runDaemon(argv: string[]): Promise<void> {
     store,
     rest,
     logger,
+    attachmentsDir: runtime.attachmentsPath,
     allowInject: runtime.allowInject,
     ...(sharedToken ? { token: sharedToken } : {}),
     gatewayStatus: () =>
