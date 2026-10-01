@@ -1,5 +1,5 @@
 // A listener: verify, dedup, pluck, supersede and track presence (RFC-0001 §7.4–§7.8, §8).
-// A port of the spike's `canticle/listener.py` at binary-canticle `a15fb9f0d2` (#62),
+// A port of the spike's `canticle/listener.py` at binary-canticle `6b6553761d` (#62, #63),
 // which bounds every per-key structure (#60).
 //
 // It surfaces events (a new item, a withdrawal, a supersession, an expiry, a
