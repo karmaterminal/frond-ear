@@ -5,10 +5,12 @@
 // `parse` is the strict admission path. It never throws anything but
 // `Reject`, whatever the input, so one bad datagram cannot stop a receiver.
 //
-// One deliberate difference from the spike: millisecond timestamps are JS
-// numbers, so a timestamp above Number.MAX_SAFE_INTEGER (about year 287 000)
-// is rejected as `bad-field` instead of being accepted. Sequence numbers keep
-// the full uint64 range as bigint.
+// One deliberate difference from the spike: every uint except a sequence number
+// is a JS number, so a value above Number.MAX_SAFE_INTEGER (2^53 - 1) is rejected
+// as `bad-field` where the spike accepts it. That covers millisecond timestamps
+// (about year 287 000) and also a BEACON stream entry's stream id, `page` and
+// `b_station`. Sequence numbers keep the full uint64 range as bigint.
+// Cross-port divergences are tracked in binary-canticle#66.
 //
 // Unknown extension keys (an ITEM's `extra`) and a BEACON's `capsid` and `relay`
 // maps are validated but not kept: nothing in a listen-only receiver reads them.
