@@ -223,8 +223,15 @@ otherwise it resumes that session with the channel flag in tmux session `frond-f
 waits for the ear to attach. `--resume` does not re-apply `permissions.defaultMode`, so `rez`
 passes the mode your settings name as `--permission-mode` (override with `frond-ear rez
 --permission-mode <mode>`); with no mode in settings it passes none. It refuses, and says why in
-the journal, rather than start a second copy. `tmux attach -t frond-frond-scribe` to look at it; `systemctl --user disable --now
-frond-ear-rez-frond-scribe.timer` to stop resurrecting it.
+the journal, rather than start a second copy. `tmux attach -t frond-frond-scribe` to look at it;
+`systemctl --user disable --now frond-ear-rez-frond-scribe.timer` to stop resurrecting it.
+
+A seat that runs Claude with its own `CLAUDE_CONFIG_DIR`, env file or flags must resume through
+the same environment, or `--resume` looks for the session under the wrong config and logs in as
+someone else. Either export `CLAUDE_CONFIG_DIR` when running `ops/install-rez.sh` (it is written
+into the unit), or pass `--launcher /abs/path/to/launch.sh`: `rez` then runs that script in place
+of `claude`, with `claude`'s arguments, so it must end in `exec claude "$@"`. `--permission-mode
+<mode>` is written into the unit too, for a seat whose settings `rez` cannot read.
 
 A second bot on the same seat is a second instance, with its own unit, config directory, database
 and socket: `FROND_EAR_INSTANCE=gloss ops/install-systemd.sh`, then

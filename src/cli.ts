@@ -37,8 +37,10 @@ usage:
                                       move an ear to a session on purpose (default session: the
                                       CLAUDE_CODE_SESSION_ID of the calling session), or unbind it
   frond-ear rez --ear <name> [--tmux <name>] [--timeout <s>] [--no-confirm] [--permission-mode <m>]
+                [--launcher <path>]
                                       resume the ear's bound session, hearing, in tmux; no-op if live
-                                      (permission mode default: permissions.defaultMode from its settings)
+                                      (permission mode default: permissions.defaultMode from its settings;
+                                      --launcher: a seat's script, run in place of claude with its args)
   frond-ear hook session-start        SessionStart hook: tells a (re-)entering session where it stands
   frond-ear inject --chat <id> --author <id> [--guild <id>] [--name <n>] [--bot] [--mention] <text…>
                                       push a synthetic MESSAGE_CREATE (dry-run or FROND_EAR_ALLOW_INJECT=1)
@@ -515,6 +517,7 @@ async function runRez(argv: string[]): Promise<void> {
       `--permission-mode must be one of: ${PERMISSION_MODES.join(", ")}`,
     );
   }
+  const launcher = flag(argv, "--launcher") ?? env.FROND_EAR_REZ_LAUNCHER;
   const configDir = env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
   const result = await rez(
     {
@@ -526,6 +529,7 @@ async function runRez(argv: string[]): Promise<void> {
         (Number.isFinite(timeout) && timeout > 0 ? timeout : 90) * 1_000,
       confirmChannelPrompt: !argv.includes("--no-confirm"),
       ...(permissionMode ? { permissionMode } : {}),
+      ...(launcher ? { launcher } : {}),
     },
     {
       ear: async (name) => {

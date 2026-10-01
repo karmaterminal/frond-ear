@@ -20,6 +20,11 @@ export interface RezOptions {
   ear: string;
   tmuxSession: string;
   claudeBin: string;
+  /**
+   * Run this instead of `claudeBin`, with the same arguments: a seat's own launcher that sets its
+   * environment (CLAUDE_CONFIG_DIR and the like) and then execs claude with what it was given.
+   */
+  launcher?: string;
   serverName: string;
   timeoutMs: number;
   /** Answer Claude Code's development-channel confirmation, and nothing else. */
@@ -165,6 +170,7 @@ export async function rez(
     `server:${options.serverName}`,
     ...(permissionMode ? ["--permission-mode", permissionMode] : []),
   ];
+  const launch = options.launcher ?? options.claudeBin;
   const started = deps.run("tmux", [
     "new-session",
     "-d",
@@ -173,7 +179,7 @@ export async function rez(
     "-c",
     binding.cwd,
     "--",
-    options.claudeBin,
+    launch,
     ...claudeArgs,
   ]);
   if (started.code !== 0) {
@@ -199,7 +205,7 @@ export async function rez(
     if (deps.run("tmux", ["has-session", "-t", `=${tmuxSession}`]).code !== 0) {
       return {
         code: 5,
-        message: `claude exited before attaching; try by hand: cd ${binding.cwd} && ${options.claudeBin} ${claudeArgs.join(" ")}`,
+        message: `claude exited before attaching; try by hand: cd ${binding.cwd} && ${launch} ${claudeArgs.join(" ")}`,
       };
     }
     if (options.confirmChannelPrompt && !confirmed) {

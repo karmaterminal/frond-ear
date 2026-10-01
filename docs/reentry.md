@@ -103,6 +103,8 @@ These are recorded in the #6 checklist:
    else none. Still to see on a real seat: that the explicit mode suppresses that prompt, and that
    `bypassPermissions` raises no acceptance dialog on a seat that has already accepted it. `rez`
    answers neither; a session stuck there shows up as exit 5.
+   A seat with its own `CLAUDE_CONFIG_DIR` or launcher resumes through it: `CLAUDE_CONFIG_DIR` in
+   the unit, or `rez --launcher <script>`, which runs in place of `claude` with the same arguments.
 6. **tmux under systemd.** tmux started by the rez oneshot (`KillMode=process`) survives the unit
    finishing, and the resumed session inherits a usable environment. The unit sets `PATH`, and
    `claude` finds its credentials under `$HOME`.

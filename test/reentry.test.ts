@@ -366,3 +366,29 @@ test("settingsPermissionMode layers local project, project, then user settings, 
   );
   assert.equal(settingsPermissionMode("/x", "/nowhere", read), undefined);
 });
+
+test("rez runs a seat's launcher in place of claude, with the same arguments", async () => {
+  const deps = fakeDeps([bound(), bound({ attached: true })], {
+    settingsMode: "bypassPermissions",
+  });
+  await rez(
+    {
+      ...OPTIONS,
+      launcher: "/home/figs/seat/launch.sh",
+      permissionMode: "bypassPermissions",
+    },
+    deps,
+  );
+  assert.deepEqual(
+    deps.commands.find((command) => command[1] === "new-session")?.slice(8),
+    [
+      "/home/figs/seat/launch.sh",
+      "--resume",
+      "s-123",
+      "--dangerously-load-development-channels",
+      "server:frond-ear",
+      "--permission-mode",
+      "bypassPermissions",
+    ],
+  );
+});

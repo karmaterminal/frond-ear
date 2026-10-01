@@ -5,15 +5,30 @@
 # the channel flag in tmux session "frond-<ear>" when it is not, and refuses
 # (loudly, in the journal) rather than start a second copy.
 #
-#   ops/install-rez.sh <ear> [--no-timer]
+#   ops/install-rez.sh <ear> [--no-timer] [--launcher <abs path>] [--permission-mode <mode>]
+#
+# A seat that runs claude through its own launcher (its own CLAUDE_CONFIG_DIR, env file, ...)
+# passes --launcher: rez runs it in place of claude, with claude's arguments, so the launcher
+# must end in `exec claude "$@"`. CLAUDE_CONFIG_DIR, if set now, is written into the unit too.
 #
 # Stop resurrection with: systemctl --user disable --now frond-ear-rez-<ear>.timer
 # (or `frond-ear bind --ear <ear> --release`, which leaves nothing to resume).
 set -euo pipefail
 
+USAGE="usage: ops/install-rez.sh <ear> [--no-timer] [--launcher <abs path>] [--permission-mode <mode>]"
 EAR="${1:-}"
-[ -n "$EAR" ] || { echo "usage: ops/install-rez.sh <ear> [--no-timer]" >&2; exit 2; }
-TIMER=1; [ "${2:-}" = "--no-timer" ] && TIMER=0
+[ -n "$EAR" ] || { echo "$USAGE" >&2; exit 2; }
+shift
+TIMER=1; LAUNCHER=""; MODE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --no-timer) TIMER=0 ;;
+    --launcher) LAUNCHER="${2:-}"; shift ;;
+    --permission-mode) MODE="${2:-}"; shift ;;
+    *) echo "$USAGE" >&2; exit 2 ;;
+  esac
+  shift
+done
 
 INSTANCE="${FROND_EAR_INSTANCE:-}"
 DAEMON_UNIT="${FROND_EAR_UNIT:-frond-ear${INSTANCE:+-$INSTANCE}}"
@@ -29,6 +44,12 @@ case "$EAR" in *[!A-Za-z0-9_-]*) die "ear names are letters, digits, - or _" ;; 
 # systemd has no login shell, so every binary must be an absolute path.
 case "$NODE_BIN" in /*) ;; *) die "no absolute node; set NODE_BIN" ;; esac
 case "$CLAUDE_BIN" in /*) ;; *) die "no absolute claude; set CLAUDE_BIN" ;; esac
+case "$LAUNCHER${CLAUDE_CONFIG_DIR:-}" in *[[:space:]]*) die "paths with spaces cannot go in a unit line" ;; esac
+case "$LAUNCHER" in "" | /*) ;; *) die "--launcher must be an absolute path" ;; esac
+[ -z "$LAUNCHER" ] || [ -x "$LAUNCHER" ] || die "$LAUNCHER is not executable"
+case "$MODE" in "" | default | acceptEdits | plan | auto | dontAsk | bypassPermissions) ;;
+  *) die "unknown permission mode: $MODE" ;; esac
+case "${CLAUDE_CONFIG_DIR:-}" in "" | /*) ;; *) die "CLAUDE_CONFIG_DIR must be absolute" ;; esac
 [ -n "$TMUX_BIN" ] || die "tmux is required (the session needs a terminal to live in)"
 systemctl --user cat "$DAEMON_UNIT.service" >/dev/null 2>&1 \
   || die "$DAEMON_UNIT.service is not installed; run ops/install-systemd.sh first"
@@ -47,7 +68,8 @@ WorkingDirectory=$REPO_DIR
 Environment=PATH=$(dirname "$CLAUDE_BIN"):$(dirname "$NODE_BIN"):$(dirname "$TMUX_BIN"):/usr/bin:/bin
 Environment=CLAUDE_BIN=$CLAUDE_BIN
 ${INSTANCE:+Environment=FROND_EAR_INSTANCE=$INSTANCE
-}ExecStart=$NODE_BIN src/cli.ts rez --ear $EAR
+}${CLAUDE_CONFIG_DIR:+Environment=CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR
+}ExecStart=$NODE_BIN src/cli.ts rez --ear $EAR${LAUNCHER:+ --launcher $LAUNCHER}${MODE:+ --permission-mode $MODE}
 # 3 = unbound, nothing to resume: not a failure. 4 (refused) and 5 (failed) stay visible.
 SuccessExitStatus=3
 # The tmux server (and the session inside it) must outlive this oneshot.
