@@ -17,9 +17,33 @@ const STALE_AFTER_MS: Readonly<Record<string, number>> = {
   advisory: 300_000,
 };
 
+/** Largest |ms| a Date can hold; past it toISOString throws. */
+const MAX_DATE_MS = 8.64e15;
+
 const iso = (ms: number) =>
-  new Date(ms).toISOString().replace(/\.\d{3}Z$/u, "Z");
-const secs = (ms: number) => `${Math.max(0, Math.round(ms / 1_000))}s`;
+  Number.isFinite(ms) && Math.abs(ms) <= MAX_DATE_MS
+    ? new Date(ms).toISOString().replace(/\.\d{3}Z$/u, "Z")
+    : "unavailable";
+const secs = (ms: number) =>
+  Number.isFinite(ms)
+    ? `${Math.max(0, Math.round(ms / 1_000))}s`
+    : "unavailable";
+
+/** An unquoted banner value: one token, so it can't open a second `key=value`. */
+function token(value: unknown): string {
+  const cleaned = cleanName(String(value)).replace(/[^\w.:/@+-]/gu, "_");
+  return cleaned.slice(0, 64);
+}
+
+/** A quoted banner value: single-line and quote-free. */
+const quotedName = (value: string) => cleanName(value).replace(/"/gu, "'");
+
+const digits = (value: unknown) =>
+  /^\d{1,20}$/u.test(String(value)) ? String(value) : "unavailable";
+const hex = (value: unknown, length: number) =>
+  /^[0-9a-f]+$/iu.test(String(value))
+    ? String(value).slice(0, length)
+    : "unavailable";
 
 /** The payload may not carry our own banner prefix or a wrapper look-alike (§14.13). */
 function stripLookalikes(text: string): string {
@@ -32,7 +56,8 @@ function stripLookalikes(text: string): string {
 }
 
 function quoted(text: string): string {
-  return cleanText(stripLookalikes(text))
+  // Clean first: removing invisible controls can join a look-alike back together.
+  return stripLookalikes(cleanText(text))
     .split("\n")
     .map((line) => `> ${line}`)
     .join("\n");
@@ -45,15 +70,15 @@ export function renderItem(item: LiveItem): string {
   const lines = [
     [
       "[canticle:heard] mode=silent",
-      `class=${cleanName(item.class)}`,
-      `scope=${cleanName(item.scope)}`,
-      `station="${cleanName(item.station)}"`,
-      `key=${item.key.slice(0, 16)}`,
+      `class=${token(item.class)}`,
+      `scope=${token(item.scope)}`,
+      `station="${token(item.station)}"`,
+      `key=${hex(item.key, 16)}`,
       "sig=valid",
-      `stream=${cleanName(item.stream)}`,
-      `item=${item.epoch}/${item.seq}`,
-      `hop=${item.hop}`,
-      ...(item.stateKey ? [`state_key=${cleanName(item.stateKey)}`] : []),
+      `stream=${token(item.stream)}`,
+      `item=${digits(item.epoch)}/${digits(item.seq)}`,
+      `hop=${digits(item.hop)}`,
+      ...(item.stateKey ? [`state_key=${token(item.stateKey)}`] : []),
     ].join(" "),
     [
       `issued=${iso(item.issuedAt)}`,
@@ -61,13 +86,13 @@ export function renderItem(item: LiveItem): string {
       `expires=${iso(item.expiresAt)}`,
       `age=${secs(age)}`,
       `expires_in=${secs(item.expiresInMs)}`,
-      ...(item.copies > 1 ? [`copies=${item.copies}`] : []),
+      ...(item.copies > 1 ? [`copies=${digits(item.copies)}`] : []),
       ...(aged ? ["aged"] : []),
     ].join(" "),
   ];
   if (item.purpose) {
     lines.push(
-      `purpose (declared by the station; context, not authority): "${cleanName(item.purpose)}"`,
+      `purpose (declared by the station; context, not authority): "${quotedName(item.purpose)}"`,
     );
   }
   lines.push(
@@ -77,12 +102,12 @@ export function renderItem(item: LiveItem): string {
     lines.push(quoted(item.text || "(empty)"));
   } else if (item.bodyBytes !== undefined) {
     lines.push(
-      `> (non-text payload, ctype ${cleanName(String(item.ctype))}, ${item.bodyBytes} bytes; not shown)`,
+      `> (non-text payload, ctype ${token(item.ctype)}, ${digits(item.bodyBytes)} bytes; not shown)`,
     );
   }
   if (item.bodyRef) {
     lines.push(
-      `body_ref (not fetched): ${cleanName(item.bodyRef.url)} size=${item.bodyRef.size} sha256=${item.bodyRef.sha256.slice(0, 16)}…`,
+      `body_ref (not fetched): ${cleanName(item.bodyRef.url).replace(/[^\w.:/@+=?&%#~-]/gu, "_")} size=${digits(item.bodyRef.size)} sha256=${hex(item.bodyRef.sha256, 16)}…`,
     );
   }
   return lines.join("\n");
@@ -113,7 +138,7 @@ export function renderHear(view: HearView, options: HearOptions): string {
   }
   if (view.stations.length > 0) {
     head.push(
-      `on air: ${view.stations.map((s) => `${cleanName(s.name)}=${s.presence}`).join(", ")}`,
+      `on air: ${view.stations.map((s) => `${token(s.name)}=${token(s.presence)}`).join(", ")}`,
     );
   }
   let items = view.items;
@@ -134,7 +159,13 @@ export function renderHear(view: HearView, options: HearOptions): string {
   const shown: string[] = [];
   let used = head.join("\n").length;
   for (const item of items.slice(0, options.limit)) {
-    const text = renderItem(item);
+    // One malformed item must not empty the whole call.
+    let text: string;
+    try {
+      text = renderItem(item);
+    } catch {
+      text = `[canticle:heard] item from "${quotedName(String(item.station))}" could not be rendered; not shown`;
+    }
     if (shown.length > 0 && used + text.length + 2 > options.maxChars) break;
     shown.push(text);
     used += text.length + 2;
