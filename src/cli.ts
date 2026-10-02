@@ -24,6 +24,8 @@ usage:
                                       --channel id[:mode], --mention-pattern, --no-dms, --token-file, --token-stdin,
                                       --config, --force)
   frond-ear doctor [--json]           read-only checks: config, token, socket, daemon, gateway, ears, node
+                                      (reads what the daemon reads: FROND_EAR_CONFIG, DISCORD_BOT_TOKEN_FILE;
+                                      or --config, --token-file; init prints the env to use)
   frond-ear daemon [--dry-run]        run the gateway daemon (config: FROND_EAR_CONFIG, default ./frond-ear.json)
   frond-ear shim                      run the Claude Code channel shim (stdio MCP; launched by Claude Code)
   frond-ear status                    print daemon status as JSON

@@ -7,8 +7,14 @@ manual path; this page is the contract.
 ```sh
 git clone https://github.com/karmaterminal/frond-ear && cd frond-ear
 node src/cli.ts init      # asks for IDs, the ear name, channels and the token; writes two files
+export FROND_EAR_CONFIG="$HOME/.config/frond-ear/frond-ear.json"   # what the daemon and doctor read
+export DISCORD_BOT_TOKEN_FILE="$HOME/.config/frond-ear/token"
 node src/cli.ts doctor    # read-only: says what is working and how to fix what is not
 ```
+
+The two `export` lines matter: the daemon and `doctor` have no fallback to `~/.config/frond-ear`
+(§3), so without them `doctor` looks for `./frond-ear.json` and finds no token. `init` prints the
+same two variables in front of every command it suggests.
 
 Node ≥ 22.18 is the only requirement for the daemon and the CLI. `pnpm install` is for the tests.
 
@@ -109,7 +115,9 @@ it has been detached.
 Read-only. Every check prints ✓ or ✗ with a fix line; `--json` gives `{ ok, checks[] }`. Exit
 status is 1 if any **required** check fails, 0 otherwise. Flags: `--config`, `--token-file`,
 `--timeout-ms` (daemon reply, default 3000). The env the daemon uses (`FROND_EAR_CONFIG`,
-`DISCORD_BOT_TOKEN_FILE`, `FROND_EAR_SOCKET`, `FROND_EAR_TCP`) is honoured.
+`DISCORD_BOT_TOKEN_FILE`, `FROND_EAR_SOCKET`, `FROND_EAR_TCP`) is honoured, and is the way to run
+it: set the same two paths you give the daemon (or that `init` printed), as in the examples above.
+Bare `doctor` checks what a daemon started in the current directory with no env would load.
 
 | Check               | Required | What passes                                                                                                                                                   |
 | ------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -144,6 +152,7 @@ write it to the token file themselves, or pipe it in from a file they control.
 
 ```sh
 # the human does this once, in their own terminal, so the token never appears in a transcript:
+install -d -m 700 ~/.config/frond-ear
 install -m 600 /dev/null ~/.config/frond-ear/token && $EDITOR ~/.config/frond-ear/token
 
 # the agent does this, with the IDs the human gave it:
@@ -155,6 +164,8 @@ node src/cli.ts init --non-interactive \
   --channel 700000000000000007 --channel 700000000000000008:room \
   --mention-pattern '\bmy-ear\b' \
   --token-file ~/.config/frond-ear/token
+export FROND_EAR_CONFIG="$HOME/.config/frond-ear/frond-ear.json"
+export DISCORD_BOT_TOKEN_FILE="$HOME/.config/frond-ear/token"
 node src/cli.ts doctor
 ```
 

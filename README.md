@@ -26,15 +26,21 @@ Discord ──ws──▶ frond-ear daemon ──unix socket──▶ frond-ear 
 ```sh
 git clone https://github.com/karmaterminal/frond-ear && cd frond-ear
 node src/cli.ts init      # asks for the bot's ID, your IDs, the channels and the token
+export FROND_EAR_CONFIG="$HOME/.config/frond-ear/frond-ear.json"
+export DISCORD_BOT_TOKEN_FILE="$HOME/.config/frond-ear/token"
 node src/cli.ts doctor    # read-only: ✓/✗ per check, a fix line for each ✗
 ```
 
 `init` writes two files, `~/.config/frond-ear/frond-ear.json` and the 0600 token file, validates
 the config before writing, and prints the steps it cannot do for you: start the daemon (or
 `ops/install-systemd.sh`), `claude mcp add` in the project that owns the ear, and the launch flag
-`--dangerously-load-development-channels server:frond-ear`. `doctor` then checks config, token,
-socket, daemon, gateway and each ear. An agent can run `init --non-interactive` with flags and
-needs only the token and the IDs from you.
+`--dangerously-load-development-channels server:frond-ear`. The daemon, `doctor` and
+`ops/install-systemd.sh` read the config and token only from `FROND_EAR_CONFIG` and
+`DISCORD_BOT_TOKEN_FILE` (the daemon's own default is `./frond-ear.json`), which is why the two
+`export` lines come before `doctor`; `init` also prints them in front of every command. `doctor`
+then checks config, token, socket, daemon, gateway and each ear: config and token pass at once,
+and the socket and daemon checks stay ✗ until you start the daemon. An agent can run
+`init --non-interactive` with flags and needs only the token and the IDs from you.
 
 - [`docs/onboarding.md`](docs/onboarding.md): the contract. Every config field and where it comes
   from, what `init` writes and what stays manual, what `doctor` checks and what it refuses to probe.
