@@ -1,8 +1,16 @@
 #!/usr/bin/env node
-import { readFileSync, watch } from "node:fs";
-import { connect, type Socket } from "node:net";
+import {
+  chmodSync,
+  copyFileSync,
+  mkdirSync,
+  watch,
+  writeFileSync,
+} from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { parseArgs } from "node:util";
 
+import { connectToDaemon, request, tcpTarget, tcpToken } from "./client.ts";
 import {
   defaultSocketPath,
   loadConfigFile,
@@ -14,20 +22,31 @@ import { Manifest } from "./canticle/manifest.ts";
 import { Daemon } from "./daemon.ts";
 import { DiscordGateway } from "./gateway.ts";
 import { StructuredLogger } from "./logger.ts";
+import { runDoctor, runInit } from "./onboard.ts";
 import type { DaemonMessage } from "./protocol.ts";
 import { EAR_PROTOCOL_VERSION, LineConnection } from "./protocol.ts";
 import { HttpDiscordRest, RecordingRest } from "./rest.ts";
 import { listenTcp, listenUnix } from "./server.ts";
-import { ChannelShim } from "./shim.ts";
+import { ChannelShim, TOOLS } from "./shim.ts";
 import { EventStore } from "./store.ts";
 import type { DiscordMessage } from "./types.ts";
 
 const USAGE = `frond-ear — Discord Gateway ear for long-running Claude Code sessions
 
 usage:
+  frond-ear init [--non-interactive …] write a config and a 0600 token file, then print the next steps
+                                      (flags: --bot-user-id, --principal id[:label], --peer id[:label], --ear,
+                                      --channel id[:mode], --mention-pattern, --no-dms, --token-file, --token-stdin,
+                                      --config, --force)
+  frond-ear doctor [--json]           read-only checks: config, token, socket, daemon, gateway, ears, node
+                                      (reads what the daemon reads: FROND_EAR_CONFIG, DISCORD_BOT_TOKEN_FILE;
+                                      or --config, --token-file; init prints the env to use)
   frond-ear daemon [--dry-run]        run the gateway daemon (config: FROND_EAR_CONFIG, default ./frond-ear.json)
   frond-ear shim                      run the Claude Code channel shim (stdio MCP; launched by Claude Code)
   frond-ear status                    print daemon status as JSON
+  frond-ear copilot-extension --ear <name> [--dir <path>]
+                                      install the Copilot CLI extension for an ear
+                                      (default dir $COPILOT_HOME/extensions/frond-ear; run copilot --experimental)
   frond-ear tap --ear <name>          stream the batches pushed to an ear's attached session (read-only;\n                                      wakes a session without channel push; a shim must be attached)
   frond-ear inject --chat <id> --author <id> [--guild <id>] [--name <n>] [--bot] [--mention] <text…>
                                       push a synthetic MESSAGE_CREATE (dry-run or FROND_EAR_ALLOW_INJECT=1)
@@ -40,34 +59,6 @@ environment:
   FROND_EAR_DATABASE      SQLite path (default $XDG_STATE_HOME/frond-ear/frond-ear.db)
   DISCORD_BOT_TOKEN_FILE  bot token file (or DISCORD_BOT_TOKEN)
 `;
-
-function tcpTarget(
-  env: NodeJS.ProcessEnv,
-): { host: string; port: number } | undefined {
-  const value = env.FROND_EAR_TCP;
-  if (!value) {
-    return undefined;
-  }
-  const index = value.lastIndexOf(":");
-  const port = Number(value.slice(index + 1));
-  if (index <= 0 || !Number.isInteger(port)) {
-    throw new Error("FROND_EAR_TCP must be host:port");
-  }
-  return { host: value.slice(0, index), port };
-}
-
-function tcpToken(env: NodeJS.ProcessEnv): string | undefined {
-  return env.FROND_EAR_TOKEN_FILE
-    ? readFileSync(env.FROND_EAR_TOKEN_FILE, "utf8").trim()
-    : undefined;
-}
-
-function connectToDaemon(env: NodeJS.ProcessEnv): () => Socket {
-  const tcp = tcpTarget(env);
-  return tcp
-    ? () => connect(tcp.port, tcp.host)
-    : () => connect(defaultSocketPath(env));
-}
 
 async function runDaemon(argv: string[]): Promise<void> {
   const { values } = parseArgs({
@@ -222,39 +213,6 @@ function runShim(): void {
   process.stdin.on("end", () => process.exit(0));
 }
 
-/** One request/response exchange with the daemon as a CLI client. */
-function request(
-  message: { type: "status" } | { type: "inject"; message: DiscordMessage },
-): Promise<{ ok: boolean; text: string }> {
-  const env = process.env;
-  return new Promise((resolve, reject) => {
-    const socket = connectToDaemon(env)();
-    const connection = new LineConnection(
-      socket,
-      (raw) => {
-        const reply = raw as DaemonMessage;
-        if (reply.type === "welcome") {
-          connection.send({ ...message, id: 1 });
-        } else if (reply.type === "result") {
-          connection.close();
-          resolve({ ok: reply.ok, text: reply.text });
-        }
-      },
-      () => reject(new Error("daemon closed the connection")),
-    );
-    socket.once("connect", () => {
-      const token = tcpTarget(env) ? tcpToken(env) : undefined;
-      connection.send({
-        type: "hello",
-        role: "cli",
-        protocol: EAR_PROTOCOL_VERSION,
-        ...(token ? { token } : {}),
-      });
-    });
-    socket.once("error", (error) => reject(error));
-  });
-}
-
 async function runInject(argv: string[]): Promise<void> {
   const { values, positionals } = parseArgs({
     args: argv,
@@ -389,9 +347,82 @@ function runTap(argv: string[]): void {
   connect();
 }
 
+/**
+ * Installs the Copilot CLI extension (copilot-extension/) for one ear: the two .mjs files
+ * plus a config.json carrying the daemon address and the shim's own TOOLS, so the Claude
+ * and Copilot targets expose the same tools from one definition.
+ */
+function runCopilotExtension(argv: string[]): void {
+  const { values } = parseArgs({
+    args: argv,
+    options: { ear: { type: "string" }, dir: { type: "string" } },
+  });
+  const env = process.env;
+  const ear = values.ear ?? env.FROND_EAR_EAR;
+  if (!ear) {
+    process.stderr.write(
+      "frond-ear copilot-extension: --ear <name> is required\n",
+    );
+    process.exitCode = 2;
+    return;
+  }
+  const dir =
+    values.dir ??
+    join(
+      env.COPILOT_HOME ?? join(homedir(), ".copilot"),
+      "extensions",
+      "frond-ear",
+    );
+  const source = join(import.meta.dirname, "..", "copilot-extension");
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  for (const file of ["core.mjs", "extension.mjs"]) {
+    copyFileSync(join(source, file), join(dir, file));
+  }
+  const tcp = tcpTarget(env);
+  const config = {
+    ear,
+    tools: TOOLS,
+    ...(tcp
+      ? {
+          tcp,
+          ...(env.FROND_EAR_TOKEN_FILE
+            ? { tokenFile: env.FROND_EAR_TOKEN_FILE }
+            : {}),
+        }
+      : { socket: defaultSocketPath(env) }),
+  };
+  const configFile = join(dir, "config.json");
+  writeFileSync(configFile, `${JSON.stringify(config, null, 2)}\n`, {
+    mode: 0o600,
+  });
+  // `mode` applies only when the file is created; a reinstall over an older, looser
+  // config.json would keep its mode, so tighten it explicitly.
+  chmodSync(configFile, 0o600);
+  process.stdout.write(
+    `installed frond-ear Copilot extension for ear "${ear}" in ${dir}\n` +
+      `set ears.${ear}.target to "copilot-extension" in the daemon config, then start: copilot --experimental\n`,
+  );
+}
+
 async function main(): Promise<void> {
   const [command, ...rest] = process.argv.slice(2);
   switch (command) {
+    case "init":
+      process.exitCode = await runInit(rest, {
+        stdin: process.stdin,
+        stdout: process.stdout,
+        stderr: process.stderr,
+        env: process.env,
+      });
+      return;
+    case "doctor":
+      process.exitCode = await runDoctor(rest, {
+        stdin: process.stdin,
+        stdout: process.stdout,
+        stderr: process.stderr,
+        env: process.env,
+      });
+      return;
     case "daemon":
       await runDaemon(rest);
       return;
@@ -408,6 +439,9 @@ async function main(): Promise<void> {
       return;
     case "tap":
       runTap(rest);
+      return;
+    case "copilot-extension":
+      runCopilotExtension(rest);
       return;
     case undefined:
     case "help":
