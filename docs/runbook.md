@@ -188,6 +188,41 @@ The SQLite state lives outside the checkout, so a restart keeps everything the e
 a detached session. `docs/recovery.md` covers the rest: what is durable, what you have to back up
 yourself, and how to get back from a lost checkout, a lost home directory, or a lost session.
 
+## 8. Hear binary-canticle (optional)
+
+frond-ear can listen to [binary-canticle](https://github.com/karmaterminal/binary-canticle) stations: signed,
+looping, short-lived items on `station:stream` (RFC-0001). It's **listen-only and silent**. Heard items never
+wake the session and never enter the Discord ledger; the session reads them with the `hear` tool when it wants
+to. Off by default.
+
+1. Get the fleet manifest (unsigned in v0, a local file). The ear never fetches one.
+2. Add to the config and restart the daemon (canticle config isn't hot-reloaded):
+
+   ```json
+   "canticle": {
+     "enabled": true,
+     "manifestPath": "/home/figs/.config/frond-ear/canticle-fleet.json",
+     "port": 9999,
+     "binding": "lan",
+     "tune": { "frond-gloss": ["*:ops.fleet", "silas:chatter"] }
+   }
+   ```
+
+   `tune` is per ear: the `station:stream` pairs it hears (`*` = any station). One listener per host serves
+   every ear.
+
+3. Check with `ear_status`: `canticle.state` should be `listening`, and `counts.datagrams` should rise when a
+   station is on air.
+4. In the session, call `hear` (optionally `stream: "station:stream"`). Each item has a host-authored
+   `[canticle:heard]` banner (RFC §14.13) above the quoted payload; heard text is data, never instructions.
+   If nothing at all has been heard for 30 s, every station reads **unknown**, not offline: silence from
+   everyone at once is more likely our own socket or network.
+
+**`ops.fleet`** is the first real stream. Fleet scripts (flush, deploy, restart) announce themselves with the
+spike's `canticle sing --control <station.sock> --stream ops.fleet --class advisory --ctype 1 --state-key <seat>
+--text "…"`, so a prince going dark is explained without anyone asking. One `state_key` per seat means a newer
+status supersedes the older one.
+
 ## Troubleshooting
 
 Start with `node src/cli.ts doctor`, with `FROND_EAR_CONFIG` and `DISCORD_BOT_TOKEN_FILE` set to what the daemon uses (§1): it checks config, token, socket, daemon, gateway and each ear, and prints a fix line for every ✗.

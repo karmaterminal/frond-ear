@@ -127,6 +127,9 @@ async function runDaemon(argv: string[]): Promise<void> {
     gatewayStatus: () =>
       gateway?.status() ?? { state: runtime.dryRun ? "dry-run" : "disabled" },
     canticleStatus: () => canticle?.status() ?? { state: "disabled" },
+    ...(canticle
+      ? { canticleHear: (ear: string) => canticle!.hearView(ear) }
+      : {}),
   });
   const server = tcp
     ? await listenTcp(daemon, tcp.host, tcp.port)
