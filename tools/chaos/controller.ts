@@ -755,7 +755,10 @@ class Controller {
         condition = () => {
           const ledger = db();
           const seen = new Set(
-            this.session.notifications.map((item) => item.meta.batch_id),
+            // A pushed batch_id is `<id>-<delivery token>`.
+            this.session.notifications.map(
+              (item) => item.meta.batch_id?.split("-")[0],
+            ),
           );
           return (
             !ledger.events.some((row) => row.state === "queued") &&
