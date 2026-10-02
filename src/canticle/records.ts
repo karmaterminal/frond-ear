@@ -7,6 +7,8 @@
 // - an unknown major `v` stops delivery (receive health `failed`, `record_version`);
 // - an unknown `type` within v1 is counted and ignored;
 // - a missing or mistyped required field drops the record (`malformed_record`);
+//   `stream`, `class` and `hop` may be null where the frame doesn't carry them, but
+//   a surfaced item must have all three;
 // - a `rec_seq` gap marks receive health `degraded`, `records_lost`, and clears the
 //   live set, since the gap may have held a `retract` (a reconnect loses records too);
 // - nothing from a run is delivered before that run's first `landing_state`;
@@ -403,10 +405,13 @@ export class RecordConsumer {
       !int(f.bytes) ||
       !(rec.dedup === "first" || rec.dedup === "resurfaced") ||
       !isObj(rec.versions) ||
-      !str(rec.stream) ||
-      !str(rec.class) ||
+      // Null where the frame doesn't carry the field (§14.18.3, binary-canticle#79):
+      // `stream` for an id with no known name, `class` for an unknown code or a
+      // PLUCK, `hop` for a PLUCK. Present either way; a wrong type is malformed.
+      !strOrNull(rec.stream) ||
+      !strOrNull(rec.class) ||
       !str(rec.scope) ||
-      !int(rec.hop)
+      !intOrNull(rec.hop)
     ) {
       this.#count("malformed_record");
       return;
@@ -419,6 +424,14 @@ export class RecordConsumer {
       const admission = ADMISSIONS.has(rec.admission) ? rec.admission : "other";
       this.#count(`not_deliverable_${admission}`);
       return; // reaches at most the local ring and status (§14.18.4)
+    }
+    // A surfaced item always names its stream and class and carries a hop: the
+    // receptor keeps an unnamed stream or unknown class at `ringbuffer_only`. A
+    // `surface` record without them contradicts its own disposition; drop it
+    // rather than render a null.
+    if (!str(rec.stream) || !str(rec.class) || !int(rec.hop)) {
+      this.#count("malformed_record");
+      return;
     }
     if (!int(times.local_expiry_at) || times.local_expiry_at <= nowMs) {
       this.#count("expired_on_arrival");

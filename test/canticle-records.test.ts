@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -907,4 +907,97 @@ test("record client: real socket — first join, same-run rejoin, malformed boot
     server.close();
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("records: null stream, class and hop where the frame doesn't carry them aren't malformed, and never deliver (bc#79)", () => {
+  const c = started();
+  const pluckFrame = frame(1, {
+    class: null,
+    hop: null,
+    state_key: null,
+    purpose: null,
+    intensity: null,
+    lens: null,
+    admission: "pluck_mismatch",
+    disposition: "drop",
+    body: undefined,
+  }) as unknown as { frame: Record<string, unknown> };
+  pluckFrame.frame.kind = "pluck";
+  c.feed(pluckFrame, NOW);
+  c.feed(
+    frame(2, {
+      stream: null,
+      disposition: "ringbuffer_only",
+      reasons: ["unnamed_stream"],
+    }),
+    NOW,
+  );
+  c.feed(
+    frame(3, {
+      class: null,
+      disposition: "ringbuffer_only",
+      reasons: ["unknown_class"],
+    }),
+    NOW,
+  );
+  assert.equal(c.counts.malformed_record, undefined);
+  assert.equal(c.counts.not_deliverable_pluck_mismatch, 1);
+  assert.equal(c.counts.not_deliverable_verified, 2);
+  assert.equal(items(c).length, 0);
+  // Under a tune that would match any stream name, nothing renders as "null".
+  const view = c.hearView(["*:null", ...TUNE], NOW, true);
+  assert.equal(view.items.length, 0);
+  assert.doesNotMatch(
+    renderHear(view, { limit: 10, maxChars: 4_000 }),
+    /null/u,
+  );
+  assert.equal(c.health, "ok");
+});
+
+test("records: a wrong type in a nullable frame field is still malformed; a surfaced item needs all three", () => {
+  const c = started();
+  c.feed(frame(1, { hop: "x" }), NOW);
+  c.feed(frame(2, { class: 3 }), NOW);
+  c.feed(frame(3, { stream: 7 }), NOW);
+  c.feed(frame(4, { stream: undefined }), NOW); // missing is not null
+  assert.equal(c.counts.malformed_record, 4);
+  // `surface` with a null stream, class or hop contradicts itself: dropped, not rendered.
+  c.feed(frame(5, { stream: null }), NOW);
+  c.feed(frame(6, { class: null }), NOW);
+  c.feed(frame(7, { hop: null }), NOW);
+  assert.equal(c.counts.malformed_record, 7);
+  assert.equal(items(c).length, 0);
+  c.feed(frame(8), NOW);
+  assert.equal(items(c).length, 1);
+});
+
+test("records: binary-canticle#79's emitter output reads with nothing malformed (interop fixture)", () => {
+  const T0 = 1_790_000_000_000;
+  const lines = readFileSync(
+    new URL("./fixtures/canticle/records-v1-sample.jsonl", import.meta.url),
+    "utf8",
+  )
+    .split("\n")
+    .filter((l) => l !== "");
+  assert.equal(lines.length, 8);
+  const c = new RecordConsumer();
+  const tune = ["*:chatter"];
+  // Through the hop_limit frame, before the valid PLUCK's retract.
+  for (const l of lines.slice(0, 6)) c.feedLine(l, T0);
+  assert.deepEqual(
+    { ...c.counts },
+    {
+      not_deliverable_verified: 2, // unnamed stream, unknown class
+      not_deliverable_pluck_mismatch: 1,
+    },
+  );
+  const live = c.hearView(tune, T0, true).items;
+  assert.equal(live.length, 1);
+  assert.equal(live[0]!.stream, "chatter");
+  assert.equal(live[0]!.seq, "1");
+  for (const l of lines.slice(6)) c.feedLine(l, T0);
+  assert.equal(c.counts.malformed_record, undefined);
+  assert.equal(c.counts.not_deliverable_hop_limit, 1);
+  assert.equal(c.hearView(tune, T0, true).items.length, 0); // retracted
+  assert.equal(c.health, "ok");
 });
