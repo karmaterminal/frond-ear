@@ -22,7 +22,19 @@ pnpm check            # format, typecheck, tests, credential scan
 
 ## 1. Configure
 
-Copy `frond-ear.example.json` to `frond-ear.json`. That filename is git-ignored. Then fill in the fields below.
+The short way is `node src/cli.ts init`, which asks for the IDs, the ear and the token, validates
+the result and writes `~/.config/frond-ear/frond-ear.json` plus the 0600 token file. Then point
+the daemon and `doctor` at those two files, which they do not look for on their own, and check
+the install:
+
+```sh
+export FROND_EAR_CONFIG="$HOME/.config/frond-ear/frond-ear.json"
+export DISCORD_BOT_TOKEN_FILE="$HOME/.config/frond-ear/token"
+node src/cli.ts doctor
+```
+
+[`docs/onboarding.md`](onboarding.md) is the contract for both. The manual path: copy `frond-ear.example.json` to `frond-ear.json` (that
+filename is git-ignored) and fill in the fields below.
 
 **Identity and trust**
 
@@ -212,6 +224,8 @@ spike's `canticle sing --control <station.sock> --stream ops.fleet --class advis
 status supersedes the older one.
 
 ## Troubleshooting
+
+Start with `node src/cli.ts doctor`, with `FROND_EAR_CONFIG` and `DISCORD_BOT_TOKEN_FILE` set to what the daemon uses (§1): it checks config, token, socket, daemon, gateway and each ear, and prints a fix line for every ✗.
 
 | Symptom                                       | Likely cause                                                                                                                                                                                                      |
 | --------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
