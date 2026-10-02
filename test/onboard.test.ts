@@ -1,0 +1,463 @@
+// `frond-ear init` and `frond-ear doctor`. Everything runs in-process against
+// temp directories; doctor talks to a real daemon over a real unix socket.
+import assert from "node:assert/strict";
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { PassThrough, Readable } from "node:stream";
+import test from "node:test";
+
+import { loadConfigFile, parseConfig } from "../src/config.ts";
+import { runDoctor, runInit, type Check, type Io } from "../src/onboard.ts";
+import { listenUnix } from "../src/server.ts";
+import { BOT, CHANNEL, PRINCIPAL, ROOM, harness } from "./helpers.ts";
+
+// Short on purpose: unix socket paths are capped at 107 bytes.
+const TOKEN = "not-a-real-token-123";
+
+interface Captured {
+  io: Io;
+  stdout: () => string;
+  stderr: () => string;
+}
+
+function capture(
+  env: NodeJS.ProcessEnv = {},
+  stdin: NodeJS.ReadableStream = Readable.from([]),
+): Captured {
+  let out = "";
+  let err = "";
+  const stdout = new PassThrough();
+  stdout.on("data", (chunk: Buffer) => {
+    out += chunk.toString();
+  });
+  const stderr = new PassThrough();
+  stderr.on("data", (chunk: Buffer) => {
+    err += chunk.toString();
+  });
+  return {
+    io: { stdin, stdout, stderr, env: { PATH: "", ...env } },
+    stdout: () => out,
+    stderr: () => err,
+  };
+}
+
+function temp(): string {
+  return mkdtempSync(join(tmpdir(), "frond-ear-onboard-"));
+}
+
+const FLAGS = [
+  "--non-interactive",
+  "--bot-user-id",
+  BOT,
+  "--principal",
+  `${PRINCIPAL}:figs`,
+  "--peer",
+  "300000000000000003",
+  "--ear",
+  "scribe",
+  "--channel",
+  CHANNEL,
+  "--channel",
+  `${ROOM}:room`,
+];
+
+test("init --non-interactive writes a config parseConfig accepts and a 0600 token file, without echoing the token", async () => {
+  const directory = temp();
+  try {
+    const configPath = join(directory, "conf", "frond-ear.json");
+    const tokenPath = join(directory, "conf", "token");
+    const c = capture({}, Readable.from([`${TOKEN}\n`]));
+    const code = await runInit(
+      [
+        ...FLAGS,
+        "--token-stdin",
+        "--token-file",
+        tokenPath,
+        "--config",
+        configPath,
+      ],
+      c.io,
+    );
+    assert.equal(code, 0, c.stderr());
+
+    const config = loadConfigFile(configPath);
+    assert.equal(config.botUserId, BOT);
+    assert.deepEqual(config.principals, [PRINCIPAL]);
+    assert.deepEqual(config.peerAgents, ["300000000000000003"]);
+    assert.deepEqual(config.labels, { [PRINCIPAL]: "figs" });
+    assert.deepEqual(Object.keys(config.ears), ["scribe"]);
+    assert.equal(config.ears.scribe?.channels[CHANNEL]?.mode, "mentions");
+    assert.equal(config.ears.scribe?.channels[ROOM]?.mode, "room");
+    assert.equal(config.dmEar, "scribe");
+    assert.equal(statSync(configPath).mode & 0o777, 0o600);
+    assert.equal(statSync(join(directory, "conf")).mode & 0o777, 0o700);
+
+    assert.equal(readFileSync(tokenPath, "utf8"), `${TOKEN}\n`);
+    assert.equal(statSync(tokenPath).mode & 0o777, 0o600);
+    const printed = c.stdout() + c.stderr();
+    assert.ok(!printed.includes(TOKEN), "the token must never be printed");
+    assert.ok(
+      !readFileSync(configPath, "utf8").includes(TOKEN),
+      "the token must never land in the config",
+    );
+    // The next steps carry what the operator cannot guess.
+    assert.match(printed, /FROND_EAR_EAR=scribe/u);
+    assert.match(
+      printed,
+      /--dangerously-load-development-channels server:frond-ear/u,
+    );
+    assert.match(printed, /DISCORD_BOT_TOKEN_FILE=/u);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("init refuses to overwrite an existing config or token file without --force", async () => {
+  const directory = temp();
+  try {
+    const configPath = join(directory, "frond-ear.json");
+    const tokenPath = join(directory, "token");
+    writeFileSync(configPath, "{ existing }");
+    writeFileSync(tokenPath, "old\n", { mode: 0o600 });
+
+    const refusedConfig = capture();
+    assert.equal(
+      await runInit([...FLAGS, "--config", configPath], refusedConfig.io),
+      1,
+    );
+    assert.match(refusedConfig.stderr(), /exists; pass --force/u);
+    assert.equal(readFileSync(configPath, "utf8"), "{ existing }");
+
+    const refusedToken = capture({}, Readable.from([`${TOKEN}\n`]));
+    assert.equal(
+      await runInit(
+        [
+          ...FLAGS,
+          "--config",
+          join(directory, "other.json"),
+          "--token-stdin",
+          "--token-file",
+          tokenPath,
+        ],
+        refusedToken.io,
+      ),
+      1,
+    );
+    assert.match(refusedToken.stderr(), /token exists; pass --force/u);
+    assert.equal(readFileSync(tokenPath, "utf8"), "old\n");
+    assert.ok(
+      !existsSync(join(directory, "other.json")),
+      "a refusal writes nothing at all",
+    );
+
+    const forced = capture({}, Readable.from([`${TOKEN}\n`]));
+    assert.equal(
+      await runInit(
+        [
+          ...FLAGS,
+          "--config",
+          configPath,
+          "--token-stdin",
+          "--token-file",
+          tokenPath,
+          "--force",
+        ],
+        forced.io,
+      ),
+      0,
+      forced.stderr(),
+    );
+    assert.doesNotThrow(() => loadConfigFile(configPath));
+    assert.equal(readFileSync(tokenPath, "utf8"), `${TOKEN}\n`);
+    assert.equal(statSync(tokenPath).mode & 0o777, 0o600);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("init rejects invalid snowflakes, ear names and modes before writing anything", async () => {
+  const directory = temp();
+  try {
+    const configPath = join(directory, "frond-ear.json");
+    const cases: Array<[string[], RegExp]> = [
+      [["--bot-user-id", "abc", "--ear", "e"], /--bot-user-id/u],
+      [
+        ["--bot-user-id", BOT, "--ear", "e", "--principal", "12x:figs"],
+        /--principal "12x:figs": not a Discord snowflake/u,
+      ],
+      [
+        ["--bot-user-id", BOT, "--ear", "e", "--channel", `${CHANNEL}:loud`],
+        /mode must be silent, mentions or room/u,
+      ],
+      [["--bot-user-id", BOT, "--ear", "bad name"], /--ear/u],
+      [
+        ["--bot-user-id", BOT, "--ear", "e", "--mention-pattern", "("],
+        /invalid mention pattern/u,
+      ],
+    ];
+    for (const [flags, expected] of cases) {
+      const c = capture();
+      assert.equal(
+        await runInit(
+          ["--non-interactive", ...flags, "--config", configPath],
+          c.io,
+        ),
+        1,
+        flags.join(" "),
+      );
+      assert.match(c.stderr(), expected);
+      assert.ok(!existsSync(configPath), `${flags.join(" ")} wrote a config`);
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("init interactive: answers over a pipe, the token hidden and written 0600", async () => {
+  const directory = temp();
+  try {
+    const configPath = join(directory, "frond-ear.json");
+    const tokenPath = join(directory, "token");
+    const answers = [
+      "not-an-id", // rejected, asked again
+      BOT,
+      PRINCIPAL,
+      "figs",
+      "", // no more principals
+      "", // no peers
+      "\\bscribe\\b",
+      "scribe",
+      CHANNEL,
+      "", // mode: default mentions
+      ROOM,
+      "room",
+      "", // no more channels
+      "n", // no DMs
+      "1", // paste the token
+      TOKEN,
+    ];
+    const c = capture({}, Readable.from(answers.map((line) => `${line}\n`)));
+    const code = await runInit(
+      ["--config", configPath, "--token-file", tokenPath],
+      c.io,
+    );
+    assert.equal(code, 0, c.stderr());
+    const config = loadConfigFile(configPath);
+    assert.deepEqual(config.mentionPatterns, ["\\bscribe\\b"]);
+    assert.equal(config.ears.scribe?.dms, false);
+    assert.equal(config.ears.scribe?.channels[ROOM]?.mode, "room");
+    assert.equal(readFileSync(tokenPath, "utf8"), `${TOKEN}\n`);
+    assert.equal(statSync(tokenPath).mode & 0o777, 0o600);
+    assert.ok(!c.stdout().includes(TOKEN), "the pasted token must not echo");
+    assert.match(c.stdout(), /not a Discord ID/u);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+// ---- doctor -------------------------------------------------------------------------------
+
+interface DoctorRun {
+  code: number;
+  ok: boolean;
+  checks: Check[];
+  byName: (name: string) => Check;
+}
+
+async function doctor(
+  argv: string[],
+  env: NodeJS.ProcessEnv,
+): Promise<DoctorRun> {
+  const c = capture(env);
+  const code = await runDoctor(["--json", ...argv], c.io);
+  const report = JSON.parse(c.stdout()) as { ok: boolean; checks: Check[] };
+  return {
+    code,
+    ok: report.ok,
+    checks: report.checks,
+    byName: (name) => {
+      const check = report.checks.find((item) => item.name === name);
+      assert.ok(check, `no check named ${name} in ${JSON.stringify(report)}`);
+      return check;
+    },
+  };
+}
+
+const CONFIG_JSON = {
+  botUserId: BOT,
+  principals: [PRINCIPAL],
+  ears: {
+    scribe: {
+      target: "claude-channel",
+      attachCanary: true,
+      channels: { [CHANNEL]: "mentions" },
+    },
+  },
+};
+
+test("doctor: a healthy daemon with no session attached passes, with the attach step as advice", async () => {
+  const directory = temp();
+  const configPath = join(directory, "frond-ear.json");
+  const tokenPath = join(directory, "token");
+  writeFileSync(configPath, JSON.stringify(CONFIG_JSON));
+  writeFileSync(tokenPath, `${TOKEN}\n`, { mode: 0o600 });
+  const socketPath = join(directory, "run", "daemon.sock");
+  const h = harness(parseConfig(CONFIG_JSON), {
+    gatewayStatus: () => ({ state: "connected" }),
+  });
+  const server = await listenUnix(h.daemon, socketPath);
+  try {
+    const env = { FROND_EAR_SOCKET: socketPath };
+    const detached = await doctor(
+      ["--config", configPath, "--token-file", tokenPath],
+      env,
+    );
+    assert.equal(detached.code, 0);
+    assert.equal(detached.ok, true);
+    for (const name of [
+      "node",
+      "config",
+      "token",
+      "socket dir",
+      "socket",
+      "daemon",
+      "gateway",
+    ]) {
+      assert.equal(detached.byName(name).ok, true, name);
+      assert.equal(detached.byName(name).required, true, name);
+    }
+    const attach = detached.byName("ear scribe: attached");
+    assert.equal(attach.ok, false);
+    assert.equal(attach.required, false);
+    assert.match(attach.hint ?? "", /FROND_EAR_EAR=scribe/u);
+    assert.match(
+      attach.hint ?? "",
+      /--dangerously-load-development-channels server:frond-ear/u,
+    );
+    assert.equal(detached.byName("claude").ok, false, "PATH is empty");
+    assert.match(detached.byName("claude").detail, /NOT probed/u);
+    assert.ok(
+      !JSON.stringify(detached.checks).includes(TOKEN),
+      "doctor never prints the token",
+    );
+
+    // A shim attaches but never acks the canary: registered is false, and the
+    // report says that can be a false negative.
+    const shim = h.attach("scribe");
+    const attached = await doctor(
+      ["--config", configPath, "--token-file", tokenPath],
+      env,
+    );
+    assert.equal(attached.code, 0);
+    assert.equal(attached.byName("ear scribe: attached").ok, true);
+    const registered = attached.byName("ear scribe: registered");
+    assert.equal(registered.ok, false);
+    assert.equal(registered.required, false);
+    assert.match(registered.detail, /grace period/u);
+
+    // Acking the canary registers the ear and flips the check.
+    const ack = await h.call(shim, "ack", { nonce: "nonce-1" });
+    assert.equal(ack.ok, true, ack.text);
+    const proven = await doctor(
+      ["--config", configPath, "--token-file", tokenPath],
+      env,
+    );
+    assert.equal(proven.byName("ear scribe: registered").ok, true);
+    assert.equal(
+      proven.checks.every((check) => check.ok || check.name === "claude"),
+      true,
+    );
+  } finally {
+    server.close();
+    h.dispose();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("doctor: a 0644 token, a dead gateway, and a missing daemon each fail a required check", async () => {
+  const directory = temp();
+  const configPath = join(directory, "frond-ear.json");
+  const tokenPath = join(directory, "token");
+  writeFileSync(configPath, JSON.stringify(CONFIG_JSON));
+  writeFileSync(tokenPath, `${TOKEN}\n`, { mode: 0o644 });
+  const socketPath = join(directory, "run", "daemon.sock");
+  const h = harness(parseConfig(CONFIG_JSON), {
+    gatewayStatus: () => ({ state: "disconnected", closeCode: 4014 }),
+  });
+  const server = await listenUnix(h.daemon, socketPath);
+  try {
+    const env = { FROND_EAR_SOCKET: socketPath };
+    const run = await doctor(
+      ["--config", configPath, "--token-file", tokenPath],
+      env,
+    );
+    assert.equal(run.code, 1);
+    assert.equal(run.ok, false);
+    const token = run.byName("token");
+    assert.equal(token.ok, false);
+    assert.match(token.detail, /mode 0644, want 0600/u);
+    assert.match(token.hint ?? "", /chmod 600/u);
+    const gateway = run.byName("gateway");
+    assert.equal(gateway.ok, false);
+    assert.match(gateway.detail, /disconnected \(close code 4014\)/u);
+    assert.match(gateway.hint ?? "", /Message Content Intent/u);
+    assert.equal(run.byName("daemon").ok, true);
+
+    chmodSync(tokenPath, 0o600);
+    const fixedToken = await doctor(
+      ["--config", configPath, "--token-file", tokenPath],
+      env,
+    );
+    assert.equal(fixedToken.byName("token").ok, true);
+    assert.equal(fixedToken.code, 1, "the gateway still fails");
+  } finally {
+    server.close();
+    h.dispose();
+  }
+  try {
+    // Nobody is listening any more.
+    const gone = await doctor(
+      ["--config", configPath, "--token-file", tokenPath],
+      { FROND_EAR_SOCKET: socketPath, DISCORD_BOT_TOKEN_FILE: tokenPath },
+    );
+    assert.equal(gone.code, 1);
+    assert.equal(gone.byName("daemon").ok, false);
+    assert.match(gone.byName("daemon").hint ?? "", /start the daemon/u);
+    assert.ok(
+      !gone.checks.some((check) => check.name === "gateway"),
+      "nothing to ask about the gateway without a daemon",
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("doctor: a config that does not parse, a missing token file, and no claude on PATH", async () => {
+  const directory = temp();
+  try {
+    const configPath = join(directory, "frond-ear.json");
+    writeFileSync(configPath, JSON.stringify({ ...CONFIG_JSON, ears: {} }));
+    const run = await doctor(
+      ["--config", configPath, "--token-file", join(directory, "nope")],
+      { FROND_EAR_SOCKET: join(directory, "none", "daemon.sock") },
+    );
+    assert.equal(run.code, 1);
+    assert.match(run.byName("config").detail, /ears must define at least one/u);
+    assert.match(run.byName("config").hint ?? "", /frond-ear init/u);
+    assert.match(run.byName("token").detail, /no token file/u);
+    assert.match(run.byName("token").hint ?? "", /install -m 600/u);
+    assert.equal(run.byName("socket dir").ok, false);
+    assert.equal(run.byName("daemon").ok, false);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});

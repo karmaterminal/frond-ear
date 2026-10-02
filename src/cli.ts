@@ -1,17 +1,13 @@
 #!/usr/bin/env node
-import { readFileSync, watch } from "node:fs";
-import { connect, type Socket } from "node:net";
+import { watch } from "node:fs";
 import { parseArgs } from "node:util";
 
-import {
-  defaultSocketPath,
-  loadConfigFile,
-  readBotToken,
-  runtimeOptions,
-} from "./config.ts";
+import { connectToDaemon, request, tcpTarget, tcpToken } from "./client.ts";
+import { loadConfigFile, readBotToken, runtimeOptions } from "./config.ts";
 import { Daemon } from "./daemon.ts";
 import { DiscordGateway } from "./gateway.ts";
 import { StructuredLogger } from "./logger.ts";
+import { runDoctor, runInit } from "./onboard.ts";
 import type { DaemonMessage } from "./protocol.ts";
 import { EAR_PROTOCOL_VERSION, LineConnection } from "./protocol.ts";
 import { HttpDiscordRest, RecordingRest } from "./rest.ts";
@@ -23,6 +19,11 @@ import type { DiscordMessage } from "./types.ts";
 const USAGE = `frond-ear — Discord Gateway ear for long-running Claude Code sessions
 
 usage:
+  frond-ear init [--non-interactive …] write a config and a 0600 token file, then print the next steps
+                                      (flags: --bot-user-id, --principal id[:label], --peer id[:label], --ear,
+                                      --channel id[:mode], --mention-pattern, --no-dms, --token-file, --token-stdin,
+                                      --config, --force)
+  frond-ear doctor [--json]           read-only checks: config, token, socket, daemon, gateway, ears, node
   frond-ear daemon [--dry-run]        run the gateway daemon (config: FROND_EAR_CONFIG, default ./frond-ear.json)
   frond-ear shim                      run the Claude Code channel shim (stdio MCP; launched by Claude Code)
   frond-ear status                    print daemon status as JSON
@@ -38,34 +39,6 @@ environment:
   FROND_EAR_DATABASE      SQLite path (default $XDG_STATE_HOME/frond-ear/frond-ear.db)
   DISCORD_BOT_TOKEN_FILE  bot token file (or DISCORD_BOT_TOKEN)
 `;
-
-function tcpTarget(
-  env: NodeJS.ProcessEnv,
-): { host: string; port: number } | undefined {
-  const value = env.FROND_EAR_TCP;
-  if (!value) {
-    return undefined;
-  }
-  const index = value.lastIndexOf(":");
-  const port = Number(value.slice(index + 1));
-  if (index <= 0 || !Number.isInteger(port)) {
-    throw new Error("FROND_EAR_TCP must be host:port");
-  }
-  return { host: value.slice(0, index), port };
-}
-
-function tcpToken(env: NodeJS.ProcessEnv): string | undefined {
-  return env.FROND_EAR_TOKEN_FILE
-    ? readFileSync(env.FROND_EAR_TOKEN_FILE, "utf8").trim()
-    : undefined;
-}
-
-function connectToDaemon(env: NodeJS.ProcessEnv): () => Socket {
-  const tcp = tcpTarget(env);
-  return tcp
-    ? () => connect(tcp.port, tcp.host)
-    : () => connect(defaultSocketPath(env));
-}
 
 async function runDaemon(argv: string[]): Promise<void> {
   const { values } = parseArgs({
@@ -201,39 +174,6 @@ function runShim(): void {
   });
   shim.start();
   process.stdin.on("end", () => process.exit(0));
-}
-
-/** One request/response exchange with the daemon as a CLI client. */
-function request(
-  message: { type: "status" } | { type: "inject"; message: DiscordMessage },
-): Promise<{ ok: boolean; text: string }> {
-  const env = process.env;
-  return new Promise((resolve, reject) => {
-    const socket = connectToDaemon(env)();
-    const connection = new LineConnection(
-      socket,
-      (raw) => {
-        const reply = raw as DaemonMessage;
-        if (reply.type === "welcome") {
-          connection.send({ ...message, id: 1 });
-        } else if (reply.type === "result") {
-          connection.close();
-          resolve({ ok: reply.ok, text: reply.text });
-        }
-      },
-      () => reject(new Error("daemon closed the connection")),
-    );
-    socket.once("connect", () => {
-      const token = tcpTarget(env) ? tcpToken(env) : undefined;
-      connection.send({
-        type: "hello",
-        role: "cli",
-        protocol: EAR_PROTOCOL_VERSION,
-        ...(token ? { token } : {}),
-      });
-    });
-    socket.once("error", (error) => reject(error));
-  });
 }
 
 async function runInject(argv: string[]): Promise<void> {
@@ -373,6 +313,22 @@ function runTap(argv: string[]): void {
 async function main(): Promise<void> {
   const [command, ...rest] = process.argv.slice(2);
   switch (command) {
+    case "init":
+      process.exitCode = await runInit(rest, {
+        stdin: process.stdin,
+        stdout: process.stdout,
+        stderr: process.stderr,
+        env: process.env,
+      });
+      return;
+    case "doctor":
+      process.exitCode = await runDoctor(rest, {
+        stdin: process.stdin,
+        stdout: process.stdout,
+        stderr: process.stderr,
+        env: process.env,
+      });
+      return;
     case "daemon":
       await runDaemon(rest);
       return;

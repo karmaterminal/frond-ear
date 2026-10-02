@@ -190,7 +190,11 @@ export interface Harness {
 
 export function harness(
   config: Config = testConfig(),
-  options: { nonce?: string; path?: string } = {},
+  options: {
+    nonce?: string;
+    path?: string;
+    gatewayStatus?: () => { state: string; closeCode?: number };
+  } = {},
 ): Harness {
   const clock = new FakeClock();
   const timers = new FakeTimers(clock);
@@ -210,6 +214,7 @@ export function harness(
     timers,
     allowInject: true,
     nonce: () => options.nonce ?? "nonce-1",
+    ...(options.gatewayStatus ? { gatewayStatus: options.gatewayStatus } : {}),
   });
   let callId = 0;
   const flush = () => new Promise<void>((resolve) => setImmediate(resolve));

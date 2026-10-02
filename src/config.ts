@@ -63,8 +63,8 @@ export interface WakeBudget {
 }
 
 const RESERVED_TARGETS = new Set(["copilot-sdk", "claude-monitor"]);
-const EAR_NAME = /^[A-Za-z0-9_-]{1,64}$/u;
-const SNOWFLAKE = /^\d{1,25}$/u;
+export const EAR_NAME = /^[A-Za-z0-9_-]{1,64}$/u;
+export const SNOWFLAKE = /^\d{1,25}$/u;
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);

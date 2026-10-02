@@ -22,7 +22,11 @@ pnpm check            # format, typecheck, tests, credential scan
 
 ## 1. Configure
 
-Copy `frond-ear.example.json` to `frond-ear.json`. That filename is git-ignored. Then fill in the fields below.
+The short way is `node src/cli.ts init`, which asks for the IDs, the ear and the token, validates
+the result and writes `~/.config/frond-ear/frond-ear.json` plus the 0600 token file;
+`node src/cli.ts doctor` then checks the install. [`docs/onboarding.md`](onboarding.md) is the
+contract for both. The manual path: copy `frond-ear.example.json` to `frond-ear.json` (that
+filename is git-ignored) and fill in the fields below.
 
 **Identity and trust**
 
@@ -177,6 +181,8 @@ a detached session. `docs/recovery.md` covers the rest: what is durable, what yo
 yourself, and how to get back from a lost checkout, a lost home directory, or a lost session.
 
 ## Troubleshooting
+
+Start with `node src/cli.ts doctor`: it checks config, token, socket, daemon, gateway and each ear, and prints a fix line for every ✗.
 
 | Symptom                                       | Likely cause                                                                                                                                                                                                      |
 | --------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
