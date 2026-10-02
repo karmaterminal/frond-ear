@@ -10,3 +10,14 @@ a pre-A1 8-element entry and `b_stream` = 2^60 as `bad-field`).
 They are **candidate** vectors (RFC-0001 §9.13), produced by the Python spike. `test/canticle.test.ts` runs every case
 against this TypeScript port, which is a second, independent implementation. Don't edit the file here; regenerate
 it upstream and copy it again. Prettier ignores this directory so the bytes stay identical.
+
+# Record v1 interop sample
+
+`records-v1-sample.jsonl` is real output of binary-canticle's receptor (`canticle.records.Receptor`), captured from
+PR #79 (`gloss/20261002/bc2-record-v1-host-daemon`) at head `946aba08ab47405faed7d1423be810d7fcf6765e`, sha256
+`7b16abcf76a0490383547576f403d0580a029d8eff0e96cc023926f5f6fa22be`. It was produced by driving the `Harness` of that
+commit's `prototype/canticle-station/tests/test_records.py` (manifest classes 1, 3, 6, 9 and 42) with, in order: a
+named-stream item (`surface`), an item on an unnamed stream (`stream: null`), an item of unknown class 42
+(`class: null`), a PLUCK that misses its held target (`pluck_mismatch`, with `class` and `hop` null), a valid PLUCK
+(`retract`), and an item over its hop limit (`hop_limit`). The run id and `pid` are those of the capture.
+`test/canticle-records.test.ts` feeds every line through `RecordConsumer`. Don't edit it here; recapture it upstream.
