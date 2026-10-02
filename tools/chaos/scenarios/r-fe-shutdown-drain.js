@@ -40,7 +40,7 @@ export default function () {
     args: {
       chat_id: IDS.channel,
       text: "drained reply",
-      batch_id: Number(mention.notification.meta.batch_id),
+      batch_id: mention.notification.meta.batch_id,
     },
   });
   if (!barrier("reply is in flight, held at Discord", "held", { count: 1 }))

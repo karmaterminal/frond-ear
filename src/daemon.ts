@@ -1,4 +1,9 @@
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import {
+  createHash,
+  createHmac,
+  randomBytes,
+  timingSafeEqual,
+} from "node:crypto";
 
 import type { Config } from "./config.ts";
 import type { StructuredLogger } from "./logger.ts";
@@ -192,6 +197,11 @@ export class Daemon {
    * woken by the same push without polling.
    */
   private readonly taps = new Map<string, Set<Client>>();
+  /**
+   * Keys the delivery token in a pushed batch_id (#21). Never stored, logged or sent
+   * to a tap, so only the push itself carries a token.
+   */
+  private readonly pushSecret = randomBytes(16);
   private botLimiter: WakeLimiter;
   private ambientLimiter: WakeLimiter;
   private timer: unknown;
@@ -502,7 +512,13 @@ export class Daemon {
       content: notification.content,
       meta: notification.meta,
     } as const;
-    client.connection.send(event);
+    // The session's copy names the batch as `<id>-<token>`; a tap gets the bare id, which
+    // tools accept but which proves nothing about delivery (#21).
+    const token = this.pushToken(ear, client.attachGeneration, batch.id);
+    client.connection.send({
+      ...event,
+      meta: { ...event.meta, batch_id: `${batch.id}-${token}` },
+    });
     for (const tap of this.taps.get(ear) ?? []) {
       tap.connection.send(event);
     }
@@ -848,11 +864,12 @@ export class Daemon {
     if (requested === undefined || requested === null || requested === "") {
       return latest;
     }
-    const batch = Number(requested);
-    if (!Number.isSafeInteger(batch) || batch < 1) {
-      throw new Error("batch_id must be the positive integer from the event");
+    const match = /^(\d+)(?:-([0-9a-f]+))?$/u.exec(String(requested));
+    const batch = Number(match?.[1]);
+    if (!match || !Number.isSafeInteger(batch) || batch < 1) {
+      throw new Error("batch_id must be the batch_id from the event");
     }
-    this.provenByUse(client, ear, batch);
+    this.provenByUse(client, ear, batch, match[2]);
     return Math.min(batch, latest);
   }
 
@@ -1251,7 +1268,7 @@ export class Daemon {
 
   /**
    * Whether the attached session has proven it receives pushed events: by acking the
-   * attach canary's nonce, or by acting on a pushed batch by its batch_id (#21).
+   * attach canary's nonce, or by passing a pushed batch_id with its delivery token (#21).
    * Both are only possible after seeing a push.
    */
   private delivery(
@@ -1284,15 +1301,23 @@ export class Daemon {
   }
 
   /**
-   * A batch_id reaches the session only inside a pushed `<channel>` event (inbox
-   * and fetch_messages never show one). So a session that acts on a batch offered
-   * to its own attach generation has proved it receives pushes, which is stronger
-   * evidence than the canary, and the canary can be lost before the session can
-   * take it (#21). Register the ear rather than keep calling a working session deaf.
+   * The bare batch id also reaches a session by other routes (`frond-ear tap` prints it,
+   * the log and the store hold it, and ids are sequential), so it proves nothing. The
+   * token only rides in the pushed `<channel>` event. A session that passes it for a
+   * batch offered to its own attach generation has proved it receives pushes, and the
+   * canary can be lost before the session can take it (#21). Register the ear rather
+   * than keep calling a working session deaf.
    */
-  private provenByUse(client: Client, ear: string, batch: number): void {
+  private provenByUse(
+    client: Client,
+    ear: string,
+    batch: number,
+    token: string | undefined,
+  ): void {
     if (
+      token !== undefined &&
       !this.store.ear(ear)?.registered &&
+      token === this.pushToken(ear, client.attachGeneration, batch) &&
       this.store.offeredTo(batch, ear, client.attachGeneration) &&
       this.store.registerEarByUse(ear)
     ) {
@@ -1302,6 +1327,13 @@ export class Daemon {
         batch,
       });
     }
+  }
+
+  private pushToken(ear: string, generation: number, batch: number): string {
+    return createHmac("sha256", this.pushSecret)
+      .update(`${ear}\n${generation}\n${batch}`)
+      .digest("hex")
+      .slice(0, 8);
   }
 
   private withDeliveryWarning(client: Client, text: string): string {
