@@ -437,6 +437,74 @@ test("records: required frame fields are enforced; a pluck frame is never live",
   assert.equal(c.health, "ok"); // no rec_seq gap along the way
 });
 
+test("records: a refused frame carries no receipt pointers; a verified one must", () => {
+  const c = started();
+  const withFrame = (
+    n: number,
+    change: Record<string, unknown>,
+    extra = {},
+  ) => {
+    const r = frame(n, extra) as unknown as Record<string, unknown> & {
+      frame: Record<string, unknown>;
+    };
+    Object.assign(r.frame, change);
+    return r;
+  };
+  const nulls = { sha256: null, bytes: null };
+  // The nine refusals (binary-canticle#79): null pointers read, never deliver.
+  const refusals = [
+    "capability_exceeded",
+    "scope_violation",
+    "hop_limit",
+    "over_quota",
+    "pluck_mismatch",
+    "plucked",
+    "superseded",
+    "class_change",
+    "equivocation",
+  ];
+  let n = 0;
+  for (const admission of refusals)
+    c.feed(withFrame(++n, nulls, { admission, disposition: "drop" }), NOW);
+  // Tolerant reader: a refusal that carries pointers anyway still reads, unused.
+  c.feed(
+    withFrame(++n, {}, { admission: "hop_limit", disposition: "drop" }),
+    NOW,
+  );
+  assert.equal(c.counts.malformed_record, undefined);
+  for (const admission of refusals)
+    assert.ok((c.counts[`not_deliverable_${admission}`] ?? 0) >= 1, admission);
+  assert.equal(items(c).length, 0);
+  // Verified without either pointer is malformed, delivered or not.
+  c.feed(withFrame(++n, { sha256: null }), NOW);
+  c.feed(withFrame(++n, { bytes: null }), NOW);
+  c.feed(withFrame(++n, nulls), NOW);
+  c.feed(
+    withFrame(++n, { bytes: null }, { disposition: "ringbuffer_only" }),
+    NOW,
+  );
+  assert.equal(c.counts.malformed_record, 4);
+  // Missing and mistyped stay malformed, refusal or not.
+  const noBytes = withFrame(++n, { sha256: null }, { admission: "plucked" });
+  delete noBytes.frame.bytes;
+  c.feed(noBytes, NOW);
+  c.feed(withFrame(++n, { sha256: 7 }), NOW);
+  c.feed(withFrame(++n, { bytes: "100" }), NOW);
+  c.feed(
+    withFrame(++n, { sha256: 7, bytes: null }, { admission: "plucked" }),
+    NOW,
+  );
+  c.feed(
+    withFrame(++n, { sha256: null, bytes: 1.5 }, { admission: "plucked" }),
+    NOW,
+  );
+  assert.equal(c.counts.malformed_record, 9);
+  assert.equal(items(c).length, 0);
+  c.feed(frame(++n), NOW);
+  assert.equal(items(c).length, 1);
+  assert.equal(c.health, "ok");
+});
+
 test("records: sender-chosen values never grow a map without bound", () => {
   const c = started();
   for (let i = 0; i < 300; i++) {
@@ -980,6 +1048,18 @@ test("records: binary-canticle#79's emitter output reads with nothing malformed 
     .split("\n")
     .filter((l) => l !== "");
   assert.equal(lines.length, 8);
+  // Receipt pointers exactly on verified frames; the two refusals carry null.
+  for (const l of lines) {
+    const r = JSON.parse(l) as {
+      type: string;
+      admission?: string;
+      frame?: { sha256: unknown; bytes: unknown };
+    };
+    if (r.type !== "frame") continue;
+    const verified = r.admission === "verified";
+    assert.equal(typeof r.frame!.sha256, verified ? "string" : "object");
+    assert.equal(r.frame!.bytes === null, !verified);
+  }
   const c = new RecordConsumer();
   const tune = ["*:chatter"];
   // Through the hop_limit frame, before the valid PLUCK's retract.

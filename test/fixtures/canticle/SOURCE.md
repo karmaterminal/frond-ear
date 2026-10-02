@@ -14,10 +14,11 @@ it upstream and copy it again. Prettier ignores this directory so the bytes stay
 # Record v1 interop sample
 
 `records-v1-sample.jsonl` is real output of binary-canticle's receptor (`canticle.records.Receptor`), captured from
-PR #79 (`gloss/20261002/bc2-record-v1-host-daemon`) at head `946aba08ab47405faed7d1423be810d7fcf6765e`, sha256
-`7b16abcf76a0490383547576f403d0580a029d8eff0e96cc023926f5f6fa22be`. It was produced by driving the `Harness` of that
+PR #79 (`gloss/20261002/bc2-record-v1-host-daemon`) at head `6ee47865af98a46a19eaf53271603bd30295945c`, sha256
+`ae5b7e469f65ef9741e2b2fe145de71a1f01e615f859aca034d25c9eb4b04ece`. It was produced by driving the `Harness` of that
 commit's `prototype/canticle-station/tests/test_records.py` (manifest classes 1, 3, 6, 9 and 42) with, in order: a
 named-stream item (`surface`), an item on an unnamed stream (`stream: null`), an item of unknown class 42
 (`class: null`), a PLUCK that misses its held target (`pluck_mismatch`, with `class` and `hop` null), a valid PLUCK
-(`retract`), and an item over its hop limit (`hop_limit`). The run id and `pid` are those of the capture.
+(`retract`), and an item over its hop limit (`hop_limit`). The two refused frames carry `sha256` and `bytes` as null:
+receipt pointers exist only for a `verified` admission. The run id and `pid` are those of the capture.
 `test/canticle-records.test.ts` feeds every line through `RecordConsumer`. Don't edit it here; recapture it upstream.
