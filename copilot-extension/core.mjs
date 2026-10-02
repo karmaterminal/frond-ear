@@ -26,6 +26,7 @@ const CALL_TIMEOUT_MS = 60_000;
  * @typedef {{ type: "result"; id: number; ok: boolean; text: string }} CallResult
  * @typedef {Welcome | EarEvent | CallResult | { type: "detached"; reason: string }} DaemonMessage
  * @typedef {{ name: string; description: string; inputSchema: object }} ToolSpec
+ * @typedef {{ textResultForLlm: string; resultType: "failure" | "timeout"; error: string }} ToolFailure
  * @typedef {{ ear: string; tools: ToolSpec[]; socket?: string;
  *   tcp?: { host: string; port: number }; tokenFile?: string }} ExtensionConfig
  * @typedef {{ sessionId?: string;
@@ -89,7 +90,11 @@ export async function start(joinSession, config, deps = {}) {
   let closed = false;
   /** @type {string | undefined} */
   let instructions;
-  let preambleSent = false;
+  // Each welcome is a fresh attach with its own instructions (a daemon restart or config
+  // change can rewrite them), so the preamble is owed once per welcome, not once per
+  // extension lifetime. `welcomes` counts them; `preambleFor` is the one last prefixed.
+  let welcomes = 0;
+  let preambleFor = 0;
   /** @type {Promise<void>} */
   let delivering = Promise.resolve();
   /** @type {ReturnType<typeof setTimeout> | undefined} */
@@ -104,7 +109,7 @@ export async function start(joinSession, config, deps = {}) {
   /**
    * @param {string} tool
    * @param {Record<string, unknown>} args
-   * @returns {Promise<{ ok: boolean; text: string }>}
+   * @returns {Promise<{ ok: boolean; text: string; timedOut?: boolean }>}
    */
   const call = (tool, args) => {
     if (!socket || !connected) {
@@ -117,7 +122,11 @@ export async function start(joinSession, config, deps = {}) {
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
         calls.delete(id);
-        resolve({ ok: false, text: `frond-ear: ${tool} timed out` });
+        resolve({
+          ok: false,
+          text: `frond-ear: ${tool} timed out`,
+          timedOut: true,
+        });
       }, CALL_TIMEOUT_MS);
       calls.set(id, (result) => {
         clearTimeout(timer);
@@ -131,10 +140,20 @@ export async function start(joinSession, config, deps = {}) {
     name: spec.name,
     description: spec.description,
     parameters: spec.inputSchema,
-    /** @param {Record<string, unknown> | undefined} args */
+    // Success is the plain text; a failure is the SDK's ToolResultObject, so the session
+    // sees a failed call rather than a success whose text happens to start with "error".
+    /**
+     * @param {Record<string, unknown> | undefined} args
+     * @returns {Promise<string | ToolFailure>}
+     */
     handler: async (args) => {
       const result = await call(spec.name, args ?? {});
-      return result.ok ? result.text : `error: ${result.text}`;
+      if (result.ok) return result.text;
+      return {
+        textResultForLlm: `error: ${result.text}`,
+        resultType: result.timedOut ? "timeout" : "failure",
+        error: result.text,
+      };
     },
   }));
 
@@ -152,15 +171,16 @@ export async function start(joinSession, config, deps = {}) {
    */
   const deliver = (event) => {
     delivering = delivering.then(async () => {
+      const owed = welcomes;
       const preamble =
-        !preambleSent && instructions ? `${instructions}\n\n` : "";
+        preambleFor !== owed && instructions ? `${instructions}\n\n` : "";
       try {
         await session.send({
           prompt: `${preamble}${renderChannel(event)}`,
           source: "system",
           mode: "enqueue",
         });
-        preambleSent = preambleSent || preamble !== "";
+        if (preamble !== "") preambleFor = owed;
         state.delivered += 1;
         if (event.batchId !== null)
           send({ type: "offered", batchId: event.batchId });
@@ -183,6 +203,7 @@ export async function start(joinSession, config, deps = {}) {
           return;
         }
         instructions = message.instructions;
+        welcomes += 1;
         state.attached = message.attached;
         state.generation = message.generation ?? 0;
         return;
@@ -271,7 +292,11 @@ export async function start(joinSession, config, deps = {}) {
   open();
 
   return {
-    status: () => ({ ...state, connected, preambleSent }),
+    status: () => ({
+      ...state,
+      connected,
+      preambleSent: welcomes > 0 && preambleFor === welcomes,
+    }),
     stop: () => {
       closed = true;
       if (reconnectTimer) clearTimeout(reconnectTimer);

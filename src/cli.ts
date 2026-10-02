@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import {
+  chmodSync,
   copyFileSync,
   mkdirSync,
   readFileSync,
@@ -425,11 +426,13 @@ function runCopilotExtension(argv: string[]): void {
         }
       : { socket: defaultSocketPath(env) }),
   };
-  writeFileSync(
-    join(dir, "config.json"),
-    `${JSON.stringify(config, null, 2)}\n`,
-    { mode: 0o600 },
-  );
+  const configFile = join(dir, "config.json");
+  writeFileSync(configFile, `${JSON.stringify(config, null, 2)}\n`, {
+    mode: 0o600,
+  });
+  // `mode` applies only when the file is created; a reinstall over an older, looser
+  // config.json would keep its mode, so tighten it explicitly.
+  chmodSync(configFile, 0o600);
   process.stdout.write(
     `installed frond-ear Copilot extension for ear "${ear}" in ${dir}\n` +
       `set ears.${ear}.target to "copilot-extension" in the daemon config, then start: copilot --experimental\n`,

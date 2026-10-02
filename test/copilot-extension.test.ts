@@ -4,6 +4,7 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
   mkdtempSync,
   readFileSync,
@@ -25,10 +26,21 @@ interface Sent {
   source?: string;
   mode?: string;
 }
+interface ToolFailure {
+  textResultForLlm: string;
+  resultType: "failure" | "timeout";
+  error: string;
+}
 interface Tool {
   name: string;
   parameters: unknown;
-  handler: (args: Record<string, unknown>) => Promise<string>;
+  handler: (args: Record<string, unknown>) => Promise<string | ToolFailure>;
+}
+
+/** A successful tool call returns plain text; anything else is a failure. */
+function text(result: string | ToolFailure): string {
+  assert.equal(typeof result, "string", JSON.stringify(result));
+  return result as string;
 }
 
 async function waitFor<T>(
@@ -162,8 +174,8 @@ test("copilot extension: install, attach, canary, <channel> push via session.sen
   );
   const nonce = /nonce="([^"]+)"/u.exec(canary.prompt)?.[1];
   assert.ok(nonce);
-  assert.doesNotMatch(await tool("ack").handler({ nonce }), /^error/u);
-  const status = JSON.parse(await tool("ear_status").handler({})) as {
+  text(await tool("ack").handler({ nonce }));
+  const status = JSON.parse(text(await tool("ear_status").handler({}))) as {
     ears: Array<{ registered: boolean; sessionId: string }>;
   };
   assert.equal(status.ears[0]?.registered, true);
@@ -199,13 +211,15 @@ test("copilot extension: install, attach, canary, <channel> push via session.sen
   assert.ok(batchId > 0);
 
   // Replying goes out through the daemon (dry-run records it) and marks the batch seen.
-  const reply = await tool("reply").handler({
-    chat_id: CHANNEL,
-    batch_id: batchId,
-    text: "green.",
-  });
+  const reply = text(
+    await tool("reply").handler({
+      chat_id: CHANNEL,
+      batch_id: batchId,
+      text: "green.",
+    }),
+  );
   assert.doesNotMatch(reply, /^error/u);
-  const inbox = await tool("inbox").handler({});
+  const inbox = text(await tool("inbox").handler({}));
   assert.doesNotMatch(inbox, /walker, status please/u);
 });
 
@@ -246,4 +260,188 @@ test("copilot extension: a send the session refuses is never marked offered", as
     [8],
   );
   ext.stop();
+});
+
+type Start = (...args: unknown[]) => Promise<{
+  stop(): void;
+  settled(): Promise<void>;
+  status(): { preambleSent: boolean };
+}>;
+
+function fakeSocket() {
+  return import("node:events").then(({ EventEmitter }) => {
+    const written: Array<Record<string, unknown>> = [];
+    const socket = Object.assign(new EventEmitter(), {
+      written,
+      setEncoding: () => undefined,
+      destroy: () => undefined,
+      write: (line: string) => written.push(JSON.parse(line)),
+      line: (m: object) => socket.emit("data", `${JSON.stringify(m)}\n`),
+    });
+    return socket;
+  });
+}
+
+test("copilot extension: each new attach generation gets its own instructions preamble, once", async () => {
+  const { start } = (await import("../copilot-extension/core.mjs")) as {
+    start: Start;
+  };
+  const sockets: Array<Awaited<ReturnType<typeof fakeSocket>>> = [];
+  const pending = [await fakeSocket(), await fakeSocket()];
+  const prompts: string[] = [];
+  const ext = await start(
+    async () => ({
+      send: async ({ prompt }: Sent) => {
+        prompts.push(prompt);
+      },
+      log: async () => undefined,
+    }),
+    { ear: "walker", tools: [] },
+    {
+      connect: () => {
+        const next = pending.shift();
+        assert.ok(next, "a third connection was not expected");
+        sockets.push(next);
+        return next;
+      },
+      reconnectMs: 1,
+    },
+  );
+  const event = (batchId: number) => ({
+    type: "event",
+    batchId,
+    content: `event ${batchId}`,
+    meta: { kind: "mention" },
+  });
+
+  // Generation 1.
+  const first = sockets[0]!;
+  first.emit("connect");
+  first.line({
+    type: "welcome",
+    protocol: 1,
+    attached: true,
+    generation: 1,
+    instructions: "instructions A",
+  });
+  first.line(event(1));
+  first.line(event(2));
+  await ext.settled();
+  assert.equal(ext.status().preambleSent, true);
+
+  // The daemon restarts: the socket closes and the extension reconnects.
+  first.emit("close");
+  const second = await waitFor(() => sockets[1], "reconnect");
+  second.emit("connect");
+  second.line({
+    type: "welcome",
+    protocol: 1,
+    attached: true,
+    generation: 2,
+    instructions: "instructions B",
+  });
+  second.line(event(3));
+  second.line(event(4));
+  await ext.settled();
+
+  assert.deepEqual(
+    prompts.map((prompt) => prompt.split("\n")[0]),
+    [
+      "instructions A",
+      '<channel source="frond-ear" kind="mention">',
+      "instructions B",
+      '<channel source="frond-ear" kind="mention">',
+    ],
+  );
+  assert.equal(prompts.filter((p) => p.includes("instructions A")).length, 1);
+  assert.equal(prompts.filter((p) => p.includes("instructions B")).length, 1);
+  assert.match(prompts[2]!, /^instructions B\n\n<channel [^>]*>\nevent 3\n/u);
+  assert.equal(ext.status().preambleSent, true);
+  assert.deepEqual(
+    second.written.filter((m) => m.type === "offered").map((m) => m.batchId),
+    [3, 4],
+  );
+  ext.stop();
+});
+
+test("copilot extension: a failed tool call is an SDK failure result, not success text", async () => {
+  const { start } = (await import("../copilot-extension/core.mjs")) as {
+    start: Start;
+  };
+  const socket = await fakeSocket();
+  let tools: Tool[] = [];
+  const ext = await start(
+    async (options: { tools: Tool[] }) => {
+      tools = options.tools;
+      return { send: async () => undefined, log: async () => undefined };
+    },
+    {
+      ear: "walker",
+      tools: [{ name: "reply", description: "reply", inputSchema: {} }],
+    },
+    { connect: () => socket, reconnectMs: 60_000 },
+  );
+  const reply = tools[0]!;
+
+  // Not connected yet: the daemon is unreachable.
+  const unreachable = await reply.handler({});
+  assert.equal(typeof unreachable, "object");
+  assert.equal((unreachable as ToolFailure).resultType, "failure");
+  assert.match((unreachable as ToolFailure).error, /not reachable/u);
+  assert.match((unreachable as ToolFailure).textResultForLlm, /^error: /u);
+
+  socket.emit("connect");
+  const answer = (ok: boolean, text: string) => {
+    const call = socket.written.findLast((m) => m.type === "call")!;
+    socket.line({ type: "result", id: call.id, ok, text });
+  };
+
+  // The daemon refuses the call.
+  const refused = reply.handler({ chat_id: "1", text: "x" });
+  answer(false, "chat 1 is not allowed");
+  assert.deepEqual(await refused, {
+    textResultForLlm: "error: chat 1 is not allowed",
+    resultType: "failure",
+    error: "chat 1 is not allowed",
+  });
+
+  // A successful call stays plain text.
+  const sent = reply.handler({ chat_id: "1", text: "x" });
+  answer(true, "sent");
+  assert.equal(await sent, "sent");
+  ext.stop();
+});
+
+test("copilot extension: reinstall tightens an existing 0644 config.json to 0600", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "frond-ear-copilot-reinstall-"));
+  try {
+    const extDir = join(directory, "ext");
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      HOME: directory,
+      COPILOT_HOME: join(directory, "copilot-home"),
+      FROND_EAR_SOCKET: join(directory, "daemon.sock"),
+    };
+    const first = await run(
+      ["copilot-extension", "--ear", "walker", "--dir", extDir],
+      env,
+    );
+    assert.equal(first.code, 0);
+    const configFile = join(extDir, "config.json");
+    chmodSync(configFile, 0o644);
+    assert.equal(statSync(configFile).mode & 0o777, 0o644);
+
+    const again = await run(
+      ["copilot-extension", "--ear", "walker", "--dir", extDir],
+      env,
+    );
+    assert.equal(again.code, 0);
+    assert.equal(statSync(configFile).mode & 0o777, 0o600);
+    assert.equal(
+      (JSON.parse(readFileSync(configFile, "utf8")) as { ear: string }).ear,
+      "walker",
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
