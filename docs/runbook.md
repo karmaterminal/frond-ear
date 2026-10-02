@@ -113,7 +113,7 @@ claude --dangerously-load-development-channels server:frond-ear
 
 Claude Code asks you to confirm the development-channel flag. Then:
 
-1. **Canary.** Claude receives a `<channel … kind="attach">` event and calls `ack` with the nonce. Running `node src/cli.ts status` should show `"attached": true, "registered": true`. If `registered` stays `false`, the channel was not registered; see Troubleshooting.
+1. **Canary.** Claude receives a `<channel … kind="attach">` event and calls `ack` with the nonce. Running `node src/cli.ts status` should show `"attached": true, "registered": true`. If `registered` stays `false`, the channel was not registered; see Troubleshooting. A session whose canary was lost also registers the first time it passes a pushed `batch_id` to a tool: that id carries a delivery token only the push has. The bare id `frond-ear tap` prints works in tools but proves nothing.
 2. **Idle wake.** From another terminal, inject a mention from a principal:
    ```sh
    FROND_EAR_BOT_USER_ID=<botUserId> node src/cli.ts inject \

@@ -215,6 +215,7 @@ export function harness(
     allowInject: true,
     nonce: () => options.nonce ?? "nonce-1",
     ...(options.gatewayStatus ? { gatewayStatus: options.gatewayStatus } : {}),
+    attachmentsDir: join(directory, "attachments"),
   });
   let callId = 0;
   const flush = () => new Promise<void>((resolve) => setImmediate(resolve));

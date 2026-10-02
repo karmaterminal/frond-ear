@@ -49,6 +49,8 @@ export interface Config {
   limits: {
     maxMessageChars: number;
     maxNotificationChars: number;
+    /** Largest attachment `fetch_attachment` will download. */
+    maxAttachmentBytes: number;
     maxPendingPerEar: number;
     retentionMs: number;
   };
@@ -317,6 +319,12 @@ export function parseConfig(candidate: unknown): Config {
         "limits.maxNotificationChars",
         500,
       ),
+      maxAttachmentBytes: integer(
+        limitsInput.maxAttachmentBytes,
+        8 * 1024 * 1024,
+        "limits.maxAttachmentBytes",
+        1,
+      ),
       maxPendingPerEar: integer(
         limitsInput.maxPendingPerEar,
         500,
@@ -341,6 +349,8 @@ export function loadConfigFile(path: string): Config {
 export interface RuntimeOptions {
   configPath: string;
   databasePath: string;
+  /** Where `fetch_attachment` saves files, one subdirectory per ear. */
+  attachmentsPath: string;
   socketPath: string;
   gatewayUrl: string;
   apiBase: string;
@@ -379,6 +389,8 @@ export function runtimeOptions(
     configPath: daemonConfigPath(env),
     databasePath:
       env.FROND_EAR_DATABASE ?? join(stateHome, "frond-ear", "frond-ear.db"),
+    attachmentsPath:
+      env.FROND_EAR_ATTACHMENTS ?? join(stateHome, "frond-ear", "attachments"),
     socketPath: defaultSocketPath(env),
     gatewayUrl: env.DISCORD_GATEWAY_URL ?? "wss://gateway.discord.gg",
     apiBase: env.DISCORD_API_BASE ?? "https://discord.com/api/v10",
