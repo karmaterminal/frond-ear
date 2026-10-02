@@ -1,7 +1,7 @@
 // RFC-0001 §14.18.3 "Join snapshot" (amendment BC-1b, D36, binary-canticle#81): the
 // binding side of proof case (5)(a)–(h) of §14.18.2, frond-ear#44.
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -796,4 +796,61 @@ test("join snapshot: held entries are bounded by bytes as well as count", () => 
   assert.equal(MAX_SNAPSHOT_BYTES, 1024 * 1024);
   assert.equal(k, 17);
   assert.deepEqual(seqs(c), []);
+});
+
+test("join snapshot: binary-canticle#85's daemon output reads with nothing malformed (interop fixture)", () => {
+  const lines = readFileSync(
+    new URL("./fixtures/canticle/join-snapshot-sample.jsonl", import.meta.url),
+    "utf8",
+  )
+    .split("\n")
+    .filter((l) => l !== "");
+  assert.equal(lines.length, 7);
+  const recs = lines.map((l) => JSON.parse(l) as R);
+  // The entry form the daemon settled on: wrapped one level.
+  assert.deepEqual(
+    recs
+      .filter((r) => r.type === "snapshot")
+      .map((r) => Object.keys(r.entry as R)),
+    [["presence"], ["frame"], ["frame"]],
+  );
+  // Between the capture's received_at and every item's local expiry.
+  const now = 1_790_966_923_260;
+  const tune = ["*:alarms", "*:chatter"];
+  const texts = (c: RecordConsumer) =>
+    c
+      .hearView(tune, now, true)
+      .items.map((i) => `${i.stream}#${i.seq}`)
+      .sort();
+  const c = new RecordConsumer();
+  c.reconnected({ joinSnapshot: true }); // a host-socket connection that asked
+  for (const l of lines.slice(0, 2)) c.feedLine(l, now);
+  assert.equal(c.snapshotState, "pending");
+  assert.ok(c.joinedLate);
+  for (const l of lines.slice(2, 5)) c.feedLine(l, now);
+  assert.equal(c.snapshotState, "open");
+  assert.deepEqual(texts(c), [], "held until snapshot_end");
+  c.feedLine(lines[5]!, now); // snapshot_end W=7 count=3, untruncated
+  assert.equal(c.connectionLost, false);
+  assert.equal(c.snapshotState, "complete");
+  assert.equal(c.joinedLate, false);
+  assert.deepEqual(stations(c), { cael: "ROOT_UNKNOWN" });
+  assert.deepEqual(
+    texts(c),
+    ["alarms#1", "chatter#1"],
+    "both surfaced frames before the live record",
+  );
+  c.feedLine(lines[6]!, now); // live frame at W + 1
+  assert.deepEqual(texts(c), ["alarms#1", "chatter#1", "chatter#4"]);
+  const view = c.hearView(tune, now, true);
+  assert.deepEqual(view.items.map((i) => i.text).sort(), [
+    "live after the snapshot",
+    "smoke in the east wing",
+    "the kettle is on",
+  ]);
+  assert.equal(c.counts.malformed_record ?? 0, 0);
+  assert.equal(c.counts.records_lost ?? 0, 0);
+  assert.equal(c.counts.snapshot_frames, 2);
+  assert.ok(!c.healthReasons.includes("joined_late"));
+  assert.ok(!c.healthReasons.includes("records_lost"));
 });
