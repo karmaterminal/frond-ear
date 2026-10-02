@@ -898,8 +898,11 @@ export class Listener {
         cmp === 0 &&
         prev.cls === undefined
       ) {
-        prev.cls = it.cls; // a mark loaded from v1/v2 state learns its class
-        this.#dirty = true;
+        // A mark loaded from v1/v2 state learns its class. That is a raised guard like any
+        // other: journal it now, or a crash before the next checkpoint forgets it and a
+        // different class could be admitted in this epoch before the item comes round again.
+        prev.cls = it.cls;
+        this.#raise().hkeys.add(hkey);
       }
       if (cmp > 0) {
         let until = retain + spec.maxTtlS * 1000;

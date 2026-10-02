@@ -511,6 +511,56 @@ test("q21: state v3 keeps a mark's class; a v2 mark learns it when its own item 
   assert.equal(r.hwm.get(hkey)!.cls, 3, "learned on resurface");
 });
 
+test("q21 + journal: a v2 mark's learned class is journaled and survives a crash before the checkpoint (🕯 #32)", () => {
+  const l = new Listener(manifest, { warmup: false, restore: null });
+  l.hear(
+    item({ seq: 1, cls: 3, stateKey: "s", stream: THREAT, ttlMs: 120_000 }),
+    T0,
+  );
+  const snap = l.snapshot();
+  const v2 = {
+    ...snap,
+    version: 2,
+    hwm: snap.hwm.map((r) => r.slice(0, 5)),
+  } as never;
+  const hkey = `${kid.toString("hex")}:${THREAT}:s`;
+  // Restore from v2: the mark has no class until its own item resurfaces.
+  const r = new Listener(manifest, { warmup: false, restore: v2 });
+  r.takeJournal();
+  r.hear(
+    item({ seq: 1, cls: 3, stateKey: "s", stream: THREAT, ttlMs: 120_000 }),
+    T0 + 1_000,
+  );
+  assert.equal(r.hwm.get(hkey)!.cls, 3);
+  assert.equal(r.urgent, true, "learning a class is a raised guard");
+  const rec = r.takeJournal();
+  assert.ok(rec, "and it is journaled");
+  // Crash before any checkpoint: restart from the same v2 snapshot plus the journal.
+  const after = new Listener(manifest, {
+    warmup: false,
+    restore: v2,
+    journal: [rec],
+  });
+  assert.equal(after.hwm.get(hkey)!.cls, 3, "the learned class survived");
+  // A different class later in the same epoch is still a class change, and dropped.
+  assert.deepEqual(
+    kinds(
+      after.hear(
+        item({
+          seq: 2,
+          cls: 4,
+          stateKey: "s",
+          stream: THREAT,
+          issued: T0 + 2_000,
+          ttlMs: 120_000,
+        }),
+        T0 + 2_000,
+      ),
+    ),
+    ["evidence:class-change"],
+  );
+});
+
 test("restart: journal records replay over the snapshot idempotently and monotonically", () => {
   const l = new Listener(manifest, { warmup: false, restore: null });
   l.hear(item({ seq: 1 }), T0); // epoch adopted
