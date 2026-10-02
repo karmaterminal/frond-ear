@@ -113,7 +113,8 @@ export interface Pluck {
 /**
  * One §9.8 `stream-entry` (post-A1): 9 elements, or 10 with `lens`. `trailSeq` (amendment A1) is the
  * lowest seq of any ITEM or PLUCK still on air on the stream in this epoch, `headSeq + 1` when nothing
- * is. The listener holds it; §7.10's wait-or-repair is not built (binary-canticle#70).
+ * is. A `trailSeq` above `headSeq + 1` is bad-field (§9.8, binary-canticle#72). The listener holds it;
+ * §7.10's wait-or-repair is not built (binary-canticle#70).
  */
 export interface StreamEntry {
   streamId: number;
@@ -347,10 +348,21 @@ function parseBeacon(m: IntMap): Beacon {
     // §9.8 CDDL: `.size 4` fields are u32; head_seq and trail_seq (`.size 8`) are u64.
     const n = (i: number, name: string) =>
       uint(e[i], `stream-entry.${name}`, U32_MAX);
+    const headSeq = uintBig(e[1], "stream-entry.head_seq");
+    const trailSeq = uintBig(e[2], "stream-entry.trail_seq");
+    // §9.8 receiver rule (binary-canticle#72): a sender builds trail_seq as min(ring) <= head_seq, or
+    // head_seq + 1 when nothing is on air. Anything larger is no station state. bigint doesn't wrap, so
+    // head_seq = 2^64-1 is safe.
+    if (trailSeq > headSeq + 1n) {
+      throw new Reject(
+        "bad-field",
+        "stream-entry.trail_seq exceeds head_seq + 1",
+      );
+    }
     return {
       streamId: n(0, "stream_id"),
-      headSeq: uintBig(e[1], "stream-entry.head_seq"),
-      trailSeq: uintBig(e[2], "stream-entry.trail_seq"),
+      headSeq,
+      trailSeq,
       live: n(3, "live"),
       loopMs: n(4, "loop_ms"),
       loopMaxMs: n(5, "loop_max_ms"),
