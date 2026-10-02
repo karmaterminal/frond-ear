@@ -1,10 +1,27 @@
 import assert from "node:assert/strict";
-import { readFileSync, statSync, readdirSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
 
+import { Daemon } from "../src/daemon.ts";
+import { StructuredLogger } from "../src/logger.ts";
 import { HttpDiscordRest, assertAttachmentUrl } from "../src/rest.ts";
-import { AMBIENT, CHANNEL, PRINCIPAL, harness, message } from "./helpers.ts";
+import {
+  AMBIENT,
+  CHANNEL,
+  PRINCIPAL,
+  harness,
+  message,
+  testConfig,
+} from "./helpers.ts";
 
 const PNG = new Uint8Array([
   0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3,
@@ -147,6 +164,62 @@ test("fetch_attachment refuses: unbound chat, index out of range, oversize, mess
   });
   assert.equal(moved.ok, false);
   assert.match(moved.text, /is not in chat/u);
+  h.dispose();
+});
+
+const HOUR = 60 * 60 * 1_000;
+
+test("retention: an idle ear's files are deleted after 24 h with no further fetch, every ear's directory swept", async () => {
+  const h = harness();
+  // File mtimes are wall-clock; start the daemon clock there.
+  h.clock.value = Date.now();
+  withAttachment(h);
+  const shim = h.attach("scribe");
+  const result = await h.call(shim, "fetch_attachment", {
+    chat_id: CHANNEL,
+    message_id: "800000000000000001",
+  });
+  assert.equal(result.ok, true, result.text);
+  assert.match(
+    result.text,
+    /deleted once older than 24 h \(swept at daemon start and every 1 h\)/u,
+  );
+  const path = /^saved (.+)$/mu.exec(result.text)![1]!;
+  // Another ear's directory (one that never fetches here) is swept too.
+  const other = join(h.directory, "attachments", "elliott");
+  mkdirSync(other, { recursive: true });
+  const otherFile = join(other, "1-0-note.txt");
+  writeFileSync(otherFile, "x");
+  h.timers.advance(23 * HOUR);
+  assert.ok(existsSync(path), "kept inside 24 h");
+  assert.ok(existsSync(otherFile), "kept inside 24 h");
+  h.timers.advance(2 * HOUR);
+  assert.equal(existsSync(path), false, "idle ear's file swept after 24 h");
+  assert.equal(existsSync(otherFile), false, "other ear's file swept too");
+  assert.ok(h.timers.count >= 1, "the sweep keeps rescheduling itself");
+  h.dispose();
+});
+
+test("retention: a restarted daemon sweeps expired attachments at startup", async () => {
+  const h = harness();
+  const earDir = join(h.directory, "attachments", "scribe");
+  mkdirSync(earDir, { recursive: true });
+  const stale = join(earDir, "1-0-old.png");
+  const fresh = join(earDir, "2-0-new.png");
+  writeFileSync(stale, "x");
+  writeFileSync(fresh, "x");
+  const old = new Date(Date.now() - 25 * HOUR);
+  utimesSync(stale, old, old);
+  const restarted = new Daemon({
+    config: testConfig(),
+    store: h.store,
+    rest: h.rest,
+    logger: new StructuredLogger(() => {}),
+    attachmentsDir: join(h.directory, "attachments"),
+  });
+  assert.equal(existsSync(stale), false, "expired file removed at startup");
+  assert.ok(existsSync(fresh), "fresh file kept");
+  await restarted.shutdown();
   h.dispose();
 });
 
