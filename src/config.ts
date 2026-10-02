@@ -74,8 +74,8 @@ const TARGETS: ReadonlySet<string> = new Set([
   "copilot-extension",
 ]);
 const RESERVED_TARGETS = new Set(["copilot-sdk", "claude-monitor"]);
-const EAR_NAME = /^[A-Za-z0-9_-]{1,64}$/u;
-const SNOWFLAKE = /^\d{1,25}$/u;
+export const EAR_NAME = /^[A-Za-z0-9_-]{1,64}$/u;
+export const SNOWFLAKE = /^\d{1,25}$/u;
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -381,6 +381,15 @@ export function defaultSocketPath(
   return join(base, "daemon.sock");
 }
 
+/**
+ * The config path the daemon loads: FROND_EAR_CONFIG, else `frond-ear.json` relative to its
+ * working directory. No fallback to ~/.config/frond-ear. `doctor` resolves through this too,
+ * so the two cannot drift.
+ */
+export function daemonConfigPath(env: NodeJS.ProcessEnv): string {
+  return env.FROND_EAR_CONFIG ?? "frond-ear.json";
+}
+
 export function runtimeOptions(
   env: NodeJS.ProcessEnv,
   flags: { dryRun: boolean },
@@ -388,7 +397,7 @@ export function runtimeOptions(
   const stateHome = env.XDG_STATE_HOME ?? join(homedir(), ".local", "state");
   const dryRun = flags.dryRun || env.FROND_EAR_DRY_RUN === "1";
   return {
-    configPath: env.FROND_EAR_CONFIG ?? "frond-ear.json",
+    configPath: daemonConfigPath(env),
     databasePath:
       env.FROND_EAR_DATABASE ?? join(stateHome, "frond-ear", "frond-ear.db"),
     attachmentsPath:
