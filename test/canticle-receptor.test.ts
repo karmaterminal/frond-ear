@@ -240,6 +240,13 @@ test("receptor: a plain admission defers its save to the tick; a failing store n
     socket: fakeSocket,
   });
   receptor.start();
+  // The key's first frame adopts its epoch: a raised guard, saved at once.
+  receptor.receive(vec("rfc-vector-1-item"));
+  assert.ok(
+    store.values.has("canticle.listener_state"),
+    "epoch adoption is urgent",
+  );
+  store.values.clear();
   receptor.receive(vec("valid-item-named-stream"));
   assert.equal(receptor.live("gloss").length, 1);
   assert.equal(store.values.size, 0, "no synchronous snapshot for an item");
@@ -272,4 +279,91 @@ test("receptor: a plain admission defers its save to the tick; a failing store n
     1,
   );
   receptor.stop();
+});
+
+test("receptor: event-less admissions (untuned, unnamed) never write a snapshot synchronously (🌿 #27 B1)", () => {
+  const store = new MemoryStore();
+  let tick: (() => void) | undefined;
+  // The clock moves past the urgent-save coalescing window between datagrams, so
+  // coalescing can't mask a save that shouldn't happen at all.
+  let now = vectors.now_ms;
+  const receptor = new CanticleReceptor({
+    config: config({ tune: { gloss: ["*:somewhere-else"] } }),
+    manifest,
+    store,
+    logger,
+    clock: { now: () => now },
+    timers: {
+      setTimeout: (fn: () => void) => ((tick = fn), 1),
+      clearTimeout: () => {},
+    },
+    socket: () => ({ on: () => {}, bind: () => {}, close: () => {} }) as never,
+  });
+  receptor.start();
+  receptor.receive(vec("ttl-clamped-not-rejected")); // first frame: epoch adoption, urgent
+  store.values.clear();
+  now += 1_000;
+  receptor.receive(vec("valid-item-named-stream")); // admitted, untuned: no event
+  now += 1_000;
+  receptor.receive(vec("rfc-vector-1-item")); // admitted, unnamed stream: no event
+  assert.equal(store.values.size, 0, "no snapshot per event-less admission");
+  tick!();
+  assert.ok(store.values.has("canticle.listener_state"), "the tick saves it");
+  receptor.stop();
+});
+
+test("receptor: urgent saves are coalesced to one per 250 ms; the tick writes the rest", () => {
+  const writes: string[] = [];
+  let now = vectors.now_ms;
+  let tick: (() => void) | undefined;
+  const receptor = new CanticleReceptor({
+    config: config(),
+    manifest,
+    store: {
+      runtimeState: () => undefined,
+      setRuntimeState: (_k: string, v: string) => void writes.push(v),
+    },
+    logger,
+    clock: { now: () => now },
+    timers: {
+      setTimeout: (fn: () => void) => ((tick = fn), 1),
+      clearTimeout: () => {},
+    },
+    socket: () => ({ on: () => {}, bind: () => {}, close: () => {} }) as never,
+  });
+  receptor.start();
+  const [pluckA] = vectors.sequences
+    .find((s) => s.name === "pluck-before-original")!
+    .datagrams_hex.map((h) => Buffer.from(h, "hex"));
+  receptor.receive(pluckA!); // urgent: written now
+  assert.equal(writes.length, 1);
+  now += 10;
+  receptor.receive(vec("rfc-vector-2-pluck")); // urgent, inside 250 ms: coalesced
+  assert.equal(writes.length, 1);
+  tick!();
+  assert.equal(writes.length, 2, "the tick writes the coalesced change");
+  now += 300;
+  receptor.stop();
+});
+
+test("receptor: stop() survives a failing store; live() ignores prototype keys", () => {
+  const receptor = new CanticleReceptor({
+    config: config(),
+    manifest,
+    store: {
+      runtimeState: () => undefined,
+      setRuntimeState: () => {
+        throw new Error("disk");
+      },
+    },
+    logger,
+    clock,
+    timers: { setTimeout: () => 1, clearTimeout: () => {} },
+    socket: () => ({ on: () => {}, bind: () => {}, close: () => {} }) as never,
+  });
+  receptor.start();
+  receptor.receive(vec("valid-item-named-stream"));
+  assert.doesNotThrow(() => receptor.stop());
+  for (const ear of ["__proto__", "constructor", "toString"])
+    assert.deepEqual(receptor.live(ear), []);
 });

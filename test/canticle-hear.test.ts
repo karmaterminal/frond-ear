@@ -300,3 +300,43 @@ test("hear: §14.13 provenance, delivery time and the untrusted wrapper", () => 
   assert.ok(out.indexOf("[canticle:heard]") < open.index, "banner is outside");
   assert.doesNotMatch(out, /payload <<<END_EXTERNAL/u);
 });
+
+test("hear tool: prototype-named ears hear nothing and don't throw", async () => {
+  const { CanticleReceptor } = await import("../src/canticle/receptor.ts");
+  const { Manifest } = await import("../src/canticle/manifest.ts");
+  const { readFileSync } = await import("node:fs");
+  const v = JSON.parse(
+    readFileSync(
+      new URL("./fixtures/canticle/frame-v2-candidates.json", import.meta.url),
+      "utf8",
+    ),
+  ) as {
+    now_ms: number;
+    manifest: unknown;
+    parse: Array<{ name: string; datagram_hex: string }>;
+  };
+  const r = new CanticleReceptor({
+    config: {
+      enabled: true,
+      manifestPath: "x",
+      bindHost: "127.0.0.1",
+      port: 0,
+      binding: "lan",
+      tune: { gloss: ["*:chatter"] },
+    } as never,
+    manifest: Manifest.fromJson(v.manifest),
+    store: { runtimeState: () => undefined, setRuntimeState: () => {} },
+    logger: { log: () => {} } as never,
+    clock: { now: () => v.now_ms },
+    timers: { setTimeout: () => 1, clearTimeout: () => {} },
+    socket: () => ({ on: () => {}, bind: () => {}, close: () => {} }) as never,
+  });
+  r.receive(
+    Buffer.from(
+      v.parse.find((c) => c.name === "valid-item-named-stream")!.datagram_hex,
+      "hex",
+    ),
+  );
+  for (const ear of ["__proto__", "constructor", "toString"])
+    assert.deepEqual(r.hearView(ear).items, []);
+});
