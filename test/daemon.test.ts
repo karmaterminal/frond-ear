@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
@@ -333,6 +334,64 @@ test("delivery: a deaf copilot-extension session gets the Copilot fix, never Cla
     assert.doesNotMatch(deaf.text, CLAUDE_ADVICE);
   } finally {
     h.dispose();
+  }
+});
+
+test("delivery: a deaf copilot-extension session on a TCP daemon is told a TCP reinstall, never a socket one (#40 review)", async () => {
+  const config = testConfig({
+    ears: {
+      scribe: {
+        target: "copilot-extension",
+        attachCanary: true,
+        channels: { [CHANNEL]: "mentions" },
+      },
+    },
+  });
+  // The installer writes a unix socket unless FROND_EAR_TCP is set (cli.ts), so a
+  // socket-only reinstall would replace this ear's working TCP config.
+  // A real token file: its path is advice, its contents never are.
+  const secret = "tcp-shared-secret-never-printed";
+  const directory = mkdtempSync(join(tmpdir(), "frond-ear tcp-"));
+  const tokenFile = join(directory, "tcp-token");
+  writeFileSync(tokenFile, `${secret}\n`, { mode: 0o600 });
+  const env = {
+    FROND_EAR_TCP: "127.0.0.1:7461",
+    FROND_EAR_TOKEN_FILE: tokenFile,
+  };
+  const h = harness(config, { nonce: "c0ffee", env });
+  try {
+    const shim = h.attach("scribe", { sessionId: "copilot-session-1" });
+    h.clock.advance(2 * 60 * 1_000);
+    const hint = delivery(h).hint ?? "";
+    assert.ok(
+      hint.includes(
+        `after upgrading frond-ear, re-run the install: FROND_EAR_TCP=127.0.0.1:7461 FROND_EAR_TOKEN_FILE='${tokenFile}' `,
+      ) && hint.includes(" copilot-extension --ear scribe. Until then"),
+      hint,
+    );
+    assert.doesNotMatch(hint, /FROND_EAR_SOCKET/u);
+    assert.doesNotMatch(hint, new RegExp(secret, "u"));
+    const deaf = await h.call(shim, "inbox", { chat_id: CHANNEL });
+    assert.ok(deaf.text.endsWith(`\n\n⚠️ frond-ear: ${hint}`), deaf.text);
+    assert.doesNotMatch(deaf.text, new RegExp(secret, "u"));
+  } finally {
+    h.dispose();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("advice: a TCP env without a token file names a placeholder, never a guessed path or a socket", () => {
+  const advice = targetAdvice(
+    { name: "scribe", target: "copilot-extension" },
+    { FROND_EAR_TCP: "127.0.0.1:7461", FROND_EAR_SOCKET: "/run/x.sock" },
+  );
+  assert.ok(advice);
+  for (const text of [advice.attach, advice.deaf]) {
+    assert.match(
+      text,
+      /FROND_EAR_TCP=127\.0\.0\.1:7461 FROND_EAR_TOKEN_FILE=<token-file> \S+ \S+ copilot-extension --ear scribe \(replace <token-file> with the daemon's FROND_EAR_TOKEN_FILE path/u,
+    );
+    assert.doesNotMatch(text, /FROND_EAR_SOCKET/u);
   }
 });
 

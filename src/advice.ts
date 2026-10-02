@@ -39,6 +39,23 @@ export interface TargetAdvice {
   deaf: string;
 }
 
+/**
+ * The env prefix that makes `copilot-extension` write the transport this env reaches the
+ * daemon by. A TCP env without a token file gets a `<token-file>` placeholder to fill in:
+ * frond-ear does not guess the daemon's token file.
+ */
+function installerEnv(env: NodeJS.ProcessEnv): string {
+  if (env.FROND_EAR_TCP) {
+    const tokenFile = env.FROND_EAR_TOKEN_FILE
+      ? shellWord(env.FROND_EAR_TOKEN_FILE)
+      : "<token-file>";
+    return `FROND_EAR_TCP=${shellWord(env.FROND_EAR_TCP)} FROND_EAR_TOKEN_FILE=${tokenFile} `;
+  }
+  return env.FROND_EAR_SOCKET
+    ? `FROND_EAR_SOCKET=${shellWord(env.FROND_EAR_SOCKET)} `
+    : "";
+}
+
 /** `undefined` for a target this build does not know (in doctor, a mismatched daemon's). */
 export function targetAdvice(
   ear: AdviceEar,
@@ -59,12 +76,16 @@ export function targetAdvice(
     };
   }
   if (target === "copilot-extension") {
-    // The installer reads the same socket env as the daemon, and copies the shim's tool
-    // schemas into config.json, so an upgrade needs a reinstall.
-    const socketEnv = env.FROND_EAR_SOCKET
-      ? `FROND_EAR_SOCKET=${shellWord(env.FROND_EAR_SOCKET)} `
-      : "";
-    const install = `${socketEnv}${shellWord(process.execPath)} ${shellWord(CLI)} copilot-extension --ear ${ear.name}`;
+    // The installer copies the shim's tool schemas into config.json, so an upgrade needs a
+    // reinstall. It picks its transport from the same env the daemon reads (cli.ts:
+    // tcpTarget, FROND_EAR_TOKEN_FILE), and without FROND_EAR_TCP it writes a unix socket,
+    // so a reinstall printed without a TCP ear's transport would disconnect it (#40 review).
+    // Only the token file's path is printed, never the token.
+    const install =
+      `${installerEnv(env)}${shellWord(process.execPath)} ${shellWord(CLI)} copilot-extension --ear ${ear.name}` +
+      (env.FROND_EAR_TCP && !env.FROND_EAR_TOKEN_FILE
+        ? " (replace <token-file> with the daemon's FROND_EAR_TOKEN_FILE path; this env does not name it)"
+        : "");
     return {
       attach: `install the Copilot extension for this ear: ${install}; then start Copilot with extensions enabled: copilot --experimental. Re-run the install after upgrading frond-ear: it copies the tool schemas`,
       // Only an attached session gets this, and an attached extension usually proves it is

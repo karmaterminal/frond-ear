@@ -195,6 +195,8 @@ export function harness(
     path?: string;
     gatewayStatus?: () => { state: string; closeCode?: number };
     env?: NodeJS.ProcessEnv;
+    /** The TCP shared token, for a test that serves this daemon over listenTcp. */
+    token?: string;
   } = {},
 ): Harness {
   const clock = new FakeClock();
@@ -218,6 +220,7 @@ export function harness(
     ...(options.gatewayStatus ? { gatewayStatus: options.gatewayStatus } : {}),
     attachmentsDir: join(directory, "attachments"),
     ...(options.env ? { env: options.env } : {}),
+    ...(options.token ? { token: options.token } : {}),
   });
   let callId = 0;
   const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
