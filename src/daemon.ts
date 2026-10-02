@@ -13,6 +13,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 
+import { unconfirmedWarning } from "./advice.ts";
 import type { Config } from "./config.ts";
 import type { StructuredLogger } from "./logger.ts";
 import {
@@ -1424,7 +1425,8 @@ export class Daemon {
   /**
    * Whether the attached session has proven it receives pushed events: by acking the
    * attach canary's nonce, or by passing a pushed batch_id with its delivery token (#21).
-   * Both are only possible after seeing a push.
+   * Both are only possible after seeing a push. The unconfirmed hint is per target and
+   * shared with doctor (#39).
    */
   private delivery(
     name: string,
@@ -1443,15 +1445,16 @@ export class Daemon {
     if (this.clock.now() - attachedAt < DELIVERY_CONFIRM_GRACE_MS) {
       return { delivery: "pending" };
     }
-    const resume = client.sessionId ?? record.sessionId ?? "<session-id>";
     return {
       delivery: "unconfirmed",
-      hint:
-        "this session never acked frond-ear's attach canary, so it is not receiving pushed " +
-        "Discord events (tools still work). Claude Code only delivers channel events to " +
-        "sessions launched with --dangerously-load-development-channels server:frond-ear; " +
-        `relaunch with: claude --resume ${resume} --dangerously-load-development-channels ` +
-        "server:frond-ear. Until then, read new messages with inbox.",
+      hint: unconfirmedWarning(
+        {
+          name,
+          target: this.config.ears[name]?.target,
+          sessionId: client.sessionId ?? record.sessionId,
+        },
+        process.env,
+      ),
     };
   }
 

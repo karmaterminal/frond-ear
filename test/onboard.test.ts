@@ -16,6 +16,11 @@ import { join, resolve } from "node:path";
 import { PassThrough, Readable } from "node:stream";
 import test from "node:test";
 
+import {
+  PROVE_DELIVERY,
+  targetAdvice,
+  UNCONFIRMED_DETAIL,
+} from "../src/advice.ts";
 import { loadConfigFile, parseConfig, runtimeOptions } from "../src/config.ts";
 import {
   doctorChecks,
@@ -403,6 +408,7 @@ async function withDaemon(
   body: (
     h: ReturnType<typeof harness>,
     run: () => Promise<DoctorRun>,
+    socketPath: string,
   ) => Promise<void>,
   mutate: (parsed: ReturnType<typeof parseConfig>) => void = () => {},
 ): Promise<void> {
@@ -417,10 +423,13 @@ async function withDaemon(
   const h = harness(parsed, { gatewayStatus: () => ({ state: "connected" }) });
   const server = await listenUnix(h.daemon, socketPath);
   try {
-    await body(h, () =>
-      doctor(["--config", configPath, "--token-file", tokenPath], {
-        FROND_EAR_SOCKET: socketPath,
-      }),
+    await body(
+      h,
+      () =>
+        doctor(["--config", configPath, "--token-file", tokenPath], {
+          FROND_EAR_SOCKET: socketPath,
+        }),
+      socketPath,
     );
   } finally {
     server.close();
@@ -517,6 +526,42 @@ test("doctor: a copilot-extension ear gets Copilot advice, never Claude setup", 
     assert.doesNotMatch(unconfirmed.detail, /Claude Code/u);
   });
 });
+
+for (const target of ["claude-channel", "copilot-extension"]) {
+  test(`doctor and the daemon's delivery warning share one advice source: ${target} (#39)`, async () => {
+    const config = {
+      ...CONFIG_JSON,
+      ears: { scribe: { ...CONFIG_JSON.ears.scribe, target } },
+    };
+    await withDaemon(config, async (h, run, socketPath) => {
+      const shim = h.attach("scribe");
+      await pushPastGrace(h, shim);
+      const doctor = (await run()).byName("ear scribe: registered");
+      const result = await h.call(shim, "inbox", { chat_id: CHANNEL });
+      const warning = result.text.slice(result.text.indexOf("⚠️ frond-ear: "));
+      // doctor runs with FROND_EAR_SOCKET set and the daemon with its own env, so each
+      // side's advice is the shared function applied to its own env.
+      const status = h.daemon.status("scribe") as {
+        ears: Array<{ sessionId: string | null }>;
+      };
+      const ear = {
+        name: "scribe",
+        target,
+        sessionId: status.ears[0]?.sessionId ?? null,
+      };
+      const forDoctor = targetAdvice(ear, { FROND_EAR_SOCKET: socketPath });
+      const forDaemon = targetAdvice(ear, process.env);
+      assert.ok(forDoctor && forDaemon);
+
+      assert.equal(doctor.detail, UNCONFIRMED_DETAIL);
+      assert.ok(warning.includes(UNCONFIRMED_DETAIL), warning);
+      assert.ok(doctor.hint?.includes(PROVE_DELIVERY), doctor.hint);
+      assert.ok(warning.includes(PROVE_DELIVERY), warning);
+      assert.ok(doctor.hint?.includes(forDoctor.deaf), doctor.hint);
+      assert.ok(warning.includes(forDaemon.deaf), warning);
+    });
+  });
+}
 
 test("doctor: a target it does not know gets an honest not-supported note, no setup advice", async () => {
   // config.ts rejects reserved targets, so only a mismatched daemon reports one.

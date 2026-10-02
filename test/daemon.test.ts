@@ -245,7 +245,7 @@ test("delivery: an unacked canary is reported as a deaf session, with the relaun
       /--dangerously-load-development-channels server:frond-ear/u,
     );
     const deaf = await h.call(shim, "inbox", { chat_id: CHANNEL });
-    assert.match(deaf.text, /⚠️ frond-ear: this session never acked/u);
+    assert.match(deaf.text, /⚠️ frond-ear: delivery unconfirmed/u);
 
     assert.equal((await h.call(shim, "ack", { nonce: "c0ffee" })).ok, true);
     assert.equal(status().ears[0]?.delivery, "confirmed");
@@ -254,6 +254,81 @@ test("delivery: an unacked canary is reported as a deaf session, with the relaun
   } finally {
     h.dispose();
   }
+});
+
+const CLAUDE_ADVICE =
+  /claude mcp|claude --|dangerously-load-development-channels|Claude Code/u;
+
+/** An attached session whose delivery grace ran out with no canary ack: its warning text. */
+async function unconfirmedWarningFor(target: string): Promise<string> {
+  const config = testConfig({
+    ears: {
+      scribe: { attachCanary: true, channels: { [CHANNEL]: "mentions" } },
+    },
+  });
+  // Set after parsing: config.ts rejects reserved targets, so only a daemon newer or
+  // older than this advice could hold one.
+  (config.ears.scribe as { target: string }).target = target;
+  const h = harness(config, { nonce: "c0ffee" });
+  try {
+    const shim = h.attach("scribe");
+    h.clock.advance(2 * 60 * 1_000);
+    const result = await h.call(shim, "inbox", { chat_id: CHANNEL });
+    const at = result.text.indexOf("⚠️ frond-ear: ");
+    assert.ok(at >= 0, `a delivery warning is appended: ${result.text}`);
+    const warning = result.text.slice(at);
+    const status = h.daemon.status("scribe") as {
+      ears: Array<{ delivery: string; hint?: string }>;
+    };
+    assert.equal(status.ears[0]?.delivery, "unconfirmed");
+    assert.equal(warning, `⚠️ frond-ear: ${status.ears[0]?.hint}`);
+    return warning;
+  } finally {
+    h.dispose();
+  }
+}
+
+test("delivery warning: a claude-channel ear gets #30's proofs and the channel-flag relaunch (#39)", async () => {
+  const warning = await unconfirmedWarningFor("claude-channel");
+  assert.match(warning, /delivery unconfirmed/u);
+  assert.match(warning, /ack the attach canary's nonce/u);
+  assert.match(
+    warning,
+    /pushed batch_id exactly as the <channel> element shows it \(N-<token>\)/u,
+  );
+  assert.match(
+    warning,
+    /A bare id from tap or inbox marks a batch seen but proves nothing/u,
+  );
+  assert.match(
+    warning,
+    /--dangerously-load-development-channels server:frond-ear/u,
+  );
+  assert.match(warning, /Claude Code delivers channel events only/u);
+  assert.match(warning, /read new messages with inbox/u);
+  assert.doesNotMatch(warning, /copilot/iu);
+});
+
+test("delivery warning: a copilot-extension ear gets Copilot advice, never Claude's (#39)", async () => {
+  const warning = await unconfirmedWarningFor("copilot-extension");
+  assert.match(warning, /delivery unconfirmed/u);
+  assert.match(warning, /N-<token>/u);
+  assert.match(warning, /tap or inbox marks a batch seen but proves nothing/u);
+  assert.match(warning, /copilot-extension --ear scribe/u);
+  assert.match(warning, /copilot --experimental/u);
+  assert.match(warning, /re-run it after upgrading frond-ear/u);
+  assert.doesNotMatch(warning, CLAUDE_ADVICE);
+});
+
+test("delivery warning: a target with no advice gets a neutral note, no setup advice (#39)", async () => {
+  const warning = await unconfirmedWarningFor("copilot-sdk");
+  assert.match(warning, /N-<token>/u);
+  assert.match(warning, /No setup advice for target copilot-sdk/u);
+  assert.doesNotMatch(warning, CLAUDE_ADVICE);
+  assert.doesNotMatch(
+    warning,
+    /copilot --experimental|copilot-extension --ear/u,
+  );
 });
 
 test("delivery: acting on a pushed batch by its batch_id proves delivery when the canary was lost (#21)", async () => {

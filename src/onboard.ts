@@ -16,6 +16,14 @@ import { createInterface, type Interface } from "node:readline/promises";
 import { Writable } from "node:stream";
 import { parseArgs } from "node:util";
 
+import {
+  CLI,
+  LAUNCH_FLAG,
+  PROVE_DELIVERY,
+  shellWord,
+  targetAdvice,
+  UNCONFIRMED_DETAIL,
+} from "./advice.ts";
 import { request, tcpTarget } from "./client.ts";
 import {
   EAR_NAME,
@@ -34,11 +42,9 @@ export interface Io {
   env: NodeJS.ProcessEnv;
 }
 
-const CLI = join(import.meta.dirname, "cli.ts");
 const MIN_NODE = { major: 22, minor: 18 };
 const MAX_SOCKET_PATH = 107;
 const MODES = new Set<Mode>(["silent", "mentions", "room"]);
-const LAUNCH_FLAG = "--dangerously-load-development-channels server:frond-ear";
 
 // ---- paths -------------------------------------------------------------------------------
 
@@ -61,12 +67,6 @@ function modeOf(path: string): number {
 
 function octal(mode: number): string {
   return `0${mode.toString(8)}`;
-}
-
-function shellWord(value: string): string {
-  return /^[\w./:@=+-]+$/u.test(value)
-    ? value
-    : `'${value.replace(/'/gu, `'\\''`)}'`;
 }
 
 // ---- init: answers -----------------------------------------------------------------------
@@ -821,47 +821,6 @@ function socketChecks(env: NodeJS.ProcessEnv, startHint: string): Check[] {
   return checks;
 }
 
-/**
- * Per-target advice for an ear's session. The daemon treats both targets alike; only
- * the session side differs (#36). `undefined` for a target this doctor does not know.
- */
-interface TargetAdvice {
-  /** How to attach a session to this ear. */
-  attach: string;
-  /** What to check when no `<channel>` events reach the session at all. */
-  deaf: string;
-}
-
-function targetAdvice(
-  ear: StatusEar,
-  env: NodeJS.ProcessEnv,
-): TargetAdvice | undefined {
-  const target = ear.target ?? "claude-channel";
-  if (target === "claude-channel") {
-    const relaunch = `claude${ear.sessionId ? ` --resume ${ear.sessionId}` : ""} ${LAUNCH_FLAG}`;
-    const socketEnv = env.FROND_EAR_SOCKET
-      ? ` -e FROND_EAR_SOCKET=${shellWord(env.FROND_EAR_SOCKET)}`
-      : "";
-    return {
-      attach: `in the project that owns this ear: claude mcp add -s local frond-ear -e FROND_EAR_EAR=${ear.name}${socketEnv} -- ${shellWord(process.execPath)} ${shellWord(CLI)} shim; then ${relaunch}`,
-      deaf: `Claude Code delivers channel events only to a session launched with the development-channel flag: ${relaunch}`,
-    };
-  }
-  if (target === "copilot-extension") {
-    // The installer reads the same socket env as the daemon, and copies the shim's tool
-    // schemas into config.json, so an upgrade needs a reinstall.
-    const socketEnv = env.FROND_EAR_SOCKET
-      ? `FROND_EAR_SOCKET=${shellWord(env.FROND_EAR_SOCKET)} `
-      : "";
-    const install = `${socketEnv}${shellWord(process.execPath)} ${shellWord(CLI)} copilot-extension --ear ${ear.name}`;
-    return {
-      attach: `install the Copilot extension for this ear: ${install}; then start Copilot with extensions enabled: copilot --experimental. Re-run the install after upgrading frond-ear: it copies the tool schemas`,
-      deaf: `the extension must be installed for this ear (${install}; re-run it after upgrading frond-ear) and Copilot started with copilot --experimental`,
-    };
-  }
-  return undefined;
-}
-
 function earChecks(ear: StatusEar, env: NodeJS.ProcessEnv): Check[] {
   const advice = targetAdvice(ear, env);
   const checks: Check[] = [
@@ -888,10 +847,6 @@ function earChecks(ear: StatusEar, env: NodeJS.ProcessEnv): Check[] {
   if (!ear.attached) {
     return checks;
   }
-  // Since #30 two things confirm delivery: the canary ack, or a tool call that passes a
-  // pushed batch_id in its token form (N-<token>). status does not say which one did.
-  const prove =
-    "ack the attach canary's nonce, or act on a pushed batch_id exactly as the <channel> element shows it (N-<token>)";
   if (ear.registered) {
     checks.push({
       name: `ear ${ear.name}: registered`,
@@ -907,16 +862,15 @@ function earChecks(ear: StatusEar, env: NodeJS.ProcessEnv): Check[] {
       required: false,
       detail:
         "not yet: the session attached moments ago and has not confirmed delivery (grace period)",
-      hint: `re-run doctor in a minute; the session confirms when it does either: ${prove}`,
+      hint: `re-run doctor in a minute; the session confirms when it does either: ${PROVE_DELIVERY}`,
     });
   } else {
     checks.push({
       name: `ear ${ear.name}: registered`,
       ok: false,
       required: false,
-      detail:
-        "delivery unconfirmed: the session has neither acked the attach canary nor used a pushed batch_id in its token form (N-<token>). A bare id from tap or inbox marks a batch seen but proves nothing, so a session that has only used those stays unconfirmed while it may still hear",
-      hint: `to confirm: ${prove}${advice ? `. If no <channel> events arrive at all: ${advice.deaf}` : ""}`,
+      detail: UNCONFIRMED_DETAIL,
+      hint: `to confirm: ${PROVE_DELIVERY}${advice ? `. If no <channel> events arrive at all: ${advice.deaf}` : ""}`,
     });
   }
   return checks;
