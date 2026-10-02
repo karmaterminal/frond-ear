@@ -136,6 +136,8 @@ const config = (over: Partial<CanticleConfig> = {}): CanticleConfig => ({
   port: 0, // tests bind an ephemeral port
   binding: "lan",
   tune: { gloss: ["*:chatter"], other: ["test2:chatter"] },
+  source: "embedded",
+  hostSocket: "/nonexistent/canticle.sock",
   ...over,
 });
 
@@ -269,6 +271,8 @@ test("config: canticle defaults and validation", () => {
     port: 9999,
     binding: "lan",
     tune: { gloss: ["*:ops.fleet"] },
+    source: "embedded",
+    hostSocket: c.canticle!.hostSocket,
   });
   const bad = (canticle: unknown) => () => parseConfig({ ...base, canticle });
   assert.throws(bad({ enabled: true }), /manifestPath is required/);

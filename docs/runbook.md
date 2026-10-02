@@ -210,6 +210,11 @@ to. Off by default.
 
    `tune` is per ear: the `station:stream` pairs it hears (`*` = any station). One listener per host serves
    every ear.
+   **Where frames come from (`canticle.source`).** `embedded` (default) runs frond-ear's own listener. That's
+   allowed only while frond-ear is the host's one listener (RFC-0001 §14), and it refuses to bind if a canticle
+   host daemon answers on `canticle.hostSocket`. `host-daemon` binds nothing and reads record v1
+   (§14.18.3) from the host daemon's socket (default `$XDG_RUNTIME_DIR/canticle/daemon.sock`). Use it on any
+   host where another harness (an OpenClaw prince) also hears canticle (binary-canticle#65).
 
 3. Check with `ear_status`: `canticle.state` should be `listening`, and `counts.datagrams` should rise when a
    station is on air.

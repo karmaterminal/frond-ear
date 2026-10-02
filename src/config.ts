@@ -74,6 +74,14 @@ export interface CanticleConfig {
   binding: "host" | "lan" | "fleet" | "public";
   /** Per ear, the `station:stream` pairs it hears; `*` matches any station. */
   tune: Record<string, string[]>;
+  /**
+   * `embedded` (default): frond-ear runs its own listener, only where it is the host's
+   * one listener (RFC-0001 §14). `host-daemon`: frond-ear binds nothing and reads
+   * record v1 from the host daemon's socket (§11.1, §14.18; binary-canticle#65).
+   */
+  source: "embedded" | "host-daemon";
+  /** The host daemon's socket (default $XDG_RUNTIME_DIR/canticle/daemon.sock). */
+  hostSocket: string;
 }
 
 export interface WakeBudget {
@@ -149,7 +157,7 @@ function parseCanticle(
   }
   const enabled = value.enabled === true;
   if (typeof value.manifestPath !== "string" || value.manifestPath === "") {
-    if (enabled) {
+    if (enabled && value.source !== "host-daemon") {
       throw new Error("canticle.manifestPath is required when enabled");
     }
   }
@@ -191,6 +199,20 @@ function parseCanticle(
     }
     tune[ear] = list;
   }
+  const source = value.source ?? "embedded";
+  if (source !== "embedded" && source !== "host-daemon") {
+    throw new Error("canticle.source must be embedded or host-daemon");
+  }
+  const hostSocket =
+    value.hostSocket ??
+    join(
+      process.env.XDG_RUNTIME_DIR ?? join(homedir(), ".cache"),
+      "canticle",
+      "daemon.sock",
+    );
+  if (typeof hostSocket !== "string" || hostSocket === "") {
+    throw new Error("canticle.hostSocket must be a path");
+  }
   return {
     enabled,
     manifestPath:
@@ -199,6 +221,8 @@ function parseCanticle(
     port,
     binding,
     tune,
+    source,
+    hostSocket,
   };
 }
 
