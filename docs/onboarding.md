@@ -90,7 +90,8 @@ Without any token flag it writes the config only and prints the `install -m 600`
 
 The daemon's own default for `FROND_EAR_CONFIG` is `./frond-ear.json` in its working directory,
 which is why `init` prints `FROND_EAR_CONFIG=` and `DISCORD_BOT_TOKEN_FILE=` in front of every
-command. The systemd installer bakes both into the unit.
+command. The systemd installer bakes both into the unit, and tightens `~/.config/frond-ear` to
+0700 only when one of the two files lives there.
 
 ## 4. Clients
 
@@ -110,18 +111,18 @@ status is 1 if any **required** check fails, 0 otherwise. Flags: `--config`, `--
 `--timeout-ms` (daemon reply, default 3000). The env the daemon uses (`FROND_EAR_CONFIG`,
 `DISCORD_BOT_TOKEN_FILE`, `FROND_EAR_SOCKET`, `FROND_EAR_TCP`) is honoured.
 
-| Check               | Required | What passes                                                                                                                             |
-| ------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| node                | yes      | ≥ 22.18                                                                                                                                 |
-| config              | yes      | the file `parseConfig` would load, found at `--config` → `FROND_EAR_CONFIG` → `./frond-ear.json` → `~/.config/frond-ear/frond-ear.json` |
-| token               | yes      | the file exists, is 0600 and non-empty (its contents are never read back or printed); or `DISCORD_BOT_TOKEN` is set                     |
-| socket dir / socket | yes      | 0700 / 0600, path ≤ 107 bytes; skipped in TCP mode                                                                                      |
-| daemon              | yes      | answers `status` over the socket                                                                                                        |
-| gateway             | yes      | `connected`, or `dry-run`                                                                                                               |
-| paused              | advisory | reported when the kill switch is on                                                                                                     |
-| ear _n_: attached   | advisory | a shim is attached. Not required: an ear with no session is healthy and holds events for it                                             |
-| ear _n_: registered | advisory | the session acked the attach canary                                                                                                     |
-| claude              | advisory | `claude` is on `PATH`                                                                                                                   |
+| Check               | Required | What passes                                                                                                                                                   |
+| ------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| node                | yes      | ≥ 22.18                                                                                                                                                       |
+| config              | yes      | `--config`, else what the daemon loads here: `FROND_EAR_CONFIG`, else `./frond-ear.json` (no `~/.config` fallback); names a home config the daemon would miss |
+| token               | yes      | `--token-file` / `DISCORD_BOT_TOKEN_FILE` is 0600 and non-empty (never read back), or `DISCORD_BOT_TOKEN` is set; no default path                             |
+| socket dir / socket | yes      | 0700 / 0600, path ≤ 107 bytes; skipped in TCP mode                                                                                                            |
+| daemon              | yes      | answers `status` over the socket                                                                                                                              |
+| gateway             | yes      | `connected`, or `dry-run`                                                                                                                                     |
+| paused              | advisory | reported when the kill switch is on                                                                                                                           |
+| ear _n_: attached   | advisory | a shim is attached. Not required: an ear with no session is healthy and holds events for it                                                                   |
+| ear _n_: registered | advisory | the session acked the attach canary                                                                                                                           |
+| claude              | advisory | `claude` is on `PATH`                                                                                                                                         |
 
 Two things `doctor` deliberately does not do:
 

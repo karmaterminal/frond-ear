@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   chmodSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -11,12 +12,19 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { PassThrough, Readable } from "node:stream";
 import test from "node:test";
 
-import { loadConfigFile, parseConfig } from "../src/config.ts";
-import { runDoctor, runInit, type Check, type Io } from "../src/onboard.ts";
+import { loadConfigFile, parseConfig, runtimeOptions } from "../src/config.ts";
+import {
+  doctorChecks,
+  resolveConfigPath,
+  runDoctor,
+  runInit,
+  type Check,
+  type Io,
+} from "../src/onboard.ts";
 import { listenUnix } from "../src/server.ts";
 import { BOT, CHANNEL, PRINCIPAL, ROOM, harness } from "./helpers.ts";
 
@@ -457,6 +465,98 @@ test("doctor: a config that does not parse, a missing token file, and no claude 
     assert.match(run.byName("token").hint ?? "", /install -m 600/u);
     assert.equal(run.byName("socket dir").ok, false);
     assert.equal(run.byName("daemon").ok, false);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("doctor resolves config and token exactly as the daemon does, and names a home config the daemon would not load", async () => {
+  const directory = temp();
+  try {
+    const confDir = join(directory, "conf");
+    const homeConfig = join(confDir, "frond-ear.json");
+    const homeToken = join(confDir, "token");
+    mkdirSync(confDir, { mode: 0o700 });
+    writeFileSync(homeConfig, JSON.stringify(CONFIG_JSON), { mode: 0o600 });
+    writeFileSync(homeToken, `${TOKEN}\n`, { mode: 0o600 });
+    const cwd = join(directory, "work");
+    mkdirSync(cwd);
+    const base = {
+      PATH: "",
+      FROND_EAR_CONF_DIR: confDir,
+      FROND_EAR_SOCKET: join(directory, "none", "daemon.sock"),
+    };
+    const daemonPath = (env: NodeJS.ProcessEnv): string =>
+      resolve(cwd, runtimeOptions(env, { dryRun: false }).configPath);
+    const byName = (checks: Check[], name: string): Check => {
+      const check = checks.find((item) => item.name === name);
+      assert.ok(check, `no check named ${name} in ${JSON.stringify(checks)}`);
+      return check;
+    };
+
+    // Flagless, no ./frond-ear.json: doctor checks what the daemon would load, not the home
+    // config, and says why the daemon would not find the config that does exist.
+    assert.equal(
+      resolveConfigPath(undefined, base, cwd).path,
+      daemonPath(base),
+    );
+    const stranded = await doctorChecks({ "timeout-ms": "200" }, base, cwd);
+    const config = byName(stranded, "config");
+    assert.equal(config.ok, false);
+    assert.ok(
+      config.detail.includes(join(cwd, "frond-ear.json")),
+      config.detail,
+    );
+    assert.match(config.detail, /the daemon's default/u);
+    assert.ok(config.detail.includes(homeConfig), config.detail);
+    assert.match(config.detail, /will not load it/u);
+    assert.ok(
+      (config.hint ?? "").includes(`FROND_EAR_CONFIG=${homeConfig}`),
+      config.hint,
+    );
+    const token = byName(stranded, "token");
+    assert.equal(
+      token.ok,
+      false,
+      "the daemon has no default token path either",
+    );
+    assert.match(
+      token.detail,
+      /neither DISCORD_BOT_TOKEN_FILE nor DISCORD_BOT_TOKEN/u,
+    );
+    assert.ok(token.detail.includes(homeToken), token.detail);
+    assert.ok(
+      (token.hint ?? "").includes(`DISCORD_BOT_TOKEN_FILE=${homeToken}`),
+      token.hint,
+    );
+
+    // The env the daemon would get: both pass, and the config names where it came from.
+    const named = {
+      ...base,
+      FROND_EAR_CONFIG: homeConfig,
+      DISCORD_BOT_TOKEN_FILE: homeToken,
+    };
+    assert.equal(
+      resolveConfigPath(undefined, named, cwd).path,
+      daemonPath(named),
+    );
+    const fixed = await doctorChecks({ "timeout-ms": "200" }, named, cwd);
+    assert.equal(byName(fixed, "config").ok, true);
+    assert.match(byName(fixed, "config").detail, /\(FROND_EAR_CONFIG\)/u);
+    assert.equal(byName(fixed, "token").ok, true);
+
+    // A ./frond-ear.json in the working directory is what a flagless daemon loads.
+    writeFileSync(join(cwd, "frond-ear.json"), JSON.stringify(CONFIG_JSON));
+    assert.equal(
+      resolveConfigPath(undefined, base, cwd).path,
+      daemonPath(base),
+    );
+    const local = await doctorChecks({ "timeout-ms": "200" }, base, cwd);
+    assert.equal(byName(local, "config").ok, true);
+    assert.ok(
+      byName(local, "config").detail.startsWith(join(cwd, "frond-ear.json")),
+      byName(local, "config").detail,
+    );
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

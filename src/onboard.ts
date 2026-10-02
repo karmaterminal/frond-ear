@@ -20,6 +20,7 @@ import { request, tcpTarget } from "./client.ts";
 import {
   EAR_NAME,
   SNOWFLAKE,
+  daemonConfigPath,
   defaultSocketPath,
   loadConfigFile,
   parseConfig,
@@ -608,32 +609,60 @@ function nodeCheck(): Check {
   };
 }
 
-/** Which config the daemon would load, mirroring runtimeOptions plus the init default. */
+/** A config path doctor checks, and why that one. */
+export interface ConfigSource {
+  path: string;
+  from: string;
+  /** True when the path is the daemon's own default, not one somebody named. */
+  daemonDefault: boolean;
+}
+
+/**
+ * Which config doctor checks: `--config` if given, else exactly what the daemon would load from
+ * `cwd` (daemonConfigPath: FROND_EAR_CONFIG, else ./frond-ear.json). No ~/.config fallback,
+ * because the daemon has none.
+ */
 export function resolveConfigPath(
   flag: string | undefined,
   env: NodeJS.ProcessEnv,
-): string {
+  cwd: string = process.cwd(),
+): ConfigSource {
   if (flag) {
-    return resolve(flag);
+    return {
+      path: resolve(cwd, flag),
+      from: "--config (the daemon itself reads FROND_EAR_CONFIG)",
+      daemonDefault: false,
+    };
   }
-  if (env.FROND_EAR_CONFIG) {
-    return resolve(env.FROND_EAR_CONFIG);
-  }
-  if (existsSync("frond-ear.json")) {
-    return resolve("frond-ear.json");
-  }
-  return defaultConfigPath(env);
+  return {
+    path: resolve(cwd, daemonConfigPath(env)),
+    from:
+      env.FROND_EAR_CONFIG === undefined
+        ? `the daemon's default, ./frond-ear.json in ${cwd}`
+        : "FROND_EAR_CONFIG",
+    daemonDefault: env.FROND_EAR_CONFIG === undefined,
+  };
 }
 
-function configCheck(path: string): { check: Check; ears: string[] } {
+function configCheck(
+  source: ConfigSource,
+  env: NodeJS.ProcessEnv,
+): { check: Check; ears: string[] } {
+  const { path, from } = source;
   if (!existsSync(path)) {
+    const home = resolve(defaultConfigPath(env));
+    const stranded = source.daemonDefault && home !== path && existsSync(home);
     return {
       check: {
         name: "config",
         ok: false,
         required: true,
-        detail: `no config at ${path}`,
-        hint: "run `frond-ear init`, or point FROND_EAR_CONFIG / --config at the file",
+        detail: stranded
+          ? `no config at ${path} (${from}). ${home} exists, but a daemon started here without FROND_EAR_CONFIG will not load it: the daemon has no fallback to that path`
+          : `no config at ${path} (${from})`,
+        hint: stranded
+          ? `export FROND_EAR_CONFIG=${shellWord(home)} for the daemon and for doctor (init prints it in front of every command), or pass --config to check that file`
+          : "run `frond-ear init`, or point FROND_EAR_CONFIG / --config at the file",
       },
       ears: [],
     };
@@ -646,7 +675,7 @@ function configCheck(path: string): { check: Check; ears: string[] } {
         name: "config",
         ok: true,
         required: true,
-        detail: `${path}: ${ears.length} ear(s): ${ears.join(", ")}`,
+        detail: `${path} (${from}): ${ears.length} ear(s): ${ears.join(", ")}`,
       },
       ears,
     };
@@ -656,7 +685,7 @@ function configCheck(path: string): { check: Check; ears: string[] } {
         name: "config",
         ok: false,
         required: true,
-        detail: `${path}: ${error instanceof Error ? error.message : String(error)}`,
+        detail: `${path} (${from}): ${error instanceof Error ? error.message : String(error)}`,
         hint: "fix the field named above (docs/onboarding.md lists every field), or re-run `frond-ear init --force`",
       },
       ears: [],
@@ -665,7 +694,8 @@ function configCheck(path: string): { check: Check; ears: string[] } {
 }
 
 function tokenCheck(flag: string | undefined, env: NodeJS.ProcessEnv): Check {
-  const path = flag ?? env.DISCORD_BOT_TOKEN_FILE;
+  // Same precedence as readBotToken: the file if named, else the variable, else nothing.
+  const path = flag || env.DISCORD_BOT_TOKEN_FILE;
   if (!path && env.DISCORD_BOT_TOKEN?.trim()) {
     return {
       name: "token",
@@ -675,14 +705,27 @@ function tokenCheck(flag: string | undefined, env: NodeJS.ProcessEnv): Check {
         "token comes from DISCORD_BOT_TOKEN (a 0600 file via DISCORD_BOT_TOKEN_FILE is safer)",
     };
   }
-  const file = resolve(path ?? defaultTokenPath(env));
+  if (!path) {
+    const home = resolve(defaultTokenPath(env));
+    const found = existsSync(home);
+    return {
+      name: "token",
+      ok: false,
+      required: true,
+      detail: `neither DISCORD_BOT_TOKEN_FILE nor DISCORD_BOT_TOKEN is set, and the daemon reads its token from nowhere else${found ? `; ${home} exists but the daemon does not look there` : ""}`,
+      hint: found
+        ? `export DISCORD_BOT_TOKEN_FILE=${shellWord(home)} for the daemon and for doctor`
+        : `install -m 600 /dev/null ${shellWord(home)} && $EDITOR ${shellWord(home)}, then export DISCORD_BOT_TOKEN_FILE=${shellWord(home)}`,
+    };
+  }
+  const file = resolve(path);
   if (!existsSync(file)) {
     return {
       name: "token",
       ok: false,
       required: true,
       detail: `no token file at ${file}`,
-      hint: `install -m 600 /dev/null ${shellWord(file)} && $EDITOR ${shellWord(file)}  (then export DISCORD_BOT_TOKEN_FILE=${shellWord(file)} if that is not the default path)`,
+      hint: `install -m 600 /dev/null ${shellWord(file)} && $EDITOR ${shellWord(file)}`,
     };
   }
   const mode = modeOf(file);
@@ -865,10 +908,12 @@ function formatChecks(checks: Check[]): string {
 export async function doctorChecks(
   values: { config?: string; "token-file"?: string; "timeout-ms"?: string },
   env: NodeJS.ProcessEnv,
+  cwd: string = process.cwd(),
 ): Promise<Check[]> {
   const checks: Check[] = [nodeCheck()];
-  const configPath = resolveConfigPath(values.config, env);
-  const { check: config, ears: configuredEars } = configCheck(configPath);
+  const source = resolveConfigPath(values.config, env, cwd);
+  const configPath = source.path;
+  const { check: config, ears: configuredEars } = configCheck(source, env);
   checks.push(config);
   const token = tokenCheck(values["token-file"], env);
   checks.push(token);
