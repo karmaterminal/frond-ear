@@ -365,6 +365,81 @@ test("copilot extension: each new attach generation gets its own instructions pr
   ext.stop();
 });
 
+test("copilot extension: an event pending across a reconnect keeps its own attach's preamble", async () => {
+  const { start } = (await import("../copilot-extension/core.mjs")) as {
+    start: Start;
+  };
+  const sockets: Array<Awaited<ReturnType<typeof fakeSocket>>> = [];
+  const pending = [await fakeSocket(), await fakeSocket()];
+  const prompts: string[] = [];
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const ext = await start(
+    async () => ({
+      send: async ({ prompt }: Sent) => {
+        prompts.push(prompt);
+        if (prompts.length === 1) await gate; // A's first send is still pending at the reconnect
+      },
+      log: async () => undefined,
+    }),
+    { ear: "walker", tools: [] },
+    {
+      connect: () => {
+        const next = pending.shift();
+        assert.ok(next, "a third connection was not expected");
+        sockets.push(next);
+        return next;
+      },
+      reconnectMs: 1,
+    },
+  );
+  const event = (batchId: number) => ({
+    type: "event",
+    batchId,
+    content: `event ${batchId}`,
+    meta: { kind: "mention" },
+  });
+  const welcome = (generation: number, instructions: string) => ({
+    type: "welcome",
+    protocol: 1,
+    attached: true,
+    generation,
+    instructions,
+  });
+
+  const first = sockets[0]!;
+  first.emit("connect");
+  first.line(welcome(1, "instructions A"));
+  first.line(event(1));
+  first.line(event(2)); // queued behind the pending send
+  first.emit("close");
+  const second = await waitFor(() => sockets[1], "reconnect");
+  second.emit("connect");
+  second.line(welcome(2, "instructions B"));
+  second.line(event(3));
+  release();
+  await ext.settled();
+
+  assert.deepEqual(
+    prompts.map((prompt) => prompt.split("\n")[0]),
+    [
+      "instructions A",
+      '<channel source="frond-ear" kind="mention">',
+      "instructions B",
+    ],
+  );
+  assert.match(prompts[1]!, /\nevent 2\n/u);
+  assert.match(prompts[2]!, /^instructions B\n\n<channel [^>]*>\nevent 3\n/u);
+  // A's events are never offered on B's socket; the daemon re-offers them as a digest
+  assert.deepEqual(
+    second.written.filter((m) => m.type === "offered").map((m) => m.batchId),
+    [3],
+  );
+  ext.stop();
+});
+
 test("copilot extension: a failed tool call is an SDK failure result, not success text", async () => {
   const { start } = (await import("../copilot-extension/core.mjs")) as {
     start: Start;

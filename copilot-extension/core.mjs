@@ -170,10 +170,15 @@ export async function start(joinSession, config, deps = {}) {
    * @param {EarEvent} event
    */
   const deliver = (event) => {
+    // The attach an event belongs to is the one it arrived on, not the one current when
+    // its turn in the queue comes: a reconnect while a send is pending must not hand the
+    // old attach's queued events the new instructions, nor offer them on the new socket.
+    const owed = welcomes;
+    const owedInstructions = instructions;
+    const via = socket;
     delivering = delivering.then(async () => {
-      const owed = welcomes;
       const preamble =
-        preambleFor !== owed && instructions ? `${instructions}\n\n` : "";
+        preambleFor < owed && owedInstructions ? `${owedInstructions}\n\n` : "";
       try {
         await session.send({
           prompt: `${preamble}${renderChannel(event)}`,
@@ -182,7 +187,7 @@ export async function start(joinSession, config, deps = {}) {
         });
         if (preamble !== "") preambleFor = owed;
         state.delivered += 1;
-        if (event.batchId !== null)
+        if (event.batchId !== null && socket === via)
           send({ type: "offered", batchId: event.batchId });
       } catch (error) {
         state.failed += 1;
