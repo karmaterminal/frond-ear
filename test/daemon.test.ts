@@ -256,6 +256,138 @@ test("delivery: an unacked canary is reported as a deaf session, with the relaun
   }
 });
 
+test("delivery: acting on a pushed batch by its batch_id proves delivery when the canary was lost (#21)", async () => {
+  const config = testConfig({
+    ears: {
+      scribe: { attachCanary: true, channels: { [CHANNEL]: "mentions" } },
+    },
+  });
+  const h = harness(config, { nonce: "c0ffee" });
+  try {
+    const shim = h.attach("scribe");
+    const status = () =>
+      h.daemon.status("scribe") as {
+        ears: Array<{ delivery: string; registered: boolean }>;
+      };
+    // The canary is never acked (lost before the session could take it).
+    h.daemon.ingest(
+      message({
+        author: { id: PRINCIPAL },
+        mentions: [{ id: BOT }],
+        content: "can you hear me?",
+      }),
+    );
+    h.timers.advance(1_000);
+    const pushed = shim.connection.events().at(-1);
+    const batchId = pushed?.batchId as number;
+    await shim.send({ type: "offered", batchId });
+    h.clock.advance(2 * 60 * 1_000);
+    assert.equal(status().ears[0]?.delivery, "unconfirmed");
+
+    // The pushed batch_id carries a delivery token only the push has: using it
+    // proves delivery.
+    assert.match(
+      pushed?.meta.batch_id ?? "",
+      new RegExp(`^${batchId}-[0-9a-f]+$`, "u"),
+    );
+    const reply = await h.call(shim, "reply", {
+      chat_id: CHANNEL,
+      text: "yes",
+      batch_id: pushed?.meta.batch_id,
+    });
+    assert.equal(reply.ok, true);
+    assert.doesNotMatch(reply.text, /⚠️ frond-ear/u);
+    assert.equal(status().ears[0]?.delivery, "confirmed");
+    assert.equal(status().ears[0]?.registered, true);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("delivery: a batch_id learned from a tap marks seen but does not prove delivery (#21)", async () => {
+  const config = testConfig({
+    ears: {
+      scribe: { attachCanary: true, channels: { [CHANNEL]: "mentions" } },
+    },
+  });
+  const h = harness(config, { nonce: "c0ffee" });
+  try {
+    // A deaf session: attached, canary never acked, no push reaches the model.
+    const shim = h.attach("scribe");
+    const tap = h.attach("scribe", { role: "tap" });
+    h.daemon.ingest(
+      message({
+        author: { id: PRINCIPAL },
+        mentions: [{ id: BOT }],
+        content: "anyone there?",
+      }),
+    );
+    h.timers.advance(1_000);
+    const pushed = shim.connection.events().at(-1);
+    const batchId = pushed?.batchId as number;
+    await shim.send({ type: "offered", batchId });
+    h.clock.advance(2 * 60 * 1_000);
+    // What `frond-ear tap` prints: the bare id, never the session's token.
+    const tapped = tap.connection.events().at(-1);
+    assert.equal(tapped?.batchId, batchId);
+    assert.equal(tapped?.meta.batch_id, String(batchId));
+    assert.equal(h.store.stateCounts("scribe").offered, 1);
+
+    const acked = await h.call(shim, "ack", {
+      chat_id: CHANNEL,
+      batch_id: tapped?.meta.batch_id,
+    });
+    assert.equal(acked.ok, true);
+    assert.equal(h.store.stateCounts("scribe").seen, 1);
+    // The bare id with a forged token proves nothing either.
+    await h.call(shim, "ack", {
+      chat_id: CHANNEL,
+      batch_id: `${batchId}-00000000`,
+    });
+    const status = h.daemon.status("scribe") as {
+      ears: Array<{ delivery: string; registered: boolean }>;
+    };
+    assert.equal(status.ears[0]?.registered, false);
+    assert.equal(status.ears[0]?.delivery, "unconfirmed");
+  } finally {
+    h.dispose();
+  }
+});
+
+test("delivery: a batch_id that was never pushed to this attach does not prove delivery", async () => {
+  const config = testConfig({
+    ears: {
+      scribe: { attachCanary: true, channels: { [CHANNEL]: "mentions" } },
+    },
+  });
+  const h = harness(config, { nonce: "c0ffee" });
+  try {
+    const first = h.attach("scribe");
+    h.daemon.ingest(
+      message({
+        author: { id: PRINCIPAL },
+        mentions: [{ id: BOT }],
+        content: "for the first attach",
+      }),
+    );
+    h.timers.advance(1_000);
+    const earlier = first.connection.events().at(-1)?.batchId as number;
+    await first.send({ type: "offered", batchId: earlier });
+    // A new attach (new generation) that guesses or carries over an old batch id…
+    const second = h.attach("scribe");
+    h.clock.advance(2 * 60 * 1_000);
+    await h.call(second, "ack", { chat_id: CHANNEL, batch_id: earlier });
+    // …and one that names a batch that doesn't exist.
+    await h.call(second, "ack", { chat_id: CHANNEL, batch_id: 99_999 });
+    const status = h.daemon.status("scribe") as {
+      ears: Array<{ delivery: string }>;
+    };
+    assert.equal(status.ears[0]?.delivery, "unconfirmed");
+  } finally {
+    h.dispose();
+  }
+});
+
 test("tap: mirrors exactly the batch pushed to the attached session, at the same moment", async () => {
   const h = harness();
   try {
@@ -278,7 +410,12 @@ test("tap: mirrors exactly the batch pushed to the attached session, at the same
     const [pushed] = shim.connection.events();
     const [tapped] = tap.connection.events();
     assert.ok(pushed && pushed.batchId !== null);
-    assert.deepEqual(tapped, pushed);
+    // Except the session's delivery token: the tap gets the bare batch id (#21).
+    assert.deepEqual(tapped, {
+      ...pushed,
+      meta: { ...pushed.meta, batch_id: String(pushed.batchId) },
+    });
+    assert.notEqual(pushed.meta.batch_id, String(pushed.batchId));
   } finally {
     h.dispose();
   }
