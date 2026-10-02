@@ -60,6 +60,20 @@ export interface Config {
   };
   /** Kill switch: keep ingesting, stop pushing. */
   paused: boolean;
+  /** Optional binary-canticle receptor (listen-only). Absent or disabled: no socket. */
+  canticle?: CanticleConfig;
+}
+
+export interface CanticleConfig {
+  enabled: boolean;
+  /** Local fleet manifest (unsigned in v0; the ear never fetches one). */
+  manifestPath: string;
+  bindHost: string;
+  port: number;
+  /** Where frames reach this listener (RFC-0001 §4.3): narrower-scoped frames are refused. */
+  binding: "host" | "lan" | "fleet" | "public";
+  /** Per ear, the `station:stream` pairs it hears; `*` matches any station. */
+  tune: Record<string, string[]>;
 }
 
 export interface WakeBudget {
@@ -118,6 +132,74 @@ function integer(
     throw new Error(`${name} must be an integer >= ${minimum}`);
   }
   return value;
+}
+
+const TUNE =
+  /^(\*|[a-z][a-z0-9-]{0,30}):[a-z][a-z0-9-]{0,30}(\.[a-z][a-z0-9-]{0,30}){0,3}$/u;
+
+function parseCanticle(
+  value: unknown,
+  ears: Record<string, EarConfig>,
+): CanticleConfig | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!isObject(value)) {
+    throw new Error("canticle must be an object");
+  }
+  const enabled = value.enabled === true;
+  if (typeof value.manifestPath !== "string" || value.manifestPath === "") {
+    if (enabled) {
+      throw new Error("canticle.manifestPath is required when enabled");
+    }
+  }
+  const bindHost = value.bindHost ?? "0.0.0.0";
+  if (typeof bindHost !== "string") {
+    throw new Error("canticle.bindHost must be a string");
+  }
+  const port = integer(value.port, 9999, "canticle.port", 1);
+  if (port > 65_535) {
+    throw new Error("canticle.port must be at most 65535");
+  }
+  const binding = value.binding ?? "lan";
+  if (
+    binding !== "host" &&
+    binding !== "lan" &&
+    binding !== "fleet" &&
+    binding !== "public"
+  ) {
+    throw new Error("canticle.binding must be host, lan, fleet or public");
+  }
+  const tune: Record<string, string[]> = {};
+  const tuneInput = value.tune ?? {};
+  if (!isObject(tuneInput)) {
+    throw new Error(
+      "canticle.tune must be an object of ear -> [station:stream]",
+    );
+  }
+  for (const [ear, pairs] of Object.entries(tuneInput)) {
+    if (!Object.hasOwn(ears, ear)) {
+      throw new Error(`canticle.tune.${ear}: no such ear`);
+    }
+    const list = stringArray(pairs, `canticle.tune.${ear}`);
+    for (const pair of list) {
+      if (!TUNE.test(pair)) {
+        throw new Error(
+          `canticle.tune.${ear}: ${JSON.stringify(pair)} must be station:stream (station may be *)`,
+        );
+      }
+    }
+    tune[ear] = list;
+  }
+  return {
+    enabled,
+    manifestPath:
+      typeof value.manifestPath === "string" ? value.manifestPath : "",
+    bindHost,
+    port,
+    binding,
+    tune,
+  };
 }
 
 function parseChannel(value: unknown, name: string): ChannelConfig {
@@ -350,7 +432,14 @@ export function parseConfig(candidate: unknown): Config {
       ),
     },
     paused: candidate.paused === true,
+    ...canticleField(parseCanticle(candidate.canticle, ears)),
   };
+}
+
+function canticleField(canticle: CanticleConfig | undefined): {
+  canticle?: CanticleConfig;
+} {
+  return canticle ? { canticle } : {};
 }
 
 export function loadConfigFile(path: string): Config {

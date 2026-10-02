@@ -395,11 +395,14 @@ export function localExpiryMs(
   firstHeardMs?: number,
 ): number {
   const b = frame.body;
-  let exp = b.expiresAt;
-  if (frame.kind === KIND_ITEM) {
-    const maxTtlS = CLASSES.get((b as Item).cls)?.maxTtlS ?? MAX_CLAMP_TTL_S;
-    exp = Math.min(b.expiresAt, b.issuedAt + maxTtlS * 1000);
-  }
+  // An ITEM clamps to its class max TTL (§6.2). A PLUCK clamps to the largest class max
+  // TTL, since its target's class isn't known here: a far-future PLUCK must not pin a
+  // sticky entry and a dedup slot for decades (binary-canticle#60; the spike doesn't clamp).
+  const maxTtlS =
+    frame.kind === KIND_ITEM
+      ? (CLASSES.get((b as Item).cls)?.maxTtlS ?? MAX_CLAMP_TTL_S)
+      : MAX_CLAMP_TTL_S;
+  const exp = Math.min(b.expiresAt, b.issuedAt + maxTtlS * 1000);
   let local = exp + clockOffsetMs;
   if (firstHeardMs !== undefined)
     local = Math.min(local, firstHeardMs + (exp - b.issuedAt));

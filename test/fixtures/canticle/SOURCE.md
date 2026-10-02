@@ -2,7 +2,7 @@
 
 `frame-v2-candidates.json` is copied byte for byte from
 `karmaterminal/binary-canticle` at `prototype/canticle-station/vectors/frame-v2-candidates.json`,
-sha256 `eeb3b5e660eda16abcb5488310a69b9ae930124208f64735ae4537f8a64a4b16`, last changed in `6072b356490f2e73574a7d40331f356b63776fd6` (copied at main `25081b39b4e0979d43e03c396662c221e225b267`).
+sha256 `71db3fc69b37a3a0b850cbe7d9d694879813208f5e2a4d1437704bce5bab3783`, last changed in `324a3b70cb6f2476c73e1f0f9c7b8b0488492adb` (copied at main `a15fb9f0d215a2471fbe44b5ad0757804e2e2667`).
 
 They are **candidate** vectors (RFC-0001 §9.13), produced by the Python spike. `test/canticle.test.ts` runs every case
 against this TypeScript port, which is a second, independent implementation. Don't edit the file here; regenerate
