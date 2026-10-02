@@ -401,8 +401,8 @@ export class RecordConsumer {
       !(int(f.stream_id) || str(f.stream_id)) ||
       !(int(f.seq) || (str(f.seq) && /^\d{1,20}$/u.test(f.seq))) ||
       !(f.kind === "item" || f.kind === "pluck") ||
-      !str(f.sha256) ||
-      !int(f.bytes) ||
+      !strOrNull(f.sha256) ||
+      !intOrNull(f.bytes) ||
       !(rec.dedup === "first" || rec.dedup === "resurfaced") ||
       !isObj(rec.versions) ||
       // Null where the frame doesn't carry the field (§14.18.3, binary-canticle#79):
@@ -413,6 +413,14 @@ export class RecordConsumer {
       !str(rec.scope) ||
       !intOrNull(rec.hop)
     ) {
+      this.#count("malformed_record");
+      return;
+    }
+    // The receipt pointers (`frame.sha256`, `frame.bytes`) exist exactly when the
+    // frame was admitted: a frame refused before the ring has none (§14.18.3,
+    // binary-canticle#79). A verified frame without them is malformed; a refusal
+    // that carries them anyway is tolerated, and nothing here reads them.
+    if (rec.admission === "verified" && (!str(f.sha256) || !int(f.bytes))) {
       this.#count("malformed_record");
       return;
     }
