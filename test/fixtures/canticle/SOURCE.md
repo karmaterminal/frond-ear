@@ -2,10 +2,11 @@
 
 `frame-v2-candidates.json` is copied byte for byte from
 `karmaterminal/binary-canticle` at `prototype/canticle-station/vectors/frame-v2-candidates.json`,
-sha256 `fce58bb800f014286d7c7318c7d8016ba6db1729a7c7680c91692969abd1e2e6`, taken from `main` at
-`2254fb8c70101a697087338b1988cf8b91993bb8` (last changed in `60482766180ac3d0adee5748d824fb3bf56f62d5`, binary-canticle PR #71,
-after PR #68 and #74; 46 vectors: the post-A1 `stream-entry` with `trail_seq`, the #66 map-key and null cases,
-a pre-A1 8-element entry and `b_stream` = 2^60 as `bad-field`).
+sha256 `943f77094ffc7e207a9af6de3cccd8d09741fdc997bbcc9fb489c95bfcbcfc63`, identical to binary-canticle `main` at
+`95b14c4e09c3855da408f27c8042e46b5513d4f2` (PR #89 merged; verified byte for byte after the merge). 48 vectors: the post-A1 `stream-entry` with `trail_seq`, the
+#66 map-key and null cases, a pre-A1 8-element entry and `b_stream` = 2^60 as `bad-field`, and the #72 pair
+(`trail_seq = head_seq + 1` accepted as the empty window, `head_seq + 2` as `bad-field`). The previous copy was
+sha256 `fce58bb8…`, from `main` at `2254fb8c` (binary-canticle PR #71, 46 vectors).
 
 They are **candidate** vectors (RFC-0001 §9.13), produced by the Python spike. `test/canticle.test.ts` runs every case
 against this TypeScript port, which is a second, independent implementation. Don't edit the file here; regenerate
