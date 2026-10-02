@@ -1,5 +1,5 @@
 // A listener: verify, dedup, pluck, supersede and track presence (RFC-0001 §7.4–§7.8, §8).
-// A port of the spike's `canticle/listener.py` at binary-canticle `a15fb9f0d2` (#62),
+// A port of the spike's `canticle/listener.py` at binary-canticle `6b6553761d` (#62, #63),
 // which bounds every per-key structure (#60).
 //
 // It surfaces events (a new item, a withdrawal, a supersession, an expiry, a
@@ -234,8 +234,12 @@ export interface ListenerOptions {
   ephemeral?: true;
 }
 
-/** 2: dedup rows carry the ITEM's (expires_at, scope) for the §9.7 PLUCK check. 1 still loads. */
-export const SAFETY_STATE_VERSION = 2;
+/**
+ * 2: dedup rows carry the ITEM's (expires_at, scope) for the §9.7 PLUCK check.
+ * 3: marks carry their class (§23.2 q21), in snapshots and `takeJournal()` records alike.
+ * 1 and 2 still load, as snapshots or journal records (their marks' class is unknown).
+ */
+export const SAFETY_STATE_VERSION = 3;
 
 /** The state that must survive a restart, as JSON (bigints as decimal strings). */
 export interface SafetyState {
@@ -249,8 +253,11 @@ export interface SafetyState {
   >;
   /** [target identity, retain_until]. */
   stickyPluck: Array<[string, number]>;
-  /** [hkey, issued_at, epoch, seq, retain_until]. */
-  hwm: Array<[string, number, number, string, number]>;
+  /** [hkey, issued_at, epoch, seq, retain_until, class | null]; rows before v3 stop at retain. */
+  hwm: Array<
+    | [string, number, number, string, number]
+    | [string, number, number, string, number, number | null]
+  >;
 }
 
 export class Listener {
@@ -264,8 +271,11 @@ export class Listener {
   readonly dedup = new Map<string, DedupEntry>();
   readonly dedupPerKey = new Map<string, number>();
   readonly stickyPluck = new Map<string, number>();
-  /** `${kid}:${stream}:${stateKey}` → order + horizon. */
-  readonly hwm = new Map<string, { order: Order; retain: number }>();
+  /** `${kid}:${stream}:${stateKey}` → order + horizon + class (undefined for marks loaded from v1/v2 state). */
+  readonly hwm = new Map<
+    string,
+    { order: Order; retain: number; cls: number | undefined }
+  >();
   readonly hwmPerKey = new Map<string, number>();
   readonly #dedupDue = new Expiries();
   readonly #stickyDue = new Expiries();
@@ -389,6 +399,7 @@ export class Listener {
           v.order[1],
           v.order[2].toString(),
           v.retain,
+          v.cls ?? null,
         ]);
     }
     this.#raised = undefined;
@@ -418,13 +429,14 @@ export class Listener {
         v.order[1],
         v.order[2].toString(),
         v.retain,
+        v.cls ?? null,
       ]),
     };
   }
 
   /** Merge a snapshot or journal record in. Monotone, so applying one twice changes nothing. */
   #load(state: SafetyState): void {
-    if (state.version !== 1 && state.version !== SAFETY_STATE_VERSION) {
+    if (![1, 2, SAFETY_STATE_VERSION].includes(state.version)) {
       throw new Error(
         `listener state: unsupported version ${String(state.version)}`,
       );
@@ -455,27 +467,37 @@ export class Listener {
       this.stickyPluck.set(ident, retain);
       this.#stickyDue.push(retain, ident);
     }
-    for (const [hkey, issuedAt, epoch, seq, retain] of state.hwm) {
+    for (const row of state.hwm) {
+      // Rows before v3 (snapshots and journal records alike) carry no class: those marks skip
+      // the class-change check until their own item resurfaces and teaches them one.
+      const [hkey, issuedAt, epoch, seq, retain] = row;
+      const cls = row.length > 5 && row[5] != null ? row[5] : undefined;
       const order: Order = [issuedAt, epoch, BigInt(seq)];
       const prev = this.hwm.get(hkey);
       if (prev === undefined) {
         const kid = kidOf(hkey);
         this.hwmPerKey.set(kid, (this.hwmPerKey.get(kid) ?? 0) + 1);
-      } else if (
-        compareOrder(order, prev.order) <= 0 &&
-        retain <= prev.retain
+        this.hwm.set(hkey, { order, retain, cls });
+        this.#hwmDue.push(retain, hkey);
+        continue;
+      }
+      // Monotone merge: max order (its class comes with it), max horizon. At equal order (one
+      // identity, so one class) a known class is kept over an unknown one, never downgraded.
+      const cmp = compareOrder(order, prev.order);
+      const merged = {
+        order: cmp > 0 ? order : prev.order,
+        retain: Math.max(retain, prev.retain),
+        cls: cmp > 0 ? cls : cmp === 0 ? (prev.cls ?? cls) : prev.cls,
+      };
+      if (
+        cmp <= 0 &&
+        merged.retain === prev.retain &&
+        merged.cls === prev.cls
       ) {
         continue;
       }
-      const until = Math.max(retain, prev?.retain ?? -Infinity);
-      this.hwm.set(hkey, {
-        order:
-          prev === undefined || compareOrder(order, prev.order) > 0
-            ? order
-            : prev.order,
-        retain: until,
-      });
-      this.#hwmDue.push(until, hkey);
+      this.hwm.set(hkey, merged);
+      this.#hwmDue.push(merged.retain, hkey);
     }
   }
 
@@ -835,6 +857,26 @@ export class Listener {
         this.#dirty = true;
         prev = undefined;
       }
+      // One class per state_key within an epoch (§7.8, §23.2 q21): a change of class in
+      // the mark's epoch is dropped and doesn't move the mark. A new epoch may change it.
+      if (
+        prev !== undefined &&
+        prev.cls !== undefined &&
+        it.epoch === prev.order[1] &&
+        it.cls !== prev.cls
+      ) {
+        events.push(
+          plucked // §7.7: a plucked tuple reports plucked
+            ? this.#evidence("plucked", kid, "item arrived after its pluck", at)
+            : this.#evidence(
+                "class-change",
+                kid,
+                `class ${it.cls} for a key marked with class ${prev.cls} in epoch ${prev.order[1]}`,
+                at,
+              ),
+        );
+        return events;
+      }
       // Equal order is only possible for the same identity, i.e. a re-surface after a restart.
       const cmp = prev === undefined ? 1 : compareOrder(order, prev.order);
       if (cmp < 0 || (cmp === 0 && !resurface)) {
@@ -850,6 +892,18 @@ export class Listener {
         );
         return events;
       }
+      if (
+        prev !== undefined &&
+        resurface &&
+        cmp === 0 &&
+        prev.cls === undefined
+      ) {
+        // A mark loaded from v1/v2 state learns its class. That is a raised guard like any
+        // other: journal it now, or a crash before the next checkpoint forgets it and a
+        // different class could be admitted in this epoch before the item comes round again.
+        prev.cls = it.cls;
+        this.#raise().hkeys.add(hkey);
+      }
       if (cmp > 0) {
         let until = retain + spec.maxTtlS * 1000;
         if (prev === undefined) {
@@ -857,7 +911,7 @@ export class Listener {
         } else {
           until = Math.max(until, prev.retain);
         }
-        this.hwm.set(hkey, { order, retain: until });
+        this.hwm.set(hkey, { order, retain: until, cls: it.cls });
         this.#hwmDue.push(until, hkey);
         this.#raise().hkeys.add(hkey);
       }
