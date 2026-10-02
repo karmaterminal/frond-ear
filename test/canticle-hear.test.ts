@@ -325,7 +325,12 @@ test("hear tool: prototype-named ears hear nothing and don't throw", async () =>
       tune: { gloss: ["*:chatter"] },
     } as never,
     manifest: Manifest.fromJson(v.manifest),
-    store: { runtimeState: () => undefined, setRuntimeState: () => {} },
+    store: {
+      runtimeState: () => undefined,
+      runtimeJournal: () => [],
+      appendRuntimeJournal: () => {},
+      checkpointRuntimeState: () => {},
+    },
     logger: { log: () => {} } as never,
     clock: { now: () => v.now_ms },
     timers: { setTimeout: () => 1, clearTimeout: () => {} },

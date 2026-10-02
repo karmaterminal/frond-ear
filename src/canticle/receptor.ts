@@ -19,17 +19,26 @@ import type { Identity } from "./wire.ts";
 
 const STATE_KEY = "canticle.listener_state";
 const TICK_MS = 1_000;
-/** At most one synchronous safety save per this interval; the rest ride the tick. */
-const URGENT_SAVE_MIN_MS = 250;
+/** The guard journal is checkpointed into a full snapshot before it outgrows either cap. */
+export const JOURNAL_MAX_RECORDS = 4_096;
+export const JOURNAL_MAX_BYTES = 1 << 20;
 const RETRY_MIN_MS = 1_000;
 const RETRY_MAX_MS = 30_000;
 /** No datagram from anyone for this long: render stations `unknown`, not `offline`. */
 const BLIND_AFTER_MS = 30_000;
 
-/** Where the restart-safety snapshot lives (the event store's runtime_state). */
+/**
+ * Where restart safety lives (the event store's runtime_state + runtime_journal): a snapshot,
+ * plus a write-ahead journal of the guards raised since it was written.
+ */
 export interface StateStore {
   runtimeState(name: string): string | undefined;
-  setRuntimeState(name: string, value: string): void;
+  /** The journal's records, oldest first. */
+  runtimeJournal(name: string): string[];
+  /** Append one record; durable when it returns, as durable as a snapshot write. */
+  appendRuntimeJournal(name: string, value: string): void;
+  /** Replace the snapshot and empty its journal, atomically. */
+  checkpointRuntimeState(name: string, value: string): void;
 }
 
 export interface LiveItem {
@@ -122,7 +131,8 @@ export class CanticleReceptor {
   #tickHandle: unknown;
   #retryHandle: unknown;
   #lastDatagramAt: number | undefined;
-  #lastUrgentSaveAt = Number.NEGATIVE_INFINITY;
+  #journalRecords = 0;
+  #journalBytes = 0;
   readonly #counts = {
     datagrams: 0,
     items: 0,
@@ -154,10 +164,29 @@ export class CanticleReceptor {
         );
       }
     }
+    const lines = options.store.runtimeJournal(STATE_KEY);
+    const journal: SafetyState[] = [];
+    lines.forEach((line, i) => {
+      try {
+        journal.push(JSON.parse(line) as SafetyState);
+      } catch {
+        // Only the last record can be torn by a crash mid-append; its datagram never
+        // finished, so it was never relied on. Anything earlier is corruption: refuse.
+        if (i < lines.length - 1) {
+          throw new Error(
+            "canticle: listener journal record is not valid JSON; refusing to start",
+          );
+        }
+        options.logger.log("warn", "canticle.journal_torn", { record: i });
+      }
+    });
+    this.#journalRecords = lines.length;
+    this.#journalBytes = lines.reduce((n, l) => n + l.length, 0);
     this.#listener = new Listener(options.manifest, {
       tuned: streams,
       binding: options.config.binding,
       restore,
+      journal,
     });
   }
 
@@ -243,19 +272,26 @@ export class CanticleReceptor {
     this.#lastDatagramAt = this.#clock.now();
     const events = this.#listener.hear(datagram, this.#clock.now());
     this.#apply(events);
-    // Only a raised safety guard (epoch, sticky pluck, supersession mark) is written now; it
-    // must outlive a crash (§7.7). Everything else waits for the tick's save (≤ TICK_MS), so a
-    // flood of admissions can't serialise the whole snapshot per datagram.
-    // Urgent saves are coalesced (≤ 1 per URGENT_SAVE_MIN_MS) so keyed churn at line rate
-    // can't serialise per datagram either; a coalesced one is written by the next tick.
-    if (!this.#listener.urgent) return;
-    const now = this.#clock.now();
-    if (now - this.#lastUrgentSaveAt < URGENT_SAVE_MIN_MS) return;
-    this.#lastUrgentSaveAt = now;
+    // A raised safety guard (epoch, sticky pluck, supersession mark) must outlive a crash
+    // (§7.7, §7.8), so it is journaled before this returns: one small record of just those
+    // guards, not the whole snapshot. Everything else waits for the tick's checkpoint
+    // (≤ TICK_MS), so neither a flood of admissions nor keyed churn serialises the state
+    // per datagram. A full journal is checkpointed early, keeping it bounded.
+    const record = this.#listener.takeJournal();
+    if (record === undefined) return;
+    const line = JSON.stringify(record);
     try {
-      this.#save();
+      this.#options.store.appendRuntimeJournal(STATE_KEY, line);
+      this.#journalRecords += 1;
+      this.#journalBytes += line.length;
+      if (
+        this.#journalRecords >= JOURNAL_MAX_RECORDS ||
+        this.#journalBytes >= JOURNAL_MAX_BYTES
+      ) {
+        this.#save();
+      }
     } catch (error) {
-      this.#saveFailed(error);
+      this.#saveFailed(error); // still dirty: the next tick's checkpoint retries it
     }
   }
 
@@ -282,13 +318,16 @@ export class CanticleReceptor {
     }
   }
 
+  /** Checkpoint: the full snapshot replaces the old one and empties the journal. */
   #save(): void {
-    if (!this.#listener.dirty) return;
-    this.#options.store.setRuntimeState(
+    if (!this.#listener.dirty && this.#journalRecords === 0) return;
+    this.#options.store.checkpointRuntimeState(
       STATE_KEY,
       JSON.stringify(this.#listener.snapshot()),
     );
     this.#listener.markSaved();
+    this.#journalRecords = 0;
+    this.#journalBytes = 0;
   }
 
   /** What one ear hears right now: live items on its tuned station:streams. */
@@ -388,6 +427,7 @@ export class CanticleReceptor {
       binding: this.#options.config.binding,
       ...(this.#lastError ? { lastError: this.#lastError } : {}),
       onAir: this.#listener.current.size,
+      journal: this.#journalRecords,
       counts: { ...this.#counts },
       evidence: Object.fromEntries(this.#listener.evidenceCounts),
       stations: Object.fromEntries(
