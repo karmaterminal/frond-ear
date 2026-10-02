@@ -36,6 +36,8 @@ import {
 } from "./render.ts";
 import type { DiscordRest } from "./rest.ts";
 import { chunkMessage, RestError } from "./rest.ts";
+import { renderHear } from "./canticle/hear.ts";
+import type { HearView } from "./canticle/receptor.ts";
 import type { EventStore } from "./store.ts";
 import type {
   BatchKind,
@@ -59,6 +61,10 @@ export interface DaemonOptions {
   token?: string;
   nonce?: () => string;
   gatewayStatus?: () => object;
+  /** The binary-canticle receptor's status, when one is running. */
+  canticleStatus?: () => object;
+  /** What an ear hears on its tuned canticle streams (the `hear` tool), when a receptor runs. */
+  canticleHear?: (ear: string) => HearView;
   /** Directory for `fetch_attachment` (one subdirectory per ear). Absent: the tool is off. */
   attachmentsDir?: string;
   /**
@@ -122,6 +128,9 @@ function stringArg(
 }
 
 const SNOWFLAKE = /^\d{1,25}$/u;
+const CANTICLE_TUNE =
+  /^(\*|[a-z][a-z0-9-]{0,30}):[a-z][a-z0-9-]{0,30}(\.[a-z][a-z0-9-]{0,30}){0,3}$/u;
+
 const ATTACHMENT_RETENTION_MS = 24 * 60 * 60 * 1_000;
 /** How often the daemon sweeps every ear's saved attachments, fetching or not. */
 const ATTACHMENT_SWEEP_MS = 60 * 60 * 1_000;
@@ -1116,6 +1125,22 @@ export class Daemon {
       }
       case "set_attention":
         return this.setAttention(client, args);
+      case "hear": {
+        const ear = this.readableEar(client, args);
+        if (!this.options.canticleHear) {
+          return "canticle is not enabled on this daemon (config canticle.enabled).";
+        }
+        const stream = stringArg(args, "stream");
+        if (stream !== undefined && !CANTICLE_TUNE.test(stream)) {
+          throw new Error("stream must be station:stream (station may be *)");
+        }
+        // A read, not a wake: it marks nothing seen and touches no ledger.
+        return renderHear(this.options.canticleHear(ear), {
+          stream,
+          limit: numberArg(args, "limit", 10, 50),
+          maxChars: this.config.limits.maxNotificationChars,
+        });
+      }
       case "fetch_attachment":
         return this.fetchAttachment(args);
       case "ear_status":
@@ -1529,6 +1554,7 @@ export class Daemon {
     return {
       paused: this.config.paused,
       gateway: this.options.gatewayStatus?.() ?? { state: "disabled" },
+      canticle: this.options.canticleStatus?.() ?? { state: "disabled" },
       ears,
       ambiguousSends: this.store.ambiguousSends(this.sendsInFlight),
       botLoopCooling: this.botLimiter.cooling(this.clock.now()),

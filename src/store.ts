@@ -202,6 +202,11 @@ export class EventStore {
         name TEXT PRIMARY KEY,
         value TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS runtime_journal (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        value TEXT NOT NULL
+      );
     `);
   }
 
@@ -244,6 +249,13 @@ export class EventStore {
     return Object.fromEntries(rows.map((row) => [row.name, row.value]));
   }
 
+  public runtimeState(name: string): string | undefined {
+    const row = this.database
+      .prepare("SELECT value FROM runtime_state WHERE name = ?")
+      .get(name) as { value: string } | undefined;
+    return row?.value;
+  }
+
   public setRuntimeState(name: string, value: string): void {
     this.database
       .prepare(
@@ -251,6 +263,31 @@ export class EventStore {
          ON CONFLICT(name) DO UPDATE SET value = excluded.value`,
       )
       .run(name, value);
+  }
+
+  /** A runtime_state entry's write-ahead records since it was last checkpointed, oldest first. */
+  public runtimeJournal(name: string): string[] {
+    const rows = this.database
+      .prepare("SELECT value FROM runtime_journal WHERE name = ? ORDER BY id")
+      .all(name) as Array<{ value: string }>;
+    return rows.map((row) => row.value);
+  }
+
+  /** One autocommit insert: as durable on return as `setRuntimeState`. */
+  public appendRuntimeJournal(name: string, value: string): void {
+    this.database
+      .prepare("INSERT INTO runtime_journal (name, value) VALUES (?, ?)")
+      .run(name, value);
+  }
+
+  /** Replace the entry and drop its journal in one transaction. */
+  public checkpointRuntimeState(name: string, value: string): void {
+    this.transaction(() => {
+      this.setRuntimeState(name, value);
+      this.database
+        .prepare("DELETE FROM runtime_journal WHERE name = ?")
+        .run(name);
+    });
   }
 
   // ---- gateway cursor ------------------------------------------------------

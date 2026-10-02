@@ -8,8 +8,9 @@
 // One deliberate difference from the spike: every uint except a sequence number
 // is a JS number, so a value above Number.MAX_SAFE_INTEGER (2^53 - 1) is rejected
 // as `bad-field` where the spike accepts it. That covers millisecond timestamps
-// (about year 287 000) and also a BEACON stream entry's stream id, `page` and
-// `b_station`. Sequence numbers keep the full uint64 range as bigint.
+// (about year 287 000) and a BEACON's `page`. Sequence numbers keep the full
+// uint64 range as bigint, and the §9.8 u32 fields (a stream entry's `.size 4`
+// fields, `next_beacon_ms`, `b_station`) are bounded at 2^32 - 1 on both ports.
 // Cross-port divergences are tracked in binary-canticle#66.
 //
 // Unknown extension keys (an ITEM's `extra`) and a BEACON's `capsid` and `relay`
@@ -109,9 +110,15 @@ export interface Pluck {
   reason: number | undefined;
 }
 
+/**
+ * One §9.8 `stream-entry` (post-A1): 9 elements, or 10 with `lens`. `trailSeq` (amendment A1) is the
+ * lowest seq of any ITEM or PLUCK still on air on the stream in this epoch, `headSeq + 1` when nothing
+ * is. The listener holds it; §7.10's wait-or-repair is not built (binary-canticle#70).
+ */
 export interface StreamEntry {
   streamId: number;
   headSeq: bigint;
+  trailSeq: bigint;
   live: number;
   loopMs: number;
   loopMaxMs: number;
@@ -331,20 +338,26 @@ function parseBeacon(m: IntMap): Beacon {
   const rawStreams = m.get(6);
   if (!Array.isArray(rawStreams)) throw new Reject("bad-field", "streams");
   const streams = rawStreams.map((e): StreamEntry => {
-    if (!Array.isArray(e) || (e.length !== 8 && e.length !== 9)) {
+    // 9 elements, or 10 with lens (§9.8 post-A1). A pre-A1 8-element entry is bad-field: accepting it
+    // would read every field after head_seq shifted, since no length tells the shapes apart
+    // (binary-canticle#70).
+    if (!Array.isArray(e) || (e.length !== 9 && e.length !== 10)) {
       throw new Reject("bad-field", "stream-entry");
     }
-    const n = (i: number) => uint(e[i], "stream-entry");
+    // §9.8 CDDL: `.size 4` fields are u32; head_seq and trail_seq (`.size 8`) are u64.
+    const n = (i: number, name: string) =>
+      uint(e[i], `stream-entry.${name}`, U32_MAX);
     return {
-      streamId: n(0),
-      headSeq: uintBig(e[1], "stream-entry"),
-      live: n(2),
-      loopMs: n(3),
-      loopMaxMs: n(4),
-      defaultTtlS: n(5),
-      maxTtlS: n(6),
-      bStream: n(7),
-      lens: e.length === 9 ? n(8) : undefined,
+      streamId: n(0, "stream_id"),
+      headSeq: uintBig(e[1], "stream-entry.head_seq"),
+      trailSeq: uintBig(e[2], "stream-entry.trail_seq"),
+      live: n(3, "live"),
+      loopMs: n(4, "loop_ms"),
+      loopMaxMs: n(5, "loop_max_ms"),
+      defaultTtlS: n(6, "default_ttl_s"),
+      maxTtlS: n(7, "max_ttl_s"),
+      bStream: n(8, "b_stream"),
+      lens: e.length === 10 ? n(9, "lens") : undefined,
     };
   });
   let page: [number, number] | undefined;
@@ -371,10 +384,10 @@ function parseBeacon(m: IntMap): Beacon {
     epoch: uint(m.get(1), "epoch", U32_MAX),
     bseq: uintBig(m.get(2), "bseq"),
     wallclock: uint(m.get(3), "wallclock"),
-    nextBeaconMs: uint(m.get(4), "next_beacon_ms"),
+    nextBeaconMs: uint(m.get(4), "next_beacon_ms", U32_MAX),
     profile: tstr(m.get(5), "profile", 1, 32),
     streams,
-    bStation: uint(m.get(8), "b_station"),
+    bStation: uint(m.get(8), "b_station", U32_MAX),
     page,
     catalogDigest: digest,
   };
@@ -395,11 +408,14 @@ export function localExpiryMs(
   firstHeardMs?: number,
 ): number {
   const b = frame.body;
-  let exp = b.expiresAt;
-  if (frame.kind === KIND_ITEM) {
-    const maxTtlS = CLASSES.get((b as Item).cls)?.maxTtlS ?? MAX_CLAMP_TTL_S;
-    exp = Math.min(b.expiresAt, b.issuedAt + maxTtlS * 1000);
-  }
+  // An ITEM clamps to its class max TTL (§6.2). A PLUCK clamps to the largest class max
+  // TTL, since its target's class isn't known here: a far-future PLUCK must not pin a
+  // sticky entry and a dedup slot for decades (binary-canticle#60; the spike doesn't clamp).
+  const maxTtlS =
+    frame.kind === KIND_ITEM
+      ? (CLASSES.get((b as Item).cls)?.maxTtlS ?? MAX_CLAMP_TTL_S)
+      : MAX_CLAMP_TTL_S;
+  const exp = Math.min(b.expiresAt, b.issuedAt + maxTtlS * 1000);
   let local = exp + clockOffsetMs;
   if (firstHeardMs !== undefined)
     local = Math.min(local, firstHeardMs + (exp - b.issuedAt));

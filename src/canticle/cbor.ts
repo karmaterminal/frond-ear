@@ -8,12 +8,18 @@
 // (so no duplicates), no floats, no tags, bounded depth and entry counts, and
 // no trailing bytes.
 //
+// Map keys are integers or text strings at every depth (binary-canticle#66):
+// a boolean, null, byte-string, array or map key is `map-key-type`, in the
+// decoder and in the encoder alike, so nothing here ever produces a map no
+// receiver admits. A host language whose map folds `false` into `0` would
+// otherwise read a bool key as a core key.
+//
 // Integers decode to `bigint` so the full uint64 range round-trips exactly.
 
 export const MAX_DEPTH = 4;
 export const MAX_ENTRIES = 32;
 
-export type CborKey = bigint | string | Uint8Array | boolean | null;
+export type CborKey = bigint | string;
 export type CborValue =
   | bigint
   | string
@@ -95,7 +101,10 @@ export function encode(value: CborValue | number): Uint8Array {
     ]);
   }
   const entries = [...value.entries()]
-    .map(([k, v]) => [encode(k), encode(v)] as const)
+    .map(([k, v]) => {
+      if (!isKey(k)) throw new CborError("map-key-type");
+      return [encode(k), encode(v)] as const;
+    })
     .sort((a, b) => compareBytes(a[0], b[0]));
   for (let i = 1; i < entries.length; i++) {
     if (compareBytes(entries[i - 1]![0], entries[i]![0]) === 0) {
@@ -103,6 +112,10 @@ export function encode(value: CborValue | number): Uint8Array {
     }
   }
   return concat([head(5, BigInt(entries.length)), ...entries.flat()]);
+}
+
+function isKey(k: unknown): k is CborKey {
+  return typeof k === "bigint" || typeof k === "string";
 }
 
 class Reader {
@@ -188,9 +201,7 @@ function decodeItem(r: Reader, depth: number): CborValue {
       throw new CborError("map-key-order");
     }
     prev = keyBytes;
-    if (Array.isArray(key) || key instanceof Map) {
-      throw new CborError("complex-key");
-    }
+    if (!isKey(key)) throw new CborError("map-key-type");
     out.set(key, decodeItem(r, depth + 1));
   }
   return out;
