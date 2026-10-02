@@ -47,7 +47,7 @@ bad value names the field.
 | `labels`                   | no       | init          | `id → name`, shown in event headers and the channel instructions. `init` takes `id:label` on `--principal` and `--peer`.                                                                                                                                                                 |
 | `mentionPatterns`          | no       | init          | Regexes (case-insensitive) that count as addressing the bot, e.g. `\bscribe\b`.                                                                                                                                                                                                          |
 | `ears.<name>`              | yes, ≥1  | init          | One ear per session. The name is what the shim attaches to (`FROND_EAR_EAR`); letters, digits, `-`, `_`, up to 64. `init` writes one ear.                                                                                                                                                |
-| `ears.<name>.target`       | no       | init          | `claude-channel` (the default and the only one on `main`). `copilot-sdk` and `claude-monitor` are reserved; `copilot-extension` arrives with [#36](https://github.com/karmaterminal/frond-ear/pull/36).                                                                                  |
+| `ears.<name>.target`       | no       | init          | `claude-channel` (the default) or `copilot-extension` (a Copilot CLI session, [#36](https://github.com/karmaterminal/frond-ear/pull/36); see the README). `copilot-sdk` and `claude-monitor` are reserved.                                                                               |
 | `ears.<name>.channels`     | no       | init          | `channelId → mode` or `channelId → { mode, quietWindowMs?, maxDelayMs?, historyLimit? }`. Modes: `silent` (store only), `mentions` (default: wake on @mention, reply, pattern or DM), `room` (every message wakes, debounced). A channel belongs to one ear. Threads inherit the parent. |
 | `ears.<name>.dms`          | no       | init          | Whether DMs from principals and peers route here. Only one ear may own DMs. `init` sets `true` unless `--no-dms`.                                                                                                                                                                        |
 | `ears.<name>.dmMode`       | no       | init          | `mentions` (default: every DM wakes) or `silent`.                                                                                                                                                                                                                                        |
@@ -101,11 +101,11 @@ command. The systemd installer bakes both into the unit, and tightens `~/.config
 
 ## 4. Clients
 
-| Client                | How it attaches                                                                                                                  | State                                                                                                          |
-| --------------------- | -------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| Claude Code           | the channel shim (`frond-ear shim`), a stdio MCP server Claude Code launches; `FROND_EAR_EAR` names the ear                      | on `main`, proven live                                                                                         |
-| GitHub Copilot CLI    | a Copilot extension that joins the session and enqueues events (`copilot-extension` target, `frond-ear copilot-extension --ear`) | upcoming: [#36](https://github.com/karmaterminal/frond-ear/pull/36). Not on `main`; nothing here depends on it |
-| `frond-ear tap --ear` | read-only stream of what is pushed to an ear; never attaches                                                                     | on `main`                                                                                                      |
+| Client                | How it attaches                                                                                                                  | State                                                                                                                                                                                               |
+| --------------------- | -------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Claude Code           | the channel shim (`frond-ear shim`), a stdio MCP server Claude Code launches; `FROND_EAR_EAR` names the ear                      | on `main`, proven live                                                                                                                                                                              |
+| GitHub Copilot CLI    | a Copilot extension that joins the session and enqueues events (`copilot-extension` target, `frond-ear copilot-extension --ear`) | on `main` since [#36](https://github.com/karmaterminal/frond-ear/pull/36), covered by tests against a fake session; no live Copilot CLI attach has been proved yet. Nothing else here depends on it |
+| `frond-ear tap --ear` | read-only stream of what is pushed to an ear; never attaches                                                                     | on `main`                                                                                                                                                                                           |
 
 One session per ear. A second shim attaching to the same ear takes it over, and the first is told
 it has been detached.
@@ -137,11 +137,12 @@ Two things `doctor` deliberately does not do:
 - **It does not probe `claude mcp` registration.** `claude mcp list` / `claude mcp get` start the
   shim to query it, and the newest attach takes the ear from the live session. Check the
   registration by reading `.claude/settings.local.json` or `.mcp.json`, never by running those.
-- **It does not treat `registered: false` as proof of deafness.** The canary ack is the only thing
-  that sets `registered`, and a session can act on pushed events (reply, react, ack by `batch_id`)
-  without ever acking the canary. Until [#30](https://github.com/karmaterminal/frond-ear/pull/30)
-  lands, a session that acts on live batch ids is receiving, whatever the flag says. If events
-  really do not arrive, the usual cause is a launch without the development-channel flag.
+- **It does not treat `registered: false` as proof of deafness.** Two things set `registered`: the canary ack,
+  and acting on a pushed `batch_id`. Since [#30](https://github.com/karmaterminal/frond-ear/pull/30),
+  using the id exactly as a `<channel>` element shows it (`N-<token>`) proves delivery, while an id read from `tap` or `inbox` marks the
+  batch seen but proves nothing. A session that has only acted on such ids stays `registered: false`
+  by design. If events really do not arrive, the usual cause is a launch without the
+  development-channel flag.
 
 ## 6. Agent onboarding
 
