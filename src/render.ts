@@ -74,7 +74,7 @@ export function renderEvent(event: StoredEvent, config: Config): string {
           (file) =>
             `${cleanName(file.name)} (${cleanName(file.type)}, ${Math.ceil(file.size / 1024)}KB)`,
         )
-        .join("; ")}`,
+        .join("; ")} (open with fetch_attachment)`,
     );
   }
   const body = cleanText(
