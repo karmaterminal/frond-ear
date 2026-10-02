@@ -143,7 +143,8 @@ Two things `doctor` deliberately does not do:
   batch seen but proves nothing. A session that has only acted on such ids stays `registered: false`
   by design. If events really do not arrive, the usual cause for a Claude Code ear is a launch without the
   development-channel flag; for a Copilot ear, an extension not installed for that ear (or not
-  reinstalled after an upgrade) or Copilot started without `--experimental`.
+  reinstalled after an upgrade), Copilot started without `--experimental`, or a push Copilot
+  refused, which the extension logs in the session as `frond-ear: could not deliver batch`.
 
 ## 6. Agent onboarding
 
