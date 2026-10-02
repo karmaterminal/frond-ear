@@ -147,7 +147,11 @@ export function renderHear(view: HearView, options: HearOptions): string {
     return "canticle: this ear tunes no station:stream (config canticle.tune).";
   }
   const head: string[] = [];
-  if (!view.listening) {
+  if (view.ended) {
+    head.push(
+      "canticle: the host daemon's receptor ended its run cleanly (bye); nothing is live until it starts again.",
+    );
+  } else if (!view.listening) {
     head.push(
       "canticle: the listener is not bound right now (see ear_status); nothing can be heard.",
     );

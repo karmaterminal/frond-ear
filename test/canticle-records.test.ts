@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { renderHear } from "../src/canticle/hear.ts";
 import { RecordClient } from "../src/canticle/record-client.ts";
 import {
   MAX_DEPTH,
@@ -354,6 +355,53 @@ test("records: a new run's hello recovers a failed receive", () => {
   assert.equal(items(c).length, 1);
 });
 
+test("records: run A's live item doesn't survive run B's hello + landing_state (🌫 #34)", () => {
+  const c = started();
+  c.feed(rec("presence", { station: "ops", state: "on_air" }), NOW);
+  c.feed(frame(1), NOW);
+  assert.equal(items(c).length, 1);
+  // 🌫's sequence, with and without A's bye.
+  for (const [run, bye] of [
+    ["b0b0", true],
+    ["c1c1", false],
+  ] as const) {
+    if (bye) c.feed(rec("bye"), NOW);
+    c.feed(rec("hello", {}, run), NOW);
+    c.feed(rec("landing_state", { mute: null, breaker: "closed" }, run), NOW);
+    const view = c.hearView(TUNE, NOW, true);
+    assert.equal(view.listening, true);
+    assert.deepEqual(view.items, [], `nothing from the old run under ${run}`);
+    assert.deepEqual(view.stations, [], "old run's presence dropped");
+    assert.equal(
+      view.lastDatagramAt,
+      undefined,
+      "old run's datagram clock dropped",
+    );
+    // Only the new run's own frame brings an item back.
+    c.feed(frame(1, { run, dedup: "resurfaced" }), NOW);
+    assert.equal(items(c).length, 1);
+    if (run === "b0b0") c.feed(frame(2), NOW); // a stray old-run record is a run change too
+  }
+});
+
+test("records: bye ends the run; its items stop being deliverable while still connected (🌫 #34)", () => {
+  const c = started();
+  c.feed(frame(1), NOW);
+  assert.equal(items(c).length, 1);
+  c.feed(rec("bye"), NOW);
+  const view = c.hearView(TUNE, NOW, true);
+  assert.deepEqual(view.items, []);
+  assert.equal(view.listening, false);
+  assert.equal(view.ended, true);
+  assert.equal(c.health, "stopped");
+  c.closed();
+  assert.equal(
+    c.health,
+    "stopped",
+    "a closed transport after bye isn't a failure",
+  );
+});
+
 test("records: a rec_seq gap clears the live set (it may have held a retract)", () => {
   const c = started();
   c.feed(frame(1), NOW);
@@ -483,4 +531,52 @@ test("records: principal and lineage root reach the banner; absent reads unavail
   assert.equal(a!.root, "f6eecf2f43082a97:7:0000001a:1");
   assert.equal(b!.principal, undefined);
   assert.equal(b!.root, undefined);
+});
+
+test("record client + hear: run A's item never shows under run B, nor after bye (🌫 #34)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "canticle-sock-"));
+  const path = join(dir, "daemon.sock");
+  let peer: Socket | undefined;
+  const server = createServer((s) => (peer = s));
+  await new Promise<void>((r) => server.listen(path, r));
+  const client = new RecordClient({
+    socketPath: path,
+    tune: { gloss: TUNE },
+    logger,
+    clock: { now: () => NOW },
+  });
+  client.start();
+  // A failed assertion must not leave the socket open and hang the run.
+  try {
+    while (!peer) await new Promise((r) => setTimeout(r, 5));
+    const send = async (...recs: object[]) => {
+      peer!.write(recs.map((r) => `${JSON.stringify(r)}\n`).join(""));
+      await new Promise((r) => setTimeout(r, 30));
+    };
+    const hear = () =>
+      renderHear(client.hearView("gloss"), { limit: 10, maxChars: 4_000 });
+    seq = 0;
+    await send(
+      rec("hello"),
+      rec("landing_state", { mute: null, breaker: "closed" }),
+      rec("health", { last_datagram_at: NOW, reasons: [] }),
+      frame(1),
+    );
+    assert.match(hear(), /deploy\.started 1/u);
+    await send(rec("bye"));
+    assert.doesNotMatch(hear(), /deploy\.started/u);
+    assert.match(hear(), /ended its run cleanly/u);
+    await send(
+      rec("hello", {}, "b0b0"),
+      rec("landing_state", { mute: null, breaker: "closed" }, "b0b0"),
+    );
+    assert.equal(client.consumer.health, "ok");
+    assert.doesNotMatch(hear(), /deploy\.started/u);
+    assert.match(hear(), /nothing live on your tuned streams/u);
+  } finally {
+    peer?.destroy();
+    client.stop();
+    server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

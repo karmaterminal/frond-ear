@@ -68,6 +68,8 @@ export interface HearView {
   /** Whether this ear tunes any station:stream at all. */
   tuned: boolean;
   listening: boolean;
+  /** The source's run ended cleanly (record v1 `bye`); not set by the embedded receptor. */
+  ended?: boolean;
   blind: boolean;
   lastDatagramAt: number | undefined;
   stations: Array<{ name: string; presence: string }>;

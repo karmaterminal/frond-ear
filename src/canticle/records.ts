@@ -14,7 +14,10 @@
 //   deliverable, and never once past `local_expiry_at`;
 // - `retract` removes; an active `mute` withdraws everything;
 // - `fatal`, or a run that ends without `bye`, marks receive health `failed` until
-//   the next run's `hello` (the restart §14.18.2 expects).
+//   the next run's `hello` (the restart §14.18.2 expects);
+// - a record with a new `run` ends the old one: its live items, presence and datagram
+//   clock are dropped, so nothing from it can surface under the new run;
+// - `bye` ends the run cleanly: its items stop being deliverable and `hear` says so.
 // Every map here has a fixed bound (§14.18.2 "nothing in the pipe is unbounded").
 // Framing: at most 64 KiB per line and nesting depth 8 (§14.18.2 [PROPOSED DEFAULT]).
 
@@ -185,9 +188,9 @@ export class RecordConsumer {
       // A new receptor run: the previous one ended without `bye` unless we saw it.
       if (this.run !== undefined && !this.#byeSeen)
         this.#degrade("run_restarted_without_bye");
+      this.#endRun();
       this.run = rec.run;
       this.#lastSeq = undefined;
-      this.#landingSeen = false;
       this.#byeSeen = false;
     }
     if (this.#lastSeq !== undefined && rec.rec_seq !== this.#lastSeq + 1) {
@@ -265,8 +268,12 @@ export class RecordConsumer {
         this.#fail(reasonToken(rec.reason));
         return;
       case "bye":
+        // A clean end: the run's items stop being deliverable now, not at local
+        // expiry, since no retract for them can follow from this run.
         this.#byeSeen = true;
         this.health = "stopped";
+        this.#live.clear();
+        this.#landingSeen = false;
         return;
       default:
         this.#count("unknown_type");
@@ -373,6 +380,21 @@ export class RecordConsumer {
     });
   }
 
+  /**
+   * Drop everything the previous run vouched for. A new run can't retract what the
+   * last one heard, so its items, presence and datagram clock end with it; anything
+   * still live comes back only through the new run's own frames (`dedup: resurfaced`),
+   * after its `landing_state`. The last mute stays until that `landing_state` replaces
+   * it (status only: nothing is delivered before it anyway).
+   */
+  #endRun(): void {
+    this.#live.clear();
+    this.#landingSeen = false;
+    this.presence.clear();
+    this.lastDatagramAt = undefined;
+    this.noDatagrams = false;
+  }
+
   #prune(nowMs: number): void {
     for (const [idem, r] of this.#live) {
       if (r.localExpiryAt <= nowMs) this.#live.delete(idem);
@@ -423,11 +445,9 @@ export class RecordConsumer {
         const s = p.slice(0, at);
         return (s === "*" || s === station) && p.slice(at + 1) === stream;
       });
+    const live = this.health !== "failed" && this.health !== "stopped";
     const deliverable =
-      listening &&
-      this.health !== "failed" &&
-      this.#landingSeen &&
-      this.mute === null;
+      listening && live && this.#landingSeen && this.mute === null;
     const items: LiveItem[] = [];
     for (const [idem, r] of this.#live) {
       if (r.localExpiryAt <= nowMs) {
@@ -446,7 +466,8 @@ export class RecordConsumer {
     return {
       now: nowMs,
       tuned: patterns.length > 0,
-      listening: listening && this.health !== "failed",
+      listening: listening && live,
+      ...(this.health === "stopped" ? { ended: true } : {}),
       blind,
       lastDatagramAt: this.lastDatagramAt,
       stations: [...this.presence].map(([name, state]) => ({
