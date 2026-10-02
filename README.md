@@ -55,6 +55,8 @@ An ear can serve a Copilot CLI session instead of a Claude Code one (`target: "c
 2. Install the extension: `node src/cli.ts copilot-extension --ear <name>`. It writes to `$COPILOT_HOME/extensions/frond-ear/`, with `config.json` at 0600.
 3. Start Copilot with extensions enabled: `copilot --experimental`. The attach canary works the same way: `ack` its nonce.
 
+**After upgrading frond-ear, re-run the install** (step 2), with the `FROND_EAR_SOCKET`, or `FROND_EAR_TCP` and `FROND_EAR_TOKEN_FILE`, that the daemon uses: the install writes the daemon's address into `config.json`. It copies the extension's files and the shim's tool schemas, so an existing install keeps the old ones until it is reinstalled and lacks any tool added since. An install from before #30 also still declares `batch_id` as a number, so its session cannot pass a pushed id as the `<channel>` element shows it (`N-<token>`), one of the two ways to prove delivery.
+
 Copilot extensions are experimental. An extension reloads on `/clear`, which is just a re-attach. A `source: "system"` message is still a user-message event tagged as system, not a separate channel type, and the trust model is unchanged: trust comes from verified author IDs in the element's attributes, never from text.
 
 ## Docs

@@ -17,6 +17,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
 
+import { targetAdvice } from "../src/advice.ts";
 import { BOT, CHANNEL, GUILD, PRINCIPAL } from "./helpers.ts";
 
 const CLI = join(import.meta.dirname, "..", "src", "cli.ts");
@@ -485,6 +486,51 @@ test("copilot extension: a failed tool call is an SDK failure result, not succes
   const sent = reply.handler({ chat_id: "1", text: "x" });
   answer(true, "sent");
   assert.equal(await sent, "sent");
+  ext.stop();
+});
+
+test("copilot extension: a refused push is logged with the text the deaf advice names (#39)", async () => {
+  const { start } = (await import("../copilot-extension/core.mjs")) as {
+    start: Start;
+  };
+  const socket = await fakeSocket();
+  const logged: string[] = [];
+  const ext = await start(
+    async () => ({
+      send: async () => {
+        throw new Error("session busy");
+      },
+      log: async (message: string) => {
+        logged.push(message);
+      },
+    }),
+    { ear: "walker", tools: [] },
+    { connect: () => socket, reconnectMs: 60_000 },
+  );
+  socket.emit("connect");
+  socket.line({
+    type: "welcome",
+    protocol: 1,
+    attached: true,
+    instructions: "hi",
+  });
+  socket.line({
+    type: "event",
+    batchId: 7,
+    content: "x",
+    meta: { kind: "mention" },
+  });
+  await ext.settled();
+  // doctor and the daemon's delivery warning tell a deaf Copilot session to look for it.
+  const deaf =
+    targetAdvice({ name: "walker", target: "copilot-extension" }, {})?.deaf ??
+    "";
+  const named = /"(frond-ear: could not deliver batch)"/u.exec(deaf)?.[1];
+  assert.ok(named, deaf);
+  assert.ok(
+    logged.some((message) => message.startsWith(`${named} 7: session busy`)),
+    JSON.stringify(logged),
+  );
   ext.stop();
 });
 

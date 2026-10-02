@@ -11,6 +11,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { PassThrough, Readable } from "node:stream";
@@ -25,11 +26,13 @@ import {
   type Check,
   type Io,
 } from "../src/onboard.ts";
-import { listenUnix } from "../src/server.ts";
+import { listenTcp, listenUnix } from "../src/server.ts";
 import { BOT, CHANNEL, PRINCIPAL, ROOM, harness, message } from "./helpers.ts";
 
 // Short on purpose: unix socket paths are capped at 107 bytes.
 const TOKEN = "not-a-real-token-123";
+/** The daemon's TCP shared token: its file's path may be advised, never its contents. */
+const TCP_TOKEN = "tcp-shared-secret-456";
 
 interface Captured {
   io: Io;
@@ -405,6 +408,7 @@ async function withDaemon(
     run: () => Promise<DoctorRun>,
   ) => Promise<void>,
   mutate: (parsed: ReturnType<typeof parseConfig>) => void = () => {},
+  transport: "unix" | "tcp" = "unix",
 ): Promise<void> {
   const directory = temp();
   const configPath = join(directory, "frond-ear.json");
@@ -414,13 +418,29 @@ async function withDaemon(
   const socketPath = join(directory, "run", "daemon.sock");
   const parsed = parseConfig(config);
   mutate(parsed);
-  const h = harness(parsed, { gatewayStatus: () => ({ state: "connected" }) });
-  const server = await listenUnix(h.daemon, socketPath);
+  // The daemon gets the env doctor gets, so their advice can be compared (#39). In TCP
+  // mode the address is known only once listening, so the env is filled in after.
+  const tcpTokenPath = join(directory, "tcp-token");
+  writeFileSync(tcpTokenPath, `${TCP_TOKEN}\n`, { mode: 0o600 });
+  const env: NodeJS.ProcessEnv =
+    transport === "unix" ? { FROND_EAR_SOCKET: socketPath } : {};
+  const h = harness(parsed, {
+    gatewayStatus: () => ({ state: "connected" }),
+    env,
+    ...(transport === "tcp" ? { token: TCP_TOKEN } : {}),
+  });
+  const server =
+    transport === "unix"
+      ? await listenUnix(h.daemon, socketPath)
+      : await listenTcp(h.daemon, "127.0.0.1", 0);
+  if (transport === "tcp") {
+    const { port } = server.address() as AddressInfo;
+    env.FROND_EAR_TCP = `127.0.0.1:${port}`;
+    env.FROND_EAR_TOKEN_FILE = tcpTokenPath;
+  }
   try {
     await body(h, () =>
-      doctor(["--config", configPath, "--token-file", tokenPath], {
-        FROND_EAR_SOCKET: socketPath,
-      }),
+      doctor(["--config", configPath, "--token-file", tokenPath], { ...env }),
     );
   } finally {
     server.close();
@@ -453,6 +473,25 @@ async function pushPastGrace(
 const CLAUDE_ADVICE =
   /claude mcp|claude --|dangerously-load-development-channels/u;
 
+/** The no-events fix in a doctor hint or in the daemon's delivery warning. */
+function deafFix(text: string): string {
+  const fix =
+    /If no <channel> events arrive at all: (.*?)(?:\. Until then|$)/u.exec(
+      text,
+    )?.[1];
+  assert.ok(fix, text);
+  return fix;
+}
+
+/** The warning the daemon appends to `scribe`'s tool results while delivery is unconfirmed. */
+function daemonWarning(h: ReturnType<typeof harness>): string {
+  const status = h.daemon.status("scribe") as {
+    ears: Array<{ delivery: string; hint?: string }>;
+  };
+  assert.equal(status.ears[0]?.delivery, "unconfirmed");
+  return status.ears[0]?.hint ?? "";
+}
+
 test("doctor: a claude-channel ear with unconfirmed delivery gets #30's proofs and the channel flag; a token-form batch_id confirms it without an ack claim", async () => {
   await withDaemon(CONFIG_JSON, async (h, run) => {
     // The canary is never acked (lost), and the grace runs out.
@@ -470,6 +509,8 @@ test("doctor: a claude-channel ear with unconfirmed delivery gets #30's proofs a
       unconfirmed.hint ?? "",
       /--dangerously-load-development-channels server:frond-ear/u,
     );
+    // The session itself is told the same fix (#39).
+    assert.equal(deafFix(daemonWarning(h)), deafFix(unconfirmed.hint ?? ""));
 
     // Using the pushed id in its token form registers the ear with no canary ack.
     const reply = await h.call(shim, "reply", {
@@ -512,10 +553,60 @@ test("doctor: a copilot-extension ear gets Copilot advice, never Claude setup", 
     assert.equal(unconfirmed.ok, false);
     assert.match(unconfirmed.hint ?? "", /N-<token>/u);
     assert.match(unconfirmed.hint ?? "", /copilot --experimental/u);
-    assert.match(unconfirmed.hint ?? "", /re-run it after upgrading/u);
+    assert.match(
+      unconfirmed.hint ?? "",
+      /after upgrading frond-ear, re-run the install: .*copilot-extension --ear scribe$/u,
+    );
+    assert.match(unconfirmed.hint ?? "", /could not deliver batch/u);
     assert.doesNotMatch(unconfirmed.hint ?? "", CLAUDE_ADVICE);
     assert.doesNotMatch(unconfirmed.detail, /Claude Code/u);
+    // The session itself is told the same Copilot fix, never Claude's relaunch (#39).
+    const warning = daemonWarning(h);
+    assert.equal(deafFix(warning), deafFix(unconfirmed.hint ?? ""));
+    assert.doesNotMatch(warning, CLAUDE_ADVICE);
+    assert.doesNotMatch(warning, /Claude Code/u);
   });
+});
+
+test("doctor: a copilot-extension ear on a TCP daemon is told a TCP reinstall, never a socket one (#40 review)", async () => {
+  const config = {
+    ...CONFIG_JSON,
+    ears: {
+      scribe: { ...CONFIG_JSON.ears.scribe, target: "copilot-extension" },
+    },
+  };
+  await withDaemon(
+    config,
+    async (h, run) => {
+      // The installer writes a unix socket unless FROND_EAR_TCP is set (cli.ts), so a
+      // socket-only reinstall would replace this ear's working TCP config.
+      const tcpInstall =
+        /FROND_EAR_TCP=127\.0\.0\.1:\d+ FROND_EAR_TOKEN_FILE=\S*tcp-token \S+ \S+ copilot-extension --ear scribe/u;
+      const detached = await run();
+      const attach = detached.byName("ear scribe: attached");
+      assert.match(attach.hint ?? "", tcpInstall);
+      assert.doesNotMatch(attach.hint ?? "", /FROND_EAR_SOCKET/u);
+
+      const shim = h.attach("scribe");
+      await pushPastGrace(h, shim);
+      const run2 = await run();
+      const unconfirmed = run2.byName("ear scribe: registered");
+      assert.match(
+        unconfirmed.hint ?? "",
+        new RegExp(`re-run the install: ${tcpInstall.source}$`, "u"),
+      );
+      assert.doesNotMatch(unconfirmed.hint ?? "", /FROND_EAR_SOCKET/u);
+      // The session is told the same TCP reinstall.
+      const warning = daemonWarning(h);
+      assert.equal(deafFix(warning), deafFix(unconfirmed.hint ?? ""));
+      assert.doesNotMatch(warning, /FROND_EAR_SOCKET/u);
+      for (const text of [warning, JSON.stringify(run2.checks)]) {
+        assert.doesNotMatch(text, new RegExp(TCP_TOKEN, "u"));
+      }
+    },
+    () => {},
+    "tcp",
+  );
 });
 
 test("doctor: a target it does not know gets an honest not-supported note, no setup advice", async () => {

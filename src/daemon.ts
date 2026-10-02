@@ -13,6 +13,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 
+import { DELIVERY_PROOF, targetAdvice } from "./advice.ts";
 import type { Config } from "./config.ts";
 import type { StructuredLogger } from "./logger.ts";
 import {
@@ -66,6 +67,11 @@ export interface DaemonOptions {
   canticleHear?: (ear: string) => HearView;
   /** Directory for `fetch_attachment` (one subdirectory per ear). Absent: the tool is off. */
   attachmentsDir?: string;
+  /**
+   * The daemon's environment, for the commands its delivery warning prints (a Copilot
+   * reinstall must reach this daemon's socket). Default: process.env.
+   */
+  env?: NodeJS.ProcessEnv;
 }
 
 interface Client {
@@ -85,8 +91,9 @@ interface Client {
 const SEND_DEDUPE_WINDOW_MS = 5 * 60 * 1_000;
 /**
  * How long an attached session may leave the attach canary unacked before the ear
- * reports it as deaf. A session that never acks is almost always a Claude process
- * started without the development-channels flag: tools still work, pushes are dropped.
+ * reports it as deaf. For a claude-channel ear, a session that never acks is almost always
+ * a Claude process started without the development-channels flag: tools still work,
+ * pushes are dropped.
  */
 const DELIVERY_CONFIRM_GRACE_MS = 2 * 60 * 1_000;
 
@@ -1443,15 +1450,25 @@ export class Daemon {
     if (this.clock.now() - attachedAt < DELIVERY_CONFIRM_GRACE_MS) {
       return { delivery: "pending" };
     }
-    const resume = client.sessionId ?? record.sessionId ?? "<session-id>";
+    // The fix depends on what kind of session this is (#39): the same advice doctor gives.
+    const advice = targetAdvice(
+      {
+        name,
+        target: this.config.ears[name]?.target,
+        sessionId: client.sessionId ?? record.sessionId,
+      },
+      this.options.env ?? process.env,
+    );
     return {
       delivery: "unconfirmed",
       hint:
-        "this session never acked frond-ear's attach canary, so it is not receiving pushed " +
-        "Discord events (tools still work). Claude Code only delivers channel events to " +
-        "sessions launched with --dangerously-load-development-channels server:frond-ear; " +
-        `relaunch with: claude --resume ${resume} --dangerously-load-development-channels ` +
-        "server:frond-ear. Until then, read new messages with inbox.",
+        "this session never acked frond-ear's attach canary or used a pushed batch_id in its " +
+        "token form, so frond-ear cannot confirm that pushed Discord events reach it (tools " +
+        `still work). If they do, ${DELIVERY_PROOF}.` +
+        (advice
+          ? ` If no <channel> events arrive at all: ${advice.deaf}.`
+          : "") +
+        " Until then, read new messages with inbox.",
     };
   }
 
