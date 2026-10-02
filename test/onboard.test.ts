@@ -414,7 +414,11 @@ async function withDaemon(
   const socketPath = join(directory, "run", "daemon.sock");
   const parsed = parseConfig(config);
   mutate(parsed);
-  const h = harness(parsed, { gatewayStatus: () => ({ state: "connected" }) });
+  // The daemon gets the env doctor gets, so their advice can be compared (#39).
+  const h = harness(parsed, {
+    gatewayStatus: () => ({ state: "connected" }),
+    env: { FROND_EAR_SOCKET: socketPath },
+  });
   const server = await listenUnix(h.daemon, socketPath);
   try {
     await body(h, () =>
@@ -453,6 +457,25 @@ async function pushPastGrace(
 const CLAUDE_ADVICE =
   /claude mcp|claude --|dangerously-load-development-channels/u;
 
+/** The no-events fix in a doctor hint or in the daemon's delivery warning. */
+function deafFix(text: string): string {
+  const fix =
+    /If no <channel> events arrive at all: (.*?)(?:\. Until then|$)/u.exec(
+      text,
+    )?.[1];
+  assert.ok(fix, text);
+  return fix;
+}
+
+/** The warning the daemon appends to `scribe`'s tool results while delivery is unconfirmed. */
+function daemonWarning(h: ReturnType<typeof harness>): string {
+  const status = h.daemon.status("scribe") as {
+    ears: Array<{ delivery: string; hint?: string }>;
+  };
+  assert.equal(status.ears[0]?.delivery, "unconfirmed");
+  return status.ears[0]?.hint ?? "";
+}
+
 test("doctor: a claude-channel ear with unconfirmed delivery gets #30's proofs and the channel flag; a token-form batch_id confirms it without an ack claim", async () => {
   await withDaemon(CONFIG_JSON, async (h, run) => {
     // The canary is never acked (lost), and the grace runs out.
@@ -470,6 +493,8 @@ test("doctor: a claude-channel ear with unconfirmed delivery gets #30's proofs a
       unconfirmed.hint ?? "",
       /--dangerously-load-development-channels server:frond-ear/u,
     );
+    // The session itself is told the same fix (#39).
+    assert.equal(deafFix(daemonWarning(h)), deafFix(unconfirmed.hint ?? ""));
 
     // Using the pushed id in its token form registers the ear with no canary ack.
     const reply = await h.call(shim, "reply", {
@@ -515,6 +540,11 @@ test("doctor: a copilot-extension ear gets Copilot advice, never Claude setup", 
     assert.match(unconfirmed.hint ?? "", /re-run it after upgrading/u);
     assert.doesNotMatch(unconfirmed.hint ?? "", CLAUDE_ADVICE);
     assert.doesNotMatch(unconfirmed.detail, /Claude Code/u);
+    // The session itself is told the same Copilot fix, never Claude's relaunch (#39).
+    const warning = daemonWarning(h);
+    assert.equal(deafFix(warning), deafFix(unconfirmed.hint ?? ""));
+    assert.doesNotMatch(warning, CLAUDE_ADVICE);
+    assert.doesNotMatch(warning, /Claude Code/u);
   });
 });
 

@@ -194,6 +194,7 @@ export function harness(
     nonce?: string;
     path?: string;
     gatewayStatus?: () => { state: string; closeCode?: number };
+    env?: NodeJS.ProcessEnv;
   } = {},
 ): Harness {
   const clock = new FakeClock();
@@ -216,6 +217,7 @@ export function harness(
     nonce: () => options.nonce ?? "nonce-1",
     ...(options.gatewayStatus ? { gatewayStatus: options.gatewayStatus } : {}),
     attachmentsDir: join(directory, "attachments"),
+    ...(options.env ? { env: options.env } : {}),
   });
   let callId = 0;
   const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
