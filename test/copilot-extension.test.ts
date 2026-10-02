@@ -207,8 +207,9 @@ test("copilot extension: install, attach, canary, <channel> push via session.sen
     mention.prompt,
     /^<channel source="frond-ear" [^>]*chat_id="700000000000000007"[^>]*trust="principal"[^>]*>\n[\s\S]*> <@100000000000000001> walker, status please\n<\/channel>$/u,
   );
-  const batchId = Number(/batch_id="(\d+)"/u.exec(mention.prompt)?.[1]);
-  assert.ok(batchId > 0);
+  // passed back exactly as shown: the pushed id carries the daemon's delivery token (#30)
+  const batchId = /batch_id="(\d+-[0-9a-f]+)"/u.exec(mention.prompt)?.[1];
+  assert.ok(batchId);
 
   // Replying goes out through the daemon (dry-run records it) and marks the batch seen.
   const reply = text(
