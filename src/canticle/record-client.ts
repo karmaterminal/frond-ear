@@ -6,13 +6,21 @@
 // Lines over 64 KiB are discarded up to their newline and counted. Reconnects back off
 // on the same curve as the Discord gateway (1 s·2^n ≤ 30 s + jitter). Silent, like the
 // embedded receptor: nothing here wakes a session.
+//
+// Every connection's first line asks for a join snapshot (§14.18.3 "Join snapshot",
+// D36): the bootstrap alone leaves a late joiner blind to what surfaced before it, and
+// receive health says `joined_late` until a complete snapshot arrives.
 
 import { connect, type Socket } from "node:net";
 
 import type { StructuredLogger } from "../logger.ts";
 import type { Clock, Timers } from "../types.ts";
 import { systemClock, systemTimers } from "../types.ts";
-import { MAX_LINE_BYTES, RecordConsumer } from "./records.ts";
+import {
+  JOIN_SNAPSHOT_REQUEST,
+  MAX_LINE_BYTES,
+  RecordConsumer,
+} from "./records.ts";
 import type { HearView } from "./receptor.ts";
 
 export interface RecordClientOptions {
@@ -68,7 +76,10 @@ export class RecordClient {
     socket.on("connect", () => {
       this.#state = "connected";
       this.#attempt = 0;
-      this.consumer.reconnected();
+      // The request goes first, before anything is read (§14.18.3: it need not wait
+      // for `hello`). A daemon that doesn't serve snapshots ignores it.
+      socket.write(JOIN_SNAPSHOT_REQUEST);
+      this.consumer.reconnected({ joinSnapshot: true });
       this.#lastError = undefined;
       this.#options.logger.log("info", "canticle.host_daemon_connected", {
         socket: this.#options.socketPath,
@@ -146,6 +157,10 @@ export class RecordClient {
       ...(this.#lastError ? { lastError: this.#lastError } : {}),
       receiveHealth: this.consumer.health,
       reasons: this.consumer.healthReasons,
+      joinSnapshot: this.consumer.snapshotState,
+      ...(this.consumer.snapshotOmitted !== undefined
+        ? { joinSnapshotOmitted: this.consumer.snapshotOmitted }
+        : {}),
       run: this.consumer.run ?? null,
       mute: this.consumer.mute,
       counts: { ...this.consumer.counts },

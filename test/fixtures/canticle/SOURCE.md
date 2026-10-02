@@ -22,3 +22,13 @@ named-stream item (`surface`), an item on an unnamed stream (`stream: null`), an
 (`retract`), and an item over its hop limit (`hop_limit`). The two refused frames carry `sha256` and `bytes` as null:
 receipt pointers exist only for a `verified` admission. The run id and `pid` are those of the capture.
 `test/canticle-records.test.ts` feeds every line through `RecordConsumer`. Don't edit it here; recapture it upstream.
+
+# Join-snapshot interop sample
+
+`join-snapshot-sample.jsonl` is real output of binary-canticle's host daemon, captured from PR #85 at head
+`6c5da21` by `capture_snapshot.py`, sha256 `9bb5de50dacbc67a0f5a9a74c4ad05c9833ebf786445d9894951ed7b8e9f2b64`.
+A host-socket connection that sent the join-snapshot request reads: `hello` (`join_snapshot: true`), `landing_state`,
+three `snapshot` records at W = 7 whose `entry` is wrapped one level (`{"presence": …}` for station `cael`,
+`{"frame": …}` for a surfaced `alarms` item and a surfaced `chatter` item), `snapshot_end` (W 7, count 3, not
+truncated), then a live `frame` at rec_seq 8. This settles the entry form as the wrapped `{frame|presence}`.
+`test/canticle-join-snapshot.test.ts` feeds every line through `RecordConsumer`. Don't edit it here; recapture it upstream.

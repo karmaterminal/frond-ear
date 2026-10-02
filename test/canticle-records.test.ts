@@ -685,7 +685,10 @@ test("records: first join — hello(1), landing_state(50), live 100 is no loss; 
     "the 1→50 and 50→100 skips are a join",
   );
   assert.equal(c.counts.rec_seq_regression ?? 0, 0);
-  assert.equal(c.health, "ok");
+  // No join snapshot asked for: blind to what came before the join, and saying so
+  // (§14.18.3 "Join snapshot", D36).
+  assert.equal(c.health, "degraded");
+  assert.deepEqual(c.healthReasons, ["joined_late"]);
   assert.deepEqual(
     items(c).map((i) => i.seq),
     ["100"],
@@ -881,7 +884,10 @@ test("record client: real socket — first join, same-run rejoin, malformed boot
   const dir = mkdtempSync(join(tmpdir(), "canticle-sock-"));
   const path = join(dir, "daemon.sock");
   const peers: Socket[] = [];
-  const server = createServer((s) => peers.push(s));
+  const server = createServer((s) => {
+    peers.push(s);
+    s.resume(); // read the client's request line, so its close is seen as an end
+  });
   await new Promise<void>((r) => server.listen(path, r));
   const client = new RecordClient({
     socketPath: path,
