@@ -21,9 +21,9 @@ export const SUPPORTED_PROTOCOL_VERSIONS = [
 export const SHIM_VERSION = "0.1.0";
 
 const batchId = {
-  type: "number",
+  type: "string",
   description:
-    "batch_id from the <channel> event you are acting on; only that batch and earlier ones in the chat are marked seen",
+    "batch_id from the <channel> event you are acting on, exactly as shown; only that batch and earlier ones in the chat are marked seen",
 };
 
 const chatId = {
