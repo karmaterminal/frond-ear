@@ -237,6 +237,7 @@ test("beacon loop maps are capped and reset on epoch advance (#60 item 2)", () =
       b * 100 + i,
       1,
       1,
+      1,
       10_000,
       10_000,
       60,
@@ -253,7 +254,7 @@ test("beacon loop maps are capped and reset on epoch advance (#60 item 2)", () =
   );
   assert.equal(st.streamLoopMax.size, 32);
   l.hear(
-    beacon(2, 1, [[CHATTER, 1, 1, 10_000, 10_000, 60, 300, 4_000]]),
+    beacon(2, 1, [[CHATTER, 1, 1, 1, 10_000, 10_000, 60, 300, 4_000]]),
     T0 + 100,
   );
   assert.equal(st.streamLoops.size, 1);
@@ -261,9 +262,89 @@ test("beacon loop maps are capped and reset on epoch advance (#60 item 2)", () =
   assert.equal(st.bseq, 1n);
 });
 
+test("stream-entry is the post-A1 9/10-element shape, bounded per the §9.8 CDDL (binary-canticle#70)", () => {
+  const l = listener();
+  const st = () => l.stations.get(kid.toString("hex"))!;
+  const entry = [CHATTER, 9, 4, 3, 5_000, 5_000, 60, 300, 4_000];
+  assert.deepEqual(kinds(l.hear(beacon(1, 1, [entry]), T0)), []);
+  const e = st().streamEntries.get(CHATTER)!;
+  assert.deepEqual(
+    [e.headSeq, e.trailSeq, e.live, e.lens],
+    [9n, 4n, 3, undefined],
+  );
+  l.hear(beacon(1, 2, [[...entry, 7]]), T0);
+  assert.equal(st().streamEntries.get(CHATTER)!.lens, 7);
+  // nothing on air: trail_seq = head_seq + 1 (§9.8). The listener only holds it (no §7.10 wait or repair).
+  l.hear(beacon(1, 3, [[CHATTER, 10, 11, 0, 0, 0, 60, 300, 4_000]]), T0);
+  assert.equal(st().streamEntries.get(CHATTER)!.trailSeq, 11n);
+  // head_seq and trail_seq are u64 (bigint on this port)
+  const u64 = 2n ** 64n - 1n;
+  l.hear(
+    frame(KIND_BEACON, {
+      1: 1,
+      2: 4,
+      3: T0,
+      4: 1_000,
+      5: "p",
+      6: [[BigInt(CHATTER), u64, u64, 0n, 0n, 0n, 60n, 300n, 4_000n]],
+      8: 16_000,
+    }),
+    T0,
+  );
+  assert.equal(st().streamEntries.get(CHATTER)!.trailSeq, u64);
+  const bad: Record<string, number[]> = {
+    "pre-A1 8 elements (would read shifted)": [
+      CHATTER,
+      12,
+      0,
+      5_000,
+      5_000,
+      60,
+      300,
+      4_000,
+    ],
+    "7 elements": entry.slice(0, 7),
+    "11 elements": [...entry, 7, 8],
+    "stream_id > u32": [2 ** 32, ...entry.slice(1)],
+    "live > u32": [...entry.slice(0, 3), 2 ** 32, ...entry.slice(4)],
+    "b_stream > u32": [...entry.slice(0, 8), 2 ** 32],
+    "b_stream 2^60 (#66 case 4)": [...entry.slice(0, 8), 2 ** 60],
+    "lens > u32": [...entry, 2 ** 32],
+  };
+  for (const [label, b] of Object.entries(bad)) {
+    assert.deepEqual(
+      kinds(l.hear(beacon(1, 5, [b]), T0)),
+      ["evidence:bad-field"],
+      label,
+    );
+  }
+  assert.equal(
+    st().streamEntries.get(CHATTER)!.trailSeq,
+    u64,
+    "a refused beacon changes nothing",
+  );
+  // next_beacon_ms and b_station are u32 (§9.8 key table)
+  for (const [k, label] of [
+    [4, "next_beacon_ms"],
+    [8, "b_station"],
+  ] as const) {
+    const over = frame(KIND_BEACON, {
+      1: 1,
+      2: 5,
+      3: T0,
+      4: 1_000,
+      5: "p",
+      6: [],
+      8: 16_000,
+      [k]: 2 ** 32,
+    });
+    assert.deepEqual(kinds(l.hear(over, T0)), ["evidence:bad-field"], label);
+  }
+});
+
 test("a repeated or older beacon is ignored", () => {
   const l = listener();
-  const e = [[CHATTER, 1, 1, 10_000, 10_000, 60, 300, 4_000]];
+  const e = [[CHATTER, 1, 1, 1, 10_000, 10_000, 60, 300, 4_000]];
   l.hear(beacon(1, 5, e, T0), T0);
   const st = l.stations.get(kid.toString("hex"))!;
   l.hear(beacon(1, 4, e, T0 - 50_000), T0 + 10);
@@ -320,7 +401,7 @@ test("warm-up holds live-state until a beacon and one loop period, then releases
   assert.deepEqual(kinds(l.hear(live, T0)), []);
   assert.equal(l.held.size, 1);
   l.hear(
-    beacon(1, 1, [[THREAT, 1, 1, 5_000, 5_000, 180, 900, 4_000]]),
+    beacon(1, 1, [[THREAT, 1, 1, 1, 5_000, 5_000, 180, 900, 4_000]]),
     T0 + 1_000,
   );
   assert.deepEqual(kinds(l.tick(T0 + 2_000)), []); // still inside the loop period

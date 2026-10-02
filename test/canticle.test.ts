@@ -185,6 +185,26 @@ test("cbor: deterministic round trip and strict rejections", () => {
   assert.equal(reason("0000"), "trailing-bytes");
   assert.equal(reason("8181818181"), "depth");
   assert.equal(reason("62ff00"), "bad-utf8");
+  // binary-canticle#66: map keys are integers or text strings only, at every depth (reason named as
+  // the spike names it, `map-key-type`, so the two ports read alike).
+  assert.equal(reason("a1f400"), "map-key-type"); // {false: 0}
+  assert.equal(reason("a1f500"), "map-key-type"); // {true: 0}
+  assert.equal(reason("a1f600"), "map-key-type"); // {null: 0}
+  assert.equal(reason("a14000"), "map-key-type"); // {h'': 0}
+  assert.equal(reason("a18000"), "map-key-type"); // {[]: 0}
+  assert.equal(reason("a1a000"), "map-key-type"); // {{}: 0}
+  assert.equal(reason("a20000f400"), "map-key-type"); // {0: 0, false: 0}: ordered, distinct bytes
+  assert.equal(reason("a101a20100f500"), "map-key-type"); // {1: {1: 0, true: 0}}: nested
+  assert.equal(reason("a2616200616100"), "map-key-order"); // {"b": 0, "a": 0}: the order check still comes first
+  assert.equal(reason("a22000616100"), "ok"); // -1 and "a": both legal keys
+  // The encoder refuses the same keys, so it can never produce a map no receiver admits.
+  for (const k of [true, false, null, new Uint8Array(0)] as const) {
+    assert.throws(
+      () => cbor.encode(new Map([[k as never, 0n]])),
+      (e: unknown) => (e as cbor.CborError).reason === "map-key-type",
+      `key ${String(k)}`,
+    );
+  }
 });
 
 test("stream ids match the spike (vector beacon advertises chatter)", () => {
