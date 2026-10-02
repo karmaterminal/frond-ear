@@ -202,6 +202,11 @@ export class EventStore {
         name TEXT PRIMARY KEY,
         value TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS runtime_journal (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        value TEXT NOT NULL
+      );
     `);
   }
 
@@ -258,6 +263,31 @@ export class EventStore {
          ON CONFLICT(name) DO UPDATE SET value = excluded.value`,
       )
       .run(name, value);
+  }
+
+  /** A runtime_state entry's write-ahead records since it was last checkpointed, oldest first. */
+  public runtimeJournal(name: string): string[] {
+    const rows = this.database
+      .prepare("SELECT value FROM runtime_journal WHERE name = ? ORDER BY id")
+      .all(name) as Array<{ value: string }>;
+    return rows.map((row) => row.value);
+  }
+
+  /** One autocommit insert: as durable on return as `setRuntimeState`. */
+  public appendRuntimeJournal(name: string, value: string): void {
+    this.database
+      .prepare("INSERT INTO runtime_journal (name, value) VALUES (?, ?)")
+      .run(name, value);
+  }
+
+  /** Replace the entry and drop its journal in one transaction. */
+  public checkpointRuntimeState(name: string, value: string): void {
+    this.transaction(() => {
+      this.setRuntimeState(name, value);
+      this.database
+        .prepare("DELETE FROM runtime_journal WHERE name = ?")
+        .run(name);
+    });
   }
 
   // ---- gateway cursor ------------------------------------------------------
@@ -1052,6 +1082,30 @@ export class EventStore {
     this.database
       .prepare("UPDATE ears SET session_id = ? WHERE name = ?")
       .run(sessionId, name);
+  }
+
+  /** Was batch `id` offered (pushed) to this ear in this attach generation? */
+  public offeredTo(id: number, ear: string, generation: number): boolean {
+    const row = this.database
+      .prepare(
+        `SELECT 1 AS hit FROM batches
+         WHERE id = ? AND ear = ? AND attach_generation = ? AND offered_at IS NOT NULL`,
+      )
+      .get(id, ear, generation) as { hit: number } | undefined;
+    return row !== undefined;
+  }
+
+  /**
+   * Marks the ear registered without the canary: the session proved delivery by
+   * acting on a pushed batch (#21). Returns true if this changed anything.
+   */
+  public registerEarByUse(name: string): boolean {
+    const result = this.database
+      .prepare(
+        "UPDATE ears SET registered = 1, canary_nonce = NULL WHERE name = ? AND registered = 0",
+      )
+      .run(name);
+    return result.changes === 1;
   }
 
   public registerEar(name: string, nonce: string): boolean {

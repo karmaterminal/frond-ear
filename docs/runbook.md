@@ -22,7 +22,19 @@ pnpm check            # format, typecheck, tests, credential scan
 
 ## 1. Configure
 
-Copy `frond-ear.example.json` to `frond-ear.json`. That filename is git-ignored. Then fill in the fields below.
+The short way is `node src/cli.ts init`, which asks for the IDs, the ear and the token, validates
+the result and writes `~/.config/frond-ear/frond-ear.json` plus the 0600 token file. Then point
+the daemon and `doctor` at those two files, which they do not look for on their own, and check
+the install:
+
+```sh
+export FROND_EAR_CONFIG="$HOME/.config/frond-ear/frond-ear.json"
+export DISCORD_BOT_TOKEN_FILE="$HOME/.config/frond-ear/token"
+node src/cli.ts doctor
+```
+
+[`docs/onboarding.md`](onboarding.md) is the contract for both. The manual path: copy `frond-ear.example.json` to `frond-ear.json` (that
+filename is git-ignored) and fill in the fields below.
 
 **Identity and trust**
 
@@ -101,7 +113,7 @@ claude --dangerously-load-development-channels server:frond-ear
 
 Claude Code asks you to confirm the development-channel flag. Then:
 
-1. **Canary.** Claude receives a `<channel … kind="attach">` event and calls `ack` with the nonce. Running `node src/cli.ts status` should show `"attached": true, "registered": true`. If `registered` stays `false`, the channel was not registered; see Troubleshooting.
+1. **Canary.** Claude receives a `<channel … kind="attach">` event and calls `ack` with the nonce. Running `node src/cli.ts status` should show `"attached": true, "registered": true`. If `registered` stays `false`, the channel was not registered; see Troubleshooting. A session whose canary was lost also registers the first time it passes a pushed `batch_id` to a tool: that id carries a delivery token only the push has. The bare id `frond-ear tap` prints works in tools but proves nothing.
 2. **Idle wake.** From another terminal, inject a mention from a principal:
    ```sh
    FROND_EAR_BOT_USER_ID=<botUserId> node src/cli.ts inject \
@@ -217,6 +229,8 @@ spike's `canticle sing --control <station.sock> --stream ops.fleet --class advis
 status supersedes the older one.
 
 ## Troubleshooting
+
+Start with `node src/cli.ts doctor`, with `FROND_EAR_CONFIG` and `DISCORD_BOT_TOKEN_FILE` set to what the daemon uses (§1): it checks config, token, socket, daemon, gateway and each ear, and prints a fix line for every ✗.
 
 | Symptom                                       | Likely cause                                                                                                                                                                                                      |
 | --------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

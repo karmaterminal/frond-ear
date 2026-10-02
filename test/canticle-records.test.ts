@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { renderHear } from "../src/canticle/hear.ts";
 import { RecordClient } from "../src/canticle/record-client.ts";
 import {
   MAX_DEPTH,
@@ -354,6 +355,53 @@ test("records: a new run's hello recovers a failed receive", () => {
   assert.equal(items(c).length, 1);
 });
 
+test("records: run A's live item doesn't survive run B's hello + landing_state (🌫 #34)", () => {
+  const c = started();
+  c.feed(rec("presence", { station: "ops", state: "on_air" }), NOW);
+  c.feed(frame(1), NOW);
+  assert.equal(items(c).length, 1);
+  // 🌫's sequence, with and without A's bye.
+  for (const [run, bye] of [
+    ["b0b0", true],
+    ["c1c1", false],
+  ] as const) {
+    if (bye) c.feed(rec("bye"), NOW);
+    c.feed(rec("hello", {}, run), NOW);
+    c.feed(rec("landing_state", { mute: null, breaker: "closed" }, run), NOW);
+    const view = c.hearView(TUNE, NOW, true);
+    assert.equal(view.listening, true);
+    assert.deepEqual(view.items, [], `nothing from the old run under ${run}`);
+    assert.deepEqual(view.stations, [], "old run's presence dropped");
+    assert.equal(
+      view.lastDatagramAt,
+      undefined,
+      "old run's datagram clock dropped",
+    );
+    // Only the new run's own frame brings an item back.
+    c.feed(frame(1, { run, dedup: "resurfaced" }), NOW);
+    assert.equal(items(c).length, 1);
+    if (run === "b0b0") c.feed(frame(2), NOW); // a stray old-run record is a run change too
+  }
+});
+
+test("records: bye ends the run; its items stop being deliverable while still connected (🌫 #34)", () => {
+  const c = started();
+  c.feed(frame(1), NOW);
+  assert.equal(items(c).length, 1);
+  c.feed(rec("bye"), NOW);
+  const view = c.hearView(TUNE, NOW, true);
+  assert.deepEqual(view.items, []);
+  assert.equal(view.listening, false);
+  assert.equal(view.ended, true);
+  assert.equal(c.health, "stopped");
+  c.closed();
+  assert.equal(
+    c.health,
+    "stopped",
+    "a closed transport after bye isn't a failure",
+  );
+});
+
 test("records: a rec_seq gap clears the live set (it may have held a retract)", () => {
   const c = started();
   c.feed(frame(1), NOW);
@@ -483,4 +531,380 @@ test("records: principal and lineage root reach the banner; absent reads unavail
   assert.equal(a!.root, "f6eecf2f43082a97:7:0000001a:1");
   assert.equal(b!.principal, undefined);
   assert.equal(b!.root, undefined);
+});
+
+test("record client + hear: run A's item never shows under run B, nor after bye (🌫 #34)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "canticle-sock-"));
+  const path = join(dir, "daemon.sock");
+  let peer: Socket | undefined;
+  const server = createServer((s) => (peer = s));
+  await new Promise<void>((r) => server.listen(path, r));
+  const client = new RecordClient({
+    socketPath: path,
+    tune: { gloss: TUNE },
+    logger,
+    clock: { now: () => NOW },
+  });
+  client.start();
+  // A failed assertion must not leave the socket open and hang the run.
+  try {
+    while (!peer) await new Promise((r) => setTimeout(r, 5));
+    const send = async (...recs: object[]) => {
+      peer!.write(recs.map((r) => `${JSON.stringify(r)}\n`).join(""));
+      await new Promise((r) => setTimeout(r, 30));
+    };
+    const hear = () =>
+      renderHear(client.hearView("gloss"), { limit: 10, maxChars: 4_000 });
+    seq = 0;
+    await send(
+      rec("hello"),
+      rec("landing_state", { mute: null, breaker: "closed" }),
+      rec("health", { last_datagram_at: NOW, reasons: [] }),
+      frame(1),
+    );
+    assert.match(hear(), /deploy\.started 1/u);
+    await send(rec("bye"));
+    assert.doesNotMatch(hear(), /deploy\.started/u);
+    assert.match(hear(), /ended its run cleanly/u);
+    await send(
+      rec("hello", {}, "b0b0"),
+      rec("landing_state", { mute: null, breaker: "closed" }, "b0b0"),
+    );
+    assert.equal(client.consumer.health, "ok");
+    assert.doesNotMatch(hear(), /deploy\.started/u);
+    assert.match(hear(), /nothing live on your tuned streams/u);
+  } finally {
+    peer?.destroy();
+    client.stop();
+    server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- §14.18.3 "Joining a run": the host socket's per-connection bootstrap (🌫 #34, bc#69)
+
+/** A record at an exact rec_seq (the daemon's bootstrap replays original values). */
+const at = (n: number, make: () => object) => {
+  seq = n - 1;
+  return make();
+};
+const landing = (extra: Record<string, unknown> = {}, run = RUN) =>
+  rec("landing_state", { mute: null, breaker: "closed", ...extra }, run);
+
+function firstJoin(): RecordConsumer {
+  const c = new RecordConsumer();
+  c.reconnected(); // every connection, the first included
+  c.feed(
+    at(1, () => rec("hello")),
+    NOW,
+  );
+  c.feed(
+    at(50, () => landing()),
+    NOW,
+  );
+  c.feed(
+    at(100, () => frame(100)),
+    NOW,
+  );
+  return c;
+}
+
+test("records: first join — hello(1), landing_state(50), live 100 is no loss; landing restored (🌫 #34)", () => {
+  const c = firstJoin();
+  assert.equal(
+    c.counts.records_lost ?? 0,
+    0,
+    "the 1→50 and 50→100 skips are a join",
+  );
+  assert.equal(c.counts.rec_seq_regression ?? 0, 0);
+  assert.equal(c.health, "ok");
+  assert.deepEqual(
+    items(c).map((i) => i.seq),
+    ["100"],
+    "the replayed landing_state lets the first live frame deliver",
+  );
+  assert.equal(c.connectionLost, false);
+});
+
+test("records: rejoin — seen to 120, hello(1), landing_state(150), live 151: landing restored, records_lost once (🌫 #34, bc#69)", () => {
+  const c = firstJoin();
+  // Contiguous live records to 120; a mute lands at 120.
+  for (let n = 101; n < 120; n++)
+    c.feed(
+      at(n, () => rec("health", { reasons: [] })),
+      NOW,
+    );
+  c.feed(
+    at(120, () => landing({ mute: { until: null, by: "ops" } })),
+    NOW,
+  );
+  assert.equal(c.counts.records_lost ?? 0, 0);
+  assert.equal(items(c).length, 0, "muted");
+  // Connection lost; a retract at 130 is missed. Same run, new connection.
+  c.closed();
+  c.reconnected();
+  c.feed(
+    at(1, () => rec("hello")),
+    NOW,
+  );
+  c.feed(
+    at(150, () => landing()),
+    NOW,
+  );
+  assert.equal(
+    c.counts.rec_seq_regression ?? 0,
+    0,
+    "bootstrap below 120 isn't a regression",
+  );
+  assert.equal(
+    c.counts.records_lost ?? 0,
+    0,
+    "nothing counted until the join step",
+  );
+  c.feed(
+    at(151, () => frame(151)),
+    NOW,
+  );
+  assert.equal(
+    c.counts.records_lost,
+    1,
+    "a rejoin loses records exactly once, even 150→151",
+  );
+  assert.ok(c.healthReasons.includes("records_lost"));
+  assert.equal(c.health, "degraded");
+  assert.deepEqual(
+    items(c).map((i) => i.seq),
+    ["151"],
+    "the replayed (unmuted) landing_state replaced the muted one",
+  );
+  c.feed(
+    at(152, () => frame(152)),
+    NOW,
+  );
+  assert.equal(c.counts.records_lost, 1, "152 follows 151");
+  // Step 3: from the first live record on, any skip is a gap.
+  c.feed(
+    at(154, () => frame(154)),
+    NOW,
+  );
+  assert.equal(
+    c.counts.records_lost,
+    2,
+    "151→153-style skip after the join is a gap",
+  );
+  assert.deepEqual(
+    items(c).map((i) => i.seq),
+    ["154"],
+  );
+  assert.equal(c.counts.rec_seq_regression ?? 0, 0);
+});
+
+test("records: a gap right after the join (151→153) is counted", () => {
+  const c = new RecordConsumer();
+  c.reconnected();
+  c.feed(
+    at(1, () => rec("hello")),
+    NOW,
+  );
+  c.feed(
+    at(150, () => landing()),
+    NOW,
+  );
+  c.feed(
+    at(151, () => frame(151)),
+    NOW,
+  );
+  assert.equal(c.counts.records_lost ?? 0, 0, "first join");
+  c.feed(
+    at(153, () => frame(153)),
+    NOW,
+  );
+  assert.equal(c.counts.records_lost, 1);
+  assert.equal(c.health, "degraded");
+});
+
+test("records: a malformed bootstrap is malformed_record and loses the connection", () => {
+  const cases: [string, () => object[]][] = [
+    [
+      "first record not hello",
+      () => [at(10, () => rec("health", { reasons: [] }))],
+    ],
+    [
+      "second record not landing_state",
+      () => [at(1, () => rec("hello")), at(2, () => frame(2))],
+    ],
+    [
+      "landing_state of another run",
+      () => [at(1, () => rec("hello")), at(50, () => landing({}, "f00d"))],
+    ],
+    [
+      "landing_state seq equal to hello's",
+      () => [at(5, () => rec("hello")), at(5, () => landing())],
+    ],
+    [
+      "landing_state seq below hello's",
+      () => [at(5, () => rec("hello")), at(4, () => landing())],
+    ],
+    [
+      "landing_state with a mistyped mute",
+      () => [at(1, () => rec("hello")), at(50, () => landing({ mute: 0 }))],
+    ],
+  ];
+  for (const [name, bootstrap] of cases) {
+    const c = new RecordConsumer();
+    c.reconnected();
+    for (const r of bootstrap()) c.feed(r, NOW);
+    assert.equal(c.connectionLost, true, name);
+    assert.ok((c.counts.malformed_record ?? 0) >= 1, name);
+    assert.equal(c.health, "failed", name);
+    // Nothing more is read from this connection.
+    c.feed(
+      at(60, () => landing()),
+      NOW,
+    );
+    c.feed(
+      at(61, () => frame(61)),
+      NOW,
+    );
+    assert.equal(items(c).length, 0, name);
+    // The next connection's good bootstrap recovers.
+    c.reconnected();
+    c.feed(
+      at(1, () => rec("hello")),
+      NOW,
+    );
+    c.feed(
+      at(70, () => landing()),
+      NOW,
+    );
+    c.feed(
+      at(71, () => frame(71)),
+      NOW,
+    );
+    assert.equal(c.connectionLost, false, name);
+    assert.equal(items(c).length, 1, name);
+  }
+  // An unparseable first line is malformed too.
+  const d = new RecordConsumer();
+  d.reconnected();
+  d.feedLine("{not json", NOW);
+  assert.equal(d.connectionLost, true);
+});
+
+test("records: without a per-connection bootstrap (one reader per run) the ordinary rules hold", () => {
+  const c = new RecordConsumer();
+  c.feed(
+    at(1, () => rec("hello")),
+    NOW,
+  );
+  c.feed(
+    at(50, () => landing()),
+    NOW,
+  );
+  assert.equal(
+    c.counts.records_lost,
+    1,
+    "a skip on a bootstrap-less stream is a gap",
+  );
+  assert.equal(c.connectionLost, false);
+});
+
+test("record client: real socket — first join, same-run rejoin, malformed bootstrap reconnects (🌫 #34)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "canticle-sock-"));
+  const path = join(dir, "daemon.sock");
+  const peers: Socket[] = [];
+  const server = createServer((s) => peers.push(s));
+  await new Promise<void>((r) => server.listen(path, r));
+  const client = new RecordClient({
+    socketPath: path,
+    tune: { gloss: TUNE },
+    logger,
+    clock: { now: () => NOW },
+    timers: {
+      setTimeout: (fn: () => void) => setTimeout(fn, 1),
+      clearTimeout: (t: unknown) => clearTimeout(t as NodeJS.Timeout),
+    } as never,
+  });
+  const send = async (peer: Socket, ...recs: object[]) => {
+    peer.write(recs.map((r) => `${JSON.stringify(r)}\n`).join(""));
+    await new Promise((r) => setTimeout(r, 30));
+  };
+  const peerAt = async (n: number) => {
+    const deadline = Date.now() + 2_000;
+    while (peers.length < n) {
+      assert.ok(Date.now() < deadline, `connection ${n} never arrived`);
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    return peers[n - 1]!;
+  };
+  const seqs = () => client.hearView("gloss").items.map((i) => i.seq);
+  try {
+    client.start();
+    const p1 = await peerAt(1);
+    await send(
+      p1,
+      at(1, () => rec("hello")),
+      at(50, () => landing()),
+      at(100, () => frame(100)),
+    );
+    assert.deepEqual(seqs(), ["100"]);
+    assert.equal(client.consumer.counts.records_lost ?? 0, 0, "first join");
+    await send(
+      p1,
+      ...Array.from({ length: 20 }, (_, i) =>
+        at(101 + i, () => rec("health", { reasons: [] })),
+      ),
+    );
+    assert.equal(
+      client.consumer.counts.records_lost ?? 0,
+      0,
+      "contiguous to 120",
+    );
+    p1.destroy();
+    const p2 = await peerAt(2);
+    await send(
+      p2,
+      at(1, () => rec("hello")),
+      at(150, () => landing()),
+      at(151, () => frame(151)),
+    );
+    assert.deepEqual(seqs(), ["151"]);
+    assert.equal(client.consumer.counts.records_lost, 1, "rejoin, once");
+    assert.equal(client.consumer.counts.rec_seq_regression ?? 0, 0);
+    // A malformed bootstrap: the client drops the connection and reconnects.
+    p2.destroy();
+    const p3 = await peerAt(3);
+    await send(
+      p3,
+      at(160, () => frame(160)),
+    );
+    const p4 = await peerAt(4);
+    assert.equal(client.consumer.counts.bootstrap_not_hello, 1);
+    assert.equal(p3.destroyed || p3.readableEnded, true);
+    await send(
+      p4,
+      at(1, () => rec("hello")),
+      at(170, () => landing()),
+      at(171, () => frame(171)),
+    );
+    assert.deepEqual(seqs(), ["171"]);
+    // An over-long line in the bootstrap is malformed too: the client drops the
+    // connection rather than staying connected and failed (🌫 #34, second pass).
+    p4.destroy();
+    const p5 = await peerAt(5);
+    p5.write(`${"x".repeat(70 * 1024)}\n`);
+    const p6 = await peerAt(6);
+    assert.equal(p5.destroyed || p5.readableEnded, true);
+    await send(
+      p6,
+      at(1, () => rec("hello")),
+      at(180, () => landing()),
+      at(181, () => frame(181)),
+    );
+    assert.deepEqual(seqs(), ["181"]);
+  } finally {
+    client.stop();
+    server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

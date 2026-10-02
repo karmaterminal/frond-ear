@@ -338,3 +338,25 @@ test("in room mode an over-budget ambient mention loses priority but still flows
   );
   assert.equal(plain.reason, "room", "plain room chatter is not budgeted");
 });
+
+test("config: ear targets: claude-channel (default) and copilot-extension; copilot-sdk is reserved", () => {
+  const ear = (target?: unknown) => ({
+    botUserId: BOT,
+    ears: {
+      a: {
+        ...(target === undefined ? {} : { target }),
+        channels: { [CHANNEL]: "mentions" },
+      },
+    },
+  });
+  assert.equal(parseConfig(ear()).ears.a?.target, "claude-channel");
+  assert.equal(
+    parseConfig(ear("copilot-extension")).ears.a?.target,
+    "copilot-extension",
+  );
+  assert.throws(() => parseConfig(ear("copilot-sdk")), /reserved/u);
+  assert.throws(
+    () => parseConfig(ear("pager")),
+    /claude-channel or copilot-extension/u,
+  );
+});

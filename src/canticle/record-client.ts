@@ -107,16 +107,25 @@ export class RecordClient {
       }
       this.#buffer += piece;
       if (Buffer.byteLength(this.#buffer) > MAX_LINE_BYTES) {
-        this.consumer.counts.line_too_long =
-          (this.consumer.counts.line_too_long ?? 0) + 1;
+        this.consumer.dropLine("line_too_long");
         this.#buffer = "";
         this.#discarding = nl === -1;
+        if (this.consumer.connectionLost) {
+          // an over-long line in the bootstrap is a malformed bootstrap too
+          this.#socket?.destroy();
+          return;
+        }
         continue;
       }
       if (nl !== -1) {
         const line = this.#buffer;
         this.#buffer = "";
         this.consumer.feedLine(line, this.#clock.now());
+        if (this.consumer.connectionLost) {
+          // A malformed bootstrap (§14.18.3): drop this connection and reconnect.
+          this.#socket?.destroy();
+          return;
+        }
       }
     }
   }

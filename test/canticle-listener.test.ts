@@ -591,3 +591,179 @@ test("q21: state v3 keeps a mark's class; a v2 mark learns it when its own item 
   );
   assert.equal(r.hwm.get(hkey)!.cls, 3, "learned on resurface");
 });
+
+test("q21 + journal: a v2 mark's learned class is journaled and survives a crash before the checkpoint (🕯 #32)", () => {
+  const l = new Listener(manifest, { warmup: false, restore: null });
+  l.hear(
+    item({ seq: 1, cls: 3, stateKey: "s", stream: THREAT, ttlMs: 120_000 }),
+    T0,
+  );
+  const snap = l.snapshot();
+  const v2 = {
+    ...snap,
+    version: 2,
+    hwm: snap.hwm.map((r) => r.slice(0, 5)),
+  } as never;
+  const hkey = `${kid.toString("hex")}:${THREAT}:s`;
+  // Restore from v2: the mark has no class until its own item resurfaces.
+  const r = new Listener(manifest, { warmup: false, restore: v2 });
+  r.takeJournal();
+  r.hear(
+    item({ seq: 1, cls: 3, stateKey: "s", stream: THREAT, ttlMs: 120_000 }),
+    T0 + 1_000,
+  );
+  assert.equal(r.hwm.get(hkey)!.cls, 3);
+  assert.equal(r.urgent, true, "learning a class is a raised guard");
+  const rec = r.takeJournal();
+  assert.ok(rec, "and it is journaled");
+  // Crash before any checkpoint: restart from the same v2 snapshot plus the journal.
+  const after = new Listener(manifest, {
+    warmup: false,
+    restore: v2,
+    journal: [rec],
+  });
+  assert.equal(after.hwm.get(hkey)!.cls, 3, "the learned class survived");
+  // A different class later in the same epoch is still a class change, and dropped.
+  assert.deepEqual(
+    kinds(
+      after.hear(
+        item({
+          seq: 2,
+          cls: 4,
+          stateKey: "s",
+          stream: THREAT,
+          issued: T0 + 2_000,
+          ttlMs: 120_000,
+        }),
+        T0 + 2_000,
+      ),
+    ),
+    ["evidence:class-change"],
+  );
+});
+
+test("restart: journal records replay over the snapshot idempotently and monotonically", () => {
+  const l = new Listener(manifest, { warmup: false, restore: null });
+  l.hear(item({ seq: 1 }), T0); // epoch adopted
+  const rec1 = l.takeJournal()!;
+  assert.equal(l.takeJournal(), undefined, "taken once");
+  l.hear(item({ seq: 2 }), T0); // a plain admission raises nothing
+  assert.equal(l.takeJournal(), undefined);
+  l.hear(item({ seq: 3, stateKey: "k", issued: T0 + 5_000 }), T0 + 5_000);
+  const rec2 = l.takeJournal()!;
+  assert.equal(rec2.hwm.length, 1);
+  assert.equal(rec2.dedup.length, 1, "the frame that raised the mark");
+  const once = new Listener(manifest, { restore: null, journal: [rec1, rec2] });
+  const twice = new Listener(manifest, {
+    restore: null,
+    journal: [rec2, rec1, rec1, rec2],
+  });
+  const norm = (st: ReturnType<Listener["snapshot"]>) => ({
+    ...st,
+    dedup: [...st.dedup].sort((x, y) => x[0].localeCompare(y[0])),
+  });
+  assert.deepEqual(norm(twice.snapshot()), norm(once.snapshot()));
+  // An older mark replayed after a newer one never lowers it.
+  const stale = structuredClone(rec2);
+  stale.hwm[0]![1] = T0;
+  stale.hwm[0]![4] = 0;
+  const r = new Listener(manifest, { restore: null, journal: [rec2, stale] });
+  assert.deepEqual(r.snapshot().hwm, once.snapshot().hwm);
+});
+
+test("q21 + journal: a mark's journal record carries its class and replay keeps it", () => {
+  const l = new Listener(manifest, { warmup: false, restore: null });
+  const hkey = `${kid.toString("hex")}:${THREAT}:s`;
+  l.hear(item({ seq: 1, cls: 3, stateKey: "s", stream: THREAT }), T0);
+  const rec = l.takeJournal()!;
+  assert.equal(rec.version, 3);
+  assert.equal(rec.hwm.length, 1);
+  assert.equal(rec.hwm[0]![5], 3, "the journaled mark carries its class");
+  const r = new Listener(manifest, { restore: null, journal: [rec, rec] });
+  assert.equal(r.hwm.get(hkey)!.cls, 3);
+});
+
+test("q21 + journal: replay is order-independent with classes and never downgrades a known class", () => {
+  const l = new Listener(manifest, { warmup: false, restore: null });
+  const hkey = `${kid.toString("hex")}:${THREAT}:s`;
+  l.hear(item({ seq: 1, cls: 3, stateKey: "s", stream: THREAT }), T0);
+  const rec1 = l.takeJournal()!;
+  l.hear(
+    item({ seq: 2, cls: 3, stateKey: "s", stream: THREAT, issued: T0 + 1_000 }),
+    T0 + 1_000,
+  );
+  const rec2 = l.takeJournal()!;
+  // The same marks as old-shape (v2) journal records: no class.
+  const old = (rec: NonNullable<typeof rec1>) =>
+    ({
+      ...rec,
+      version: 2,
+      hwm: rec.hwm.map((row) => row.slice(0, 5)),
+    }) as never;
+  const orders = [
+    [rec1, rec2],
+    [rec2, rec1],
+    [rec2, old(rec2), rec1],
+    [old(rec2), rec2, old(rec1)],
+    [old(rec1), rec1, old(rec2), rec2],
+    [rec1, old(rec2), rec2, old(rec2)],
+  ];
+  const norm = (st: ReturnType<Listener["snapshot"]>) => ({
+    ...st,
+    dedup: [...st.dedup].sort((x, y) => x[0].localeCompare(y[0])),
+  });
+  const want = norm(
+    new Listener(manifest, { restore: null, journal: [rec1, rec2] }).snapshot(),
+  );
+  assert.equal(want.hwm[0]![5], 3);
+  for (const journal of orders) {
+    const r = new Listener(manifest, { restore: null, journal });
+    assert.equal(r.hwm.get(hkey)!.cls, 3, "a known class is never downgraded");
+    assert.equal(r.hwm.get(hkey)!.order[2], 2n);
+    assert.deepEqual(norm(r.snapshot()), want);
+  }
+  // A v3 snapshot with the class, then an old-shape record of the same mark: the class stays.
+  const r = new Listener(manifest, {
+    restore: l.snapshot(),
+    journal: [old(rec2)],
+  });
+  assert.equal(r.hwm.get(hkey)!.cls, 3);
+  // Old-shape records alone: the class is unknown, as for a v2 snapshot.
+  const u = new Listener(manifest, {
+    restore: null,
+    journal: [old(rec1), old(rec2)],
+  });
+  assert.equal(u.hwm.get(hkey)!.cls, undefined);
+});
+
+test("q21 + journal: a class change is still dropped after a crash and journal replay", () => {
+  const l = new Listener(manifest, { warmup: false, restore: null });
+  const saved = l.snapshot(); // the last periodic save, before the mark
+  const hkey = `${kid.toString("hex")}:${THREAT}:s`;
+  l.hear(item({ seq: 1, cls: 3, stateKey: "s", stream: THREAT }), T0);
+  assert.ok(l.urgent);
+  const rec = l.takeJournal()!; // journaled before any tick or periodic save; then a crash
+  const r = new Listener(manifest, {
+    warmup: false,
+    restore: saved,
+    journal: [rec],
+  });
+  assert.equal(r.hwm.get(hkey)!.cls, 3);
+  assert.deepEqual(
+    kinds(
+      r.hear(
+        item({
+          seq: 2,
+          cls: 4,
+          stateKey: "s",
+          stream: THREAT,
+          issued: T0 + 1_000,
+        }),
+        T0 + 1_000,
+      ),
+    ),
+    ["evidence:class-change"],
+  );
+  assert.equal(r.hwm.get(hkey)!.order[2], 1n, "the mark did not move");
+  assert.equal(r.hwm.get(hkey)!.cls, 3);
+});

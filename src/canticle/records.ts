@@ -14,7 +14,14 @@
 //   deliverable, and never once past `local_expiry_at`;
 // - `retract` removes; an active `mute` withdraws everything;
 // - `fatal`, or a run that ends without `bye`, marks receive health `failed` until
-//   the next run's `hello` (the restart §14.18.2 expects).
+//   the next run's `hello` (the restart §14.18.2 expects);
+// - a record with a new `run` ends the old one: its live items, presence and datagram
+//   clock are dropped, so nothing from it can surface under the new run;
+// - `bye` ends the run cleanly: its items stop being deliverable and `hear` says so.
+// Over the host socket each connection opens with a two-record bootstrap, the run's
+// `hello` and its latest `landing_state` with their original `rec_seq` (§14.18.3
+// "Joining a run", binary-canticle#69): see `reconnected()`. Other transports (one
+// reader per run, no bootstrap) never call it and take the ordinary rules throughout.
 // Every map here has a fixed bound (§14.18.2 "nothing in the pipe is unbounded").
 // Framing: at most 64 KiB per line and nesting depth 8 (§14.18.2 [PROPOSED DEFAULT]).
 
@@ -124,6 +131,17 @@ export class RecordConsumer {
   readonly counts: Record<string, number> = {};
   run: string | undefined;
   #lastSeq: number | undefined;
+  /**
+   * Where this connection is in §14.18.3 "Joining a run". `stream`: no per-connection
+   * bootstrap (a transport that never calls `reconnected()`). `hello` / `landing`: the
+   * two bootstrap records are due. `join`: the next record is the first live one.
+   * `live`: ordinary rules. `lost`: a malformed bootstrap; nothing more is read from
+   * this connection, and the transport closes it (`connectionLost`).
+   */
+  #conn: "stream" | "hello" | "landing" | "join" | "live" | "lost" = "stream";
+  #helloSeq = 0;
+  /** This connection rejoins a run the binding already held records from. */
+  #rejoin = false;
   #landingSeen = false;
   #byeSeen = false;
   mute: { until: number | null; by: string | null } | null = null;
@@ -139,22 +157,34 @@ export class RecordConsumer {
   /** One line from the transport. Never throws. */
   feedLine(line: string, nowMs: number): void {
     if (Buffer.byteLength(line) > MAX_LINE_BYTES) {
-      this.#count("line_too_long");
+      this.dropLine("line_too_long");
       return;
     }
     if (line.trim() === "") return;
     if (jsonDepth(line) > MAX_DEPTH) {
-      this.#count("depth_exceeded");
+      this.dropLine("depth_exceeded");
       return;
     }
     let rec: unknown;
     try {
       rec = JSON.parse(line);
     } catch {
-      this.#count("malformed_record");
+      this.dropLine("malformed_record");
       return;
     }
     this.feed(rec, nowMs);
+  }
+
+  /** A line the transport couldn't read as a record. In a bootstrap it loses the connection. */
+  dropLine(reason: string): void {
+    this.#count(reason);
+    if (this.#conn === "hello" || this.#conn === "landing")
+      this.#badBootstrap();
+  }
+
+  /** The bootstrap was malformed: the transport must drop this connection. */
+  get connectionLost(): boolean {
+    return this.#conn === "lost";
   }
 
   feed(rec: unknown, nowMs: number): void {
@@ -164,6 +194,7 @@ export class RecordConsumer {
     ) {
       return; // delivery stopped for good on an unknown major version
     }
+    if (this.#conn === "lost") return;
     if (
       !isObj(rec) ||
       !str(rec.v) ||
@@ -171,34 +202,46 @@ export class RecordConsumer {
       !int(rec.rec_seq) ||
       !str(rec.run)
     ) {
-      this.#count("malformed_record");
+      this.dropLine("malformed_record");
       return;
     }
     if (rec.v !== RECORD_V) {
       if (rec.v.startsWith("canticle-receptor-record/")) {
         this.#fail("record_version");
         this.#live.clear();
-      } else this.#count("malformed_record");
+      } else this.dropLine("malformed_record");
       return;
     }
-    if (rec.run !== this.run) {
-      // A new receptor run: the previous one ended without `bye` unless we saw it.
-      if (this.run !== undefined && !this.#byeSeen)
-        this.#degrade("run_restarted_without_bye");
-      this.run = rec.run;
-      this.#lastSeq = undefined;
-      this.#landingSeen = false;
-      this.#byeSeen = false;
+    if (this.#conn === "hello" || this.#conn === "landing") {
+      this.#bootstrap(
+        rec as Obj & { type: string; rec_seq: number; run: string },
+      );
+      return;
     }
+    if (this.#conn === "join") {
+      this.#conn = "live";
+      if (rec.run === this.run) {
+        // §14.18.3 step 2: the first live record is above the baseline, and the
+        // skip to it is never itself a gap. Loss depends only on the join kind: a
+        // first join loses nothing; a rejoin is `records_lost` exactly once, even
+        // when the first live record directly follows the baseline (records emitted
+        // while away, a retract among them, are not replayed).
+        if (rec.rec_seq <= this.#lastSeq!) {
+          this.#count("rec_seq_regression");
+          this.#conn = "join";
+          return;
+        }
+        if (this.#rejoin) this.#lose();
+        this.#lastSeq = rec.rec_seq - 1; // the join itself is not a gap
+      }
+    }
+    if (rec.run !== this.run) this.#beginRun(rec.run);
     if (this.#lastSeq !== undefined && rec.rec_seq !== this.#lastSeq + 1) {
       if (rec.rec_seq <= this.#lastSeq) {
         this.#count("rec_seq_regression");
         return;
       }
-      this.#count("records_lost");
-      this.#degrade("records_lost");
-      // The gap may have held a retract: nothing heard before it stays deliverable.
-      this.#live.clear();
+      this.#lose();
     }
     this.#lastSeq = rec.rec_seq;
     switch (rec.type) {
@@ -208,30 +251,9 @@ export class RecordConsumer {
         this.health = "ok";
         this.healthReasons = [];
         return;
-      case "landing_state": {
-        // A mistyped mute must not read as "not muted": drop it, keep the last one.
-        const mute = rec.mute;
-        const muteOk =
-          mute === null ||
-          (isObj(mute) && intOrNull(mute.until) && strOrNull(mute.by));
-        if (
-          !("mute" in rec) ||
-          !muteOk ||
-          !str(rec.breaker) ||
-          !BREAKER.has(rec.breaker)
-        ) {
-          this.#count("malformed_record");
-          return;
-        }
-        this.#landingSeen = true;
-        this.mute = isObj(mute)
-          ? {
-              until: mute.until as number | null,
-              by: mute.by as string | null,
-            }
-          : null;
+      case "landing_state":
+        if (!this.#landing(rec)) this.#count("malformed_record");
         return;
-      }
       case "frame":
         this.#frame(rec, nowMs);
         return;
@@ -265,12 +287,98 @@ export class RecordConsumer {
         this.#fail(reasonToken(rec.reason));
         return;
       case "bye":
+        // A clean end: the run's items stop being deliverable now, not at local
+        // expiry, since no retract for them can follow from this run.
         this.#byeSeen = true;
         this.health = "stopped";
+        this.#live.clear();
+        this.#landingSeen = false;
         return;
       default:
         this.#count("unknown_type");
     }
+  }
+
+  /**
+   * §14.18.3 step 1, bootstrap validation: `hello`, then a `landing_state` of the
+   * same run with a higher `rec_seq`. Neither is checked against the gap or
+   * regression rules; the landing state replaces the run's, and its `rec_seq` is
+   * this connection's baseline. Anything else is `malformed_record`: the connection
+   * is lost.
+   */
+  #bootstrap(rec: Obj & { type: string; rec_seq: number; run: string }): void {
+    if (this.#conn === "hello") {
+      if (rec.type !== "hello")
+        return this.#badBootstrap("bootstrap_not_hello");
+      // A rejoin only if the binding already held records from this run.
+      this.#rejoin = rec.run === this.run;
+      if (!this.#rejoin) this.#beginRun(rec.run);
+      this.#helloSeq = rec.rec_seq;
+      this.health = "ok";
+      this.healthReasons = [];
+      this.#conn = "landing";
+      return;
+    }
+    if (rec.type !== "landing_state")
+      return this.#badBootstrap("bootstrap_not_landing_state");
+    if (rec.run !== this.run)
+      return this.#badBootstrap("bootstrap_run_mismatch");
+    if (rec.rec_seq <= this.#helloSeq)
+      return this.#badBootstrap("bootstrap_seq_order");
+    if (!this.#landing(rec))
+      return this.#badBootstrap("bootstrap_landing_state_fields");
+    this.#lastSeq = rec.rec_seq;
+    this.#conn = "join";
+  }
+
+  /** `reason`: what the bootstrap record got wrong (unset: the line was already counted). */
+  #badBootstrap(reason?: string): void {
+    if (reason !== undefined) {
+      this.#count("malformed_record");
+      this.#count(reason);
+    }
+    this.#conn = "lost";
+    this.#live.clear();
+    this.#landingSeen = false;
+    this.#fail("malformed_bootstrap");
+  }
+
+  /** A `landing_state`'s fields; false (nothing applied) when malformed. */
+  #landing(rec: Obj): boolean {
+    // A mistyped mute must not read as "not muted": drop it, keep the last one.
+    const mute = rec.mute;
+    const muteOk =
+      mute === null ||
+      (isObj(mute) && intOrNull(mute.until) && strOrNull(mute.by));
+    if (
+      !("mute" in rec) ||
+      !muteOk ||
+      !str(rec.breaker) ||
+      !BREAKER.has(rec.breaker)
+    )
+      return false;
+    this.#landingSeen = true;
+    this.mute = isObj(mute)
+      ? { until: mute.until as number | null, by: mute.by as string | null }
+      : null;
+    return true;
+  }
+
+  /** A new receptor run: the previous one ended without `bye` unless we saw it. */
+  #beginRun(run: string): void {
+    if (this.run !== undefined && !this.#byeSeen)
+      this.#degrade("run_restarted_without_bye");
+    this.#endRun();
+    this.run = run;
+    this.#lastSeq = undefined;
+    this.#byeSeen = false;
+  }
+
+  /** Records were lost: the gap may have held a retract, so nothing heard before it stays. */
+  #lose(): void {
+    this.#count("records_lost");
+    this.#degrade("records_lost");
+    this.#live.clear();
   }
 
   #frame(rec: Obj, nowMs: number): void {
@@ -373,6 +481,21 @@ export class RecordConsumer {
     });
   }
 
+  /**
+   * Drop everything the previous run vouched for. A new run can't retract what the
+   * last one heard, so its items, presence and datagram clock end with it; anything
+   * still live comes back only through the new run's own frames (`dedup: resurfaced`),
+   * after its `landing_state`. The last mute stays until that `landing_state` replaces
+   * it (status only: nothing is delivered before it anyway).
+   */
+  #endRun(): void {
+    this.#live.clear();
+    this.#landingSeen = false;
+    this.presence.clear();
+    this.lastDatagramAt = undefined;
+    this.noDatagrams = false;
+  }
+
   #prune(nowMs: number): void {
     for (const [idem, r] of this.#live) {
       if (r.localExpiryAt <= nowMs) this.#live.delete(idem);
@@ -402,13 +525,16 @@ export class RecordConsumer {
   }
 
   /**
-   * A new connection to the same daemon: records between connections are lost,
-   * so a retract or a mute may have been missed. Clear the live set and deliver
-   * nothing until this connection's `landing_state`.
+   * A connection to the host daemon opened (every one, the first included). It
+   * starts with §14.18.3's bootstrap: `hello`, then the run's latest `landing_state`.
+   * Records between connections are lost, so a retract or a mute may have been
+   * missed: clear the live set and deliver nothing until this connection's
+   * `landing_state`.
    */
   reconnected(): void {
     this.#live.clear();
     this.#landingSeen = false;
+    this.#conn = "hello";
   }
 
   /** What one ear hears now, through its `station:stream` tune. */
@@ -423,11 +549,9 @@ export class RecordConsumer {
         const s = p.slice(0, at);
         return (s === "*" || s === station) && p.slice(at + 1) === stream;
       });
+    const live = this.health !== "failed" && this.health !== "stopped";
     const deliverable =
-      listening &&
-      this.health !== "failed" &&
-      this.#landingSeen &&
-      this.mute === null;
+      listening && live && this.#landingSeen && this.mute === null;
     const items: LiveItem[] = [];
     for (const [idem, r] of this.#live) {
       if (r.localExpiryAt <= nowMs) {
@@ -446,7 +570,8 @@ export class RecordConsumer {
     return {
       now: nowMs,
       tuned: patterns.length > 0,
-      listening: listening && this.health !== "failed",
+      listening: listening && live,
+      ...(this.health === "stopped" ? { ended: true } : {}),
       blind,
       lastDatagramAt: this.lastDatagramAt,
       stations: [...this.presence].map(([name, state]) => ({

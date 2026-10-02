@@ -195,6 +195,7 @@ export function harness(
     nonce?: string;
     path?: string;
     canticleHear?: (ear: string) => HearView;
+    gatewayStatus?: () => { state: string; closeCode?: number };
   } = {},
 ): Harness {
   const clock = new FakeClock();
@@ -216,6 +217,8 @@ export function harness(
     allowInject: true,
     nonce: () => options.nonce ?? "nonce-1",
     ...(options.canticleHear ? { canticleHear: options.canticleHear } : {}),
+    ...(options.gatewayStatus ? { gatewayStatus: options.gatewayStatus } : {}),
+    attachmentsDir: join(directory, "attachments"),
   });
   let callId = 0;
   const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
