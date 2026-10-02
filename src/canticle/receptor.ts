@@ -19,8 +19,8 @@ import type { Identity } from "./wire.ts";
 
 const STATE_KEY = "canticle.listener_state";
 const TICK_MS = 1_000;
-/** Listener events whose state may wait for the next tick's save. */
-const DEFERRABLE: ReadonlySet<string> = new Set(["item", "presence"]);
+/** At most one synchronous safety save per this interval; the rest ride the tick. */
+const URGENT_SAVE_MIN_MS = 250;
 const RETRY_MIN_MS = 1_000;
 const RETRY_MAX_MS = 30_000;
 /** No datagram from anyone for this long: render stations `unknown`, not `offline`. */
@@ -122,6 +122,7 @@ export class CanticleReceptor {
   #tickHandle: unknown;
   #retryHandle: unknown;
   #lastDatagramAt: number | undefined;
+  #lastUrgentSaveAt = Number.NEGATIVE_INFINITY;
   readonly #counts = {
     datagrams: 0,
     items: 0,
@@ -170,7 +171,11 @@ export class CanticleReceptor {
     this.#state = "stopped";
     this.#timers.clearTimeout(this.#tickHandle);
     this.#timers.clearTimeout(this.#retryHandle);
-    this.#save();
+    try {
+      this.#save();
+    } catch (error) {
+      this.#saveFailed(error); // a failing store must not stop the rest of shutdown
+    }
     try {
       this.#socket?.close();
     } catch {
@@ -238,12 +243,15 @@ export class CanticleReceptor {
     this.#lastDatagramAt = this.#clock.now();
     const events = this.#listener.hear(datagram, this.#clock.now());
     this.#apply(events);
-    // A plain admission can wait for the next tick (at most TICK_MS): after a crash
-    // the item is only re-heard as resurfaced. Anything else (a pluck, with or
-    // without a held target, a supersession, a quarantine) is safety state that
-    // must outlive a crash (§7.7), so it is written now. Duplicates aren't dirty.
-    if (events.length > 0 && events.every((e) => DEFERRABLE.has(e.event)))
-      return;
+    // Only a raised safety guard (epoch, sticky pluck, supersession mark) is written now; it
+    // must outlive a crash (§7.7). Everything else waits for the tick's save (≤ TICK_MS), so a
+    // flood of admissions can't serialise the whole snapshot per datagram.
+    // Urgent saves are coalesced (≤ 1 per URGENT_SAVE_MIN_MS) so keyed churn at line rate
+    // can't serialise per datagram either; a coalesced one is written by the next tick.
+    if (!this.#listener.urgent) return;
+    const now = this.#clock.now();
+    if (now - this.#lastUrgentSaveAt < URGENT_SAVE_MIN_MS) return;
+    this.#lastUrgentSaveAt = now;
     try {
       this.#save();
     } catch (error) {
@@ -285,7 +293,8 @@ export class CanticleReceptor {
 
   /** What one ear hears right now: live items on its tuned station:streams. */
   live(ear: string): LiveItem[] {
-    const patterns = this.#options.config.tune[ear] ?? [];
+    const tune = this.#options.config.tune;
+    const patterns = Object.hasOwn(tune, ear) ? (tune[ear] ?? []) : [];
     const now = this.#clock.now();
     const out: LiveItem[] = [];
     for (const h of this.#listener.current.values()) {
@@ -346,7 +355,8 @@ export class CanticleReceptor {
       this.#state !== "listening" ||
       this.#lastDatagramAt === undefined ||
       now - this.#lastDatagramAt > BLIND_AFTER_MS;
-    const patterns = this.#options.config.tune[ear] ?? [];
+    const tune = this.#options.config.tune;
+    const patterns = Object.hasOwn(tune, ear) ? (tune[ear] ?? []) : [];
     const stations = [...this.#listener.stations.keys()]
       .map((kid) => {
         const name =

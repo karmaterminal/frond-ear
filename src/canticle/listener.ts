@@ -280,6 +280,7 @@ export class Listener {
   /** Identities loaded from a snapshot that this process hasn't surfaced yet. */
   readonly #restored = new Set<string>();
   #dirty = false;
+  #urgent = false;
 
   constructor(manifest: Manifest, options: ListenerOptions) {
     if (options.ephemeral !== true && options.restore === undefined) {
@@ -308,8 +309,20 @@ export class Listener {
     return this.#dirty;
   }
 
+  /**
+   * True when a change since the last `markSaved()` *raised* a safety guard that must
+   * outlive a crash: an epoch advance, a sticky pluck mark, or a supersession mark set or
+   * raised (§7.7, §7.8). Losing anything else to a crash costs at most a re-heard item
+   * marked resurfaced, or a purge redone on the next tick, so it can wait for the
+   * caller's periodic save.
+   */
+  get urgent(): boolean {
+    return this.#urgent;
+  }
+
   markSaved(): void {
     this.#dirty = false;
+    this.#urgent = false;
   }
 
   snapshot(): SafetyState {
@@ -470,6 +483,7 @@ export class Listener {
       st.epochHwm = epoch;
       st.epochSeenAt = nowMs;
       this.#dirty = true;
+      this.#urgent = true;
       // bseq, the advertised catalog and the per-stream hearing times belong to the previous
       // epoch (§9.8): a restarted station counts beacons from 1 again and may loop different streams.
       st.bseq = 0n;
@@ -689,6 +703,7 @@ export class Listener {
       this.stickyPluck.set(target, retain);
       this.#stickyDue.push(retain, target);
       this.#dirty = true;
+      this.#urgent = true;
       for (const [k, h] of this.held) {
         if (h.ident === target) this.held.delete(k);
       }
@@ -788,6 +803,7 @@ export class Listener {
         this.hwm.set(hkey, { order, retain: until, cls: it.cls });
         this.#hwmDue.push(until, hkey);
         this.#dirty = true;
+        this.#urgent = true;
       }
       for (const [otherIdent, h] of this.current) {
         if (
