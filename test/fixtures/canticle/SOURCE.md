@@ -2,9 +2,8 @@
 
 `frame-v2-candidates.json` is copied byte for byte from
 `karmaterminal/binary-canticle` at `prototype/canticle-station/vectors/frame-v2-candidates.json`,
-sha256 `943f77094ffc7e207a9af6de3cccd8d09741fdc997bbcc9fb489c95bfcbcfc63`, taken from binary-canticle PR #89
-(branch `gloss/20261002/trail-seq-receiver-rule`) at head `f52616258b6b43f8101a622f057cf1e029c9aac7`, ahead of its merge.
-Re-take it from binary-canticle `main` once PR #89 merges. 48 vectors: the post-A1 `stream-entry` with `trail_seq`, the
+sha256 `943f77094ffc7e207a9af6de3cccd8d09741fdc997bbcc9fb489c95bfcbcfc63`, identical to binary-canticle `main` at
+`95b14c4e09c3855da408f27c8042e46b5513d4f2` (PR #89 merged; verified byte for byte after the merge). 48 vectors: the post-A1 `stream-entry` with `trail_seq`, the
 #66 map-key and null cases, a pre-A1 8-element entry and `b_stream` = 2^60 as `bad-field`, and the #72 pair
 (`trail_seq = head_seq + 1` accepted as the empty window, `head_seq + 2` as `bad-field`). The previous copy was
 sha256 `fce58bb8…`, from `main` at `2254fb8c` (binary-canticle PR #71, 46 vectors).
