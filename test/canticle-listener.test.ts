@@ -207,14 +207,27 @@ test("a mark's horizon never shrinks when a shorter-lived newer value arrives", 
 });
 
 test("stream hearing times are capped at the key's share (#60 item 1)", () => {
+  // Admitted over time (short TTL, ticks between batches), so the dedup quota alone can't
+  // bound the map: only the cap does (🌿 #27 B2: this failed to catch the cap's removal).
   const l = new Listener(manifest, {
     ephemeral: true,
     warmup: false,
     perKeyQuota: 10,
   });
-  for (let i = 0; i < 50; i++)
-    l.hear(item({ seq: i + 1, stream: 1000 + i }), T0);
-  assert.equal(l.stations.get(kid.toString("hex"))!.lastStreamItem.size, 10);
+  let at = T0;
+  for (let batch = 0; batch < 20; batch++) {
+    for (let i = 0; i < 10; i++) {
+      const n = batch * 10 + i;
+      l.hear(
+        item({ seq: n + 1, stream: 1000 + n, issued: at, ttlMs: 1_000 }),
+        at,
+      );
+    }
+    at += 1_000 + SKEW_MS + 1_000; // past the batch's dedup retention
+    l.tick(at);
+  }
+  assert.equal(l.dedup.size, 0, "every batch was admitted and then purged");
+  assert.ok(l.stations.get(kid.toString("hex"))!.lastStreamItem.size <= 10);
 });
 
 test("beacon loop maps are capped and reset on epoch advance (#60 item 2)", () => {
