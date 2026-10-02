@@ -3,7 +3,7 @@ import test from "node:test";
 
 import { renderHear, renderItem } from "../src/canticle/hear.ts";
 import type { HearView, LiveItem } from "../src/canticle/receptor.ts";
-import { harness } from "./helpers.ts";
+import { harness, testConfig } from "./helpers.ts";
 
 const NOW = 1_790_000_100_000;
 
@@ -339,4 +339,165 @@ test("hear tool: prototype-named ears hear nothing and don't throw", async () =>
   );
   for (const ear of ["__proto__", "constructor", "toString"])
     assert.deepEqual(r.hearView(ear).items, []);
+});
+
+// ---- the character cap (🩸 #28: the first item, the frame and the omission line all count)
+
+/** Every wrapper opened is closed with its own id, and nothing sits half-open. */
+function assertWellFormed(out: string): void {
+  const opens = [
+    ...out.matchAll(/<<<EXTERNAL_UNTRUSTED_CONTENT id="([0-9a-f]{12})">>>/gu),
+  ];
+  const closes = [
+    ...out.matchAll(
+      /<<<END_EXTERNAL_UNTRUSTED_CONTENT id="([0-9a-f]{12})">>>/gu,
+    ),
+  ];
+  assert.deepEqual(
+    closes.map((m) => m[1]),
+    opens.map((m) => m[1]),
+    "each wrapper closes with its own id",
+  );
+  for (const [index, open] of opens.entries()) {
+    const close = closes[index]!;
+    assert.ok(open.index < close.index);
+    // The banner precedes its wrapper, outside it.
+    const before = out.slice(0, open.index);
+    assert.ok(
+      before.lastIndexOf("[canticle:heard]") > (closes[index - 1]?.index ?? -1),
+    );
+    // Inside: only the fixed header, quoted payload, or our truncation line.
+    const inside = out
+      .slice(open.index + open[0].length, close.index)
+      .split("\n")
+      .slice(1, -1);
+    assert.deepEqual(
+      inside.slice(0, 3).map((l) => l.split(" ")[0]),
+      ["Source:", "From:", "---"],
+    );
+    for (const line of inside.slice(3)) {
+      assert.match(line, /^> |^\(payload truncated by frond-ear /u, line);
+    }
+  }
+  assert.doesNotMatch(
+    out,
+    /<<<(END_)?EXTERNAL_UNTRUSTED_CONTENT(?! id="[0-9a-f]{12}">>>)/u,
+  );
+}
+
+test("hear: cap 500, one 700-char item stays within 500 and well-formed", () => {
+  const out = renderHear(view({ items: [item({ text: "a".repeat(700) })] }), {
+    limit: 10,
+    maxChars: 500,
+  });
+  assert.ok(out.length <= 500, `rendered ${out.length} chars`);
+  assertWellFormed(out);
+  assert.match(out, /1 live item:/u);
+  assert.match(
+    out,
+    /none shown: one item's banner and wrapper alone exceed limits\.maxNotificationChars \(500\)/u,
+  );
+});
+
+test("hear: an oversize first item is truncated inside its wrapper, banner intact", () => {
+  const out = renderHear(
+    view({ items: [item({ text: "b".repeat(1_200) }), item({ seq: "8" })] }),
+    {
+      limit: 10,
+      maxChars: 1_000,
+    },
+  );
+  assert.ok(out.length <= 1_000, `rendered ${out.length} chars`);
+  assertWellFormed(out);
+  assert.equal((out.match(/^\[canticle:heard\] /gmu) ?? []).length, 1);
+  assert.match(out, /^> b+$/mu);
+  assert.match(
+    out,
+    /\(payload truncated by frond-ear to fit limits\.maxNotificationChars: \d+ of 1200 chars shown\)\n<<<END_EXTERNAL/u,
+  );
+  assert.match(out, /\(1 more live item not shown/u);
+});
+
+test("hear: output never exceeds the cap, across caps, item sizes and counts", () => {
+  const long = "x".repeat(80);
+  const stations = Array.from({ length: 40 }, (_, i) => ({
+    name: `station-${i}-${long}`,
+    presence: "EQUIPPED_SPEAKING",
+  }));
+  const shapes: Array<(n: number) => Partial<LiveItem>> = [
+    (n) => ({ text: "c".repeat(n) }),
+    (n) => ({ text: "line\n".repeat(Math.ceil(n / 5)).slice(0, n) }),
+    (n) => ({ text: "🍃".repeat(Math.ceil(n / 2)) }),
+    (n) => ({ text: undefined, bodyBytes: n }),
+    (n) => ({
+      text: "d".repeat(n),
+      station: long,
+      principal: long,
+      root: long,
+      stateKey: long,
+      purpose: long,
+      bodyRef: {
+        url: `https://example.invalid/${long}`,
+        size: "12",
+        sha256: "ab".repeat(32),
+      },
+    }),
+  ];
+  let checked = 0;
+  for (const maxChars of [
+    500, 501, 550, 615, 650, 700, 800, 900, 1_000, 1_301, 2_000, 6_000,
+  ]) {
+    for (const size of [0, 1, 50, 300, 700, 1_200]) {
+      for (const shape of shapes) {
+        for (const count of [1, 2, 7, 30]) {
+          for (const v of [
+            { stations: [{ name: "silas", presence: "EQUIPPED_SPEAKING" }] },
+            { stations, blind: true },
+          ]) {
+            const items = Array.from({ length: count }, (_, i) =>
+              item({ seq: String(i + 1), heardAt: NOW - i, ...shape(size) }),
+            );
+            const out = renderHear(view({ ...v, items }), {
+              limit: 50,
+              maxChars,
+            });
+            assert.ok(
+              out.length <= maxChars,
+              `cap ${maxChars} size ${size} count ${count}: ${out.length}`,
+            );
+            assertWellFormed(out);
+            checked += 1;
+          }
+        }
+      }
+    }
+  }
+  assert.equal(checked, 12 * 6 * 5 * 4 * 2);
+});
+
+test("hear tool: the daemon path honors limits.maxNotificationChars at its minimum", async () => {
+  for (const maxNotificationChars of [500, 1_000]) {
+    const h = harness(testConfig({ limits: { maxNotificationChars } }), {
+      canticleHear: () =>
+        view({
+          items: [
+            item({ text: "e".repeat(700) }),
+            item({ seq: "8", text: "f".repeat(700) }),
+          ],
+        }),
+    });
+    const shim = h.attach("scribe");
+    const result = await h.call(shim, "hear", {});
+    assert.equal(result.ok, true);
+    assert.ok(
+      result.text.length <= maxNotificationChars,
+      `cap ${maxNotificationChars}: ${result.text.length}`,
+    );
+    assertWellFormed(result.text);
+    assert.match(result.text, /2 live items:/u);
+    if (maxNotificationChars === 1_000) {
+      assert.match(result.text, /\(payload truncated by frond-ear /u);
+    }
+    h.dispose();
+  }
 });
