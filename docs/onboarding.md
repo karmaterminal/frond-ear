@@ -119,18 +119,18 @@ status is 1 if any **required** check fails, 0 otherwise. Flags: `--config`, `--
 it: set the same two paths you give the daemon (or that `init` printed), as in the examples above.
 Bare `doctor` checks what a daemon started in the current directory with no env would load.
 
-| Check               | Required | What passes                                                                                                                                                   |
-| ------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| node                | yes      | ≥ 22.18                                                                                                                                                       |
-| config              | yes      | `--config`, else what the daemon loads here: `FROND_EAR_CONFIG`, else `./frond-ear.json` (no `~/.config` fallback); names a home config the daemon would miss |
-| token               | yes      | `--token-file` / `DISCORD_BOT_TOKEN_FILE` is 0600 and non-empty (never read back), or `DISCORD_BOT_TOKEN` is set; no default path                             |
-| socket dir / socket | yes      | 0700 / 0600, path ≤ 107 bytes; skipped in TCP mode                                                                                                            |
-| daemon              | yes      | answers `status` over the socket                                                                                                                              |
-| gateway             | yes      | `connected`, or `dry-run`                                                                                                                                     |
-| paused              | advisory | reported when the kill switch is on                                                                                                                           |
-| ear _n_: attached   | advisory | a shim is attached. Not required: an ear with no session is healthy and holds events for it                                                                   |
-| ear _n_: registered | advisory | the session acked the attach canary                                                                                                                           |
-| claude              | advisory | `claude` is on `PATH`                                                                                                                                         |
+| Check               | Required | What passes                                                                                                                                                                                                      |
+| ------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| node                | yes      | ≥ 22.18                                                                                                                                                                                                          |
+| config              | yes      | `--config`, else what the daemon loads here: `FROND_EAR_CONFIG`, else `./frond-ear.json` (no `~/.config` fallback); names a home config the daemon would miss                                                    |
+| token               | yes      | `--token-file` / `DISCORD_BOT_TOKEN_FILE` is 0600 and non-empty (never read back), or `DISCORD_BOT_TOKEN` is set; no default path                                                                                |
+| socket dir / socket | yes      | 0700 / 0600, path ≤ 107 bytes; skipped in TCP mode                                                                                                                                                               |
+| daemon              | yes      | answers `status` over the socket                                                                                                                                                                                 |
+| gateway             | yes      | `connected`, or `dry-run`                                                                                                                                                                                        |
+| paused              | advisory | reported when the kill switch is on                                                                                                                                                                              |
+| ear _n_: attached   | advisory | a shim is attached. Not required: an ear with no session is healthy and holds events for it. The fix is per target: `claude mcp add` + the channel flag, or `copilot-extension --ear` + `copilot --experimental` |
+| ear _n_: registered | advisory | delivery confirmed: a canary ack or a pushed `batch_id` used in its token form (`status` does not say which). The fix is per target                                                                              |
+| claude              | advisory | `claude` is on `PATH`; skipped when every ear is `copilot-extension`                                                                                                                                             |
 
 Two things `doctor` deliberately does not do:
 
@@ -141,8 +141,9 @@ Two things `doctor` deliberately does not do:
   and acting on a pushed `batch_id`. Since [#30](https://github.com/karmaterminal/frond-ear/pull/30),
   using the id exactly as a `<channel>` element shows it (`N-<token>`) proves delivery, while an id read from `tap` or `inbox` marks the
   batch seen but proves nothing. A session that has only acted on such ids stays `registered: false`
-  by design. If events really do not arrive, the usual cause is a launch without the
-  development-channel flag.
+  by design. If events really do not arrive, the usual cause for a Claude Code ear is a launch without the
+  development-channel flag; for a Copilot ear, an extension not installed for that ear (or not
+  reinstalled after an upgrade) or Copilot started without `--experimental`.
 
 ## 6. Agent onboarding
 

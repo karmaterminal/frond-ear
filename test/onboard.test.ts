@@ -26,7 +26,7 @@ import {
   type Io,
 } from "../src/onboard.ts";
 import { listenUnix } from "../src/server.ts";
-import { BOT, CHANNEL, PRINCIPAL, ROOM, harness } from "./helpers.ts";
+import { BOT, CHANNEL, PRINCIPAL, ROOM, harness, message } from "./helpers.ts";
 
 // Short on purpose: unix socket paths are capped at 107 bytes.
 const TOKEN = "not-a-real-token-123";
@@ -379,7 +379,10 @@ test("doctor: a healthy daemon with no session attached passes, with the attach 
       ["--config", configPath, "--token-file", tokenPath],
       env,
     );
-    assert.equal(proven.byName("ear scribe: registered").ok, true);
+    const confirmed = proven.byName("ear scribe: registered");
+    assert.equal(confirmed.ok, true);
+    // status does not say which proof registered the ear, so neither does doctor.
+    assert.match(confirmed.detail, /status does not say which/u);
     assert.equal(
       proven.checks.every((check) => check.ok || check.name === "claude"),
       true,
@@ -389,6 +392,155 @@ test("doctor: a healthy daemon with no session attached passes, with the attach 
     h.dispose();
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+/**
+ * Starts a real daemon for `config` on a temp socket, with one ear `scribe`, and runs
+ * `body` against it. Doctor talks to it over the socket; the harness drives the session.
+ */
+async function withDaemon(
+  config: object,
+  body: (
+    h: ReturnType<typeof harness>,
+    run: () => Promise<DoctorRun>,
+  ) => Promise<void>,
+  mutate: (parsed: ReturnType<typeof parseConfig>) => void = () => {},
+): Promise<void> {
+  const directory = temp();
+  const configPath = join(directory, "frond-ear.json");
+  const tokenPath = join(directory, "token");
+  writeFileSync(configPath, JSON.stringify(config));
+  writeFileSync(tokenPath, `${TOKEN}\n`, { mode: 0o600 });
+  const socketPath = join(directory, "run", "daemon.sock");
+  const parsed = parseConfig(config);
+  mutate(parsed);
+  const h = harness(parsed, { gatewayStatus: () => ({ state: "connected" }) });
+  const server = await listenUnix(h.daemon, socketPath);
+  try {
+    await body(h, () =>
+      doctor(["--config", configPath, "--token-file", tokenPath], {
+        FROND_EAR_SOCKET: socketPath,
+      }),
+    );
+  } finally {
+    server.close();
+    h.dispose();
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+/** Pushes one event to `shim`, lets the delivery grace run out, returns the pushed event. */
+async function pushPastGrace(
+  h: ReturnType<typeof harness>,
+  shim: ReturnType<ReturnType<typeof harness>["attach"]>,
+) {
+  h.daemon.ingest(
+    message({
+      author: { id: PRINCIPAL },
+      mentions: [{ id: BOT }],
+      content: "can you hear me?",
+    }),
+  );
+  // Past the default max delay, so the batch has been pushed.
+  h.timers.advance(60_000);
+  const pushed = shim.connection.events().at(-1);
+  assert.ok(pushed && pushed.batchId !== null, "an event was pushed");
+  await shim.send({ type: "offered", batchId: pushed.batchId });
+  h.clock.advance(2 * 60 * 1_000);
+  return pushed;
+}
+
+const CLAUDE_ADVICE =
+  /claude mcp|claude --|dangerously-load-development-channels/u;
+
+test("doctor: a claude-channel ear with unconfirmed delivery gets #30's proofs and the channel flag; a token-form batch_id confirms it without an ack claim", async () => {
+  await withDaemon(CONFIG_JSON, async (h, run) => {
+    // The canary is never acked (lost), and the grace runs out.
+    const shim = h.attach("scribe");
+    const pushed = await pushPastGrace(h, shim);
+    const unconfirmed = (await run()).byName("ear scribe: registered");
+    assert.equal(unconfirmed.ok, false);
+    assert.equal(unconfirmed.required, false);
+    assert.doesNotMatch(unconfirmed.detail, /Until frond-ear#30/u);
+    assert.match(unconfirmed.detail, /token form \(N-<token>\)/u);
+    assert.match(unconfirmed.detail, /tap or inbox .* proves nothing/u);
+    assert.match(unconfirmed.hint ?? "", /ack the attach canary's nonce/u);
+    assert.match(unconfirmed.hint ?? "", /N-<token>/u);
+    assert.match(
+      unconfirmed.hint ?? "",
+      /--dangerously-load-development-channels server:frond-ear/u,
+    );
+
+    // Using the pushed id in its token form registers the ear with no canary ack.
+    const reply = await h.call(shim, "reply", {
+      chat_id: CHANNEL,
+      text: "yes",
+      batch_id: pushed?.meta.batch_id,
+    });
+    assert.equal(reply.ok, true, reply.text);
+    const confirmed = (await run()).byName("ear scribe: registered");
+    assert.equal(confirmed.ok, true);
+    assert.doesNotMatch(confirmed.detail, /acked the attach canary:/u);
+    assert.match(confirmed.detail, /status does not say which/u);
+  });
+});
+
+test("doctor: a copilot-extension ear gets Copilot advice, never Claude setup", async () => {
+  const config = {
+    ...CONFIG_JSON,
+    ears: {
+      scribe: { ...CONFIG_JSON.ears.scribe, target: "copilot-extension" },
+    },
+  };
+  await withDaemon(config, async (h, run) => {
+    const detached = await run();
+    assert.equal(detached.code, 0);
+    const attach = detached.byName("ear scribe: attached");
+    assert.equal(attach.ok, false);
+    assert.match(attach.hint ?? "", /copilot-extension --ear scribe/u);
+    assert.match(attach.hint ?? "", /copilot --experimental/u);
+    assert.match(attach.hint ?? "", /after upgrading frond-ear/u);
+    assert.doesNotMatch(attach.hint ?? "", CLAUDE_ADVICE);
+    assert.ok(
+      !detached.checks.some((check) => check.name === "claude"),
+      "no claude check when every ear is Copilot",
+    );
+
+    const shim = h.attach("scribe");
+    await pushPastGrace(h, shim);
+    const unconfirmed = (await run()).byName("ear scribe: registered");
+    assert.equal(unconfirmed.ok, false);
+    assert.match(unconfirmed.hint ?? "", /N-<token>/u);
+    assert.match(unconfirmed.hint ?? "", /copilot --experimental/u);
+    assert.match(unconfirmed.hint ?? "", /re-run it after upgrading/u);
+    assert.doesNotMatch(unconfirmed.hint ?? "", CLAUDE_ADVICE);
+    assert.doesNotMatch(unconfirmed.detail, /Claude Code/u);
+  });
+});
+
+test("doctor: a target it does not know gets an honest not-supported note, no setup advice", async () => {
+  // config.ts rejects reserved targets, so only a mismatched daemon reports one.
+  await withDaemon(
+    CONFIG_JSON,
+    async (h, run) => {
+      const detached = await run();
+      const target = detached.byName("ear scribe: target");
+      assert.equal(target.ok, false);
+      assert.equal(target.required, false);
+      assert.match(target.detail, /copilot-sdk is not supported/u);
+      assert.equal(detached.byName("ear scribe: attached").hint, undefined);
+      const shim = h.attach("scribe");
+      await pushPastGrace(h, shim);
+      const unconfirmed = (await run()).byName("ear scribe: registered");
+      assert.doesNotMatch(unconfirmed.hint ?? "", CLAUDE_ADVICE);
+      assert.doesNotMatch(unconfirmed.hint ?? "", /copilot --experimental/u);
+    },
+    (parsed) => {
+      const ear = parsed.ears.scribe;
+      assert.ok(ear);
+      (ear as { target: string }).target = "copilot-sdk";
+    },
+  );
 });
 
 test("doctor: a 0644 token, a dead gateway, and a missing daemon each fail a required check", async () => {

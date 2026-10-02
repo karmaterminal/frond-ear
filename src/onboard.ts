@@ -572,6 +572,8 @@ export interface Check {
 
 interface StatusEar {
   name: string;
+  /** Absent from a daemon older than #36, which only had claude-channel. */
+  target?: string;
   attached: boolean;
   registered: boolean;
   delivery: "confirmed" | "pending" | "unconfirmed" | "detached";
@@ -819,11 +821,49 @@ function socketChecks(env: NodeJS.ProcessEnv, startHint: string): Check[] {
   return checks;
 }
 
+/**
+ * Per-target advice for an ear's session. The daemon treats both targets alike; only
+ * the session side differs (#36). `undefined` for a target this doctor does not know.
+ */
+interface TargetAdvice {
+  /** How to attach a session to this ear. */
+  attach: string;
+  /** What to check when no `<channel>` events reach the session at all. */
+  deaf: string;
+}
+
+function targetAdvice(
+  ear: StatusEar,
+  env: NodeJS.ProcessEnv,
+): TargetAdvice | undefined {
+  const target = ear.target ?? "claude-channel";
+  if (target === "claude-channel") {
+    const relaunch = `claude${ear.sessionId ? ` --resume ${ear.sessionId}` : ""} ${LAUNCH_FLAG}`;
+    const socketEnv = env.FROND_EAR_SOCKET
+      ? ` -e FROND_EAR_SOCKET=${shellWord(env.FROND_EAR_SOCKET)}`
+      : "";
+    return {
+      attach: `in the project that owns this ear: claude mcp add -s local frond-ear -e FROND_EAR_EAR=${ear.name}${socketEnv} -- ${shellWord(process.execPath)} ${shellWord(CLI)} shim; then ${relaunch}`,
+      deaf: `Claude Code delivers channel events only to a session launched with the development-channel flag: ${relaunch}`,
+    };
+  }
+  if (target === "copilot-extension") {
+    // The installer reads the same socket env as the daemon, and copies the shim's tool
+    // schemas into config.json, so an upgrade needs a reinstall.
+    const socketEnv = env.FROND_EAR_SOCKET
+      ? `FROND_EAR_SOCKET=${shellWord(env.FROND_EAR_SOCKET)} `
+      : "";
+    const install = `${socketEnv}${shellWord(process.execPath)} ${shellWord(CLI)} copilot-extension --ear ${ear.name}`;
+    return {
+      attach: `install the Copilot extension for this ear: ${install}; then start Copilot with extensions enabled: copilot --experimental. Re-run the install after upgrading frond-ear: it copies the tool schemas`,
+      deaf: `the extension must be installed for this ear (${install}; re-run it after upgrading frond-ear) and Copilot started with copilot --experimental`,
+    };
+  }
+  return undefined;
+}
+
 function earChecks(ear: StatusEar, env: NodeJS.ProcessEnv): Check[] {
-  const relaunch = `claude${ear.sessionId ? ` --resume ${ear.sessionId}` : ""} ${LAUNCH_FLAG}`;
-  const socketEnv = env.FROND_EAR_SOCKET
-    ? ` -e FROND_EAR_SOCKET=${shellWord(env.FROND_EAR_SOCKET)}`
-    : "";
+  const advice = targetAdvice(ear, env);
   const checks: Check[] = [
     {
       name: `ear ${ear.name}: attached`,
@@ -832,22 +872,33 @@ function earChecks(ear: StatusEar, env: NodeJS.ProcessEnv): Check[] {
       detail: ear.attached
         ? `a shim is attached${ear.sessionId ? ` (session ${ear.sessionId})` : ""}`
         : "no session is attached; the ear keeps ingesting and holds events for it",
-      ...(ear.attached
-        ? {}
-        : {
-            hint: `in the project that owns this ear: claude mcp add -s local frond-ear -e FROND_EAR_EAR=${ear.name}${socketEnv} -- ${shellWord(process.execPath)} ${shellWord(CLI)} shim; then ${relaunch}`,
-          }),
+      ...(ear.attached || !advice ? {} : { hint: advice.attach }),
     },
   ];
+  if (!advice) {
+    // config.ts rejects reserved targets, so this is a daemon newer or older than this
+    // doctor. Say so rather than guess at its setup.
+    checks.push({
+      name: `ear ${ear.name}: target`,
+      ok: false,
+      required: false,
+      detail: `target ${String(ear.target)} is not supported by this doctor (claude-channel and copilot-extension are; copilot-sdk and claude-monitor are reserved, not built): no attach or delivery advice`,
+    });
+  }
   if (!ear.attached) {
     return checks;
   }
+  // Since #30 two things confirm delivery: the canary ack, or a tool call that passes a
+  // pushed batch_id in its token form (N-<token>). status does not say which one did.
+  const prove =
+    "ack the attach canary's nonce, or act on a pushed batch_id exactly as the <channel> element shows it (N-<token>)";
   if (ear.registered) {
     checks.push({
       name: `ear ${ear.name}: registered`,
       ok: true,
       required: false,
-      detail: "the session acked the attach canary: channel delivery is proven",
+      detail:
+        "delivery confirmed: the session acked the attach canary or used a pushed batch_id in its token form (status does not say which)",
     });
   } else if (ear.delivery === "pending") {
     checks.push({
@@ -855,8 +906,8 @@ function earChecks(ear: StatusEar, env: NodeJS.ProcessEnv): Check[] {
       ok: false,
       required: false,
       detail:
-        "not yet: the session attached moments ago and has not acked the canary (grace period)",
-      hint: "re-run doctor in a minute",
+        "not yet: the session attached moments ago and has not confirmed delivery (grace period)",
+      hint: `re-run doctor in a minute; the session confirms when it does either: ${prove}`,
     });
   } else {
     checks.push({
@@ -864,8 +915,8 @@ function earChecks(ear: StatusEar, env: NodeJS.ProcessEnv): Check[] {
       ok: false,
       required: false,
       detail:
-        "the session never acked the attach canary. Either a real miss (Claude Code launched without the channel flag) or a false negative: a session that acts on live batch_ids is receiving events whether or not it acked the canary. Until frond-ear#30 lands, prove delivery by acting on a pushed batch_id, not by this field",
-      hint: `if events really do not arrive: ${relaunch}`,
+        "delivery unconfirmed: the session has neither acked the attach canary nor used a pushed batch_id in its token form (N-<token>). A bare id from tap or inbox marks a batch seen but proves nothing, so a session that has only used those stays unconfirmed while it may still hear",
+      hint: `to confirm: ${prove}${advice ? `. If no <channel> events arrive at all: ${advice.deaf}` : ""}`,
     });
   }
   return checks;
@@ -989,7 +1040,14 @@ export async function doctorChecks(
       checks.push(...earChecks(ear, env));
     }
   }
-  checks.push(claudeCheck(env));
+  // A daemon whose ears are all Copilot has no use for `claude`; otherwise assume it might.
+  const copilotOnly =
+    status !== undefined &&
+    status.ears.length > 0 &&
+    status.ears.every((ear) => ear.target === "copilot-extension");
+  if (!copilotOnly) {
+    checks.push(claudeCheck(env));
+  }
   return checks;
 }
 
