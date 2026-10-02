@@ -270,6 +270,12 @@ test("delivery: an unacked canary on a claude-channel ear is reported as deaf, w
     assert.doesNotMatch(hint, COPILOT_ADVICE);
     const deaf = await h.call(shim, "inbox", { chat_id: CHANNEL });
     assert.ok(deaf.text.endsWith(`\n\n⚠️ frond-ear: ${hint}`), deaf.text);
+    // Once the shim reports its session id, the relaunch names it.
+    await shim.send({ type: "session", sessionId: "session-b" });
+    assert.match(
+      delivery(h).hint ?? "",
+      / claude --resume session-b --dangerously-load-development-channels server:frond-ear\. /u,
+    );
 
     assert.equal((await h.call(shim, "ack", { nonce: "c0ffee" })).ok, true);
     assert.equal(delivery(h).delivery, "confirmed");
@@ -298,11 +304,19 @@ test("delivery: a deaf copilot-extension session gets the Copilot fix, never Cla
     h.clock.advance(2 * 60 * 1_000);
     assert.equal(delivery(h).delivery, "unconfirmed");
     const hint = delivery(h).hint ?? "";
+    assert.ok(
+      hint.includes(
+        'If no <channel> events arrive at all: check the Copilot session for "frond-ear: could not deliver batch"',
+      ) && hint.includes("Copilot started with copilot --experimental;"),
+      hint,
+    );
     // The reinstall carries the daemon's own socket, so it reaches this daemon.
     assert.ok(
-      hint.includes(`(FROND_EAR_SOCKET=${socket} `) &&
+      hint.includes(
+        `after upgrading frond-ear, re-run the install: FROND_EAR_SOCKET=${socket} `,
+      ) &&
         hint.includes(
-          " copilot-extension --ear scribe; re-run it after upgrading frond-ear) and Copilot started with copilot --experimental.",
+          " copilot-extension --ear scribe. Until then, read new messages with inbox.",
         ),
       hint,
     );

@@ -23,7 +23,7 @@ export function shellWord(value: string): string {
 /** What the advice reads from an ear: doctor has it from `status`, the daemon live. */
 export interface AdviceEar {
   name: string;
-  /** Absent from a daemon older than #36, which only had claude-channel. */
+  /** Absent from the `status` of a daemon older than #36, which only had claude-channel. */
   target?: string | undefined;
   sessionId?: string | null | undefined;
 }
@@ -67,7 +67,10 @@ export function targetAdvice(
     const install = `${socketEnv}${shellWord(process.execPath)} ${shellWord(CLI)} copilot-extension --ear ${ear.name}`;
     return {
       attach: `install the Copilot extension for this ear: ${install}; then start Copilot with extensions enabled: copilot --experimental. Re-run the install after upgrading frond-ear: it copies the tool schemas`,
-      deaf: `the extension must be installed for this ear (${install}; re-run it after upgrading frond-ear) and Copilot started with copilot --experimental`,
+      // Only an attached session gets this, and an attached extension usually proves it is
+      // installed and Copilot runs extensions. What is left is a push that session.send
+      // refused, which core.mjs logs, so name that log first.
+      deaf: `check the Copilot session for "frond-ear: could not deliver batch", which the extension logs when Copilot refuses a push. The extension must be installed for this ear and Copilot started with copilot --experimental; after upgrading frond-ear, re-run the install: ${install}`,
     };
   }
   return undefined;

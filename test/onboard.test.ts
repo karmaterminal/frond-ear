@@ -537,7 +537,11 @@ test("doctor: a copilot-extension ear gets Copilot advice, never Claude setup", 
     assert.equal(unconfirmed.ok, false);
     assert.match(unconfirmed.hint ?? "", /N-<token>/u);
     assert.match(unconfirmed.hint ?? "", /copilot --experimental/u);
-    assert.match(unconfirmed.hint ?? "", /re-run it after upgrading/u);
+    assert.match(
+      unconfirmed.hint ?? "",
+      /after upgrading frond-ear, re-run the install: .*copilot-extension --ear scribe$/u,
+    );
+    assert.match(unconfirmed.hint ?? "", /could not deliver batch/u);
     assert.doesNotMatch(unconfirmed.hint ?? "", CLAUDE_ADVICE);
     assert.doesNotMatch(unconfirmed.detail, /Claude Code/u);
     // The session itself is told the same Copilot fix, never Claude's relaunch (#39).
