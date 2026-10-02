@@ -459,3 +459,32 @@ test("restart: a v1 snapshot (no PLUCK metadata) still loads", () => {
   const r = new Listener(manifest, { warmup: false, restore: v1 as never });
   assert.equal(r.dedup.size, 1);
 });
+
+test("restart: journal records replay over the snapshot idempotently and monotonically", () => {
+  const l = new Listener(manifest, { warmup: false, restore: null });
+  l.hear(item({ seq: 1 }), T0); // epoch adopted
+  const rec1 = l.takeJournal()!;
+  assert.equal(l.takeJournal(), undefined, "taken once");
+  l.hear(item({ seq: 2 }), T0); // a plain admission raises nothing
+  assert.equal(l.takeJournal(), undefined);
+  l.hear(item({ seq: 3, stateKey: "k", issued: T0 + 5_000 }), T0 + 5_000);
+  const rec2 = l.takeJournal()!;
+  assert.equal(rec2.hwm.length, 1);
+  assert.equal(rec2.dedup.length, 1, "the frame that raised the mark");
+  const once = new Listener(manifest, { restore: null, journal: [rec1, rec2] });
+  const twice = new Listener(manifest, {
+    restore: null,
+    journal: [rec2, rec1, rec1, rec2],
+  });
+  const norm = (st: ReturnType<Listener["snapshot"]>) => ({
+    ...st,
+    dedup: [...st.dedup].sort((x, y) => x[0].localeCompare(y[0])),
+  });
+  assert.deepEqual(norm(twice.snapshot()), norm(once.snapshot()));
+  // An older mark replayed after a newer one never lowers it.
+  const stale = structuredClone(rec2);
+  stale.hwm[0]![1] = T0;
+  stale.hwm[0]![4] = 0;
+  const r = new Listener(manifest, { restore: null, journal: [rec2, stale] });
+  assert.deepEqual(r.snapshot().hwm, once.snapshot().hwm);
+});

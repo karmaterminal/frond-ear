@@ -9,8 +9,10 @@
 // Restart safety: the state that must survive a restart (epoch maxima, dedup
 // digests with each ITEM's (expires_at, scope), sticky PLUCKs, supersession
 // marks; §5.2, §7.4, §7.7, §7.8) round-trips through `snapshot()` / `restore`.
-// The caller persists it whenever `dirty` is set. An item accepted before a
-// restart is surfaced once more, through the same checks, when next heard.
+// The caller persists it whenever `dirty` is set; a raised guard (`urgent`) can
+// instead be made durable at once as a small `takeJournal()` record replayed over
+// the snapshot (`journal`). An item accepted before a restart is surfaced once
+// more, through the same checks, when next heard.
 //
 // Bounds (§7.4, #60): dedup entries have a per-key share; supersession marks
 // have their own per-key limit (they outlive dedup entries); stream hearing
@@ -224,6 +226,11 @@ export interface ListenerOptions {
    * with `ephemeral: true` where restarts aren't under test.
    */
   restore?: SafetyState | null;
+  /**
+   * Guard records taken with `takeJournal()` since `restore` was saved, oldest first. They are
+   * merged over it (monotone: epoch max, mark max, sticky pluck union), so replay is idempotent.
+   */
+  journal?: readonly SafetyState[];
   ephemeral?: true;
 }
 
@@ -272,6 +279,14 @@ export class Listener {
   readonly #restored = new Set<string>();
   #dirty = false;
   #urgent = false;
+  /** Guards raised since the last `takeJournal()` / `markSaved()`. */
+  #raised:
+    | { kids: Set<string>; plucks: Set<string>; hkeys: Set<string> }
+    | undefined;
+  /** Identities admitted with a raised guard, journaled with it so they resurface after restart. */
+  #raisedIdents = new Set<string>();
+  #raisedNow = false;
+  #admitted: string | undefined;
 
   constructor(manifest: Manifest, options: ListenerOptions) {
     if (options.ephemeral !== true && options.restore === undefined) {
@@ -291,6 +306,7 @@ export class Listener {
     this.binding = binding;
     this.warmup = options.warmup ?? true;
     if (options.restore) this.#load(options.restore);
+    for (const record of options.journal ?? []) this.#load(record);
   }
 
   // ------------------------------------------------------------ persisted safety state
@@ -314,6 +330,70 @@ export class Listener {
   markSaved(): void {
     this.#dirty = false;
     this.#urgent = false;
+    this.#raised = undefined;
+    this.#raisedIdents.clear();
+  }
+
+  #raise(): { kids: Set<string>; plucks: Set<string>; hkeys: Set<string> } {
+    this.#dirty = true;
+    this.#urgent = true;
+    this.#raisedNow = true;
+    return (this.#raised ??= {
+      kids: new Set(),
+      plucks: new Set(),
+      hkeys: new Set(),
+    });
+  }
+
+  /**
+   * The guards raised since the last call (or `markSaved()`), as a small partial snapshot for a
+   * write-ahead journal: just those epochs, sticky plucks and marks, plus the dedup rows of the
+   * frames that raised them. `undefined` when nothing was raised. Its size doesn't grow with
+   * the rest of the state.
+   */
+  takeJournal(): SafetyState | undefined {
+    const r = this.#raised;
+    if (r === undefined) return undefined;
+    const part: SafetyState = {
+      version: SAFETY_STATE_VERSION,
+      epochs: {},
+      dedup: [],
+      stickyPluck: [],
+      hwm: [],
+    };
+    for (const kid of r.kids) {
+      const st = this.stations.get(kid);
+      if (st?.epochHwm) part.epochs[kid] = [st.epochHwm, st.epochSeenAt];
+    }
+    for (const ident of this.#raisedIdents) {
+      const v = this.dedup.get(ident);
+      if (v !== undefined)
+        part.dedup.push([
+          ident,
+          v.digest,
+          v.retain,
+          v.meta?.[0] ?? null,
+          v.meta?.[1] ?? null,
+        ]);
+    }
+    for (const ident of r.plucks) {
+      const retain = this.stickyPluck.get(ident);
+      if (retain !== undefined) part.stickyPluck.push([ident, retain]);
+    }
+    for (const hkey of r.hkeys) {
+      const v = this.hwm.get(hkey);
+      if (v !== undefined)
+        part.hwm.push([
+          hkey,
+          v.order[0],
+          v.order[1],
+          v.order[2].toString(),
+          v.retain,
+        ]);
+    }
+    this.#raised = undefined;
+    this.#raisedIdents.clear();
+    return part;
   }
 
   snapshot(): SafetyState {
@@ -342,6 +422,7 @@ export class Listener {
     };
   }
 
+  /** Merge a snapshot or journal record in. Monotone, so applying one twice changes nothing. */
   #load(state: SafetyState): void {
     if (state.version !== 1 && state.version !== SAFETY_STATE_VERSION) {
       throw new Error(
@@ -350,11 +431,14 @@ export class Listener {
     }
     for (const [kid, [epoch, seenAt]] of Object.entries(state.epochs)) {
       const st = this.#st(kid);
-      st.epochHwm = epoch;
-      st.epochSeenAt = seenAt;
+      if (epoch > st.epochHwm) {
+        st.epochHwm = epoch;
+        st.epochSeenAt = seenAt;
+      }
     }
     for (const row of state.dedup) {
       const [ident, digest, retain] = row;
+      if (this.dedup.has(ident)) continue;
       // v1 rows carry no (expires_at, scope): those targets skip the §9.7 PLUCK check.
       const meta: [number, number] | undefined =
         row.length >= 5 && row[3] != null && row[4] != null
@@ -367,14 +451,31 @@ export class Listener {
       this.#restored.add(ident);
     }
     for (const [ident, retain] of state.stickyPluck) {
+      if ((this.stickyPluck.get(ident) ?? -Infinity) >= retain) continue;
       this.stickyPluck.set(ident, retain);
       this.#stickyDue.push(retain, ident);
     }
     for (const [hkey, issuedAt, epoch, seq, retain] of state.hwm) {
-      this.hwm.set(hkey, { order: [issuedAt, epoch, BigInt(seq)], retain });
-      this.#hwmDue.push(retain, hkey);
-      const kid = kidOf(hkey);
-      this.hwmPerKey.set(kid, (this.hwmPerKey.get(kid) ?? 0) + 1);
+      const order: Order = [issuedAt, epoch, BigInt(seq)];
+      const prev = this.hwm.get(hkey);
+      if (prev === undefined) {
+        const kid = kidOf(hkey);
+        this.hwmPerKey.set(kid, (this.hwmPerKey.get(kid) ?? 0) + 1);
+      } else if (
+        compareOrder(order, prev.order) <= 0 &&
+        retain <= prev.retain
+      ) {
+        continue;
+      }
+      const until = Math.max(retain, prev?.retain ?? -Infinity);
+      this.hwm.set(hkey, {
+        order:
+          prev === undefined || compareOrder(order, prev.order) > 0
+            ? order
+            : prev.order,
+        retain: until,
+      });
+      this.#hwmDue.push(until, hkey);
     }
   }
 
@@ -416,12 +517,17 @@ export class Listener {
 
   /** Never throws: anything unexpected becomes `internal` evidence, so one datagram can't stop a receiver. */
   hear(datagram: Uint8Array, nowMs: number): ListenerEvent[] {
+    this.#raisedNow = false;
+    this.#admitted = undefined;
     try {
       return this.#hear(datagram, nowMs);
     } catch (e) {
       return [
         this.#evidence("internal", "", e instanceof Error ? e.name : typeof e),
       ];
+    } finally {
+      if (this.#raisedNow && this.#admitted !== undefined)
+        this.#raisedIdents.add(this.#admitted);
     }
   }
 
@@ -464,8 +570,7 @@ export class Listener {
     if (advance && epoch > st.epochHwm) {
       st.epochHwm = epoch;
       st.epochSeenAt = nowMs;
-      this.#dirty = true;
-      this.#urgent = true;
+      this.#raise().kids.add(kid);
       // bseq, the advertised catalog and the per-stream hearing times belong to the previous
       // epoch (§9.8): a restarted station counts beacons from 1 again and may loop different streams.
       st.bseq = 0n;
@@ -684,8 +789,7 @@ export class Listener {
       const target = identKey(kid, p.epoch, p.stream, p.targetSeq);
       this.stickyPluck.set(target, retain);
       this.#stickyDue.push(retain, target);
-      this.#dirty = true;
-      this.#urgent = true;
+      this.#raise().plucks.add(target);
       for (const [k, h] of this.held) {
         if (h.ident === target) this.held.delete(k);
       }
@@ -755,8 +859,7 @@ export class Listener {
         }
         this.hwm.set(hkey, { order, retain: until });
         this.#hwmDue.push(until, hkey);
-        this.#dirty = true;
-        this.#urgent = true;
+        this.#raise().hkeys.add(hkey);
       }
       for (const [otherIdent, h] of this.current) {
         if (
@@ -1005,6 +1108,7 @@ export class Listener {
     this.dedupPerKey.set(kid, (this.dedupPerKey.get(kid) ?? 0) + 1);
     this.#dedupDue.push(retain, ident);
     this.#dirty = true;
+    this.#admitted = ident;
   }
 
   #purgeDedup(nowMs: number): void {
