@@ -830,7 +830,11 @@ test("record client: real socket — first join, same-run rejoin, malformed boot
     await new Promise((r) => setTimeout(r, 30));
   };
   const peerAt = async (n: number) => {
-    while (peers.length < n) await new Promise((r) => setTimeout(r, 5));
+    const deadline = Date.now() + 2_000;
+    while (peers.length < n) {
+      assert.ok(Date.now() < deadline, `connection ${n} never arrived`);
+      await new Promise((r) => setTimeout(r, 5));
+    }
     return peers[n - 1]!;
   };
   const seqs = () => client.hearView("gloss").items.map((i) => i.seq);
@@ -884,6 +888,20 @@ test("record client: real socket — first join, same-run rejoin, malformed boot
       at(171, () => frame(171)),
     );
     assert.deepEqual(seqs(), ["171"]);
+    // An over-long line in the bootstrap is malformed too: the client drops the
+    // connection rather than staying connected and failed (🌫 #34, second pass).
+    p4.destroy();
+    const p5 = await peerAt(5);
+    p5.write(`${"x".repeat(70 * 1024)}\n`);
+    const p6 = await peerAt(6);
+    assert.equal(p5.destroyed || p5.readableEnded, true);
+    await send(
+      p6,
+      at(1, () => rec("hello")),
+      at(180, () => landing()),
+      at(181, () => frame(181)),
+    );
+    assert.deepEqual(seqs(), ["181"]);
   } finally {
     client.stop();
     server.close();

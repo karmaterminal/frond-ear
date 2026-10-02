@@ -110,6 +110,11 @@ export class RecordClient {
         this.consumer.dropLine("line_too_long");
         this.#buffer = "";
         this.#discarding = nl === -1;
+        if (this.consumer.connectionLost) {
+          // an over-long line in the bootstrap is a malformed bootstrap too
+          this.#socket?.destroy();
+          return;
+        }
         continue;
       }
       if (nl !== -1) {
