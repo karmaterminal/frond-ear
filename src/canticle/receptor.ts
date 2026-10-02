@@ -65,6 +65,14 @@ export interface ReceptorOptions {
 
 type ReceptorState = "starting" | "listening" | "backoff" | "stopped";
 
+/**
+ * Whether every raised guard is durable. `failed` (reason `state_not_durable`) means a guard
+ * the receptor has acted on isn't in the store: nothing is surfaced until a checkpoint lands.
+ */
+export type ReceptorHealth =
+  | { state: "ok" }
+  | { state: "failed"; reason: "state_not_durable"; error: string };
+
 /** "station:stream" tune patterns → does this item belong to this ear? */
 function tuned(
   patterns: readonly string[],
@@ -91,6 +99,8 @@ export class CanticleReceptor {
   #retryHandle: unknown;
   #journalRecords = 0;
   #journalBytes = 0;
+  /** Set while a raised guard isn't durable; cleared by the next checkpoint that lands. */
+  #notDurable: string | undefined;
   readonly #counts = {
     datagrams: 0,
     items: 0,
@@ -146,6 +156,15 @@ export class CanticleReceptor {
       restore,
       journal,
     });
+    // Fold the replayed journal into a fresh snapshot before any datagram is accepted, so a
+    // torn last record is gone before anything is appended after it (🌫 #27 review).
+    if (lines.length > 0) {
+      try {
+        this.#save();
+      } catch (error) {
+        this.#failDurability(error);
+      }
+    }
   }
 
   start(): void {
@@ -216,9 +235,10 @@ export class CanticleReceptor {
       if (this.#state === "stopped") return;
       try {
         this.#apply(this.#listener.tick(this.#clock.now()));
-        this.#save();
+        this.#save(this.#notDurable !== undefined);
       } catch (error) {
-        this.#saveFailed(error);
+        if (this.#notDurable !== undefined) this.#failDurability(error);
+        else this.#saveFailed(error);
       }
       this.#scheduleTick();
     }, TICK_MS);
@@ -236,20 +256,46 @@ export class CanticleReceptor {
     // per datagram. A full journal is checkpointed early, keeping it bounded.
     const record = this.#listener.takeJournal();
     if (record === undefined) return;
+    // Not durable: append nothing after a possibly torn tail; the tick's checkpoint retries.
+    if (this.#notDurable !== undefined) return;
     const line = JSON.stringify(record);
     try {
       this.#options.store.appendRuntimeJournal(STATE_KEY, line);
-      this.#journalRecords += 1;
-      this.#journalBytes += line.length;
-      if (
-        this.#journalRecords >= JOURNAL_MAX_RECORDS ||
-        this.#journalBytes >= JOURNAL_MAX_BYTES
-      ) {
-        this.#save();
+    } catch (appendError) {
+      // The guard is only in memory. A full checkpoint makes it durable another way; if
+      // that fails too, fail closed rather than act on a guard a restart would forget.
+      this.#saveFailed(appendError);
+      try {
+        this.#save(true);
+      } catch (error) {
+        this.#failDurability(error);
       }
-    } catch (error) {
-      this.#saveFailed(error); // still dirty: the next tick's checkpoint retries it
+      return;
     }
+    this.#journalRecords += 1;
+    this.#journalBytes += line.length;
+    if (
+      this.#journalRecords >= JOURNAL_MAX_RECORDS ||
+      this.#journalBytes >= JOURNAL_MAX_BYTES
+    ) {
+      try {
+        this.#save();
+      } catch (error) {
+        this.#saveFailed(error); // the guard is journaled; the next tick retries the checkpoint
+      }
+    }
+  }
+
+  /** Enter `state_not_durable`: logged once per transition, not per datagram or tick. */
+  #failDurability(error: unknown): void {
+    const reason = error instanceof Error ? error.message : String(error);
+    this.#counts.saveFailures += 1;
+    if (this.#notDurable === undefined) {
+      this.#options.logger.log("error", "canticle.state_not_durable", {
+        reason,
+      });
+    }
+    this.#notDurable = reason;
   }
 
   #saveFailed(error: unknown): void {
@@ -276,8 +322,8 @@ export class CanticleReceptor {
   }
 
   /** Checkpoint: the full snapshot replaces the old one and empties the journal. */
-  #save(): void {
-    if (!this.#listener.dirty && this.#journalRecords === 0) return;
+  #save(force = false): void {
+    if (!force && !this.#listener.dirty && this.#journalRecords === 0) return;
     this.#options.store.checkpointRuntimeState(
       STATE_KEY,
       JSON.stringify(this.#listener.snapshot()),
@@ -285,10 +331,26 @@ export class CanticleReceptor {
     this.#listener.markSaved();
     this.#journalRecords = 0;
     this.#journalBytes = 0;
+    if (this.#notDurable !== undefined) {
+      this.#notDurable = undefined;
+      this.#options.logger.log("info", "canticle.state_durable", {});
+    }
+  }
+
+  /** `failed` while a raised guard isn't durable; `live()` surfaces nothing until it clears. */
+  health(): ReceptorHealth {
+    return this.#notDurable === undefined
+      ? { state: "ok" }
+      : {
+          state: "failed",
+          reason: "state_not_durable",
+          error: this.#notDurable,
+        };
   }
 
   /** What one ear hears right now: live items on its tuned station:streams. */
   live(ear: string): LiveItem[] {
+    if (this.#notDurable !== undefined) return [];
     const tune = this.#options.config.tune;
     const patterns = Object.hasOwn(tune, ear) ? (tune[ear] ?? []) : [];
     const now = this.#clock.now();
@@ -332,6 +394,7 @@ export class CanticleReceptor {
       bind: `${this.#options.config.bindHost}:${this.#options.config.port}`,
       binding: this.#options.config.binding,
       ...(this.#lastError ? { lastError: this.#lastError } : {}),
+      health: this.health(),
       onAir: this.#listener.current.size,
       journal: this.#journalRecords,
       counts: { ...this.#counts },

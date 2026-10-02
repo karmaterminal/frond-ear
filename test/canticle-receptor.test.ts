@@ -336,8 +336,10 @@ test("receptor: a plain admission defers its save to the tick; a failing store n
   assert.equal(
     (broken.status() as { counts: { saveFailures: number } }).counts
       .saveFailures,
-    1,
+    2,
+    "the append, then the checkpoint fallback",
   );
+  assert.equal(broken.health().state, "failed");
   receptor.stop();
 });
 
@@ -509,9 +511,180 @@ test("receptor: a torn last journal record is ignored; earlier records still app
   const { receptor: second } = harness(store, now);
   second.receive(original!);
   assert.deepEqual(evidence(second), { plucked: 1 });
-  // A corrupt record that is not the last one is not a torn write: refuse, like a corrupt snapshot.
-  journal.splice(0, 0, "{garbage");
+});
+
+test("receptor: a torn tail is checkpointed away at startup, so a later append can't strand it (🌫 #27 repro)", () => {
+  const store = new MemoryStore();
+  const now = { t: vectors.now_ms };
+  const [pluck, original] = vectors.sequences
+    .find((s) => s.name === "pluck-before-original")!
+    .datagrams_hex.map((h) => Buffer.from(h, "hex"));
+  const { receptor: first } = harness(store, now);
+  first.receive(pluck!);
+  const journal = store.journals.get("canticle.listener_state")!;
+  journal.push(journal[0]!.slice(0, 17)); // a crash mid-append
+  const { receptor: second } = harness(store, now);
+  assert.equal(
+    store.journalLength,
+    0,
+    "replayed journal folded into the snapshot",
+  );
+  assert.deepEqual(second.health(), { state: "ok" });
+  second.receive(vec("rfc-vector-2-pluck")); // a new guard, appended after the old tail
+  assert.equal(store.journalLength, 1);
+  // crash again before the tick: the next start must not see the torn row as mid-journal.
+  const { receptor: third } = harness(store, now);
+  third.receive(original!);
+  assert.deepEqual(
+    third.live("gloss"),
+    [],
+    "the withdrawn item never reappears",
+  );
+  assert.deepEqual(evidence(third), { plucked: 1 });
+});
+
+test("receptor: a corrupt journal record that isn't the last still refuses to start", () => {
+  const store = new MemoryStore();
+  const now = { t: vectors.now_ms };
+  const [pluck] = vectors.sequences
+    .find((s) => s.name === "pluck-before-original")!
+    .datagrams_hex.map((h) => Buffer.from(h, "hex"));
+  const { receptor: first } = harness(store, now);
+  first.receive(pluck!);
+  store.journals.get("canticle.listener_state")!.unshift("{garbage");
   assert.throws(() => harness(store, now), /refusing to start/);
+});
+
+test("receptor: a failed guard append falls back to a checkpoint; the PLUCK survives a pre-tick restart (🌫 #27 repro)", () => {
+  const store = new MemoryStore();
+  const append = store.appendRuntimeJournal.bind(store);
+  let failAppend = false;
+  store.appendRuntimeJournal = (name: string, value: string) => {
+    if (failAppend) throw new Error("disk");
+    append(name, value);
+  };
+  const now = { t: vectors.now_ms };
+  const [pluck, original] = vectors.sequences
+    .find((s) => s.name === "pluck-before-original")!
+    .datagrams_hex.map((h) => Buffer.from(h, "hex"));
+  const { receptor: first } = harness(store, now);
+  first.receive(vec("rfc-vector-2-pluck"));
+  failAppend = true;
+  now.t += 10;
+  first.receive(pluck!);
+  assert.equal(
+    store.checkpoints,
+    1,
+    "the failed append was covered by a checkpoint",
+  );
+  assert.deepEqual(first.health(), { state: "ok" });
+  failAppend = false;
+  // crash: no tick ran.
+  const { receptor: second } = harness(store, now);
+  second.receive(original!);
+  assert.deepEqual(
+    second.live("gloss"),
+    [],
+    "the withdrawn item never reappears",
+  );
+  assert.deepEqual(evidence(second), { plucked: 1 });
+});
+
+test("receptor: append and checkpoint both failing fails closed (state_not_durable) until a checkpoint lands", () => {
+  const store = new MemoryStore();
+  let broken = false;
+  const append = store.appendRuntimeJournal.bind(store);
+  const checkpoint = store.checkpointRuntimeState.bind(store);
+  store.appendRuntimeJournal = (name: string, value: string) => {
+    if (broken) throw new Error("disk");
+    append(name, value);
+  };
+  store.checkpointRuntimeState = (name: string, value: string) => {
+    if (broken) throw new Error("disk");
+    checkpoint(name, value);
+  };
+  const lines: string[] = [];
+  const now = { t: vectors.now_ms };
+  let tick: (() => void) | undefined;
+  const receptor = new CanticleReceptor({
+    config: config(),
+    manifest,
+    store,
+    logger: new StructuredLogger((l) => lines.push(l)),
+    clock: { now: () => now.t },
+    timers: {
+      setTimeout: (fn: () => void) => ((tick = fn), 1),
+      clearTimeout: () => {},
+    },
+    socket: noSocket,
+  });
+  receptor.start();
+  receptor.receive(vec("valid-item-named-stream"));
+  assert.equal(receptor.live("gloss").length, 1);
+  broken = true;
+  receptor.receive(vec("rfc-vector-2-pluck"));
+  assert.deepEqual(receptor.health(), {
+    state: "failed",
+    reason: "state_not_durable",
+    error: "disk",
+  });
+  assert.deepEqual(
+    (receptor.status() as { health: unknown }).health,
+    receptor.health(),
+  );
+  assert.deepEqual(
+    receptor.live("gloss"),
+    [],
+    "nothing surfaces while not durable",
+  );
+  receptor.receive(vec("rfc-vector-1-item"));
+  tick!();
+  tick!();
+  assert.deepEqual(receptor.live("gloss"), []);
+  assert.equal(
+    lines.filter((l) => l.includes("canticle.state_not_durable")).length,
+    1,
+    "logged once per transition",
+  );
+  broken = false;
+  tick!();
+  assert.deepEqual(receptor.health(), { state: "ok" });
+  assert.ok(receptor.live("gloss").length >= 1, "surfacing resumes");
+  assert.equal(
+    lines.filter((l) => l.includes("canticle.state_durable")).length,
+    1,
+  );
+  // what the checkpoint wrote holds the guard raised while failed.
+  const { receptor: second } = harness(store, now);
+  assert.deepEqual(second.health(), { state: "ok" });
+  assert.equal(store.journalLength, 0);
+});
+
+test("receptor: a startup checkpoint that fails leaves the receptor failed closed, not appending", () => {
+  const store = new MemoryStore();
+  const now = { t: vectors.now_ms };
+  const [pluck] = vectors.sequences
+    .find((s) => s.name === "pluck-before-original")!
+    .datagrams_hex.map((h) => Buffer.from(h, "hex"));
+  harness(store, now).receptor.receive(pluck!);
+  const checkpoint = store.checkpointRuntimeState.bind(store);
+  let broken = true;
+  store.checkpointRuntimeState = (name: string, value: string) => {
+    if (broken) throw new Error("disk");
+    checkpoint(name, value);
+  };
+  const { receptor, tick } = harness(store, now);
+  assert.equal(receptor.health().state, "failed");
+  receptor.receive(vec("rfc-vector-2-pluck"));
+  assert.equal(
+    store.journalLength,
+    1,
+    "nothing appended behind an un-checkpointed journal",
+  );
+  broken = false;
+  tick();
+  assert.deepEqual(receptor.health(), { state: "ok" });
+  assert.equal(store.journalLength, 0);
 });
 
 test("receptor: stop() survives a failing store; live() ignores prototype keys", () => {
