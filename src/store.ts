@@ -1054,6 +1054,30 @@ export class EventStore {
       .run(sessionId, name);
   }
 
+  /** Was batch `id` offered (pushed) to this ear in this attach generation? */
+  public offeredTo(id: number, ear: string, generation: number): boolean {
+    const row = this.database
+      .prepare(
+        `SELECT 1 AS hit FROM batches
+         WHERE id = ? AND ear = ? AND attach_generation = ? AND offered_at IS NOT NULL`,
+      )
+      .get(id, ear, generation) as { hit: number } | undefined;
+    return row !== undefined;
+  }
+
+  /**
+   * Marks the ear registered without the canary: the session proved delivery by
+   * acting on a pushed batch (#21). Returns true if this changed anything.
+   */
+  public registerEarByUse(name: string): boolean {
+    const result = this.database
+      .prepare(
+        "UPDATE ears SET registered = 1, canary_nonce = NULL WHERE name = ? AND registered = 0",
+      )
+      .run(name);
+    return result.changes === 1;
+  }
+
   public registerEar(name: string, nonce: string): boolean {
     const result = this.database
       .prepare(
