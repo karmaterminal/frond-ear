@@ -24,6 +24,11 @@
 // `hello` and its latest `landing_state` with their original `rec_seq` (§14.18.3
 // "Joining a run", binary-canticle#69): see `reconnected()`. Other transports (one
 // reader per run, no bootstrap) never call it and take the ordinary rules throughout.
+// A connection that asked (`reconnected({ joinSnapshot: true })`) may then carry a join
+// snapshot (§14.18.3 "Join snapshot", D36, binary-canticle#81): `snapshot` records in
+// their own sequence domain, held until `snapshot_end` and applied all at once
+// (complete: replaces the local view; truncated: merge only). Every bootstrap on the
+// host socket reports `joined_late` until a complete snapshot or a new run.
 // Every map here has a fixed bound (§14.18.2 "nothing in the pipe is unbounded").
 // Framing: at most 64 KiB per line and nesting depth 8 (§14.18.2 [PROPOSED DEFAULT]).
 
@@ -36,6 +41,15 @@ export const MAX_DEPTH = 8;
 /** Bounds on what a record stream can grow (§14.18.2). */
 export const MAX_LIVE = 4_096;
 export const MAX_STATIONS = 256;
+/** The join-snapshot entry cap (§14.18.3 "Join snapshot", [PROPOSED DEFAULT]). */
+export const MAX_SNAPSHOT_ENTRIES = 511;
+/** …and of entry bytes; an entry is measured as its JSON, which is never above its line. */
+export const MAX_SNAPSHOT_BYTES = 1024 * 1024;
+/** The join-snapshot request line (§14.18.3 "Join snapshot", opt-in). */
+export const JOIN_SNAPSHOT_REQUEST = `${JSON.stringify({
+  op: "join_snapshot",
+  v: RECORD_V,
+})}\n`;
 const MAX_REASONS = 16;
 /** No item outlives the longest class TTL plus clock skew, whatever the record claims. */
 const MAX_LOCAL_LIFE_MS = MAX_CLAMP_TTL_S * 1_000 + 60_000;
@@ -64,7 +78,33 @@ interface LiveRecord {
   run: string;
   item: LiveItem;
   localExpiryAt: number;
+  /**
+   * Held from an earlier connection to this run and not yet confirmed by this one's
+   * join snapshot: kept (a truncated snapshot may omit it, and only a `retract`
+   * removes it then) but not rendered, since a `retract` may have been missed.
+   */
+  carried?: boolean;
 }
+
+/** A join-snapshot entry, parsed and held until `snapshot_end`. */
+type SnapshotEntry =
+  | { kind: "frame"; live: LiveRecord }
+  | { kind: "presence"; name: string; state: string }
+  | { kind: "skip" };
+
+/**
+ * Where this connection is with its join snapshot. `not_asked`: no request sent (or a
+ * transport without a bootstrap). `unsupported`: asked, but `hello` doesn't offer it.
+ * `pending`: asked and offered, nothing yet. `open`: entries arriving. `complete` /
+ * `truncated`: `snapshot_end` applied.
+ */
+export type JoinSnapshotState =
+  | "not_asked"
+  | "unsupported"
+  | "pending"
+  | "open"
+  | "complete"
+  | "truncated";
 
 export type ReceiveHealth =
   | "starting"
@@ -146,6 +186,16 @@ export class RecordConsumer {
   #rejoin = false;
   #landingSeen = false;
   #byeSeen = false;
+  /** This connection asked for a join snapshot (its first line). */
+  #snapAsked = false;
+  snapshotState: JoinSnapshotState = "not_asked";
+  /** The snapshot's watermark *W*, once its first record (or `snapshot_end`) arrives. */
+  #snapW: number | undefined;
+  /** Entries held until `snapshot_end`; never more than the cap. */
+  #snapHeld: SnapshotEntry[] = [];
+  #snapBytes = 0;
+  /** A truncated snapshot's `omitted`, for status and `hear`. */
+  snapshotOmitted: number | undefined;
   mute: { until: number | null; by: string | null } | null = null;
   lastDatagramAt: number | undefined;
   noDatagrams = false;
@@ -182,9 +232,11 @@ export class RecordConsumer {
     this.#count(reason);
     if (this.#conn === "hello" || this.#conn === "landing")
       this.#badBootstrap();
+    // A line lost mid-snapshot is an entry lost: the snapshot can't be applied.
+    else if (this.snapshotState === "open") this.#badSnapshot();
   }
 
-  /** The bootstrap was malformed: the transport must drop this connection. */
+  /** The bootstrap or the join snapshot was malformed: the transport must drop this connection. */
   get connectionLost(): boolean {
     return this.#conn === "lost";
   }
@@ -220,6 +272,19 @@ export class RecordConsumer {
       );
       return;
     }
+    if (rec.type === "snapshot" || rec.type === "snapshot_end") {
+      this.#snapshotRecord(
+        rec as Obj & { type: string; rec_seq: number; run: string },
+        nowMs,
+      );
+      return;
+    }
+    if (this.snapshotState === "open") {
+      // Live records above W queue behind the snapshot (§14.18.3 "The cut"): one
+      // between its entries means the snapshot is not what the daemon cut.
+      this.#badSnapshot("snapshot_interrupted");
+      return;
+    }
     if (this.#conn === "join") {
       this.#conn = "live";
       if (rec.run === this.run) {
@@ -233,7 +298,9 @@ export class RecordConsumer {
           this.#conn = "join";
           return;
         }
-        if (this.#rejoin) this.#lose();
+        // The rejoin's loss keeps what was carried: a join snapshot may still
+        // confirm it, and without one it was dropped at `hello` already.
+        if (this.#rejoin) this.#lose(false);
         this.#lastSeq = rec.rec_seq - 1; // the join itself is not a gap
       }
     }
@@ -271,12 +338,7 @@ export class RecordConsumer {
           const name = isObj(rec.station) ? rec.station.name : rec.station;
           if (!str(name) || !str(rec.state)) {
             this.#count("malformed_record");
-          } else if (
-            !this.presence.has(name) &&
-            this.presence.size >= MAX_STATIONS
-          ) {
-            this.#count("presence_overflow");
-          } else this.presence.set(name, rec.state);
+          } else this.#setPresence(name, rec.state);
         }
         return;
       case "health":
@@ -315,9 +377,20 @@ export class RecordConsumer {
       // A rejoin only if the binding already held records from this run.
       this.#rejoin = rec.run === this.run;
       if (!this.#rejoin) this.#beginRun(rec.run);
+      if (this.#snapAsked)
+        this.snapshotState =
+          rec.join_snapshot === true ? "pending" : "unsupported";
+      // What an earlier connection carried survives only for a snapshot to confirm
+      // (or, if truncated, to leave alone); with none coming, a missed `retract`
+      // could keep it forever, so it goes now, as before D36.
+      if (this.snapshotState !== "pending") this.#live.clear();
       this.#helloSeq = rec.rec_seq;
       this.health = "ok";
       this.healthReasons = [];
+      // §14.18.3 "Join snapshot": every bootstrap joins a run in progress, however
+      // early it looks (the baseline is the *latest* landing_state, not the first).
+      // Only a complete snapshot on this connection, or a new run, clears it.
+      this.#degrade("joined_late");
       this.#conn = "landing";
       return;
     }
@@ -331,6 +404,143 @@ export class RecordConsumer {
       return this.#badBootstrap("bootstrap_landing_state_fields");
     this.#lastSeq = rec.rec_seq;
     this.#conn = "join";
+  }
+
+  /**
+   * §14.18.3 "Join snapshot", validation and application. `snapshot` records come
+   * only after the bootstrap, on a connection that asked, before one `snapshot_end`;
+   * `snap_seq` runs 1, 2, 3 … without a skip; every one carries the same `rec_seq`
+   * *W* ≥ the baseline and the last live `rec_seq` read; `snapshot_end` repeats *W*
+   * and counts them. Anything else is `malformed_record` and loses the connection.
+   * None of them is checked against the gap or regression rules.
+   */
+  #snapshotRecord(
+    rec: Obj & { type: string; rec_seq: number; run: string },
+    nowMs: number,
+  ): void {
+    if (this.#conn === "stream") {
+      // No connection, so nobody asked: count it, and nothing more.
+      this.#count("malformed_record");
+      this.#count("snapshot_unsolicited");
+      return;
+    }
+    if (!this.#snapAsked) return this.#badSnapshot("snapshot_unsolicited");
+    if (this.#conn !== "join" && this.#conn !== "live")
+      return this.#badSnapshot("snapshot_before_bootstrap");
+    if (this.snapshotState === "complete" || this.snapshotState === "truncated")
+      return this.#badSnapshot("snapshot_after_end");
+    if (rec.run !== this.run) return this.#badSnapshot("snapshot_run_mismatch");
+    if (this.#snapW === undefined) {
+      if (rec.rec_seq < this.#lastSeq!)
+        return this.#badSnapshot("snapshot_watermark_behind");
+      this.#snapW = rec.rec_seq;
+    } else if (rec.rec_seq !== this.#snapW) {
+      return this.#badSnapshot("snapshot_watermark_changed");
+    }
+    if (this.#conn === "join") {
+      // §14.18.3 step 2 for a snapshot that comes first: the step from the baseline
+      // is a join, never a gap; a rejoin still reports its loss once.
+      this.#conn = "live";
+      if (this.#rejoin) this.#lose(false);
+    }
+    if (rec.type === "snapshot") {
+      this.snapshotState = "open";
+      if (rec.snap_seq !== this.#snapHeld.length + 1)
+        return this.#badSnapshot("snapshot_seq");
+      this.#snapBytes += Buffer.byteLength(JSON.stringify(rec.entry ?? null));
+      if (
+        this.#snapHeld.length >= MAX_SNAPSHOT_ENTRIES ||
+        this.#snapBytes > MAX_SNAPSHOT_BYTES
+      )
+        return this.#badSnapshot("snapshot_over_cap");
+      const entry = this.#snapshotEntry(rec, nowMs);
+      if (entry === undefined) return this.#badSnapshot("snapshot_entry");
+      this.#snapHeld.push(entry);
+      return;
+    }
+    // snapshot_end
+    if (
+      rec.watermark !== this.#snapW ||
+      rec.count !== this.#snapHeld.length ||
+      typeof rec.truncated !== "boolean" ||
+      (rec.truncated && !(int(rec.omitted) && rec.omitted >= 0))
+    )
+      return this.#badSnapshot("snapshot_end_mismatch");
+    this.#applySnapshot(rec.truncated, nowMs);
+    this.snapshotOmitted = rec.truncated ? (rec.omitted as number) : undefined;
+    this.#lastSeq = this.#snapW; // ordinary rules from W + 1
+    if (!rec.truncated) this.#clearReason("joined_late");
+  }
+
+  /**
+   * One `snapshot` record's `entry`: the fields of the item's latest deliverable
+   * `frame` record (without `v`, `type`, `rec_seq` and `run`), or a station's current
+   * presence as a `presence` record carries it. Accepted flat in `entry` (told apart by
+   * `idem` / `state`) or wrapped one level as `{frame: …}` / `{presence: …}`.
+   * Undefined when malformed; `skip` when well-formed but not deliverable now.
+   */
+  #snapshotEntry(rec: Obj, nowMs: number): SnapshotEntry | undefined {
+    const e = rec.entry;
+    if (!isObj(e)) return undefined;
+    let fields: Obj | undefined;
+    let kind: "frame" | "presence" | undefined;
+    if (isObj(e.presence)) [kind, fields] = ["presence", e.presence];
+    else if (isObj(e.frame) && str(e.frame.idem))
+      [kind, fields] = ["frame", e.frame];
+    else if (str(e.idem)) [kind, fields] = ["frame", e];
+    else if (str(e.state)) [kind, fields] = ["presence", e];
+    if (kind === undefined || fields === undefined) return undefined;
+    if (kind === "presence") {
+      const name = isObj(fields.station) ? fields.station.name : fields.station;
+      if (!str(name) || !str(fields.state)) return undefined;
+      return { kind: "presence", name, state: fields.state };
+    }
+    // The same deliverability check as a live `frame` record (§14.18.4).
+    const parsed = this.#parseFrame(fields, nowMs);
+    if (parsed === "malformed") return undefined;
+    if (parsed === undefined) return { kind: "skip" };
+    this.#count("snapshot_frames");
+    return { kind: "frame", live: parsed };
+  }
+
+  /**
+   * `snapshot_end` arrived: apply the held entries at once. Complete: the run's
+   * presence table and surfaced set become the snapshot's, so an item absent from it
+   * leaves the local view (that is all absence does: no `retract`, nothing settled).
+   * Truncated: merge only; absence means nothing, and what was carried stays, until a
+   * `retract`. Snapshot frames count toward nothing (§14.6 rate, budget, salience) and
+   * wake nothing, like `dedup: resurfaced`: this binding keeps no such quantity and
+   * `hear` is pull-only, so holding them in the live set is all delivery is here.
+   */
+  #applySnapshot(truncated: boolean, nowMs: number): void {
+    const held = this.#snapHeld;
+    this.#snapHeld = [];
+    this.#snapBytes = 0;
+    this.snapshotState = truncated ? "truncated" : "complete";
+    if (!truncated) {
+      this.#live.clear();
+      this.presence.clear();
+    }
+    for (const entry of held) {
+      if (entry.kind === "frame") this.#hold(entry.live, nowMs);
+      else if (entry.kind === "presence")
+        this.#setPresence(entry.name, entry.state);
+    }
+    // Truncated: what the snapshot left out stays held, and is shown again.
+    for (const r of this.#live.values()) delete r.carried;
+  }
+
+  /** The snapshot can't be trusted: discard it and lose the connection. */
+  #badSnapshot(reason?: string): void {
+    if (reason !== undefined) {
+      this.#count("malformed_record");
+      this.#count(reason);
+    }
+    this.#snapHeld = [];
+    this.#snapBytes = 0;
+    this.#conn = "lost";
+    this.#landingSeen = false;
+    this.#fail("malformed_snapshot");
   }
 
   /** `reason`: what the bootstrap record got wrong (unset: the line was already counted). */
@@ -376,14 +586,47 @@ export class RecordConsumer {
     this.#byeSeen = false;
   }
 
-  /** Records were lost: the gap may have held a retract, so nothing heard before it stays. */
-  #lose(): void {
+  /**
+   * Records were lost: the gap may have held a retract, so nothing heard before it
+   * stays. A rejoin's loss (`clear` false) leaves what was carried to the join
+   * snapshot, which already hides it until it is confirmed.
+   */
+  #lose(clear = true): void {
     this.#count("records_lost");
     this.#degrade("records_lost");
-    this.#live.clear();
+    if (clear) this.#live.clear();
+  }
+
+  #setPresence(name: string, state: string): void {
+    if (!this.presence.has(name) && this.presence.size >= MAX_STATIONS)
+      this.#count("presence_overflow");
+    else this.presence.set(name, state);
   }
 
   #frame(rec: Obj, nowMs: number): void {
+    const parsed = this.#parseFrame(rec, nowMs);
+    if (parsed === "malformed") this.#count("malformed_record");
+    else if (parsed !== undefined) this.#hold(parsed, nowMs);
+  }
+
+  /** Put a deliverable record in the live set, within its bound. */
+  #hold(r: LiveRecord, nowMs: number): void {
+    if (!this.#live.has(r.idem) && this.#live.size >= MAX_LIVE) {
+      this.#prune(nowMs);
+      if (this.#live.size >= MAX_LIVE) {
+        this.#count("live_overflow");
+        return;
+      }
+    }
+    this.#live.set(r.idem, r);
+  }
+
+  /**
+   * A `frame` record's fields, checked as §14.18.3–§14.18.4 require: `malformed`, or
+   * undefined (counted) when well-formed but not deliverable, or the live record.
+   * Live records and join-snapshot entries both come through here.
+   */
+  #parseFrame(rec: Obj, nowMs: number): LiveRecord | "malformed" | undefined {
     const f = rec.frame;
     const times = rec.times;
     const station = rec.station;
@@ -413,16 +656,14 @@ export class RecordConsumer {
       !str(rec.scope) ||
       !intOrNull(rec.hop)
     ) {
-      this.#count("malformed_record");
-      return;
+      return "malformed";
     }
     // The receipt pointers (`frame.sha256`, `frame.bytes`) exist exactly when the
     // frame was admitted: a frame refused before the ring has none (§14.18.3,
     // binary-canticle#79). A verified frame without them is malformed; a refusal
     // that carries them anyway is tolerated, and nothing here reads them.
     if (rec.admission === "verified" && (!str(f.sha256) || !int(f.bytes))) {
-      this.#count("malformed_record");
-      return;
+      return "malformed";
     }
     if (
       rec.admission !== "verified" ||
@@ -431,23 +672,21 @@ export class RecordConsumer {
     ) {
       const admission = ADMISSIONS.has(rec.admission) ? rec.admission : "other";
       this.#count(`not_deliverable_${admission}`);
-      return; // reaches at most the local ring and status (§14.18.4)
+      return undefined; // reaches at most the local ring and status (§14.18.4)
     }
     // A surfaced item always names its stream and class and carries a hop: the
     // receptor keeps an unnamed stream or unknown class at `ringbuffer_only`. A
     // `surface` record without them contradicts its own disposition; drop it
     // rather than render a null.
     if (!str(rec.stream) || !str(rec.class) || !int(rec.hop)) {
-      this.#count("malformed_record");
-      return;
+      return "malformed";
     }
     if (!int(times.local_expiry_at) || times.local_expiry_at <= nowMs) {
       this.#count("expired_on_arrival");
-      return; // never delivered without, or past, local_expiry_at
+      return undefined; // never delivered without, or past, local_expiry_at
     }
     if (!int(times.issued_at) || !int(times.expires_at)) {
-      this.#count("malformed_record");
-      return;
+      return "malformed";
     }
     const body = isObj(rec.body) ? rec.body : undefined;
     const text = body && str(body.text) ? body.text : undefined;
@@ -487,19 +726,12 @@ export class RecordConsumer {
       expiresInMs: times.local_expiry_at - nowMs,
       copies: 1,
     };
-    if (!this.#live.has(rec.idem) && this.#live.size >= MAX_LIVE) {
-      this.#prune(nowMs);
-      if (this.#live.size >= MAX_LIVE) {
-        this.#count("live_overflow");
-        return;
-      }
-    }
-    this.#live.set(rec.idem, {
+    return {
       idem: rec.idem,
       run: this.run!,
       item,
       localExpiryAt: Math.min(times.local_expiry_at, nowMs + MAX_LOCAL_LIFE_MS),
-    });
+    };
   }
 
   /**
@@ -533,6 +765,18 @@ export class RecordConsumer {
     this.#reason(reason);
   }
 
+  /** One reason no longer holds; a degraded receive with none left is ok again. */
+  #clearReason(reason: string): void {
+    this.healthReasons = this.healthReasons.filter((r) => r !== reason);
+    if (this.health === "degraded" && this.healthReasons.length === 0)
+      this.health = "ok";
+  }
+
+  /** Receive health says `joined_late` (§14.18.3 "Join snapshot"). */
+  get joinedLate(): boolean {
+    return this.healthReasons.includes("joined_late");
+  }
+
   #reason(reason: string): void {
     if (this.healthReasons.includes(reason)) return;
     if (this.healthReasons.length >= MAX_REASONS) this.healthReasons.shift();
@@ -541,6 +785,9 @@ export class RecordConsumer {
 
   /** The transport closed: a run that ended without `bye` is a failed receive. */
   closed(): void {
+    // An interrupted snapshot is never authoritative: nothing held is applied.
+    this.#snapHeld = [];
+    this.#snapBytes = 0;
     if (!this.#byeSeen && this.run !== undefined)
       this.#fail("exit_without_bye");
   }
@@ -549,13 +796,21 @@ export class RecordConsumer {
    * A connection to the host daemon opened (every one, the first included). It
    * starts with §14.18.3's bootstrap: `hello`, then the run's latest `landing_state`.
    * Records between connections are lost, so a retract or a mute may have been
-   * missed: clear the live set and deliver nothing until this connection's
-   * `landing_state`.
+   * missed: nothing held so far is shown again unless this connection's join snapshot
+   * confirms it (or, truncated, leaves it alone), and nothing is delivered before this
+   * connection's `landing_state`. `joinSnapshot`: the transport sent the
+   * `join_snapshot` request as this connection's first line.
    */
-  reconnected(): void {
-    this.#live.clear();
+  reconnected(options: { joinSnapshot?: boolean } = {}): void {
+    for (const r of this.#live.values()) r.carried = true;
     this.#landingSeen = false;
     this.#conn = "hello";
+    this.#snapAsked = options.joinSnapshot === true;
+    this.snapshotState = "not_asked";
+    this.snapshotOmitted = undefined;
+    this.#snapW = undefined;
+    this.#snapHeld = [];
+    this.#snapBytes = 0;
   }
 
   /** What one ear hears now, through its `station:stream` tune. */
@@ -579,7 +834,8 @@ export class RecordConsumer {
         this.#live.delete(idem);
         continue;
       }
-      if (!deliverable || !tuned(r.item.station, r.item.stream)) continue;
+      if (r.carried || !deliverable || !tuned(r.item.station, r.item.stream))
+        continue;
       items.push({
         ...r.item,
         expiresInMs: r.localExpiryAt - nowMs,
@@ -595,6 +851,16 @@ export class RecordConsumer {
       ...(this.health === "stopped" ? { ended: true } : {}),
       blind,
       lastDatagramAt: this.lastDatagramAt,
+      ...(this.joinedLate
+        ? {
+            joinedLate: {
+              snapshot: this.snapshotState,
+              ...(this.snapshotOmitted !== undefined
+                ? { omitted: this.snapshotOmitted }
+                : {}),
+            },
+          }
+        : {}),
       stations: [...this.presence].map(([name, state]) => ({
         name,
         presence: blind ? "unknown" : state,

@@ -80,6 +80,15 @@ export interface HearView {
   /** The source's run ended cleanly (record v1 `bye`); not set by the embedded receptor. */
   ended?: boolean;
   blind: boolean;
+  /**
+   * Record v1 over the host socket: this binding joined a run in progress and has no
+   * complete join snapshot, so items and presence from before the join may be missing
+   * (`joined_late`, RFC-0001 §14.18.3). Not set by the embedded receptor.
+   */
+  joinedLate?: {
+    snapshot: import("./records.ts").JoinSnapshotState;
+    omitted?: number;
+  };
   lastDatagramAt: number | undefined;
   stations: Array<{ name: string; presence: string }>;
   items: LiveItem[];

@@ -201,6 +201,7 @@ export function renderHear(view: HearView, options: HearOptions): string {
         : `canticle: no datagram from anyone for ${secs(view.now - view.lastDatagramAt)}. That looks like our socket or network, so every station is unknown, not offline.`,
     );
   }
+  if (view.joinedLate && !view.ended) head.push(joinedLate(view.joinedLate));
   if (view.stations.length > 0) {
     head.push(onAir(view.stations, Math.floor(max / 4)));
   }
@@ -273,6 +274,19 @@ export function renderHear(view: HearView, options: HearOptions): string {
   return bounded(
     `canticle: ${total} live item${total === 1 ? "" : "s"}; the listing doesn't fit limits.maxNotificationChars (${max}). Narrow with stream or raise it.`,
   );
+}
+
+/** The `joined_late` line (RFC-0001 §14.18.3 "Join snapshot"): blind, but saying so. */
+function joinedLate(late: NonNullable<HearView["joinedLate"]>): string {
+  const why =
+    late.snapshot === "truncated"
+      ? `its join snapshot was truncated (${digits(late.omitted)} omitted)`
+      : late.snapshot === "pending" || late.snapshot === "open"
+        ? "its join snapshot hasn't completed yet"
+        : late.snapshot === "unsupported"
+          ? "the host daemon doesn't serve a join snapshot"
+          : "this connection asked for no join snapshot";
+  return `canticle: joined the host daemon's run late (joined_late) and ${why}, so items and station presence from before the join may be missing here.`;
 }
 
 /** The on-air line, cut to about `budget` chars with a count of the rest. */

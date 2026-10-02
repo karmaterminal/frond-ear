@@ -214,7 +214,11 @@ to. Off by default.
    allowed only while frond-ear is the host's one listener (RFC-0001 §14), and it refuses to bind if a canticle
    host daemon answers on `canticle.hostSocket`. `host-daemon` binds nothing and reads record v1
    (§14.18.3) from the host daemon's socket (default `$XDG_RUNTIME_DIR/canticle/daemon.sock`). Use it on any
-   host where another harness (an OpenClaw prince) also hears canticle (binary-canticle#65).
+   host where another harness (an OpenClaw prince) also hears canticle (binary-canticle#65). Each connection
+   asks the daemon for a join snapshot (§14.18.3, D36) of what is live and on air. Until a complete one
+   arrives, `ear_status` reports receive health `degraded`, reason `joined_late` (`joinSnapshot` says why:
+   `pending`, `unsupported` for a daemon that doesn't serve snapshots, or `truncated`), and `hear` says so:
+   items and presence from before the join may be missing.
 
 3. Check with `ear_status`: `canticle.state` should be `listening`, and `counts.datagrams` should rise when a
    station is on air.
