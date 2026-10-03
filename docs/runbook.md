@@ -171,6 +171,21 @@ claude --resume <frond-scribe session id> --dangerously-load-development-channel
 | Pause pushes            | Set `"paused": true` in the config; it reloads live                                 |
 | Read what Claude missed | Claude calls `inbox`; everything stays in SQLite until the retention window expires |
 | Logs                    | JSON lines on the daemon's stderr. Message text and tokens are redacted.            |
+| Post from a script      | `node src/cli.ts send --chat <id> "<text>"`, below                                  |
+
+**Posting from a script.** `frond-ear send --chat <id> <text…>` posts the text as the daemon's
+bot, for scripts such as seat-pulse's outage alerts (`frond-fleet:scribe-seat-survival` in
+scribe-prince-shared). It finds the daemon the way `status` does: `FROND_EAR_SOCKET` (default
+`$XDG_RUNTIME_DIR/frond-ear/daemon.sock`), or `FROND_EAR_TCP` with `FROND_EAR_TOKEN_FILE`, never
+`FROND_EAR_CONFIG`. It goes through the daemon's `reply` tool, so the daemon keeps the token, sends
+only to chats an ear serves, and splits text longer than 2000 characters into several messages. A
+script is never the ear's session, so a send marks nothing seen. It exits 0 once Discord has
+confirmed every message; 1 when the daemon refused the send, Discord failed it or never confirmed
+it, or the daemon could not be reached or gave no answer within 30 seconds; and 2 for bad usage.
+The reason goes to stderr. After an unconfirmed send or a timeout the message may still post.
+Retrying the identical text within 5 minutes reuses the unconfirmed message's nonce, so it cannot
+post twice; a later retry, such as seat-pulse's next pulse 10 minutes on, can (and a retry of a
+long text re-posts the parts Discord did confirm). Text that starts with `-` goes after `--`.
 
 ## 7. Survive a reboot
 
