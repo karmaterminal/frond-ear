@@ -1,3 +1,4 @@
+import type { HearView } from "../src/canticle/receptor.ts";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -190,7 +191,15 @@ export interface Harness {
 
 export function harness(
   config: Config = testConfig(),
-  options: { nonce?: string; path?: string } = {},
+  options: {
+    nonce?: string;
+    path?: string;
+    canticleHear?: (ear: string) => HearView;
+    gatewayStatus?: () => { state: string; closeCode?: number };
+    env?: NodeJS.ProcessEnv;
+    /** The TCP shared token, for a test that serves this daemon over listenTcp. */
+    token?: string;
+  } = {},
 ): Harness {
   const clock = new FakeClock();
   const timers = new FakeTimers(clock);
@@ -210,6 +219,11 @@ export function harness(
     timers,
     allowInject: true,
     nonce: () => options.nonce ?? "nonce-1",
+    ...(options.canticleHear ? { canticleHear: options.canticleHear } : {}),
+    ...(options.gatewayStatus ? { gatewayStatus: options.gatewayStatus } : {}),
+    attachmentsDir: join(directory, "attachments"),
+    ...(options.env ? { env: options.env } : {}),
+    ...(options.token ? { token: options.token } : {}),
   });
   let callId = 0;
   const flush = () => new Promise<void>((resolve) => setImmediate(resolve));

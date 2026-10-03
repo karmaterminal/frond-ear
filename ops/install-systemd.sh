@@ -32,7 +32,18 @@ case "$NODE_BIN" in /*) ;; *) die "NODE_BIN must be absolute: $NODE_BIN" ;; esac
 "$NODE_BIN" -e 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"))' "$CONFIG" \
   || die "config is not valid JSON: $CONFIG"
 
-chmod 700 "$CONF_DIR"; chmod 600 "$CONFIG" "$TOKEN"
+chmod 600 "$CONFIG" "$TOKEN"
+# Tighten CONF_DIR only when it holds the config or the token. With custom paths it may not
+# exist at all, and a custom file's own directory (maybe $HOME) is not ours to chmod.
+if [ -d "$CONF_DIR" ]; then
+  conf_dir_real="$(realpath "$CONF_DIR")"
+  for f in "$CONFIG" "$TOKEN"; do
+    if [ "$(dirname "$(realpath "$f")")" = "$conf_dir_real" ]; then
+      chmod 700 "$CONF_DIR"
+      break
+    fi
+  done
+fi
 
 if [ "$(loginctl show-user "$USER" --property=Linger --value 2>/dev/null)" != "yes" ]; then
   echo "frond-ear: WARNING — linger is off, so user units do not start until you log in." >&2

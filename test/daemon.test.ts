@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
-import { rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { targetAdvice } from "../src/advice.ts";
 import { chunkMessage, RestError } from "../src/rest.ts";
 import {
   AMBIENT,
@@ -225,7 +227,207 @@ test("attach canary: registered only after ack(nonce)", async () => {
   }
 });
 
-test("delivery: an unacked canary is reported as a deaf session, with the relaunch hint", async () => {
+/** Setup advice only a Claude session should get; a Copilot ear must never see it (#39). */
+const CLAUDE_ADVICE =
+  /claude mcp|claude --|dangerously-load-development-channels|Claude Code/u;
+const COPILOT_ADVICE = /copilot-extension --ear|copilot --experimental/u;
+
+/** The ear's `status` view: delivery state and, when unconfirmed, the warning text. */
+function delivery(h: ReturnType<typeof harness>): {
+  delivery: string;
+  hint?: string;
+} {
+  const status = h.daemon.status("scribe") as {
+    ears: Array<{ delivery: string; hint?: string }>;
+  };
+  assert.ok(status.ears[0]);
+  return status.ears[0];
+}
+
+test("delivery: an unacked canary on a claude-channel ear is reported as deaf, with #30's proofs and the relaunch hint", async () => {
+  const config = testConfig({
+    ears: {
+      scribe: { attachCanary: true, channels: { [CHANNEL]: "mentions" } },
+    },
+  });
+  const h = harness(config, { nonce: "c0ffee", env: {} });
+  try {
+    // The attached session's own id goes into the relaunch (#21: a shim
+    // without one cannot claim the ear).
+    const shim = h.attach("scribe");
+    assert.equal(delivery(h).delivery, "pending");
+
+    h.clock.advance(2 * 60 * 1_000);
+    assert.equal(delivery(h).delivery, "unconfirmed");
+    const hint = delivery(h).hint ?? "";
+    assert.match(
+      hint,
+      /^this session never acked frond-ear's attach canary or used a pushed batch_id in its token form, so frond-ear cannot confirm/u,
+    );
+    assert.match(hint, /act on a pushed batch_id exactly as .* \(N-<token>\)/u);
+    assert.ok(
+      hint.includes(
+        "If no <channel> events arrive at all: Claude Code delivers channel events only to a session launched with the development-channel flag: claude --resume session-test --dangerously-load-development-channels server:frond-ear.",
+      ),
+      hint,
+    );
+    assert.doesNotMatch(hint, COPILOT_ADVICE);
+    const deaf = await h.call(shim, "inbox", { chat_id: CHANNEL });
+    assert.ok(deaf.text.endsWith(`\n\n⚠️ frond-ear: ${hint}`), deaf.text);
+    // Identity is fixed at hello (#21): a later session message cannot relabel
+    // the connection, so the relaunch still names the session that attached.
+    await shim.send({ type: "session", sessionId: "session-b" });
+    assert.match(
+      delivery(h).hint ?? "",
+      / claude --resume session-test --dangerously-load-development-channels server:frond-ear\. /u,
+    );
+
+    assert.equal((await h.call(shim, "ack", { nonce: "c0ffee" })).ok, true);
+    assert.equal(delivery(h).delivery, "confirmed");
+    const heard = await h.call(shim, "inbox", { chat_id: CHANNEL });
+    assert.doesNotMatch(heard.text, /⚠️ frond-ear/u);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("delivery: a deaf copilot-extension session gets the Copilot fix, never Claude's relaunch (#39)", async () => {
+  const config = testConfig({
+    ears: {
+      scribe: {
+        target: "copilot-extension",
+        attachCanary: true,
+        channels: { [CHANNEL]: "mentions" },
+      },
+    },
+  });
+  const socket = "/run/frond-ear-test/daemon.sock";
+  const env = { FROND_EAR_SOCKET: socket };
+  const h = harness(config, { nonce: "c0ffee", env });
+  try {
+    const shim = h.attach("scribe", { sessionId: "copilot-session-1" });
+    h.clock.advance(2 * 60 * 1_000);
+    assert.equal(delivery(h).delivery, "unconfirmed");
+    const hint = delivery(h).hint ?? "";
+    assert.ok(
+      hint.includes(
+        'If no <channel> events arrive at all: check the Copilot session for "frond-ear: could not deliver batch"',
+      ) && hint.includes("Copilot started with copilot --experimental;"),
+      hint,
+    );
+    // The reinstall carries the daemon's own socket, so it reaches this daemon.
+    assert.ok(
+      hint.includes(
+        `after upgrading frond-ear, re-run the install: FROND_EAR_SOCKET=${socket} `,
+      ) &&
+        hint.includes(
+          " copilot-extension --ear scribe. Until then, read new messages with inbox.",
+        ),
+      hint,
+    );
+    assert.ok(
+      hint.includes(
+        `If no <channel> events arrive at all: ${targetAdvice({ name: "scribe", target: "copilot-extension" }, env)?.deaf}.`,
+      ),
+      "the same advice doctor prints",
+    );
+    assert.match(hint, /\(N-<token>\)/u);
+    assert.doesNotMatch(hint, CLAUDE_ADVICE);
+    const deaf = await h.call(shim, "inbox", { chat_id: CHANNEL });
+    assert.ok(deaf.text.endsWith(`\n\n⚠️ frond-ear: ${hint}`), deaf.text);
+    assert.doesNotMatch(deaf.text, CLAUDE_ADVICE);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("delivery: a deaf copilot-extension session on a TCP daemon is told a TCP reinstall, never a socket one (#40 review)", async () => {
+  const config = testConfig({
+    ears: {
+      scribe: {
+        target: "copilot-extension",
+        attachCanary: true,
+        channels: { [CHANNEL]: "mentions" },
+      },
+    },
+  });
+  // The installer writes a unix socket unless FROND_EAR_TCP is set (cli.ts), so a
+  // socket-only reinstall would replace this ear's working TCP config.
+  // A real token file: its path is advice, its contents never are.
+  const secret = "tcp-shared-secret-never-printed";
+  const directory = mkdtempSync(join(tmpdir(), "frond-ear tcp-"));
+  const tokenFile = join(directory, "tcp-token");
+  writeFileSync(tokenFile, `${secret}\n`, { mode: 0o600 });
+  const env = {
+    FROND_EAR_TCP: "127.0.0.1:7461",
+    FROND_EAR_TOKEN_FILE: tokenFile,
+  };
+  const h = harness(config, { nonce: "c0ffee", env });
+  try {
+    const shim = h.attach("scribe", { sessionId: "copilot-session-1" });
+    h.clock.advance(2 * 60 * 1_000);
+    const hint = delivery(h).hint ?? "";
+    assert.ok(
+      hint.includes(
+        `after upgrading frond-ear, re-run the install: FROND_EAR_TCP=127.0.0.1:7461 FROND_EAR_TOKEN_FILE='${tokenFile}' `,
+      ) && hint.includes(" copilot-extension --ear scribe. Until then"),
+      hint,
+    );
+    assert.doesNotMatch(hint, /FROND_EAR_SOCKET/u);
+    assert.doesNotMatch(hint, new RegExp(secret, "u"));
+    const deaf = await h.call(shim, "inbox", { chat_id: CHANNEL });
+    assert.ok(deaf.text.endsWith(`\n\n⚠️ frond-ear: ${hint}`), deaf.text);
+    assert.doesNotMatch(deaf.text, new RegExp(secret, "u"));
+  } finally {
+    h.dispose();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("advice: a TCP env without a token file names a placeholder, never a guessed path or a socket", () => {
+  const advice = targetAdvice(
+    { name: "scribe", target: "copilot-extension" },
+    { FROND_EAR_TCP: "127.0.0.1:7461", FROND_EAR_SOCKET: "/run/x.sock" },
+  );
+  assert.ok(advice);
+  for (const text of [advice.attach, advice.deaf]) {
+    assert.match(
+      text,
+      /FROND_EAR_TCP=127\.0\.0\.1:7461 FROND_EAR_TOKEN_FILE=<token-file> \S+ \S+ copilot-extension --ear scribe \(replace <token-file> with the daemon's FROND_EAR_TOKEN_FILE path/u,
+    );
+    assert.doesNotMatch(text, /FROND_EAR_SOCKET/u);
+  }
+});
+
+test("delivery: an ear target with no advice gets the proofs and inbox, no guessed setup", async () => {
+  const config = testConfig({
+    ears: {
+      scribe: { attachCanary: true, channels: { [CHANNEL]: "mentions" } },
+    },
+  });
+  // config.ts rejects reserved targets; force one to reach the no-advice branch.
+  (config.ears.scribe as { target: string }).target = "copilot-sdk";
+  const h = harness(config, { nonce: "c0ffee", env: {} });
+  try {
+    const shim = h.attach("scribe");
+    h.clock.advance(2 * 60 * 1_000);
+    const deaf = await h.call(shim, "inbox", { chat_id: CHANNEL });
+    assert.match(
+      deaf.text,
+      /⚠️ frond-ear: this session never acked frond-ear's attach canary/u,
+    );
+    assert.match(
+      deaf.text,
+      /\(N-<token>\)\. Until then, read new messages with inbox\.$/u,
+    );
+    assert.doesNotMatch(deaf.text, CLAUDE_ADVICE);
+    assert.doesNotMatch(deaf.text, COPILOT_ADVICE);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("delivery: acting on a pushed batch by its batch_id proves delivery when the canary was lost (#21)", async () => {
   const config = testConfig({
     ears: {
       scribe: { attachCanary: true, channels: { [CHANNEL]: "mentions" } },
@@ -236,23 +438,122 @@ test("delivery: an unacked canary is reported as a deaf session, with the relaun
     const shim = h.attach("scribe");
     const status = () =>
       h.daemon.status("scribe") as {
-        ears: Array<{ delivery: string; hint?: string }>;
+        ears: Array<{ delivery: string; registered: boolean }>;
       };
-    assert.equal(status().ears[0]?.delivery, "pending");
-
+    // The canary is never acked (lost before the session could take it).
+    h.daemon.ingest(
+      message({
+        author: { id: PRINCIPAL },
+        mentions: [{ id: BOT }],
+        content: "can you hear me?",
+      }),
+    );
+    h.timers.advance(1_000);
+    const pushed = shim.connection.events().at(-1);
+    const batchId = pushed?.batchId as number;
+    await shim.send({ type: "offered", batchId });
     h.clock.advance(2 * 60 * 1_000);
     assert.equal(status().ears[0]?.delivery, "unconfirmed");
-    assert.match(
-      status().ears[0]?.hint ?? "",
-      /--dangerously-load-development-channels server:frond-ear/u,
-    );
-    const deaf = await h.call(shim, "inbox", { chat_id: CHANNEL });
-    assert.match(deaf.text, /⚠️ frond-ear: this session never acked/u);
 
-    assert.equal((await h.call(shim, "ack", { nonce: "c0ffee" })).ok, true);
+    // The pushed batch_id carries a delivery token only the push has: using it
+    // proves delivery.
+    assert.match(
+      pushed?.meta.batch_id ?? "",
+      new RegExp(`^${batchId}-[0-9a-f]+$`, "u"),
+    );
+    const reply = await h.call(shim, "reply", {
+      chat_id: CHANNEL,
+      text: "yes",
+      batch_id: pushed?.meta.batch_id,
+    });
+    assert.equal(reply.ok, true);
+    assert.doesNotMatch(reply.text, /⚠️ frond-ear/u);
     assert.equal(status().ears[0]?.delivery, "confirmed");
-    const heard = await h.call(shim, "inbox", { chat_id: CHANNEL });
-    assert.doesNotMatch(heard.text, /⚠️ frond-ear/u);
+    assert.equal(status().ears[0]?.registered, true);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("delivery: a batch_id learned from a tap marks seen but does not prove delivery (#21)", async () => {
+  const config = testConfig({
+    ears: {
+      scribe: { attachCanary: true, channels: { [CHANNEL]: "mentions" } },
+    },
+  });
+  const h = harness(config, { nonce: "c0ffee" });
+  try {
+    // A deaf session: attached, canary never acked, no push reaches the model.
+    const shim = h.attach("scribe");
+    const tap = h.attach("scribe", { role: "tap" });
+    h.daemon.ingest(
+      message({
+        author: { id: PRINCIPAL },
+        mentions: [{ id: BOT }],
+        content: "anyone there?",
+      }),
+    );
+    h.timers.advance(1_000);
+    const pushed = shim.connection.events().at(-1);
+    const batchId = pushed?.batchId as number;
+    await shim.send({ type: "offered", batchId });
+    h.clock.advance(2 * 60 * 1_000);
+    // What `frond-ear tap` prints: the bare id, never the session's token.
+    const tapped = tap.connection.events().at(-1);
+    assert.equal(tapped?.batchId, batchId);
+    assert.equal(tapped?.meta.batch_id, String(batchId));
+    assert.equal(h.store.stateCounts("scribe").offered, 1);
+
+    const acked = await h.call(shim, "ack", {
+      chat_id: CHANNEL,
+      batch_id: tapped?.meta.batch_id,
+    });
+    assert.equal(acked.ok, true);
+    assert.equal(h.store.stateCounts("scribe").seen, 1);
+    // The bare id with a forged token proves nothing either.
+    await h.call(shim, "ack", {
+      chat_id: CHANNEL,
+      batch_id: `${batchId}-00000000`,
+    });
+    const status = h.daemon.status("scribe") as {
+      ears: Array<{ delivery: string; registered: boolean }>;
+    };
+    assert.equal(status.ears[0]?.registered, false);
+    assert.equal(status.ears[0]?.delivery, "unconfirmed");
+  } finally {
+    h.dispose();
+  }
+});
+
+test("delivery: a batch_id that was never pushed to this attach does not prove delivery", async () => {
+  const config = testConfig({
+    ears: {
+      scribe: { attachCanary: true, channels: { [CHANNEL]: "mentions" } },
+    },
+  });
+  const h = harness(config, { nonce: "c0ffee" });
+  try {
+    const first = h.attach("scribe");
+    h.daemon.ingest(
+      message({
+        author: { id: PRINCIPAL },
+        mentions: [{ id: BOT }],
+        content: "for the first attach",
+      }),
+    );
+    h.timers.advance(1_000);
+    const earlier = first.connection.events().at(-1)?.batchId as number;
+    await first.send({ type: "offered", batchId: earlier });
+    // A new attach (new generation) that guesses or carries over an old batch id…
+    const second = h.attach("scribe");
+    h.clock.advance(2 * 60 * 1_000);
+    await h.call(second, "ack", { chat_id: CHANNEL, batch_id: earlier });
+    // …and one that names a batch that doesn't exist.
+    await h.call(second, "ack", { chat_id: CHANNEL, batch_id: 99_999 });
+    const status = h.daemon.status("scribe") as {
+      ears: Array<{ delivery: string }>;
+    };
+    assert.equal(status.ears[0]?.delivery, "unconfirmed");
   } finally {
     h.dispose();
   }
@@ -280,7 +581,12 @@ test("tap: mirrors exactly the batch pushed to the attached session, at the same
     const [pushed] = shim.connection.events();
     const [tapped] = tap.connection.events();
     assert.ok(pushed && pushed.batchId !== null);
-    assert.deepEqual(tapped, pushed);
+    // Except the session's delivery token: the tap gets the bare batch id (#21).
+    assert.deepEqual(tapped, {
+      ...pushed,
+      meta: { ...pushed.meta, batch_id: String(pushed.batchId) },
+    });
+    assert.notEqual(pushed.meta.batch_id, String(pushed.batchId));
   } finally {
     h.dispose();
   }

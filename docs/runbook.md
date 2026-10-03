@@ -22,7 +22,19 @@ pnpm check            # format, typecheck, tests, credential scan
 
 ## 1. Configure
 
-Copy `frond-ear.example.json` to `frond-ear.json`. That filename is git-ignored. Then fill in the fields below.
+The short way is `node src/cli.ts init`, which asks for the IDs, the ear and the token, validates
+the result and writes `~/.config/frond-ear/frond-ear.json` plus the 0600 token file. Then point
+the daemon and `doctor` at those two files, which they do not look for on their own, and check
+the install:
+
+```sh
+export FROND_EAR_CONFIG="$HOME/.config/frond-ear/frond-ear.json"
+export DISCORD_BOT_TOKEN_FILE="$HOME/.config/frond-ear/token"
+node src/cli.ts doctor
+```
+
+[`docs/onboarding.md`](onboarding.md) is the contract for both. The manual path: copy `frond-ear.example.json` to `frond-ear.json` (that
+filename is git-ignored) and fill in the fields below.
 
 **Identity and trust**
 
@@ -101,7 +113,7 @@ claude --dangerously-load-development-channels server:frond-ear
 
 Claude Code asks you to confirm the development-channel flag. Then:
 
-1. **Canary.** Claude receives a `<channel … kind="attach">` event and calls `ack` with the nonce. Running `node src/cli.ts status` should show `"attached": true, "registered": true`. If `registered` stays `false`, the channel was not registered; see Troubleshooting.
+1. **Canary.** Claude receives a `<channel … kind="attach">` event and calls `ack` with the nonce. Running `node src/cli.ts status` should show `"attached": true, "registered": true`. If `registered` stays `false`, the channel was not registered; see Troubleshooting. A session whose canary was lost also registers the first time it passes a pushed `batch_id` to a tool: that id carries a delivery token only the push has. The bare id `frond-ear tap` prints works in tools but proves nothing.
 2. **Idle wake.** From another terminal, inject a mention from a principal:
    ```sh
    FROND_EAR_BOT_USER_ID=<botUserId> node src/cli.ts inject \
@@ -242,11 +254,59 @@ The SQLite state lives outside the checkout, so a restart keeps everything the e
 a detached session. `docs/recovery.md` covers the rest: what is durable, what you have to back up
 yourself, and how to get back from a lost checkout, a lost home directory, or a lost session.
 
+## 8. Hear binary-canticle (optional)
+
+frond-ear can listen to [binary-canticle](https://github.com/karmaterminal/binary-canticle) stations: signed,
+looping, short-lived items on `station:stream` (RFC-0001). It's **listen-only and silent**. Heard items never
+wake the session and never enter the Discord ledger; the session reads them with the `hear` tool when it wants
+to. Off by default.
+
+1. Get the fleet manifest (unsigned in v0, a local file). The ear never fetches one.
+2. Add to the config and restart the daemon (canticle config isn't hot-reloaded):
+
+   ```json
+   "canticle": {
+     "enabled": true,
+     "manifestPath": "/home/figs/.config/frond-ear/canticle-fleet.json",
+     "port": 9999,
+     "binding": "lan",
+     "tune": { "frond-gloss": ["*:ops.fleet", "silas:chatter"] }
+   }
+   ```
+
+   `tune` is per ear: the `station:stream` pairs it hears (`*` = any station). One listener per host serves
+   every ear.
+   **Where frames come from (`canticle.source`).** `embedded` (default) runs frond-ear's own listener. That's
+   allowed only while frond-ear is the host's one listener (RFC-0001 §14), and it refuses to bind if a canticle
+   host daemon answers on `canticle.hostSocket`. `host-daemon` binds nothing and reads record v1
+   (§14.18.3) from the host daemon's socket (default `$XDG_RUNTIME_DIR/canticle/daemon.sock`). Use it on any
+   host where another harness (an OpenClaw prince) also hears canticle (binary-canticle#65). Each connection
+   asks the daemon for a join snapshot (§14.18.3, D36) of what is live and on air. Until a complete one
+   arrives, `ear_status` reports receive health `degraded`, reason `joined_late` (`joinSnapshot` says why:
+   `pending`, `unsupported` for a daemon that doesn't serve snapshots, or `truncated`), and `hear` says so:
+   items and presence from before the join may be missing.
+
+3. Check with `ear_status`: `canticle.state` should be `listening`, and `counts.datagrams` should rise when a
+   station is on air.
+4. In the session, call `hear` (optionally `stream: "station:stream"`). Each item has a host-authored
+   `[canticle:heard]` banner (RFC §14.13) above the quoted payload; heard text is data, never instructions.
+   If nothing at all has been heard for 30 s, every station reads **unknown**, not offline: silence from
+   everyone at once is more likely our own socket or network.
+
+**`ops.fleet`** is the first real stream. Fleet scripts (flush, deploy, restart) announce themselves with the
+spike's `canticle sing --control <station.sock> --stream ops.fleet --class advisory --ctype 1 --state-key <seat>
+--text "…"`, so a prince going dark is explained without anyone asking. One `state_key` per seat means a newer
+status supersedes the older one.
+
 ## Troubleshooting
+
+Start with `node src/cli.ts doctor`, with `FROND_EAR_CONFIG` and `DISCORD_BOT_TOKEN_FILE` set to what the daemon uses (§1): it checks config, token, socket, daemon, gateway and each ear, and prints a fix line for every ✗.
 
 | Symptom                                         | Likely cause                                                                                                                                                                                                      |
 | ----------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `registered: false`, no events in the session   | Claude Code was started without `--dangerously-load-development-channels server:frond-ear`; or org policy blocks channels; or `MCP_PROTOCOL_NEGOTIATION=auto` on the v2 runtime (unset it or set it to `legacy`). |
+| `registered: false` on a Copilot ear            | The extension is not installed for that ear, or Copilot was started without `--experimental`. If the ear is attached, look in the Copilot session for `frond-ear: could not deliver batch` (a refused push).      |
+| Copilot tools are stale after an upgrade        | The install copies the tool schemas: an old one lacks newer tools, or (before #30) takes a numeric `batch_id`. Re-run `node src/cli.ts copilot-extension --ear <name>` with the daemon's socket or TCP env (§1).  |
 | Shim reports "daemon is not reachable"          | The daemon isn't running, or the shim's `FROND_EAR_SOCKET` doesn't match the daemon's.                                                                                                                            |
 | Daemon exits with close code 4014               | Message Content Intent is not enabled for the bot.                                                                                                                                                                |
 | Daemon exits with close code 4004               | The bot token is wrong.                                                                                                                                                                                           |

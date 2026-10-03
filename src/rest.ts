@@ -28,6 +28,12 @@ export interface DiscordRest {
     channelId: string,
     options: { limit: number; before?: string },
   ): Promise<DiscordMessage[]>;
+  fetchMessage(channelId: string, messageId: string): Promise<DiscordMessage>;
+  /**
+   * Downloads an attachment from Discord's CDN, never sending the bot token,
+   * refusing redirects and stopping at `maxBytes`.
+   */
+  downloadAttachment(url: string, maxBytes: number): Promise<Uint8Array>;
 }
 
 export class RestError extends Error {
@@ -222,10 +228,68 @@ export class HttpDiscordRest implements DiscordRest {
       `/channels/${seg(channelId)}/messages?${query.toString()}`,
     )) as DiscordMessage[];
   }
+
+  public async fetchMessage(
+    channelId: string,
+    messageId: string,
+  ): Promise<DiscordMessage> {
+    return (await this.request(
+      "GET",
+      `/channels/${seg(channelId)}/messages/${seg(messageId)}`,
+    )) as DiscordMessage;
+  }
+
+  public async downloadAttachment(
+    url: string,
+    maxBytes: number,
+  ): Promise<Uint8Array> {
+    assertAttachmentUrl(url);
+    const fetchImpl = this.options.fetch ?? globalThis.fetch;
+    // No Authorization header: CDN URLs are signed, and the bot token must never
+    // leave for anything but the API. No redirects: a hop off the CDN is refused.
+    const response = await fetchImpl(url, { redirect: "error" });
+    if (!response.ok || !response.body) {
+      throw new Error(`attachment download failed: ${response.status}`);
+    }
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    for await (const chunk of response.body) {
+      total += chunk.byteLength;
+      if (total > maxBytes) {
+        throw new Error(`attachment is larger than ${maxBytes} bytes`);
+      }
+      chunks.push(chunk);
+    }
+    return Buffer.concat(chunks);
+  }
+}
+
+const ATTACHMENT_HOSTS = new Set([
+  "cdn.discordapp.com",
+  "media.discordapp.net",
+]);
+
+/** Only https URLs on Discord's attachment CDN are ever fetched. */
+export function assertAttachmentUrl(url: string): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error("attachment URL is not a URL");
+  }
+  if (
+    parsed.protocol !== "https:" ||
+    !ATTACHMENT_HOSTS.has(parsed.hostname) ||
+    parsed.port !== ""
+  ) {
+    throw new Error(
+      `attachment URL is not on Discord's CDN: ${parsed.hostname}`,
+    );
+  }
 }
 
 export interface RecordedCall {
-  method: "send" | "react" | "edit" | "fetch";
+  method: "send" | "react" | "edit" | "fetch" | "fetch_one" | "download";
   channelId: string;
   messageId?: string;
   content?: string;
@@ -308,5 +372,37 @@ export class RecordingRest implements DiscordRest {
   ): Promise<DiscordMessage[]> {
     this.record({ method: "fetch", channelId });
     return this.history(channelId, options.limit);
+  }
+
+  /** Test seam: messages by id and attachment bytes by URL. */
+  public readonly messages = new Map<string, DiscordMessage>();
+  public readonly files = new Map<string, Uint8Array>();
+
+  public async fetchMessage(
+    channelId: string,
+    messageId: string,
+  ): Promise<DiscordMessage> {
+    this.record({ method: "fetch_one", channelId, messageId });
+    const message = this.messages.get(messageId);
+    if (!message) {
+      throw new RestError(404, 10008, "Unknown Message");
+    }
+    return message;
+  }
+
+  public async downloadAttachment(
+    url: string,
+    maxBytes: number,
+  ): Promise<Uint8Array> {
+    assertAttachmentUrl(url);
+    this.record({ method: "download", channelId: "", content: url });
+    const bytes = this.files.get(url);
+    if (!bytes) {
+      throw new Error("attachment download failed: 404");
+    }
+    if (bytes.length > maxBytes) {
+      throw new Error(`attachment is larger than ${maxBytes} bytes`);
+    }
+    return bytes;
   }
 }
