@@ -181,7 +181,8 @@ export class EventStore {
         state TEXT NOT NULL CHECK (state IN ('pending', 'sent', 'failed')),
         message_id TEXT,
         created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL
+        updated_at INTEGER NOT NULL,
+        session_ear TEXT
       );
       CREATE INDEX IF NOT EXISTS outbound_intents_key
         ON outbound_intents (intent_key, state, created_at);
@@ -208,6 +209,16 @@ export class EventStore {
         value TEXT NOT NULL
       );
     `);
+    // outbound_intents shipped without session_ear; a database created before
+    // it gains the column here, and its older rows read as no session's (#49).
+    const intentColumns = this.database
+      .prepare("PRAGMA table_info(outbound_intents)")
+      .all() as Array<{ name: string }>;
+    if (!intentColumns.some((column) => column.name === "session_ear")) {
+      this.database.exec(
+        "ALTER TABLE outbound_intents ADD COLUMN session_ear TEXT",
+      );
+    }
   }
 
   public close(): void {
@@ -463,7 +474,9 @@ export class EventStore {
    * crash, timeout, lost response) and within `reuseWindowMs`, its nonce is
    * reused so Discord's enforce_nonce returns the original message instead of
    * posting a duplicate. A completed send is never reused, so a deliberate
-   * repeat of the same text still posts.
+   * repeat of the same text still posts. `sessionEar` is the ear whose attached
+   * session is sending, or null for any other client (a `frond-ear send`
+   * script): an unconfirmed send is put to that session alone.
    */
   public beginSend(
     key: string,
@@ -471,6 +484,7 @@ export class EventStore {
     preview: string,
     nonce: string,
     reuseWindowMs: number,
+    sessionEar: string | null,
   ): { nonce: string; reused: boolean } {
     const now = this.clock.now();
     const pending = this.database
@@ -489,10 +503,10 @@ export class EventStore {
     this.database
       .prepare(
         `INSERT INTO outbound_intents
-           (nonce, intent_key, chat_id, preview, state, created_at, updated_at)
-         VALUES (?, ?, ?, ?, 'pending', ?, ?)`,
+           (nonce, intent_key, chat_id, preview, state, created_at, updated_at, session_ear)
+         VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)`,
       )
-      .run(nonce, key, chatId, preview.slice(0, 80), now, now);
+      .run(nonce, key, chatId, preview.slice(0, 80), now, now, sessionEar);
     return { nonce, reused: false };
   }
 
@@ -518,17 +532,22 @@ export class EventStore {
       .run(this.clock.now(), nonce);
   }
 
-  /** Sends whose outcome is unknown (pending and not in flight right now). */
+  /**
+   * Sends whose outcome is unknown (pending and not in flight right now).
+   * `sessionEar` is null for a send no ear's session made.
+   */
   public ambiguousSends(exclude: ReadonlySet<string>): Array<{
     nonce: string;
     chatId: string;
     preview: string;
     createdAt: number;
+    sessionEar: string | null;
   }> {
     return (
       this.database
         .prepare(
-          `SELECT nonce, chat_id AS chatId, preview, created_at AS createdAt
+          `SELECT nonce, chat_id AS chatId, preview, created_at AS createdAt,
+             session_ear AS sessionEar
            FROM outbound_intents WHERE state = 'pending' ORDER BY created_at`,
         )
         .all() as Array<{
@@ -536,6 +555,7 @@ export class EventStore {
         chatId: string;
         preview: string;
         createdAt: number;
+        sessionEar: string | null;
       }>
     ).filter((row) => !exclude.has(row.nonce));
   }
@@ -1009,10 +1029,10 @@ export class EventStore {
           )
           .run(cutoff).changes,
       );
+      // Pending ones too: an unconfirmed send that no retry resolved inside the
+      // reuse window stays pending, and past retention it is history (#49).
       this.database
-        .prepare(
-          "DELETE FROM outbound_intents WHERE updated_at < ? AND state IN ('sent', 'failed')",
-        )
+        .prepare("DELETE FROM outbound_intents WHERE updated_at < ?")
         .run(cutoff);
       this.database
         .prepare(

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
 import { targetAdvice } from "../src/advice.ts";
@@ -1641,6 +1642,151 @@ test("a definitive Discord rejection is not ambiguous, and a deliberate repeat a
     );
   } finally {
     h.dispose();
+  }
+});
+
+// ---- unconfirmed sends: who is asked to check them, and for how long (#49) ---
+
+/** Discord takes every post, but no response arrives: each send stays unconfirmed. */
+function loseEveryResponse(h: helpers.Harness): void {
+  const discordSend = h.rest.sendMessage.bind(h.rest);
+  h.rest.sendMessage = async (...args) => {
+    await discordSend(...args);
+    throw new TypeError("fetch failed");
+  };
+}
+
+function sendChecks(shim: { connection: helpers.MemoryConnection }) {
+  return shim.connection
+    .events()
+    .filter((event) => event.meta.kind === "send_check");
+}
+
+function unconfirmed(h: helpers.Harness): Array<[string, string | null]> {
+  const status = h.daemon.status() as {
+    ambiguousSends: Array<{ preview: string; sessionEar: string | null }>;
+  };
+  return status.ambiguousSends.map((send) => [send.preview, send.sessionEar]);
+}
+
+test("an unconfirmed send is put only to the session that made it, at its next attach (#49)", async () => {
+  const h = harness(
+    testConfig({
+      ears: {
+        scribe: { attachCanary: false, channels: { [CHANNEL]: "mentions" } },
+        other: { attachCanary: false, channels: { [ROOM]: "room" } },
+      },
+    }),
+  );
+  try {
+    loseEveryResponse(h);
+    const script = h.attach(undefined, { role: "cli" }); // what `frond-ear send` is
+    const scribe = h.attach("scribe");
+    for (const [client, chat, text] of [
+      [script, CHANNEL, "⚠️ frond-gloss@silas: tmux session gone"],
+      [scribe, CHANNEL, "scribe's own reply"],
+      [scribe, ROOM, "scribe's reply in the other ear's room"],
+    ] as const) {
+      const result = await h.call(client, "reply", { chat_id: chat, text });
+      assert.match(result.text, /may already have been posted/u);
+      h.clock.advance(1_000);
+    }
+    assert.deepEqual(
+      unconfirmed(h),
+      [
+        ["⚠️ frond-gloss@silas: tmux session gone", null],
+        ["scribe's own reply", "scribe"],
+        ["scribe's reply in the other ear's room", "scribe"],
+      ],
+      "status shows every unconfirmed send, and which session made it",
+    );
+
+    const other = h.attach("other");
+    assert.deepEqual(
+      sendChecks(other),
+      [],
+      "the room's ear did not write the send made into its room",
+    );
+    const back = h.attach("scribe"); // supersedes the first scribe session
+    const checks = sendChecks(back);
+    assert.equal(checks.length, 1);
+    assert.equal(checks[0]?.meta.count, "2");
+    assert.match(checks[0]?.content ?? "", /scribe's own reply/u);
+    assert.match(checks[0]?.content ?? "", /the other ear's room/u);
+    assert.doesNotMatch(
+      checks[0]?.content ?? "",
+      /tmux session gone/u,
+      "a script's send is not a session's to check",
+    );
+  } finally {
+    h.dispose();
+  }
+});
+
+test("the prune drops an unconfirmed send once it is past retention (#49)", async () => {
+  const h = harness();
+  try {
+    loseEveryResponse(h);
+    const shim = h.attach("scribe");
+    const retentionMs = testConfig().limits.retentionMs;
+    await h.call(shim, "reply", { chat_id: CHANNEL, text: "an old reply" });
+    h.clock.advance(retentionMs - 1_000);
+    await h.call(shim, "reply", { chat_id: CHANNEL, text: "a recent reply" });
+    h.clock.advance(2_000);
+    h.daemon.prune();
+    assert.deepEqual(unconfirmed(h), [["a recent reply", "scribe"]]);
+    const checks = sendChecks(h.attach("scribe"));
+    assert.equal(checks.length, 1);
+    assert.match(checks[0]?.content ?? "", /a recent reply/u);
+    assert.doesNotMatch(checks[0]?.content ?? "", /an old reply/u);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("a database from before session_ear gains it, and its unconfirmed sends go to no session (#49)", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "frond-ear-legacy-"));
+  const path = join(directory, "ear.db");
+  try {
+    // outbound_intents as it shipped before #49.
+    const legacy = new DatabaseSync(path);
+    legacy.exec(`
+      CREATE TABLE outbound_intents (
+        nonce TEXT PRIMARY KEY,
+        intent_key TEXT NOT NULL,
+        chat_id TEXT NOT NULL,
+        preview TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('pending', 'sent', 'failed')),
+        message_id TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      INSERT INTO outbound_intents VALUES ('legacy-nonce', 'legacy-key', '${CHANNEL}',
+        'a reply from before the upgrade', 'pending', NULL, 1000000, 1000000);
+    `);
+    legacy.close();
+
+    const h = harness(testConfig(), { path });
+    try {
+      loseEveryResponse(h);
+      assert.deepEqual(unconfirmed(h), [
+        ["a reply from before the upgrade", null],
+      ]);
+      const shim = h.attach("scribe");
+      assert.deepEqual(sendChecks(shim), [], "an older row names no session");
+      await h.call(shim, "reply", {
+        chat_id: CHANNEL,
+        text: "a reply after the upgrade",
+      });
+      const checks = sendChecks(h.attach("scribe"));
+      assert.equal(checks.length, 1);
+      assert.match(checks[0]?.content ?? "", /a reply after the upgrade/u);
+      assert.doesNotMatch(checks[0]?.content ?? "", /before the upgrade/u);
+    } finally {
+      h.dispose();
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
   }
 });
 

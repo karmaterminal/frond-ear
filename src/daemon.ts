@@ -866,9 +866,11 @@ export class Daemon {
       const digest = renderDigest(unseen);
       client.connection.send({ type: "event", batchId: null, ...digest });
     }
+    // Only this ear's session's own sends: one a script or another ear's session
+    // made is not this session's to check, so status alone shows it (#49).
     const ambiguous = this.store
       .ambiguousSends(this.sendsInFlight)
-      .filter((send) => this.earForChat(send.chatId) === ear);
+      .filter((send) => send.sessionEar === ear);
     if (ambiguous.length > 0) {
       client.connection.send({
         type: "event",
@@ -1000,6 +1002,8 @@ export class Daemon {
         const text = stringArg(args, "text", true);
         const replyTo = snowflakeArg(args, "reply_to");
         const horizon = this.seenHorizon(client, ear, chatId, args);
+        // Set only while this client is an ear's attached session.
+        const sessionEar = client.ear ?? null;
         const ids: string[] = [];
         for (const [index, chunk] of chunkMessage(text).entries()) {
           ids.push(
@@ -1008,6 +1012,7 @@ export class Daemon {
               chunk,
               index === 0 ? replyTo : undefined,
               index,
+              sessionEar,
             ),
           );
         }
@@ -1340,13 +1345,16 @@ export class Daemon {
    * is durable before Discord is called; success records the receipt; a
    * definitive 4xx marks it failed; anything else (timeout, lost response,
    * crash) leaves it pending, i.e. ambiguous, and an identical retry reuses
-   * the nonce so Discord de-duplicates it.
+   * the nonce so Discord de-duplicates it. `sessionEar` names the attached
+   * session sending it (null for a script), the only one told at its next
+   * attach if the send stays ambiguous.
    */
   private async sendOnce(
     chatId: string,
     content: string,
     replyTo: string | undefined,
     chunkIndex: number,
+    sessionEar: string | null,
   ): Promise<string> {
     const key = createHash("sha256")
       .update(`${chatId}\n${replyTo ?? ""}\n${chunkIndex}\n${content}`)
@@ -1357,6 +1365,7 @@ export class Daemon {
       content,
       randomBytes(10).toString("hex"),
       SEND_DEDUPE_WINDOW_MS,
+      sessionEar,
     );
     this.sendsInFlight.add(intent.nonce);
     try {
