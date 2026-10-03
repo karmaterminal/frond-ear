@@ -171,6 +171,17 @@ claude --resume <frond-scribe session id> --dangerously-load-development-channel
 | Pause pushes            | Set `"paused": true` in the config; it reloads live                                 |
 | Read what Claude missed | Claude calls `inbox`; everything stays in SQLite until the retention window expires |
 | Logs                    | JSON lines on the daemon's stderr. Message text and tokens are redacted.            |
+| Post from a script      | `node src/cli.ts send --chat <id> "<text>"`, below                                  |
+
+**Posting from a script.** `frond-ear send --chat <id> <text…>` posts one message as the daemon's
+bot, for scripts such as seat-pulse's outage alerts (`frond-fleet:scribe-seat-survival` in
+scribe-prince-shared). It goes through the daemon's `reply` tool, so the daemon keeps the token,
+sends only to chats an ear serves and splits long text, and an identical retry of an unconfirmed
+send within 5 minutes cannot post twice. A script is never the ear's session, so a send marks
+nothing seen. It exits 0 once Discord has confirmed every message. It exits 1 when the daemon
+refused the send, Discord failed it or never confirmed it (the message may then have posted; stderr
+says so), or no daemon answered, and 2 for bad usage. The reason always goes to stderr. Text that
+starts with `-` goes after `--`.
 
 ## 7. Survive a reboot
 

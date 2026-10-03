@@ -1,6 +1,6 @@
 // A CLI-side client of the daemon: one request/response exchange over the
-// unix socket (or TCP with the shared token). Shared by `status`, `inject`
-// and `doctor`.
+// unix socket (or TCP with the shared token). Shared by `status`, `inject`,
+// `send` and `doctor`.
 import { readFileSync } from "node:fs";
 import { connect, type Socket } from "node:net";
 
@@ -39,7 +39,8 @@ export function connectToDaemon(env: NodeJS.ProcessEnv): () => Socket {
 
 export type CliRequest =
   | { type: "status" }
-  | { type: "inject"; message: DiscordMessage };
+  | { type: "inject"; message: DiscordMessage }
+  | { type: "call"; tool: string; args: Record<string, unknown> };
 
 /**
  * One request/response exchange with the daemon as a CLI client. With
