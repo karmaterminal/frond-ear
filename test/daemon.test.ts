@@ -1723,6 +1723,53 @@ test("an unconfirmed send is put only to the session that made it, at its next a
   }
 });
 
+test("a replaced session's unconfirmed send still goes to its ear's next session (#49)", async () => {
+  const h = harness();
+  try {
+    loseEveryResponse(h);
+    const first = h.attach("scribe");
+    h.attach("scribe"); // a second session takes the ear; the first keeps its tools
+    await h.call(first, "reply", {
+      chat_id: CHANNEL,
+      text: "from the replaced session",
+    });
+    assert.deepEqual(unconfirmed(h), [["from the replaced session", "scribe"]]);
+    const checks = sendChecks(h.attach("scribe"));
+    assert.equal(checks.length, 1);
+    assert.match(checks[0]?.content ?? "", /from the replaced session/u);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("a session retrying a script's unconfirmed send is told about it; a script's retry changes nothing (#49)", async () => {
+  const h = harness();
+  try {
+    loseEveryResponse(h);
+    const script = h.attach(undefined, { role: "cli" });
+    const shim = h.attach("scribe");
+    // Each pair is sent twice inside the reuse window, so the retry reuses the nonce.
+    await h.call(script, "reply", { chat_id: CHANNEL, text: "script first" });
+    await h.call(shim, "reply", { chat_id: CHANNEL, text: "script first" });
+    h.clock.advance(1_000);
+    await h.call(shim, "reply", { chat_id: CHANNEL, text: "session first" });
+    await h.call(script, "reply", { chat_id: CHANNEL, text: "session first" });
+    assert.equal(
+      h.rest.calls.filter((call) => call.method === "send").length,
+      2,
+      "Discord de-duplicated both retries",
+    );
+    assert.deepEqual(unconfirmed(h), [
+      ["script first", "scribe"],
+      ["session first", "scribe"],
+    ]);
+    const checks = sendChecks(h.attach("scribe"));
+    assert.equal(checks[0]?.meta.count, "2");
+  } finally {
+    h.dispose();
+  }
+});
+
 test("the prune drops an unconfirmed send once it is past retention (#49)", async () => {
   const h = harness();
   try {
@@ -1748,7 +1795,8 @@ test("a database from before session_ear gains it, and its unconfirmed sends go 
   const directory = mkdtempSync(join(tmpdir(), "frond-ear-legacy-"));
   const path = join(directory, "ear.db");
   try {
-    // outbound_intents as it shipped before #49.
+    // outbound_intents as it shipped before #49, with a pending row from a
+    // minute before the upgrade (the harness clock starts at 1_000_000).
     const legacy = new DatabaseSync(path);
     legacy.exec(`
       CREATE TABLE outbound_intents (
@@ -1762,7 +1810,7 @@ test("a database from before session_ear gains it, and its unconfirmed sends go 
         updated_at INTEGER NOT NULL
       );
       INSERT INTO outbound_intents VALUES ('legacy-nonce', 'legacy-key', '${CHANNEL}',
-        'a reply from before the upgrade', 'pending', NULL, 1000000, 1000000);
+        'a reply from before the upgrade', 'pending', NULL, 940000, 940000);
     `);
     legacy.close();
 

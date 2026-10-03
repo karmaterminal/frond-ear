@@ -74,6 +74,16 @@ export interface Batch {
   events: StoredEvent[];
 }
 
+/** A send whose outcome Discord never confirmed. */
+export interface AmbiguousSend {
+  nonce: string;
+  chatId: string;
+  preview: string;
+  createdAt: number;
+  /** The ear whose session made it; null for a script, or a row from before #49. */
+  sessionEar: string | null;
+}
+
 function mapEvent(row: EventRow): StoredEvent {
   return {
     id: row.id,
@@ -474,9 +484,11 @@ export class EventStore {
    * crash, timeout, lost response) and within `reuseWindowMs`, its nonce is
    * reused so Discord's enforce_nonce returns the original message instead of
    * posting a duplicate. A completed send is never reused, so a deliberate
-   * repeat of the same text still posts. `sessionEar` is the ear whose attached
-   * session is sending, or null for any other client (a `frond-ear send`
-   * script): an unconfirmed send is put to that session alone.
+   * repeat of the same text still posts. `sessionEar` is the ear whose session
+   * is sending, or null for any other client (a `frond-ear send` script): an
+   * unconfirmed send is put to that ear's sessions alone. A session retrying a
+   * script's pending send makes it the session's; a script's retry changes
+   * nothing.
    */
   public beginSend(
     key: string,
@@ -496,8 +508,11 @@ export class EventStore {
       .get(key, now - reuseWindowMs) as { nonce: string } | undefined;
     if (pending) {
       this.database
-        .prepare("UPDATE outbound_intents SET updated_at = ? WHERE nonce = ?")
-        .run(now, pending.nonce);
+        .prepare(
+          `UPDATE outbound_intents SET updated_at = ?, session_ear = COALESCE(?, session_ear)
+           WHERE nonce = ?`,
+        )
+        .run(now, sessionEar, pending.nonce);
       return { nonce: pending.nonce, reused: true };
     }
     this.database
@@ -532,17 +547,8 @@ export class EventStore {
       .run(this.clock.now(), nonce);
   }
 
-  /**
-   * Sends whose outcome is unknown (pending and not in flight right now).
-   * `sessionEar` is null for a send no ear's session made.
-   */
-  public ambiguousSends(exclude: ReadonlySet<string>): Array<{
-    nonce: string;
-    chatId: string;
-    preview: string;
-    createdAt: number;
-    sessionEar: string | null;
-  }> {
+  /** Sends whose outcome is unknown (pending and not in flight right now). */
+  public ambiguousSends(exclude: ReadonlySet<string>): AmbiguousSend[] {
     return (
       this.database
         .prepare(
@@ -550,13 +556,7 @@ export class EventStore {
              session_ear AS sessionEar
            FROM outbound_intents WHERE state = 'pending' ORDER BY created_at`,
         )
-        .all() as Array<{
-        nonce: string;
-        chatId: string;
-        preview: string;
-        createdAt: number;
-        sessionEar: string | null;
-      }>
+        .all() as unknown as AmbiguousSend[]
     ).filter((row) => !exclude.has(row.nonce));
   }
 

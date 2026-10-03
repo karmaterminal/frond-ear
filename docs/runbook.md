@@ -189,9 +189,9 @@ long text re-posts the parts Discord did confirm). Text that starts with `-` goe
 
 An unconfirmed send stays in `status` under `ambiguousSends` until the prune drops it, once it is
 older than `limits.retentionMs` (14 days by default). Each entry's `sessionEar` names the ear whose
-session made it, or is `null` for a script. A session is never asked to check a script's send: the
-`send_check` notice at an ear's next attach lists only that ear's session's own unconfirmed
-replies.
+session made it, or is `null` for a script (and for a send recorded before frond-ear kept track). A
+session is never asked to check a script's send: the `send_check` notice at an ear's next attach
+lists only unconfirmed replies made by that ear's sessions, including one it has since replaced.
 
 ## 7. Survive a reboot
 
