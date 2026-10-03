@@ -43,6 +43,12 @@ export type CliRequest =
   | { type: "call"; tool: string; args: Record<string, unknown> };
 
 /**
+ * `request` stopped waiting. The daemon may have taken the request and still be
+ * working on it.
+ */
+export class DaemonTimeoutError extends Error {}
+
+/**
  * One request/response exchange with the daemon as a CLI client. With
  * `timeoutMs`, a daemon that accepts the connection but never answers (or a
  * socket nobody is listening on) fails instead of hanging.
@@ -53,6 +59,9 @@ export function request(
   timeoutMs?: number,
 ): Promise<{ ok: boolean; text: string }> {
   return new Promise((resolve, reject) => {
+    // Read before connecting: an unreadable token file rejects here instead of
+    // throwing from the socket's connect handler.
+    const token = tcpTarget(env) ? tcpToken(env) : undefined;
     const socket = connectToDaemon(env)();
     let timer: NodeJS.Timeout | undefined;
     const settle = <T>(fn: (value: T) => void) => {
@@ -66,7 +75,11 @@ export function request(
     if (timeoutMs !== undefined) {
       timer = setTimeout(() => {
         socket.destroy();
-        fail(new Error(`the daemon did not answer within ${timeoutMs}ms`));
+        fail(
+          new DaemonTimeoutError(
+            `the daemon did not answer within ${timeoutMs}ms`,
+          ),
+        );
       }, timeoutMs);
     }
     const connection = new LineConnection(
@@ -83,7 +96,6 @@ export function request(
       () => fail(new Error("daemon closed the connection")),
     );
     socket.once("connect", () => {
-      const token = tcpTarget(env) ? tcpToken(env) : undefined;
       connection.send({
         type: "hello",
         role: "cli",

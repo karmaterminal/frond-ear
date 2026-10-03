@@ -1,14 +1,21 @@
-// `frond-ear send`: post one message from a script, such as seat-pulse's outage alerts (#47).
+// `frond-ear send`: post a message from a script, such as seat-pulse's outage alerts (#47).
 // A thin client of the daemon's `reply` tool, so the daemon still does everything a session's
 // reply gets: it holds the bot token, sends only to chats an ear serves, chunks long text, and
 // reuses the nonce when an unconfirmed send is retried. A CLI client is never an ear's attached
 // session, so a send marks nothing seen.
 import { parseArgs } from "node:util";
 
-import { request } from "./client.ts";
+import { DaemonTimeoutError, request } from "./client.ts";
 import type { Io } from "./onboard.ts";
 
 const USAGE = "usage: frond-ear send --chat <id> [--] <text…>";
+/**
+ * Long enough for Discord's rate-limit retries (the daemon's REST client retries a 429 up
+ * to three times, each after Discord's retry_after); short enough that a wedged daemon fails
+ * the send with a reason before a caller's own timeout kills it without one (seat-pulse
+ * allows 60 s).
+ */
+const SEND_TIMEOUT_MS = 30_000;
 
 /**
  * Exit 0 once Discord has confirmed every message, 1 when the daemon refused or failed the
@@ -18,20 +25,28 @@ const USAGE = "usage: frond-ear send --chat <id> [--] <text…>";
 export async function runSend(
   argv: string[],
   io: Pick<Io, "stdout" | "stderr" | "env">,
+  timeoutMs = SEND_TIMEOUT_MS,
 ): Promise<number> {
-  let chat: string | undefined;
+  let chats: string[];
   let text: string;
   try {
     const { values, positionals } = parseArgs({
       args: argv,
       allowPositionals: true,
-      options: { chat: { type: "string" } },
+      options: { chat: { type: "string", multiple: true } },
     });
-    chat = values.chat;
+    chats = values.chat ?? [];
     text = positionals.join(" ");
   } catch (error) {
     io.stderr.write(
       `frond-ear send: ${error instanceof Error ? error.message : String(error)}\n${USAGE}\n`,
+    );
+    return 2;
+  }
+  const [chat] = chats;
+  if (chats.length > 1) {
+    io.stderr.write(
+      `frond-ear send: one --chat per send (got ${chats.length})\n${USAGE}\n`,
     );
     return 2;
   }
@@ -46,10 +61,13 @@ export async function runSend(
     result = await request(
       { type: "call", tool: "reply", args: { chat_id: chat, text } },
       io.env,
+      timeoutMs,
     );
   } catch (error) {
     io.stderr.write(
-      `frond-ear send: no answer from the daemon (${error instanceof Error ? error.message : String(error)})\n`,
+      error instanceof DaemonTimeoutError
+        ? `frond-ear send: ${error.message}; it may still post the message\n`
+        : `frond-ear send: ${error instanceof Error ? error.message : String(error)}\n`,
     );
     return 1;
   }

@@ -49,8 +49,8 @@ usage:
   frond-ear daemon [--dry-run]        run the gateway daemon (config: FROND_EAR_CONFIG, default ./frond-ear.json)
   frond-ear shim                      run the Claude Code channel shim (stdio MCP; launched by Claude Code)
   frond-ear status                    print daemon status as JSON
-  frond-ear send --chat <id> <text…>  post one message as the daemon's bot, from a script (e.g. an alert); only
-                                      to chats an ear serves; marks nothing seen; exit 0 once Discord confirmed it
+  frond-ear send --chat <id> <text…>  post text as the daemon's bot, from a script (e.g. an alert); only to
+                                      chats an ear serves; marks nothing seen; exit 0 once Discord confirmed it
   frond-ear copilot-extension --ear <name> [--dir <path>]
                                       install the Copilot CLI extension for an ear
                                       (default dir $COPILOT_HOME/extensions/frond-ear; run copilot --experimental)

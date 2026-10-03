@@ -1,11 +1,11 @@
-// `frond-ear send` (#47): a script posts one message through the daemon's `reply` tool.
+// `frond-ear send` (#47): a script posts a message through the daemon's `reply` tool.
 // In-process against a real daemon on a real unix socket (and TCP) with the recording REST
 // double; then the CLI itself against a dry-run daemon, for its wiring and the help line
 // seat-pulse looks for.
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import type { AddressInfo } from "node:net";
+import { createServer, type AddressInfo, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -34,7 +34,11 @@ interface Sent {
   stderr: string;
 }
 
-async function send(argv: string[], env: NodeJS.ProcessEnv): Promise<Sent> {
+async function send(
+  argv: string[],
+  env: NodeJS.ProcessEnv,
+  timeoutMs?: number,
+): Promise<Sent> {
   let stdout = "";
   let stderr = "";
   const out = new PassThrough();
@@ -45,7 +49,11 @@ async function send(argv: string[], env: NodeJS.ProcessEnv): Promise<Sent> {
   err.on("data", (chunk: Buffer) => {
     stderr += chunk.toString();
   });
-  const code = await runSend(argv, { stdout: out, stderr: err, env });
+  const code = await runSend(
+    argv,
+    { stdout: out, stderr: err, env },
+    timeoutMs,
+  );
   return { code, stdout, stderr };
 }
 
@@ -140,6 +148,7 @@ test("send: bad usage exits 2 without contacting the daemon", async () => {
       ["--chat"],
       ["--chat", CHANNEL, "--reply-to", CHANNEL, "hello"],
       ["--chat", CHANNEL, "-5 min idle"],
+      ["--chat", CHANNEL, "--chat", ROOM, "hello"],
     ]) {
       const sent = await send(argv, env);
       assert.equal(sent.code, 2, `${JSON.stringify(argv)}: ${sent.stderr}`);
@@ -162,7 +171,7 @@ test("send with no daemon listening exits 1 and says why on stderr", async () =>
     assert.equal(sent.stdout, "");
     assert.match(
       sent.stderr,
-      /^frond-ear send: no answer from the daemon \(connect ENOENT .*nobody\.sock\)\n$/u,
+      /^frond-ear send: connect ENOENT .*nobody\.sock\n$/u,
     );
   } finally {
     rmSync(directory, { recursive: true, force: true });
@@ -239,7 +248,7 @@ test("send over TCP presents the shared token; a wrong token gets no answer and 
     assert.equal(refused.code, 1);
     assert.match(
       refused.stderr,
-      /^frond-ear send: no answer from the daemon \(daemon closed the connection\)/u,
+      /^frond-ear send: daemon closed the connection\n$/u,
     );
     assert.deepEqual(
       h.rest.calls.map((call) => call.content),
@@ -254,26 +263,83 @@ test("send over TCP presents the shared token; a wrong token gets no answer and 
 
 test("send: Discord not confirming exits 1 and says so; the identical retry posts once", async () => {
   await withDaemon(async (h, env) => {
-    const sendMessage = h.rest.sendMessage.bind(h.rest);
-    h.rest.sendMessage = async () => {
-      throw new Error("socket hang up");
+    const discordSend = h.rest.sendMessage.bind(h.rest);
+    let dropNext = true;
+    h.rest.sendMessage = async (...args) => {
+      const sent = await discordSend(...args); // Discord accepted it...
+      if (dropNext) {
+        dropNext = false;
+        throw new TypeError("fetch failed"); // ...but the response was lost
+      }
+      return sent;
     };
     const lost = await send(["--chat", CHANNEL, "seat gone"], env);
     assert.equal(lost.code, 1);
     assert.equal(lost.stdout, "");
     assert.match(
       lost.stderr,
-      /^frond-ear send: Discord did not confirm this send \(socket hang up\)\. The message may already have been posted\. Retrying the identical text within 5 minutes is safe/u,
+      /^frond-ear send: Discord did not confirm this send \(fetch failed\)\. The message may already have been posted\. Retrying the identical text within 5 minutes is safe/u,
     );
 
-    h.rest.sendMessage = sendMessage;
+    // The retry carries the same nonce, so Discord hands back the message it already has.
     const retried = await send(["--chat", CHANNEL, "seat gone"], env);
     assert.equal(retried.code, 0, retried.stderr);
-    assert.deepEqual(
-      h.rest.calls.map((call) => call.content),
-      ["seat gone"],
+    assert.equal(h.rest.calls.length, 1, "Discord received one message");
+    assert.equal(
+      retried.stdout,
+      `sent 1 message to ${CHANNEL} (id ${h.rest.calls[0]?.messageId})\n`,
     );
   });
+});
+
+test("send gives up on a daemon that never answers, and says the message may still post", async () => {
+  const directory = temp();
+  const socketPath = join(directory, "wedged.sock");
+  // Accepts the connection, then never answers.
+  const held: Socket[] = [];
+  const wedged = createServer((socket) => held.push(socket));
+  await new Promise<void>((resolve) => wedged.listen(socketPath, resolve));
+  // A send that never gives up would hang this file; hanging up on it fails the test instead.
+  const failsafe = setTimeout(() => {
+    for (const socket of held) socket.destroy();
+  }, 5_000);
+  try {
+    const sent = await send(
+      ["--chat", CHANNEL, "anyone?"],
+      { FROND_EAR_SOCKET: socketPath },
+      200,
+    );
+    assert.equal(held.length, 1, "it did connect");
+    assert.equal(sent.code, 1);
+    assert.equal(sent.stdout, "");
+    assert.equal(
+      sent.stderr,
+      "frond-ear send: the daemon did not answer within 200ms; it may still post the message\n",
+    );
+  } finally {
+    clearTimeout(failsafe);
+    for (const socket of held) socket.destroy();
+    wedged.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("send over TCP with an unreadable token file exits 1 with the reason, not a crash", async () => {
+  const directory = temp();
+  try {
+    const sent = await send(["--chat", CHANNEL, "over tcp"], {
+      FROND_EAR_TCP: "127.0.0.1:9",
+      FROND_EAR_TOKEN_FILE: join(directory, "missing-token"),
+    });
+    assert.equal(sent.code, 1);
+    assert.equal(sent.stdout, "");
+    assert.match(
+      sent.stderr,
+      /^frond-ear send: ENOENT: no such file or directory, open '.*missing-token'\n$/u,
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 function run(
