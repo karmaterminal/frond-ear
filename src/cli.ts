@@ -36,6 +36,7 @@ import { EAR_PROTOCOL_VERSION, LineConnection } from "./protocol.ts";
 import { HttpDiscordRest, RecordingRest } from "./rest.ts";
 import type { EarView } from "./rez.ts";
 import { PERMISSION_MODES, rez, settingsPermissionMode } from "./rez.ts";
+import { runSend } from "./send.ts";
 import { listenTcp, listenUnix } from "./server.ts";
 import { ChannelShim, TOOLS } from "./shim.ts";
 import { EventStore } from "./store.ts";
@@ -54,6 +55,8 @@ usage:
   frond-ear daemon [--dry-run]        run the gateway daemon (config: FROND_EAR_CONFIG, default ./frond-ear.json)
   frond-ear shim                      run the Claude Code channel shim (stdio MCP; launched by Claude Code)
   frond-ear status                    print daemon status as JSON
+  frond-ear send --chat <id> <text…>  post text as the daemon's bot, from a script (e.g. an alert); only to
+                                      chats an ear serves; marks nothing seen; exit 0 once Discord confirmed it
   frond-ear copilot-extension --ear <name> [--dir <path>]
                                       install the Copilot CLI extension for an ear
                                       (default dir $COPILOT_HOME/extensions/frond-ear; run copilot --experimental)
@@ -630,6 +633,13 @@ async function main(): Promise<void> {
       process.stdout.write(`${result.text}\n`);
       return;
     }
+    case "send":
+      process.exitCode = await runSend(rest, {
+        stdout: process.stdout,
+        stderr: process.stderr,
+        env: process.env,
+      });
+      return;
     case "inject":
       await runInject(rest);
       return;

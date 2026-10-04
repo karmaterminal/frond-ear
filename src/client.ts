@@ -1,6 +1,6 @@
 // A CLI-side client of the daemon: one request/response exchange over the
-// unix socket (or TCP with the shared token). Shared by `status`, `inject`
-// and `doctor`.
+// unix socket (or TCP with the shared token). Shared by `status`, `inject`,
+// `send` and `doctor`.
 import { readFileSync } from "node:fs";
 import { connect, type Socket } from "node:net";
 
@@ -38,10 +38,19 @@ export function connectToDaemon(env: NodeJS.ProcessEnv): () => Socket {
 
 type WithoutId<M> = M extends { id: number } ? Omit<M, "id"> : never;
 
-/** The requests a CLI client may send: status, inject, and the ear-binding ones. */
+/** The requests a CLI client may send: status, inject, call, and the ear-binding ones. */
 export type CliRequest = WithoutId<
-  Extract<ClientMessage, { type: "status" | "inject" | "bind" | "reentry" }>
+  Extract<
+    ClientMessage,
+    { type: "status" | "inject" | "call" | "bind" | "reentry" }
+  >
 >;
+
+/**
+ * `request` stopped waiting. The daemon may have taken the request and still be
+ * working on it.
+ */
+export class DaemonTimeoutError extends Error {}
 
 /**
  * One request/response exchange with the daemon as a CLI client. With
@@ -54,6 +63,9 @@ export function request(
   timeoutMs?: number,
 ): Promise<{ ok: boolean; text: string }> {
   return new Promise((resolve, reject) => {
+    // Read before connecting: an unreadable token file rejects here instead of
+    // throwing from the socket's connect handler.
+    const token = tcpTarget(env) ? tcpToken(env) : undefined;
     const socket = connectToDaemon(env)();
     let timer: NodeJS.Timeout | undefined;
     const settle = <T>(fn: (value: T) => void) => {
@@ -67,7 +79,11 @@ export function request(
     if (timeoutMs !== undefined) {
       timer = setTimeout(() => {
         socket.destroy();
-        fail(new Error(`the daemon did not answer within ${timeoutMs}ms`));
+        fail(
+          new DaemonTimeoutError(
+            `the daemon did not answer within ${timeoutMs}ms`,
+          ),
+        );
       }, timeoutMs);
     }
     const connection = new LineConnection(
@@ -84,7 +100,6 @@ export function request(
       () => fail(new Error("daemon closed the connection")),
     );
     socket.once("connect", () => {
-      const token = tcpTarget(env) ? tcpToken(env) : undefined;
       connection.send({
         type: "hello",
         role: "cli",
