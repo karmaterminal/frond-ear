@@ -191,10 +191,13 @@ holds an ear.
 
 ## 7. Canticle
 
-Optional, and off: `main` has no `canticle` config key and nothing in `init` or `doctor` touches
-it. The canticle listener (binary-canticle's UDP receptor) is being added in the
-[#27 → #28 → #32 → #34 → #37](https://github.com/karmaterminal/frond-ear/pulls) stack, off by
-default. On a **shared host** (one where frond-ear is not the box's only listener) the ear must
-not bind the receptor itself; it needs the host daemon from
-[binary-canticle#69](https://github.com/karmaterminal/binary-canticle/issues/69), which is not
-built yet. See the binary-canticle repo for the protocol.
+Optional, and off: the daemon builds no canticle source unless its config has a `canticle` block
+with `"enabled": true` (and never under `--dry-run`), and nothing in `init` or `doctor` touches
+it. When on, it is listen-only: nothing heard wakes a session or enters the Discord ledger. An ear
+hears only the `station:stream` pairs its `canticle.tune` lists, and the session reads them with
+the `hear` tool. Where frond-ear is the host's one canticle listener it binds its own
+(`canticle.source: "embedded"`, the default). On a **shared host** (one where another harness,
+such as an OpenClaw prince, also hears canticle) it binds nothing and reads record v1 from
+binary-canticle's host daemon (`"host-daemon"`); the embedded listener refuses to bind while a
+daemon answers. The fields, their defaults and how to check them are in
+[runbook §8](runbook.md#8-hear-binary-canticle-optional).
