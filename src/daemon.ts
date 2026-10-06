@@ -80,6 +80,12 @@ interface Client {
   hello: boolean;
   role: "shim" | "cli" | "tap" | undefined;
   ear: string | undefined;
+  /**
+   * The ear this client last attached as. Unlike `ear`, it stays set once the
+   * client is superseded or its ear removed: its tools still work, and if a
+   * send it makes stays unconfirmed, its ear's next session is told.
+   */
+  attachedAs: string | undefined;
   attachGeneration: number;
   /** Set once the deaf-session warning has been logged for this attachment. */
   deliveryWarned?: boolean;
@@ -620,6 +626,7 @@ export class Daemon {
       hello: false,
       role: undefined,
       ear: undefined,
+      attachedAs: undefined,
       attachGeneration: 0,
       sessionId: undefined,
       pid: undefined,
@@ -846,6 +853,7 @@ export class Daemon {
       : null;
     const record = this.store.attachEar(ear, message.sessionId ?? null, nonce);
     client.ear = ear;
+    client.attachedAs = ear;
     client.attachGeneration = record.generation;
     this.attached.set(ear, client);
     this.logger.log("info", "ear.attached", {
@@ -866,9 +874,11 @@ export class Daemon {
       const digest = renderDigest(unseen);
       client.connection.send({ type: "event", batchId: null, ...digest });
     }
+    // Only sends this ear's sessions made (#49): a script's is no session's and
+    // shows in status alone, and another ear's session's goes to that ear.
     const ambiguous = this.store
       .ambiguousSends(this.sendsInFlight)
-      .filter((send) => this.earForChat(send.chatId) === ear);
+      .filter((send) => send.sessionEar === ear);
     if (ambiguous.length > 0) {
       client.connection.send({
         type: "event",
@@ -1000,6 +1010,8 @@ export class Daemon {
         const text = stringArg(args, "text", true);
         const replyTo = snowflakeArg(args, "reply_to");
         const horizon = this.seenHorizon(client, ear, chatId, args);
+        // Superseded sessions included; null for a script or a tools-only shim.
+        const sessionEar = client.attachedAs ?? null;
         const ids: string[] = [];
         for (const [index, chunk] of chunkMessage(text).entries()) {
           ids.push(
@@ -1008,6 +1020,7 @@ export class Daemon {
               chunk,
               index === 0 ? replyTo : undefined,
               index,
+              sessionEar,
             ),
           );
         }
@@ -1340,13 +1353,16 @@ export class Daemon {
    * is durable before Discord is called; success records the receipt; a
    * definitive 4xx marks it failed; anything else (timeout, lost response,
    * crash) leaves it pending, i.e. ambiguous, and an identical retry reuses
-   * the nonce so Discord de-duplicates it.
+   * the nonce so Discord de-duplicates it. `sessionEar` is the ear whose
+   * session is sending (null for a script): that ear's next attach is told if
+   * the send stays ambiguous.
    */
   private async sendOnce(
     chatId: string,
     content: string,
     replyTo: string | undefined,
     chunkIndex: number,
+    sessionEar: string | null,
   ): Promise<string> {
     const key = createHash("sha256")
       .update(`${chatId}\n${replyTo ?? ""}\n${chunkIndex}\n${content}`)
@@ -1357,6 +1373,7 @@ export class Daemon {
       content,
       randomBytes(10).toString("hex"),
       SEND_DEDUPE_WINDOW_MS,
+      sessionEar,
     );
     this.sendsInFlight.add(intent.nonce);
     try {
