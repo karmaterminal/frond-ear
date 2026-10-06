@@ -23,7 +23,7 @@ import {
   routeFor,
   trustOf,
 } from "./policy.ts";
-import type { ClientMessage, Connection } from "./protocol.ts";
+import type { ClientMessage, Connection, LaunchInfo } from "./protocol.ts";
 import { EAR_PROTOCOL_VERSION } from "./protocol.ts";
 import {
   channelInstructions,
@@ -33,12 +33,13 @@ import {
   renderCanary,
   renderDigest,
   renderEvent,
+  standbyInstructions,
 } from "./render.ts";
 import type { DiscordRest } from "./rest.ts";
 import { chunkMessage, RestError } from "./rest.ts";
+import type { EarBinding, EventStore } from "./store.ts";
 import { renderHear } from "./canticle/hear.ts";
 import type { HearView } from "./canticle/receptor.ts";
-import type { EventStore } from "./store.ts";
 import type {
   BatchKind,
   Clock,
@@ -91,7 +92,37 @@ interface Client {
   deliveryWarned?: boolean;
   sessionId: string | undefined;
   pid: number | undefined;
+  /** The ear a shim asked for, attached or not (a standby shim keeps it). */
+  requestedEar?: string | undefined;
+  cwd?: string | undefined;
+  launch?: LaunchInfo | undefined;
 }
+
+/** What a standby session (one that asked for an ear it does not own) may still call. */
+const READ_ONLY_TOOLS = new Set(["inbox", "fetch_messages", "ear_status"]);
+
+/** Launch info as a client reported it, reduced to well-formed fields. */
+function launchInfo(value: unknown): LaunchInfo | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  const raw = value as Record<string, unknown>;
+  const pid = raw.pid;
+  const channels = raw.channels;
+  const resumed = raw.resumed;
+  return {
+    ...(Number.isInteger(pid) && (pid as number) > 0
+      ? { pid: pid as number }
+      : {}),
+    channels: typeof channels === "boolean" ? channels : null,
+    ...(typeof resumed === "string" && SESSION_ID.test(resumed)
+      ? { resumed }
+      : {}),
+  };
+}
+
+/** Session ids and names as Claude Code prints them; nothing path- or shell-shaped. */
+const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
 
 /** Discord's enforce_nonce window is "a few minutes"; stay inside it. */
 const SEND_DEDUPE_WINDOW_MS = 5 * 60 * 1_000;
@@ -698,10 +729,25 @@ export class Daemon {
         }
         return;
       case "session":
-        if (client.ear && typeof message.sessionId === "string") {
-          client.sessionId = message.sessionId;
-          this.store.updateEarSession(client.ear, message.sessionId);
-        }
+        // Identity is fixed at hello and bound durably; a connection cannot
+        // re-label itself as another session. Rebinding is `bind` (operator) or
+        // a /clear hand-off proven by the Claude process id (`reentry`).
+        return;
+      case "bind":
+        client.connection.send({
+          type: "result",
+          id: message.id,
+          ...this.bindCommand(client, message),
+        });
+        return;
+      case "reentry":
+        client.connection.send({
+          type: "result",
+          id: message.id,
+          ...(client.role === "cli"
+            ? { ok: true, text: this.reentry(message) }
+            : { ok: false, text: "reentry is sent by the SessionStart hook" }),
+        });
         return;
       case "status":
         client.connection.send({
@@ -769,8 +815,9 @@ export class Daemon {
     client: Client,
     message: Extract<ClientMessage, { type: "hello" }>,
   ): void {
-    if (client.role === "tap") {
-      // A tap is read-only for its whole connection; it cannot become a shim.
+    if (client.hello) {
+      // Identity is fixed for a connection's life: a tap cannot become a shim,
+      // and a standby shim cannot re-hello as the ear's owner.
       client.connection.close();
       return;
     }
@@ -795,7 +842,13 @@ export class Daemon {
     client.hello = true;
     client.role = message.role;
     client.pid = message.pid;
-    client.sessionId = message.sessionId;
+    client.sessionId =
+      typeof message.sessionId === "string" &&
+      SESSION_ID.test(message.sessionId)
+        ? message.sessionId
+        : undefined;
+    client.cwd = typeof message.cwd === "string" ? message.cwd : undefined;
+    client.launch = launchInfo(message.launch);
     if (message.role === "tap") {
       const ear = message.ear;
       if (!ear || !this.config.ears[ear]) {
@@ -842,6 +895,86 @@ export class Daemon {
       });
       return;
     }
+    client.requestedEar = ear;
+    const sessionId = client.sessionId;
+    if (!sessionId) {
+      // Without CLAUDE_CODE_SESSION_ID there is no identity to bind, so this is a
+      // stray (a health check, an old client): it serves tools and never takes the ear.
+      this.standby(
+        client,
+        ear,
+        "this shim has no Claude Code session id, so it cannot hold the ear",
+      );
+      return;
+    }
+    let binding = this.store.binding(ear);
+    if (!binding) {
+      binding = this.store.bind(ear, sessionId, client.cwd ?? null, "claim");
+      this.logger.log("info", "ear.bound", { ear, sessionId, source: "claim" });
+    } else if (
+      binding.source === "clear" &&
+      binding.previousSession === sessionId &&
+      binding.claudePid !== null &&
+      client.launch?.pid === binding.claudePid
+    ) {
+      // The owner's own process after /clear: its shim still carries the id it
+      // was started with. Same process, so the same owner.
+      client.sessionId = binding.sessionId;
+    } else if (binding.sessionId !== sessionId) {
+      // Resuming the owner's transcript is being the owner, even if Claude Code
+      // hands the resumed session a new id; but never while the owner is live.
+      const resumedOwner =
+        client.launch?.resumed === binding.sessionId && !this.attached.has(ear);
+      if (!resumedOwner) {
+        this.standby(client, ear, this.standbyReason(ear, binding, sessionId));
+        return;
+      }
+      this.store.bind(ear, sessionId, client.cwd ?? binding.cwd, "resume");
+      this.logger.log("info", "ear.bound", {
+        ear,
+        sessionId,
+        source: "resume",
+        from: binding.sessionId,
+      });
+    } else if (client.cwd && binding.cwd !== client.cwd) {
+      this.store.updateBindingCwd(ear, sessionId, client.cwd);
+    }
+    this.attachClient(client, ear);
+  }
+
+  /** Why a session is not the ear's, and the one command that would change that. */
+  private standbyReason(
+    ear: string,
+    binding: EarBinding,
+    sessionId: string,
+  ): string {
+    const live = this.attached.get(ear) !== undefined;
+    return (
+      `ear "${ear}" belongs to session ${binding.sessionId} (${live ? "live" : "not running"}); ` +
+      "this session serves tools only and hears nothing pushed. To move the ear here on purpose, run: " +
+      `frond-ear bind --ear ${ear} --session ${sessionId}`
+    );
+  }
+
+  private standby(client: Client, ear: string, reason: string): void {
+    this.logger.log("info", "ear.standby", {
+      ear,
+      sessionId: client.sessionId ?? null,
+      boundSession: this.store.binding(ear)?.sessionId ?? null,
+    });
+    client.connection.send({
+      type: "welcome",
+      protocol: EAR_PROTOCOL_VERSION,
+      attached: false,
+      ear,
+      standby: true,
+      instructions: standbyInstructions(ear, reason),
+      error: reason,
+    });
+  }
+
+  /** Attaches a shim whose session owns the ear. The same session re-entering supersedes itself. */
+  private attachClient(client: Client, ear: string): void {
     const previous = this.attached.get(ear);
     if (previous && previous !== client) {
       previous.connection.send({ type: "detached", reason: "superseded" });
@@ -851,15 +984,17 @@ export class Daemon {
     const nonce = this.config.ears[ear]?.attachCanary
       ? (this.options.nonce ?? (() => randomBytes(6).toString("hex")))()
       : null;
-    const record = this.store.attachEar(ear, message.sessionId ?? null, nonce);
+    const record = this.store.attachEar(ear, client.sessionId ?? null, nonce);
     client.ear = ear;
     client.attachedAs = ear;
     client.attachGeneration = record.generation;
+    client.deliveryWarned = false;
     this.attached.set(ear, client);
     this.logger.log("info", "ear.attached", {
       ear,
       generation: record.generation,
-      sessionId: message.sessionId ?? null,
+      sessionId: client.sessionId ?? null,
+      channels: client.launch?.channels ?? null,
     });
     client.connection.send({
       type: "welcome",
@@ -1004,6 +1139,22 @@ export class Daemon {
     tool: string,
     args: Record<string, unknown>,
   ): Promise<string> {
+    const requested = client.requestedEar;
+    if (requested && client.ear !== requested && !READ_ONLY_TOOLS.has(tool)) {
+      // A session that asked for an ear it does not own must not speak, react
+      // or set attention as that ear. Reading stays open to it.
+      const binding = this.store.binding(requested);
+      if (binding && binding.sessionId === client.sessionId) {
+        throw new Error(
+          `refused: this connection was superseded by a newer one from the same session; ear "${requested}" is attached there`,
+        );
+      }
+      throw new Error(
+        binding && client.sessionId
+          ? `refused: ${this.standbyReason(requested, binding, client.sessionId)}`
+          : `refused: ear "${requested}" is not attached to this session`,
+      );
+    }
     switch (tool) {
       case "reply": {
         const { chatId, ear } = this.requireChat(args);
@@ -1463,9 +1614,26 @@ export class Daemon {
     if (record.registered) {
       return { delivery: "confirmed" };
     }
+    // The shim read the Claude command line: no channel flag means deaf, now,
+    // without waiting out the canary grace period.
+    const launchedDeaf = client.launch?.channels === false;
     const attachedAt = record.attachedAt ?? this.clock.now();
-    if (this.clock.now() - attachedAt < DELIVERY_CONFIRM_GRACE_MS) {
+    if (
+      !launchedDeaf &&
+      this.clock.now() - attachedAt < DELIVERY_CONFIRM_GRACE_MS
+    ) {
       return { delivery: "pending" };
+    }
+    if (launchedDeaf) {
+      return {
+        delivery: "unconfirmed",
+        hint:
+          "this Claude session was launched without frond-ear's channel flag, so it is not " +
+          "receiving pushed Discord events (tools still work). Claude Code reads channel flags " +
+          "only at launch. " +
+          this.relaunchHint(name, client.sessionId ?? record.sessionId) +
+          " Until then, read new messages with inbox.",
+      };
     }
     // The fix depends on what kind of session this is (#39): the same advice doctor gives.
     const advice = targetAdvice(
@@ -1487,6 +1655,17 @@ export class Daemon {
           : "") +
         " Until then, read new messages with inbox.",
     };
+  }
+
+  /** The one supervised command that brings an ear's session back hearing. */
+  private relaunchHint(ear: string, sessionId: string | null): string {
+    const binding = this.store.binding(ear);
+    const id = sessionId ?? binding?.sessionId ?? "<session-id>";
+    const where = binding?.cwd ? `cd ${binding.cwd} && ` : "";
+    return (
+      `Exit this session, then run: frond-ear rez --ear ${ear} ` +
+      `(or by hand: ${where}claude --resume ${id} --dangerously-load-development-channels server:frond-ear).`
+    );
   }
 
   /**
@@ -1526,6 +1705,15 @@ export class Daemon {
   }
 
   private withDeliveryWarning(client: Client, text: string): string {
+    const requested = client.requestedEar;
+    if (requested && client.ear !== requested && client.role === "shim") {
+      const binding = this.store.binding(requested);
+      const reason =
+        binding && client.sessionId
+          ? this.standbyReason(requested, binding, client.sessionId)
+          : `ear "${requested}" is not attached to this session; it serves tools only`;
+      return `${text}\n\nℹ️ frond-ear: ${reason}`;
+    }
     const state = client.ear ? this.delivery(client.ear) : undefined;
     if (state?.delivery !== "unconfirmed") {
       return text;
@@ -1535,6 +1723,168 @@ export class Daemon {
       this.logger.log("warn", "ear.delivery_unconfirmed", { ear: client.ear });
     }
     return `${text}\n\n⚠️ frond-ear: ${state.hint}`;
+  }
+
+  // ---- binding ------------------------------------------------------------------------
+
+  /**
+   * Operator-driven, explicit change of an ear's owner. Binding moves the ear to
+   * a session (attaching it at once if that session's shim is already here in
+   * standby); releasing leaves it unbound until the next session claims it.
+   */
+  private bindCommand(
+    client: Client,
+    message: Extract<ClientMessage, { type: "bind" }>,
+  ): { ok: boolean; text: string } {
+    if (client.role !== "cli") {
+      return {
+        ok: false,
+        text: "bind is an operator command (frond-ear bind)",
+      };
+    }
+    const ear = message.ear;
+    if (!this.config.ears[ear]) {
+      return { ok: false, text: `unknown ear ${JSON.stringify(ear)}` };
+    }
+    const current = this.attached.get(ear);
+    if (message.sessionId === null) {
+      this.store.unbind(ear);
+      if (current) {
+        current.connection.send({ type: "detached", reason: "released" });
+        this.detach(current);
+      }
+      this.logger.log("info", "ear.released", { ear });
+      return {
+        ok: true,
+        text: `ear ${ear} released; the next Claude session that attaches to it claims it`,
+      };
+    }
+    const sessionId = message.sessionId;
+    if (!SESSION_ID.test(sessionId)) {
+      return {
+        ok: false,
+        text: `not a session id: ${JSON.stringify(sessionId)}`,
+      };
+    }
+    const waiting = [...this.clients]
+      .filter(
+        (other) =>
+          other.role === "shim" &&
+          other.requestedEar === ear &&
+          other.sessionId === sessionId,
+      )
+      .at(-1);
+    this.store.bind(
+      ear,
+      sessionId,
+      message.cwd ??
+        waiting?.cwd ??
+        (current?.sessionId === sessionId ? (current.cwd ?? null) : null),
+      "operator",
+    );
+    this.logger.log("info", "ear.bound", {
+      ear,
+      sessionId,
+      source: "operator",
+    });
+    if (current && current.sessionId !== sessionId) {
+      current.connection.send({
+        type: "detached",
+        reason: `rebound to session ${sessionId}`,
+      });
+      this.detach(current);
+    }
+    if (current?.sessionId === sessionId) {
+      return {
+        ok: true,
+        text: `ear ${ear} is bound to ${sessionId} (already attached)`,
+      };
+    }
+    if (waiting) {
+      this.attachClient(waiting, ear);
+      return {
+        ok: true,
+        text: `ear ${ear} bound to ${sessionId} and attached`,
+      };
+    }
+    return {
+      ok: true,
+      text: `ear ${ear} bound to ${sessionId}; it attaches when that session's shim connects`,
+    };
+  }
+
+  /**
+   * A SessionStart hook reporting a (re-)entry. Returns context for the session,
+   * or "" when frond-ear has nothing to say to it. /clear starts a new session id
+   * inside the same Claude process; when the hook's Claude pid matches the pid the
+   * attached shim reported, the binding follows it, since it is provably the same process.
+   */
+  private reentry(
+    message: Extract<ClientMessage, { type: "reentry" }>,
+  ): string {
+    const sessionId = message.sessionId;
+    if (!SESSION_ID.test(sessionId)) {
+      return "";
+    }
+    const lines: string[] = [];
+    const pid = message.launch?.pid;
+    if (message.source === "clear" && pid !== undefined) {
+      for (const [ear, client] of this.attached) {
+        const previous = client.sessionId;
+        if (client.launch?.pid === pid && previous && previous !== sessionId) {
+          this.store.bind(ear, sessionId, client.cwd ?? null, "clear", {
+            claudePid: pid,
+            previousSession: previous,
+          });
+          client.sessionId = sessionId;
+          this.logger.log("info", "ear.bound", {
+            ear,
+            sessionId,
+            source: "clear",
+          });
+          lines.push(
+            `frond-ear: /clear started session ${sessionId}; ear "${ear}" moved with it.`,
+          );
+        }
+      }
+    }
+    for (const ear of Object.keys(this.config.ears)) {
+      const binding = this.store.binding(ear);
+      if (binding?.sessionId === sessionId) {
+        lines.push(this.ownerNotice(ear, message));
+      } else if (message.ear === ear) {
+        lines.push(
+          binding
+            ? `frond-ear: ${this.standbyReason(ear, binding, sessionId)}`
+            : `frond-ear: ear "${ear}" is unbound; this session claims it when its shim attaches.`,
+        );
+      }
+    }
+    return lines.join("\n");
+  }
+
+  private ownerNotice(
+    ear: string,
+    message: Extract<ClientMessage, { type: "reentry" }>,
+  ): string {
+    const unseen = this.store.stateCounts(ear);
+    const waiting =
+      (unseen.queued ?? 0) + (unseen.offered ?? 0) + (unseen.stored ?? 0);
+    const held =
+      waiting > 0
+        ? ` ${waiting} Discord message(s) are waiting; call inbox to read them.`
+        : "";
+    if (message.launch?.channels === false) {
+      return (
+        `⚠️ frond-ear: this session owns ear "${ear}" but was launched without its channel flag, ` +
+        `so it will NOT hear Discord pushes. ${this.relaunchHint(ear, message.sessionId)}${held}`
+      );
+    }
+    const compacted =
+      message.source === "compact"
+        ? " Earlier channel events were compacted; inbox lists anything you have not acted on."
+        : "";
+    return `frond-ear: this session owns ear "${ear}" (${message.source}); Discord events arrive as <channel> events.${compacted}${held}`;
   }
 
   // ---- status --------------------------------------------------------------------------
@@ -1554,7 +1904,13 @@ export class Daemon {
           taps: this.taps.get(name)?.size ?? 0,
           generation: record?.generation ?? 0,
           sessionId: client?.sessionId ?? record?.sessionId ?? null,
+          binding: this.store.binding(name) ?? null,
+          standby: [...this.clients].filter(
+            (other) => other.requestedEar === name && other.ear !== name,
+          ).length,
           shimPid: client?.pid ?? null,
+          claudePid: client?.launch?.pid ?? null,
+          launchedWithChannel: client?.launch?.channels ?? null,
           channels: Object.fromEntries(
             Object.entries(ear.channels).map(([id, channel]) => [
               id,

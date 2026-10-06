@@ -4,7 +4,7 @@
 import type { Socket } from "node:net";
 import type { Readable, Writable } from "node:stream";
 
-import type { DaemonMessage } from "./protocol.ts";
+import type { DaemonMessage, LaunchInfo } from "./protocol.ts";
 import { EAR_PROTOCOL_VERSION, LineConnection } from "./protocol.ts";
 import { channelInstructions } from "./render.ts";
 
@@ -199,6 +199,10 @@ export interface ShimOptions {
   connect: () => Socket;
   ear?: string | undefined;
   sessionId?: string | undefined;
+  /** The Claude process's working directory, recorded so re-entry can resume there. */
+  cwd?: string | undefined;
+  /** Whether the Claude process that launched this shim enabled its channel. */
+  launch?: LaunchInfo | undefined;
   token?: string | undefined;
   log?: (line: string) => void;
   reconnectMs?: number;
@@ -280,6 +284,8 @@ export class ChannelShim {
         ...(this.options.sessionId
           ? { sessionId: this.options.sessionId }
           : {}),
+        ...(this.options.cwd ? { cwd: this.options.cwd } : {}),
+        ...(this.options.launch ? { launch: this.options.launch } : {}),
         ...(this.options.token ? { token: this.options.token } : {}),
       });
     });
@@ -317,6 +323,16 @@ export class ChannelShim {
         }
         for (const resolve of this.welcomeWaiters.splice(0)) {
           resolve();
+        }
+        if (message.standby && message.error) {
+          // Said once per connection, so a session that expected to be the ear
+          // learns at once that it is not, rather than from silence.
+          this.handleDaemonMessage({
+            type: "event",
+            batchId: null,
+            content: `frond-ear: ${message.error}`,
+            meta: { kind: "standby", ear: message.ear ?? "" },
+          });
         }
         return;
       case "event":

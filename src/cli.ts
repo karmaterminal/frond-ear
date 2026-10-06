@@ -1,9 +1,12 @@
 #!/usr/bin/env node
+import { spawnSync } from "node:child_process";
 import {
   chmodSync,
   copyFileSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
+  readlinkSync,
   watch,
   writeFileSync,
 } from "node:fs";
@@ -24,12 +27,15 @@ import {
 } from "./canticle/source.ts";
 import { Manifest } from "./canticle/manifest.ts";
 import { Daemon } from "./daemon.ts";
+import { detectOwnLaunch, procReader, serverName } from "./launch.ts";
 import { DiscordGateway } from "./gateway.ts";
 import { StructuredLogger } from "./logger.ts";
 import { runDoctor, runInit } from "./onboard.ts";
 import type { DaemonMessage } from "./protocol.ts";
 import { EAR_PROTOCOL_VERSION, LineConnection } from "./protocol.ts";
 import { HttpDiscordRest, RecordingRest } from "./rest.ts";
+import type { EarView } from "./rez.ts";
+import { PERMISSION_MODES, rez, settingsPermissionMode } from "./rez.ts";
 import { runSend } from "./send.ts";
 import { listenTcp, listenUnix } from "./server.ts";
 import { ChannelShim, TOOLS } from "./shim.ts";
@@ -55,6 +61,15 @@ usage:
                                       install the Copilot CLI extension for an ear
                                       (default dir $COPILOT_HOME/extensions/frond-ear; run copilot --experimental)
   frond-ear tap --ear <name>          stream the batches pushed to an ear's attached session (read-only;\n                                      wakes a session without channel push; a shim must be attached)
+  frond-ear bind --ear <name> [--session <id>] [--cwd <dir>] | --release
+                                      move an ear to a session on purpose (default session: the
+                                      CLAUDE_CODE_SESSION_ID of the calling session), or unbind it
+  frond-ear rez --ear <name> [--tmux <name>] [--timeout <s>] [--no-confirm] [--permission-mode <m>]
+                [--launcher <path>]
+                                      resume the ear's bound session, hearing, in tmux; no-op if live
+                                      (permission mode default: permissions.defaultMode from its settings;
+                                      --launcher: a seat's script, run in place of claude with its args)
+  frond-ear hook session-start        SessionStart hook: tells a (re-)entering session where it stands
   frond-ear inject --chat <id> --author <id> [--guild <id>] [--name <n>] [--bot] [--mention] <text…>
                                       push a synthetic MESSAGE_CREATE (dry-run or FROND_EAR_ALLOW_INJECT=1)
 
@@ -62,7 +77,11 @@ environment:
   FROND_EAR_SOCKET        daemon socket (default $XDG_RUNTIME_DIR/frond-ear/daemon.sock)
   FROND_EAR_TCP           host:port — connect/listen over TCP instead (requires FROND_EAR_TOKEN_FILE)
   FROND_EAR_TOKEN_FILE    shared secret for TCP mode
-  FROND_EAR_EAR           (shim) the ear this Claude session attaches to; unset = tools only
+  FROND_EAR_EAR           (shim) the ear this Claude session attaches to if it owns it; unset = tools only
+  FROND_EAR_INSTANCE      name of one of several daemons for this user (changes default paths)
+  FROND_EAR_SERVER_NAME   name frond-ear is registered under in Claude Code (default frond-ear)
+  CLAUDE_BIN              (rez) absolute path to claude (default: claude on PATH)
+  FROND_EAR_LAUNCH_DETECT off = do not read the Claude command line (the canary alone decides)
   FROND_EAR_DATABASE      SQLite path (default $XDG_STATE_HOME/frond-ear/frond-ear.db)
   DISCORD_BOT_TOKEN_FILE  bot token file (or DISCORD_BOT_TOKEN)
 `;
@@ -212,16 +231,31 @@ async function runDaemon(argv: string[]): Promise<void> {
 
 function runShim(): void {
   const env = process.env;
+  const launch = detectOwnLaunch(env);
   const shim = new ChannelShim({
     input: process.stdin,
     output: process.stdout,
     connect: connectToDaemon(env),
     ear: env.FROND_EAR_EAR || undefined,
     sessionId: env.CLAUDE_CODE_SESSION_ID || undefined,
+    cwd: claudeCwd(launch.pid) ?? process.cwd(),
+    launch,
     token: tcpTarget(env) ? tcpToken(env) : undefined,
   });
   shim.start();
   process.stdin.on("end", () => process.exit(0));
+}
+
+/** The Claude process's working directory (Linux), which is where --resume must run. */
+function claudeCwd(pid: number | undefined): string | undefined {
+  if (pid === undefined) {
+    return undefined;
+  }
+  try {
+    return readlinkSync(`/proc/${pid}/cwd`);
+  } catch {
+    return undefined;
+  }
 }
 
 async function runInject(argv: string[]): Promise<void> {
@@ -358,6 +392,160 @@ function runTap(argv: string[]): void {
   connect();
 }
 
+function flag(argv: string[], name: string): string | undefined {
+  const index = argv.indexOf(name);
+  return index >= 0 ? argv[index + 1] : undefined;
+}
+
+async function runBind(argv: string[]): Promise<void> {
+  const ear = flag(argv, "--ear") ?? process.env.FROND_EAR_EAR;
+  if (!ear) {
+    throw new Error("bind needs --ear <name>");
+  }
+  const release = argv.includes("--release");
+  const sessionId =
+    flag(argv, "--session") ?? process.env.CLAUDE_CODE_SESSION_ID;
+  if (!release && !sessionId) {
+    throw new Error(
+      "bind needs --session <id> (or run it from inside the Claude session to bind), or --release",
+    );
+  }
+  const cwd = flag(argv, "--cwd");
+  const result = await request({
+    type: "bind",
+    ear,
+    sessionId: release ? null : (sessionId as string),
+    ...(cwd ? { cwd } : {}),
+  });
+  process.stdout.write(`${result.text}\n`);
+  process.exitCode = result.ok ? 0 : 1;
+}
+
+/**
+ * SessionStart hook. Claude Code runs it on startup, resume, /clear and
+ * compaction, which are exactly the moments a session can come back deaf or as
+ * the wrong owner, so it is the one place that reaches a session that cannot
+ * hear pushes. It never blocks the session: any failure prints nothing.
+ */
+async function runHook(argv: string[]): Promise<void> {
+  if (argv[0] !== "session-start") {
+    throw new Error("usage: frond-ear hook session-start");
+  }
+  const env = process.env;
+  let input: { session_id?: unknown; source?: unknown } = {};
+  try {
+    input = JSON.parse(readFileSync(0, "utf8")) as typeof input;
+  } catch {
+    return;
+  }
+  if (typeof input.session_id !== "string") {
+    return;
+  }
+  let text = "";
+  try {
+    // A hook must never hold a session's startup hostage to a wedged daemon.
+    const timeout = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("timeout")), 5_000).unref(),
+    );
+    const result = await Promise.race([
+      timeout,
+      request({
+        type: "reentry",
+        sessionId: input.session_id,
+        source: typeof input.source === "string" ? input.source : "startup",
+        ...(env.FROND_EAR_EAR ? { ear: env.FROND_EAR_EAR } : {}),
+        launch: detectOwnLaunch(env),
+      }),
+    ]);
+    text = result.text;
+  } catch {
+    text = env.FROND_EAR_EAR
+      ? `⚠️ frond-ear: the daemon is not reachable, so ear "${env.FROND_EAR_EAR}" is not delivering Discord events to anyone. Check: systemctl --user status frond-ear`
+      : "";
+  }
+  if (text) {
+    process.stdout.write(
+      `${JSON.stringify({ hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: text } })}\n`,
+    );
+  }
+}
+
+function listProcesses(): Array<{ pid: number; argv: string[] }> {
+  let entries: string[];
+  try {
+    entries = readdirSync("/proc");
+  } catch {
+    return [];
+  }
+  return entries
+    .filter((entry) => /^\d+$/u.test(entry))
+    .map((entry) => ({
+      pid: Number(entry),
+      argv: procReader.argv(Number(entry)) ?? [],
+    }));
+}
+
+async function runRez(argv: string[]): Promise<void> {
+  const env = process.env;
+  const ear = flag(argv, "--ear") ?? env.FROND_EAR_EAR;
+  if (!ear) {
+    throw new Error("rez needs --ear <name>");
+  }
+  const timeout = Number(flag(argv, "--timeout") ?? "90");
+  const permissionMode = flag(argv, "--permission-mode");
+  if (
+    permissionMode !== undefined &&
+    !PERMISSION_MODES.includes(permissionMode)
+  ) {
+    throw new Error(
+      `--permission-mode must be one of: ${PERMISSION_MODES.join(", ")}`,
+    );
+  }
+  const launcher = flag(argv, "--launcher") ?? env.FROND_EAR_REZ_LAUNCHER;
+  const configDir = env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
+  const result = await rez(
+    {
+      ear,
+      tmuxSession: flag(argv, "--tmux") ?? `frond-${ear}`,
+      claudeBin: env.CLAUDE_BIN || "claude",
+      serverName: serverName(env),
+      timeoutMs:
+        (Number.isFinite(timeout) && timeout > 0 ? timeout : 90) * 1_000,
+      confirmChannelPrompt: !argv.includes("--no-confirm"),
+      ...(permissionMode ? { permissionMode } : {}),
+      ...(launcher ? { launcher } : {}),
+    },
+    {
+      ear: async (name) => {
+        const status = await request({ type: "status" });
+        const parsed = JSON.parse(status.text) as { ears: EarView[] };
+        return parsed.ears.find((view) => view.name === name);
+      },
+      run: (command, args) => {
+        const child = spawnSync(command, args, { encoding: "utf8" });
+        return {
+          code: child.status ?? 1,
+          stdout: `${child.stdout ?? ""}${child.stderr ?? ""}${child.error ? child.error.message : ""}`,
+        };
+      },
+      processes: listProcesses,
+      sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+      now: () => Date.now(),
+      log: (line) => process.stderr.write(`frond-ear rez: ${line}\n`),
+      settingsPermissionMode: (cwd) =>
+        settingsPermissionMode(cwd, configDir, (path) => {
+          try {
+            return readFileSync(path, "utf8");
+          } catch {
+            return undefined;
+          }
+        }),
+    },
+  );
+  process.stdout.write(`${result.message}\n`);
+  process.exitCode = result.code;
+}
+
 /**
  * Installs the Copilot CLI extension (copilot-extension/) for one ear: the two .mjs files
  * plus a config.json carrying the daemon address and the shim's own TOOLS, so the Claude
@@ -457,6 +645,15 @@ async function main(): Promise<void> {
       return;
     case "tap":
       runTap(rest);
+      return;
+    case "bind":
+      await runBind(rest);
+      return;
+    case "hook":
+      await runHook(rest);
+      return;
+    case "rez":
+      await runRez(rest);
       return;
     case "copilot-extension":
       runCopilotExtension(rest);

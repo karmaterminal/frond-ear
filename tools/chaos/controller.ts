@@ -346,6 +346,7 @@ class Supervisor {
       FROND_EAR_CONFIG: this.config,
       FROND_EAR_DATABASE: this.database,
       FROND_EAR_SOCKET: this.socket,
+      FROND_EAR_LAUNCH_DETECT: "off",
       DISCORD_BOT_TOKEN: "fixture-token",
       DISCORD_GATEWAY_URL: `ws://127.0.0.1:${this.port}/gateway`,
       DISCORD_API_BASE: `http://127.0.0.1:${this.port}/api/v10`,

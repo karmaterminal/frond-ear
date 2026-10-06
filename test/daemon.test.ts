@@ -165,7 +165,7 @@ test("an unconfirmed batch reverts when the shim drops and is redelivered to the
   }
 });
 
-test("takeover detaches the old shim; offered-but-unseen work becomes one digest, not a replay", async () => {
+test("re-entry by the same session detaches its old shim; offered-but-unseen work becomes one digest, not a replay", async () => {
   const h = harness();
   try {
     const first = h.attach("scribe", { sessionId: "session-a" });
@@ -180,7 +180,8 @@ test("takeover detaches the old shim; offered-but-unseen work becomes one digest
     const batch = first.connection.events()[0];
     await first.send({ type: "offered", batchId: batch?.batchId as number });
 
-    const second = h.attach("scribe", { sessionId: "session-b" });
+    // The same session coming back (resume, crash, /mcp reconnect): a new shim.
+    const second = h.attach("scribe", { sessionId: "session-a" });
     assert.deepEqual(first.connection.received.at(-1), {
       type: "detached",
       reason: "superseded",
@@ -193,7 +194,8 @@ test("takeover detaches the old shim; offered-but-unseen work becomes one digest
     assert.doesNotMatch(digest?.content ?? "", /secret plan/u);
     // The superseded shim can no longer mark anything seen.
     const stale = await h.call(first, "ack", {});
-    assert.match(stale.text, /^0 events/u);
+    assert.equal(stale.ok, false);
+    assert.match(stale.text, /^refused: this connection was superseded/u);
     const inbox = await h.call(second, "inbox", {});
     assert.match(inbox.text, /first secret plan/u);
     assert.match(inbox.text, /1 marked seen/u);
@@ -251,7 +253,8 @@ test("delivery: an unacked canary on a claude-channel ear is reported as deaf, w
   });
   const h = harness(config, { nonce: "c0ffee", env: {} });
   try {
-    // No session id reported: the relaunch still resumes, with a placeholder.
+    // The attached session's own id goes into the relaunch (#21: a shim
+    // without one cannot claim the ear).
     const shim = h.attach("scribe");
     assert.equal(delivery(h).delivery, "pending");
 
@@ -265,18 +268,19 @@ test("delivery: an unacked canary on a claude-channel ear is reported as deaf, w
     assert.match(hint, /act on a pushed batch_id exactly as .* \(N-<token>\)/u);
     assert.ok(
       hint.includes(
-        "If no <channel> events arrive at all: Claude Code delivers channel events only to a session launched with the development-channel flag: claude --resume <session-id> --dangerously-load-development-channels server:frond-ear.",
+        "If no <channel> events arrive at all: Claude Code delivers channel events only to a session launched with the development-channel flag: claude --resume session-test --dangerously-load-development-channels server:frond-ear.",
       ),
       hint,
     );
     assert.doesNotMatch(hint, COPILOT_ADVICE);
     const deaf = await h.call(shim, "inbox", { chat_id: CHANNEL });
     assert.ok(deaf.text.endsWith(`\n\n⚠️ frond-ear: ${hint}`), deaf.text);
-    // Once the shim reports its session id, the relaunch names it.
+    // Identity is fixed at hello (#21): a later session message cannot relabel
+    // the connection, so the relaunch still names the session that attached.
     await shim.send({ type: "session", sessionId: "session-b" });
     assert.match(
       delivery(h).hint ?? "",
-      / claude --resume session-b --dangerously-load-development-channels server:frond-ear\. /u,
+      / claude --resume session-test --dangerously-load-development-channels server:frond-ear\. /u,
     );
 
     assert.equal((await h.call(shim, "ack", { nonce: "c0ffee" })).ok, true);

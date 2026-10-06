@@ -126,6 +126,13 @@ Claude Code asks you to confirm the development-channel flag. Then:
 
 Record the results in the live checklist on karmaterminal/frond-ear#6.
 
+The throwaway session now **owns** the ear (`docs/reentry.md`). Release it before §5, so
+frond-scribe can claim it:
+
+```sh
+node src/cli.ts bind --ear frond-scribe --release
+```
+
 ## 3. Let the tools run unattended
 
 A long-running session stalls on permission prompts. Allow frond-ear's tools in that project's `.claude/settings.local.json`, or in `~/.claude/settings.json`:
@@ -152,16 +159,48 @@ Check that `node src/cli.ts status` shows `"gateway": {"state": "connected"}`. T
 
 ## 5. Attach frond-scribe
 
-Only one Claude session should claim an ear. In frond-scribe's working directory, run:
+An ear belongs to one Claude **session**, by its session id, not to whichever process attached
+last (`docs/reentry.md`). That makes it safe to register frond-ear once, at **user** scope, so it
+works from any directory:
 
 ```sh
-claude mcp add -s local frond-ear -e FROND_EAR_EAR=frond-scribe -- node /abs/path/to/frond-ear/src/cli.ts shim
+claude mcp add -s user frond-ear -e FROND_EAR_EAR=frond-scribe -- node /abs/path/to/frond-ear/src/cli.ts shim
 claude --resume <frond-scribe session id> --dangerously-load-development-channels server:frond-ear
 ```
 
-- **Why `--resume`:** it keeps the session's full history. The development-channel flag only has to be present when the process launches.
-- **Takeover:** if another session attaches to the same ear, the newer one takes over and the older one is told it has been detached.
-- **Missed messages:** anything that arrived while the ear was detached is delivered when it reattaches. Anything that was delivered but never acted on arrives as a single digest, not a replay.
+- **Who owns the ear:** the first session to attach claims it, and keeps it across resumes,
+  crashes, daemon restarts and reboots. Any other session — a second terminal, a `-p` run, a
+  subagent — gets the tools and a standby notice, and never hears pushes.
+- **Moving it on purpose:** `node src/cli.ts bind --ear frond-scribe --session <id>`. Run it
+  from inside the new session (without `--session`) to move the ear there. `--release` unbinds it.
+- **Why `--resume`:** it keeps the session's full history. The development-channel flag only has
+  to be present when the process launches; `rez` (§7) adds it for you.
+- **Missed messages:** anything that arrived while the ear was detached is delivered when it
+  reattaches. Anything that was delivered but never acted on arrives as a single digest, not a replay.
+
+Add the re-entry hook to `~/.claude/settings.json`, so that every start, resume, `/clear` and
+compaction tells the session where it stands — including the one thing a deaf session cannot
+otherwise learn, that it is deaf:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "FROND_EAR_EAR=frond-scribe node /abs/path/to/frond-ear/src/cli.ts hook session-start"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The hook prints nothing for sessions that have nothing to do with the ear, and never blocks a
+session for more than 5 seconds.
 
 ## 6. Operating
 
@@ -204,6 +243,33 @@ ops/install-systemd.sh
 It writes a `--user` unit pointing at this checkout, enables it, and waits for the gateway to
 report `connected` before claiming success. Lingering must be on (`loginctl enable-linger $USER`)
 or user units will not start until someone logs in — the script warns if it is off.
+
+To have the **session** come back too, install supervised re-entry for its ear:
+
+```sh
+ops/install-rez.sh frond-scribe
+```
+
+It installs `frond-ear-rez-frond-scribe.service` and a timer that runs it at boot and every five
+minutes. Each run is `frond-ear rez --ear frond-scribe`: a no-op while the bound session is live;
+otherwise it resumes that session with the channel flag in tmux session `frond-frond-scribe` and
+waits for the ear to attach. `--resume` does not re-apply `permissions.defaultMode`, so `rez`
+passes the mode your settings name as `--permission-mode` (override with `frond-ear rez
+--permission-mode <mode>`); with no mode in settings it passes none. It refuses, and says why in
+the journal, rather than start a second copy. `tmux attach -t frond-frond-scribe` to look at it;
+`systemctl --user disable --now frond-ear-rez-frond-scribe.timer` to stop resurrecting it.
+
+A seat that runs Claude with its own `CLAUDE_CONFIG_DIR`, env file or flags must resume through
+the same environment, or `--resume` looks for the session under the wrong config and logs in as
+someone else. Either export `CLAUDE_CONFIG_DIR` when running `ops/install-rez.sh` (it is written
+into the unit), or pass `--launcher /abs/path/to/launch.sh`: `rez` then runs that script in place
+of `claude`, with `claude`'s arguments, so it must end in `exec claude "$@"`. `--permission-mode
+<mode>` is written into the unit too, for a seat whose settings `rez` cannot read.
+
+A second bot on the same seat is a second instance, with its own unit, config directory, database
+and socket: `FROND_EAR_INSTANCE=gloss ops/install-systemd.sh`, then
+`FROND_EAR_INSTANCE=gloss ops/install-rez.sh frond-gloss`. Register its shim with
+`-e FROND_EAR_INSTANCE=gloss` too, so it finds the right daemon.
 
 The SQLite state lives outside the checkout, so a restart keeps everything the ear is holding for
 a detached session. `docs/recovery.md` covers the rest: what is durable, what you have to back up
@@ -257,12 +323,14 @@ status supersedes the older one.
 
 Start with `node src/cli.ts doctor`, with `FROND_EAR_CONFIG` and `DISCORD_BOT_TOKEN_FILE` set to what the daemon uses (§1): it checks config, token, socket, daemon, gateway and each ear, and prints a fix line for every ✗.
 
-| Symptom                                       | Likely cause                                                                                                                                                                                                      |
-| --------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `registered: false`, no events in the session | Claude Code was started without `--dangerously-load-development-channels server:frond-ear`; or org policy blocks channels; or `MCP_PROTOCOL_NEGOTIATION=auto` on the v2 runtime (unset it or set it to `legacy`). |
-| `registered: false` on a Copilot ear          | The extension is not installed for that ear, or Copilot was started without `--experimental`. If the ear is attached, look in the Copilot session for `frond-ear: could not deliver batch` (a refused push).      |
-| Copilot tools are stale after an upgrade      | The install copies the tool schemas: an old one lacks newer tools, or (before #30) takes a numeric `batch_id`. Re-run `node src/cli.ts copilot-extension --ear <name>` with the daemon's socket or TCP env (§1).  |
-| Shim reports "daemon is not reachable"        | The daemon isn't running, or the shim's `FROND_EAR_SOCKET` doesn't match the daemon's.                                                                                                                            |
-| Daemon exits with close code 4014             | Message Content Intent is not enabled for the bot.                                                                                                                                                                |
-| Daemon exits with close code 4004             | The bot token is wrong.                                                                                                                                                                                           |
-| Every session claims the ear                  | `FROND_EAR_EAR` was set in a user-scope MCP config. Use `local` or project scope for the one session that owns the ear.                                                                                           |
+| Symptom                                         | Likely cause                                                                                                                                                                                                      |
+| ----------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `registered: false`, no events in the session   | Claude Code was started without `--dangerously-load-development-channels server:frond-ear`; or org policy blocks channels; or `MCP_PROTOCOL_NEGOTIATION=auto` on the v2 runtime (unset it or set it to `legacy`). |
+| `registered: false` on a Copilot ear            | The extension is not installed for that ear, or Copilot was started without `--experimental`. If the ear is attached, look in the Copilot session for `frond-ear: could not deliver batch` (a refused push).      |
+| Copilot tools are stale after an upgrade        | The install copies the tool schemas: an old one lacks newer tools, or (before #30) takes a numeric `batch_id`. Re-run `node src/cli.ts copilot-extension --ear <name>` with the daemon's socket or TCP env (§1).  |
+| Shim reports "daemon is not reachable"          | The daemon isn't running, or the shim's `FROND_EAR_SOCKET` doesn't match the daemon's.                                                                                                                            |
+| Daemon exits with close code 4014               | Message Content Intent is not enabled for the bot.                                                                                                                                                                |
+| Daemon exits with close code 4004               | The bot token is wrong.                                                                                                                                                                                           |
+| A session gets a "standby" notice               | The ear is bound to another session (`status` shows `binding`). Intended? `frond-ear bind --ear <ear>` from inside this session.                                                                                  |
+| `delivery: "unconfirmed"` right after attach    | The shim read the Claude command line and found no channel flag. Exit the session and run `frond-ear rez --ear <ear>`.                                                                                            |
+| `rez` refuses: "already running … not attached" | The bound session is running somewhere without a working shim (wrong `FROND_EAR_INSTANCE`, or a stuck process). Find it by the pid given, and exit it.                                                            |

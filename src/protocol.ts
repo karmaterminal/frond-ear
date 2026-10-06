@@ -12,6 +12,10 @@ export type ClientMessage =
       ear?: string;
       pid?: number;
       sessionId?: string;
+      /** The Claude process's working directory, so re-entry can resume there. */
+      cwd?: string;
+      /** What the shim could learn about the Claude process that launched it. */
+      launch?: LaunchInfo;
       client?: { name: string; version: string };
       token?: string;
     }
@@ -19,7 +23,37 @@ export type ClientMessage =
   | { type: "call"; id: number; tool: string; args: Record<string, unknown> }
   | { type: "status"; id: number }
   | { type: "inject"; id: number; message: unknown }
-  | { type: "session"; sessionId: string; source?: string };
+  | { type: "session"; sessionId: string; source?: string }
+  /** Operator: bind an ear to a session, or release it (sessionId null). */
+  | {
+      type: "bind";
+      id: number;
+      ear: string;
+      sessionId: string | null;
+      cwd?: string;
+    }
+  /** A SessionStart hook reporting a (re-)entry: startup, resume, clear, compact. */
+  | {
+      type: "reentry";
+      id: number;
+      sessionId: string;
+      source: string;
+      ear?: string;
+      launch?: LaunchInfo;
+    };
+
+export interface LaunchInfo {
+  /** The Claude Code process, when it could be found. */
+  pid?: number;
+  /**
+   * Whether that process was launched with a channel entry for this server
+   * (`--dangerously-load-development-channels server:frond-ear` or `--channels`).
+   * null when the command line could not be read.
+   */
+  channels: boolean | null;
+  /** The session id the process was started to resume (`--resume <id>`), if any. */
+  resumed?: string;
+}
 
 /** Messages from the daemon to a client. */
 export type DaemonMessage =
@@ -29,6 +63,8 @@ export type DaemonMessage =
       attached: boolean;
       ear?: string;
       generation?: number;
+      /** The ear belongs to another session; this one serves tools only. */
+      standby?: boolean;
       instructions: string;
       error?: string;
     }

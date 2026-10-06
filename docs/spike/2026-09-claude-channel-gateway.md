@@ -150,7 +150,7 @@ Claude Code TUI (its own login) ──stdio──▶ frond-ear shim (MCP, hand-r
 - **Ears.** An **ear** is a named delivery target, for example `frond-scribe`. It is typed with `target: "claude-channel"`, and `"copilot-sdk"` and `"claude-monitor"` are reserved for later.
 - **Channel ownership.** Discord channels and DMs are bound to exactly one ear, each with a mode.
 - **Claiming an ear.** A shim claims an ear only when `FROND_EAR_EAR=<name>` is set. Otherwise it serves tools only, because a user-scope MCP server is launched in *every* Claude Code session.
-- **Takeover.** Each ear has one attached shim. The newest shim takes over, and the attach generation is fenced, so offers made to an older attach never count as delivered to the new one.
+- **Takeover.** Each ear has one attached shim. The newest shim takes over, and the attach generation is fenced, so offers made to an older attach never count as delivered to the new one. _Superseded by #21: the ear is now bound to a session identity, and only the owner's own shims take over from each other; see `docs/reentry.md`._
 
 ### 4.2 Delivery modes
 

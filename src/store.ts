@@ -66,6 +66,28 @@ export interface EarRecord {
   canaryNonce: string | null;
 }
 
+/**
+ * Which Claude Code session owns an ear. Durable: it survives daemon restarts
+ * and reboots, so re-entry (resume, reconnect, crash) finds the same owner and a
+ * stray session never inherits the ear by attaching first.
+ */
+export interface EarBinding {
+  ear: string;
+  sessionId: string;
+  /** The session's working directory, which `claude --resume` needs. */
+  cwd: string | null;
+  /** How it was made: first claim, operator bind, a /clear hand-off, or a resume under a new id. */
+  source: "claim" | "operator" | "clear" | "resume";
+  boundAt: number;
+  /**
+   * For a /clear hand-off: the Claude process and the id it had before. That
+   * process's shim still carries the old id in its environment, so a reconnect
+   * from it (same pid, old id) is recognised as the owner.
+   */
+  claudePid: number | null;
+  previousSession: string | null;
+}
+
 export interface Batch {
   id: number;
   ear: string;
@@ -208,6 +230,15 @@ export class EventStore {
       CREATE TABLE IF NOT EXISTS counters (
         name TEXT PRIMARY KEY,
         value INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS bindings (
+        ear TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        cwd TEXT,
+        source TEXT NOT NULL,
+        bound_at INTEGER NOT NULL,
+        claude_pid INTEGER,
+        previous_session TEXT
       );
       CREATE TABLE IF NOT EXISTS runtime_state (
         name TEXT PRIMARY KEY,
@@ -1098,10 +1129,76 @@ export class EventStore {
       : undefined;
   }
 
-  public updateEarSession(name: string, sessionId: string): void {
+  // ---- bindings -----------------------------------------------------------------
+
+  public binding(ear: string): EarBinding | undefined {
+    const row = this.database
+      .prepare(
+        "SELECT ear, session_id, cwd, source, bound_at, claude_pid, previous_session FROM bindings WHERE ear = ?",
+      )
+      .get(ear) as
+      | {
+          ear: string;
+          session_id: string;
+          cwd: string | null;
+          source: EarBinding["source"];
+          bound_at: number;
+          claude_pid: number | null;
+          previous_session: string | null;
+        }
+      | undefined;
+    return row
+      ? {
+          ear: row.ear,
+          sessionId: row.session_id,
+          cwd: row.cwd,
+          source: row.source,
+          boundAt: row.bound_at,
+          claudePid: row.claude_pid,
+          previousSession: row.previous_session,
+        }
+      : undefined;
+  }
+
+  public bind(
+    ear: string,
+    sessionId: string,
+    cwd: string | null,
+    source: EarBinding["source"],
+    handoff?: { claudePid: number; previousSession: string },
+  ): EarBinding {
     this.database
-      .prepare("UPDATE ears SET session_id = ? WHERE name = ?")
-      .run(sessionId, name);
+      .prepare(
+        `INSERT INTO bindings (ear, session_id, cwd, source, bound_at, claude_pid, previous_session)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(ear) DO UPDATE SET session_id = excluded.session_id,
+           cwd = excluded.cwd, source = excluded.source, bound_at = excluded.bound_at,
+           claude_pid = excluded.claude_pid, previous_session = excluded.previous_session`,
+      )
+      .run(
+        ear,
+        sessionId,
+        cwd,
+        source,
+        this.clock.now(),
+        handoff?.claudePid ?? null,
+        handoff?.previousSession ?? null,
+      );
+    return this.binding(ear) as EarBinding;
+  }
+
+  /** Records the bound session's working directory once its shim reports it. */
+  public updateBindingCwd(ear: string, sessionId: string, cwd: string): void {
+    this.database
+      .prepare("UPDATE bindings SET cwd = ? WHERE ear = ? AND session_id = ?")
+      .run(cwd, ear, sessionId);
+  }
+
+  public unbind(ear: string): boolean {
+    return (
+      this.database.prepare("DELETE FROM bindings WHERE ear = ?").run(ear)
+        .changes === 1
+    );
   }
 
   /** Was batch `id` offered (pushed) to this ear in this attach generation? */

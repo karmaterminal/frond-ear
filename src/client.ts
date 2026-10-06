@@ -5,9 +5,8 @@ import { readFileSync } from "node:fs";
 import { connect, type Socket } from "node:net";
 
 import { defaultSocketPath } from "./config.ts";
-import type { DaemonMessage } from "./protocol.ts";
+import type { ClientMessage, DaemonMessage } from "./protocol.ts";
 import { EAR_PROTOCOL_VERSION, LineConnection } from "./protocol.ts";
-import type { DiscordMessage } from "./types.ts";
 
 export function tcpTarget(
   env: NodeJS.ProcessEnv,
@@ -37,10 +36,15 @@ export function connectToDaemon(env: NodeJS.ProcessEnv): () => Socket {
     : () => connect(defaultSocketPath(env));
 }
 
-export type CliRequest =
-  | { type: "status" }
-  | { type: "inject"; message: DiscordMessage }
-  | { type: "call"; tool: string; args: Record<string, unknown> };
+type WithoutId<M> = M extends { id: number } ? Omit<M, "id"> : never;
+
+/** The requests a CLI client may send: status, inject, call, and the ear-binding ones. */
+export type CliRequest = WithoutId<
+  Extract<
+    ClientMessage,
+    { type: "status" | "inject" | "call" | "bind" | "reentry" }
+  >
+>;
 
 /**
  * `request` stopped waiting. The daemon may have taken the request and still be

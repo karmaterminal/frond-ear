@@ -491,16 +491,43 @@ export function defaultSocketPath(
   const base = env.XDG_RUNTIME_DIR
     ? join(env.XDG_RUNTIME_DIR, "frond-ear")
     : join(homedir(), ".frond-ear");
-  return join(base, "daemon.sock");
+  const instance = instanceName(env);
+  return join(base, instance ? `${instance}.sock` : "daemon.sock");
+}
+
+/**
+ * FROND_EAR_INSTANCE names one of several daemons run by the same Unix user
+ * (one per bot). It only changes defaults: socket, database and config paths.
+ * Unset keeps the single-daemon paths unchanged.
+ */
+export function instanceName(env: NodeJS.ProcessEnv): string | undefined {
+  const value = env.FROND_EAR_INSTANCE;
+  if (!value) {
+    return undefined;
+  }
+  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/u.test(value)) {
+    throw new Error(
+      "FROND_EAR_INSTANCE must be lowercase letters, digits, - or _",
+    );
+  }
+  return value;
 }
 
 /**
  * The config path the daemon loads: FROND_EAR_CONFIG, else `frond-ear.json` relative to its
- * working directory. No fallback to ~/.config/frond-ear. `doctor` resolves through this too,
+ * working directory (or, under FROND_EAR_INSTANCE, ~/.config/frond-ear/<instance>/). `doctor` resolves through this too,
  * so the two cannot drift.
  */
 export function daemonConfigPath(env: NodeJS.ProcessEnv): string {
-  return env.FROND_EAR_CONFIG ?? "frond-ear.json";
+  if (env.FROND_EAR_CONFIG) {
+    return env.FROND_EAR_CONFIG;
+  }
+  const instance = instanceName(env);
+  if (!instance) {
+    return "frond-ear.json";
+  }
+  const configHome = env.XDG_CONFIG_HOME ?? join(homedir(), ".config");
+  return join(configHome, "frond-ear", instance, "frond-ear.json");
 }
 
 export function runtimeOptions(
@@ -509,12 +536,19 @@ export function runtimeOptions(
 ): RuntimeOptions {
   const stateHome = env.XDG_STATE_HOME ?? join(homedir(), ".local", "state");
   const dryRun = flags.dryRun || env.FROND_EAR_DRY_RUN === "1";
+  const instance = instanceName(env);
   return {
     configPath: daemonConfigPath(env),
     databasePath:
-      env.FROND_EAR_DATABASE ?? join(stateHome, "frond-ear", "frond-ear.db"),
+      env.FROND_EAR_DATABASE ??
+      join(stateHome, "frond-ear", `${instance ?? "frond-ear"}.db`),
     attachmentsPath:
-      env.FROND_EAR_ATTACHMENTS ?? join(stateHome, "frond-ear", "attachments"),
+      env.FROND_EAR_ATTACHMENTS ??
+      join(
+        stateHome,
+        "frond-ear",
+        instance ? `${instance}-attachments` : "attachments",
+      ),
     socketPath: defaultSocketPath(env),
     gatewayUrl: env.DISCORD_GATEWAY_URL ?? "wss://gateway.discord.gg",
     apiBase: env.DISCORD_API_BASE ?? "https://discord.com/api/v10",
