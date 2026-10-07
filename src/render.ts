@@ -180,13 +180,21 @@ export function renderDigest(
 }
 
 export function renderAmbiguousSends(
-  sends: Array<{ chatId: string; preview: string }>,
+  sends: Array<{
+    chatId: string;
+    preview: string;
+    part: number | null;
+    parts: number | null;
+  }>,
 ): Notification {
   const list = sends
-    .map((send) => `chat ${send.chatId}: "${cleanName(send.preview)}"`)
+    .map(
+      (send) =>
+        `chat ${send.chatId}: ${send.part !== null && send.parts !== null && send.parts > 1 ? `part ${send.part + 1} of ${send.parts}, ` : ""}"${cleanName(send.preview)}"`,
+    )
     .join("; ");
   return {
-    content: `frond-ear could not confirm that ${sends.length} earlier repl${sends.length === 1 ? "y" : "ies"} reached Discord (${list}); the daemon stopped or the response was lost after the send began. Check with fetch_messages before re-sending. Re-sending the identical text within 5 minutes is de-duplicated by Discord.`,
+    content: `frond-ear could not confirm that ${sends.length} earlier repl${sends.length === 1 ? "y" : "ies"} reached Discord (${list}); the daemon stopped or the response was lost after the send began. Check with fetch_messages before re-sending. Re-sending a whole reply, with the identical text and reply_to, within 5 minutes of its unconfirmed send posts only what did not go out: frond-ear skips the parts Discord confirmed and reuses the unconfirmed part's nonce, so Discord de-duplicates it. A later re-send posts every part again.`,
     meta: { kind: "send_check", count: String(sends.length) },
   };
 }

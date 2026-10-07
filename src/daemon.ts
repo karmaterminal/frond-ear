@@ -38,7 +38,7 @@ import type { DiscordRest } from "./rest.ts";
 import { chunkMessage, RestError } from "./rest.ts";
 import { renderHear } from "./canticle/hear.ts";
 import type { HearView } from "./canticle/receptor.ts";
-import type { EventStore } from "./store.ts";
+import type { EventStore, ReplyPart } from "./store.ts";
 import type {
   BatchKind,
   Clock,
@@ -229,6 +229,84 @@ function displayName(message: DiscordMessage): string {
     message.author.username ??
     message.author.id
   );
+}
+
+/** Discord never answered a send, so whether it posted is unknown. */
+class UnconfirmedSendError extends Error {}
+
+/** Part numbers `first` to `last`; empty when `last` is before `first`. */
+function partRange(first: number, last: number): number[] {
+  return Array.from(
+    { length: Math.max(0, last - first + 1) },
+    (_, index) => first + index,
+  );
+}
+
+/** Parts numbered from 1, ascending: "part 2", "parts 1 and 2", "parts 1 to 3". */
+function partNames(numbers: readonly number[]): string {
+  const [first, ...rest] = numbers;
+  const last = rest.at(-1);
+  if (first === undefined || last === undefined) {
+    return `part ${first}`;
+  }
+  if (rest.length > 1 && last - first === rest.length) {
+    return `parts ${first} to ${last}`;
+  }
+  return `parts ${[first, ...rest.slice(0, -1)].join(", ")} and ${last}`;
+}
+
+/** "Part 1 was sent", "Parts 2 and 3 were not posted". */
+function partsWere(numbers: readonly number[], what: string): string {
+  const names = partNames(numbers);
+  return `${names.charAt(0).toUpperCase()}${names.slice(1)} ${numbers.length === 1 ? "was" : "were"} ${what}`;
+}
+
+/**
+ * The error a reply ends with when one of its parts fails. For a reply of
+ * several parts it names the parts already sent, with their ids, and those not
+ * sent, and says what an identical retry within the reuse window does (#55).
+ */
+function replyFailure(
+  error: unknown,
+  reply: ReplyPart,
+  replyTo: string | undefined,
+  sentIds: readonly string[],
+): Error {
+  const retry = `Retrying the identical text${replyTo ? " and reply_to" : ""} within ${SEND_DEDUPE_WINDOW_MS / 60_000} minutes`;
+  if (reply.parts === 1) {
+    if (error instanceof UnconfirmedSendError) {
+      return new Error(
+        `Discord did not confirm this send (${error.message}). The message may already have been posted. ` +
+          `${retry} is safe: frond-ear reuses the same nonce, so Discord returns the original instead of posting twice.`,
+      );
+    }
+    return error instanceof Error ? error : new Error(String(error));
+  }
+  const failed = reply.part + 1;
+  const sent = partRange(1, failed - 1);
+  const sentClause =
+    sent.length === 0
+      ? ""
+      : `${partsWere(sent, "sent")} (id${sent.length === 1 ? "" : "s"} ${sentIds.join(", ")}). `;
+  if (error instanceof UnconfirmedSendError) {
+    const unsent = partRange(failed + 1, reply.parts);
+    return new Error(
+      `Discord did not confirm part ${failed} of ${reply.parts} (${error.message}); it may already have been posted. ` +
+        sentClause +
+        (unsent.length === 0 ? "" : `${partsWere(unsent, "not sent")}. `) +
+        `${retry} is safe: frond-ear ${sent.length === 0 ? "" : `does not post ${partNames(sent)} again and `}` +
+        `reuses part ${failed}'s nonce, so Discord returns the original instead of posting it twice.`,
+    );
+  }
+  const text =
+    `${error instanceof Error ? error.message : String(error)} (part ${failed} of ${reply.parts}). ` +
+    (sent.length === 0
+      ? "Nothing was posted."
+      : `${sentClause}${partsWere(partRange(failed, reply.parts), "not posted")}. ` +
+        `${retry} does not post ${partNames(sent)} again.`);
+  return error instanceof RestError
+    ? new RestError(error.status, error.code, text)
+    : new Error(text);
 }
 
 export class Daemon {
@@ -1012,23 +1090,21 @@ export class Daemon {
         const horizon = this.seenHorizon(client, ear, chatId, args);
         // Superseded sessions included; null for a script or a tools-only shim.
         const sessionEar = client.attachedAs ?? null;
-        const ids: string[] = [];
-        for (const [index, chunk] of chunkMessage(text).entries()) {
-          ids.push(
-            await this.sendOnce(
-              chatId,
-              chunk,
-              index === 0 ? replyTo : undefined,
-              index,
-              sessionEar,
-            ),
-          );
-        }
+        const { ids, earlier } = await this.sendReply(
+          chatId,
+          text,
+          replyTo,
+          sessionEar,
+        );
         this.markSeenThrough(client, ear, chatId, horizon);
         this.store.increment("replies_sent");
+        const resumed =
+          earlier.length === 0
+            ? ""
+            : `; ${partNames(earlier.map((index) => index + 1))} had gone out on an earlier try and ${earlier.length === 1 ? "was" : "were"} not posted again`;
         return this.withDeliveryWarning(
           client,
-          `sent ${ids.length} message${ids.length === 1 ? "" : "s"} to ${chatId} (id${ids.length === 1 ? "" : "s"} ${ids.join(", ")})`,
+          `sent ${ids.length} message${ids.length === 1 ? "" : "s"} to ${chatId} (id${ids.length === 1 ? "" : "s"} ${ids.join(", ")})${resumed}`,
         );
       }
       case "react": {
@@ -1349,23 +1425,73 @@ export class Daemon {
   }
 
   /**
+   * Sends a reply as one Discord message per chunk, and returns their ids. An
+   * identical retry of a reply that did not finish resumes it (#55): `earlier`
+   * lists the parts Discord had already confirmed, which are not posted again,
+   * and an unconfirmed part reuses its nonce. When a part fails, the error says
+   * which parts went out.
+   */
+  private async sendReply(
+    chatId: string,
+    text: string,
+    replyTo: string | undefined,
+    sessionEar: string | null,
+  ): Promise<{ ids: string[]; earlier: number[] }> {
+    const chunks = chunkMessage(text);
+    const key = createHash("sha256")
+      .update(`${chatId}\n${replyTo ?? ""}\n${text}`)
+      .digest("hex");
+    const id = this.store.resumeReply(
+      key,
+      chunks.length,
+      SEND_DEDUPE_WINDOW_MS,
+      randomBytes(10).toString("hex"),
+    );
+    const ids: string[] = [];
+    const earlier: number[] = [];
+    for (const [index, chunk] of chunks.entries()) {
+      const reply = { key, id, part: index, parts: chunks.length };
+      const sent = this.store.sentPart(reply);
+      if (sent) {
+        ids.push(sent);
+        earlier.push(index);
+        continue;
+      }
+      try {
+        ids.push(
+          await this.sendOnce(
+            chatId,
+            chunk,
+            index === 0 ? replyTo : undefined,
+            sessionEar,
+            reply,
+          ),
+        );
+      } catch (error) {
+        throw replyFailure(error, reply, replyTo, ids);
+      }
+    }
+    return { ids, earlier };
+  }
+
+  /**
    * One Discord send with a write-ahead intent. The intent (with its nonce)
    * is durable before Discord is called; success records the receipt; a
    * definitive 4xx marks it failed; anything else (timeout, lost response,
-   * crash) leaves it pending, i.e. ambiguous, and an identical retry reuses
-   * the nonce so Discord de-duplicates it. `sessionEar` is the ear whose
-   * session is sending (null for a script): that ear's next attach is told if
-   * the send stays ambiguous.
+   * crash) leaves it pending, i.e. ambiguous, and an identical retry of the
+   * reply reuses the nonce so Discord de-duplicates it. `sessionEar` is the
+   * ear whose session is sending (null for a script): that ear's next attach
+   * is told if the send stays ambiguous.
    */
   private async sendOnce(
     chatId: string,
     content: string,
     replyTo: string | undefined,
-    chunkIndex: number,
     sessionEar: string | null,
+    reply: ReplyPart,
   ): Promise<string> {
     const key = createHash("sha256")
-      .update(`${chatId}\n${replyTo ?? ""}\n${chunkIndex}\n${content}`)
+      .update(`${chatId}\n${replyTo ?? ""}\n${reply.part}\n${content}`)
       .digest("hex");
     const intent = this.store.beginSend(
       key,
@@ -1374,6 +1500,7 @@ export class Daemon {
       randomBytes(10).toString("hex"),
       SEND_DEDUPE_WINDOW_MS,
       sessionEar,
+      reply,
     );
     this.sendsInFlight.add(intent.nonce);
     try {
@@ -1402,11 +1529,8 @@ export class Daemon {
         }
         throw error;
       }
-      const reason = error instanceof Error ? error.message : String(error);
-      throw new Error(
-        `Discord did not confirm this send (${reason}). The message may already have been posted. ` +
-          `Retrying the identical text within ${SEND_DEDUPE_WINDOW_MS / 60_000} minutes is safe: ` +
-          `frond-ear reuses the same nonce, so Discord returns the original instead of posting twice.`,
+      throw new UnconfirmedSendError(
+        error instanceof Error ? error.message : String(error),
       );
     } finally {
       this.sendsInFlight.delete(intent.nonce);
