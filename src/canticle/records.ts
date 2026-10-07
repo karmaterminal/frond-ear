@@ -31,6 +31,10 @@
 // host socket reports `joined_late` until a complete snapshot or a new run.
 // Every map here has a fixed bound (§14.18.2 "nothing in the pipe is unbounded").
 // Framing: at most 64 KiB per line and nesting depth 8 (§14.18.2 [PROPOSED DEFAULT]).
+// Status outlives a reconnect (frond-ear#59): `hello` clears receive health, so `counts`
+// (the process's life) counts every health reason each time it is raised, and
+// `lastFailure` keeps the latest connection's first failure. `snapshotFrames` counts
+// this connection's join snapshot; `counts.snapshot_frames` adds them up.
 
 import type { HearView, LiveItem } from "./receptor.ts";
 import { MAX_CLAMP_TTL_S } from "./wire.ts";
@@ -166,11 +170,31 @@ function rootOf(lineage: Json | undefined): string | undefined {
   return undefined;
 }
 
+/** The failure `lastFailure` keeps: its reason, when, and the run the binding held. */
+export interface FailureRecord {
+  reason: string;
+  at: number;
+  run: string | null;
+}
+
 export class RecordConsumer {
   health: ReceiveHealth = "starting";
   healthReasons: string[] = [];
-  /** Counters for the binding's own status: malformed, unknown types, gaps, … */
+  /**
+   * Counters for the binding's own status over the process's life: malformed records,
+   * unknown types, and each health reason every time it is raised (frond-ear#59).
+   */
   readonly counts: Record<string, number> = {};
+  /**
+   * The first failure of the latest connection that failed (frond-ear#59). A later
+   * failure on that connection, such as the close after a `fatal`, is its consequence
+   * and doesn't replace it. `hello` clears receive health, never this.
+   */
+  lastFailure: FailureRecord | null = null;
+  /** This connection (or run) has failed already. */
+  #failedHere = false;
+  /** A line arrived since the last close: a close that follows none reports nothing. */
+  #receiving = false;
   run: string | undefined;
   #lastSeq: number | undefined;
   /**
@@ -196,44 +220,47 @@ export class RecordConsumer {
   #snapBytes = 0;
   /** A truncated snapshot's `omitted`, for status and `hear`. */
   snapshotOmitted: number | undefined;
+  /** How many frames this connection's join snapshot applied, once it has (frond-ear#59). */
+  snapshotFrames: number | undefined;
   mute: { until: number | null; by: string | null } | null = null;
   lastDatagramAt: number | undefined;
   noDatagrams = false;
   readonly presence = new Map<string, string>();
   readonly #live = new Map<string, LiveRecord>();
 
-  #count(name: string): void {
-    this.counts[name] = (this.counts[name] ?? 0) + 1;
+  #count(name: string, n = 1): void {
+    this.counts[name] = (this.counts[name] ?? 0) + n;
   }
 
   /** One line from the transport. Never throws. */
   feedLine(line: string, nowMs: number): void {
     if (Buffer.byteLength(line) > MAX_LINE_BYTES) {
-      this.dropLine("line_too_long");
+      this.dropLine("line_too_long", nowMs);
       return;
     }
     if (line.trim() === "") return;
     if (jsonDepth(line) > MAX_DEPTH) {
-      this.dropLine("depth_exceeded");
+      this.dropLine("depth_exceeded", nowMs);
       return;
     }
     let rec: unknown;
     try {
       rec = JSON.parse(line);
     } catch {
-      this.dropLine("malformed_record");
+      this.dropLine("malformed_record", nowMs);
       return;
     }
     this.feed(rec, nowMs);
   }
 
   /** A line the transport couldn't read as a record. In a bootstrap it loses the connection. */
-  dropLine(reason: string): void {
+  dropLine(reason: string, nowMs: number): void {
+    this.#receiving = true;
     this.#count(reason);
     if (this.#conn === "hello" || this.#conn === "landing")
-      this.#badBootstrap();
+      this.#badBootstrap(nowMs);
     // A line lost mid-snapshot is an entry lost: the snapshot can't be applied.
-    else if (this.snapshotState === "open") this.#badSnapshot();
+    else if (this.snapshotState === "open") this.#badSnapshot(nowMs);
   }
 
   /** The bootstrap or the join snapshot was malformed: the transport must drop this connection. */
@@ -248,6 +275,7 @@ export class RecordConsumer {
     ) {
       return; // delivery stopped for good on an unknown major version
     }
+    this.#receiving = true;
     if (this.#conn === "lost") return;
     if (
       !isObj(rec) ||
@@ -256,19 +284,20 @@ export class RecordConsumer {
       !int(rec.rec_seq) ||
       !str(rec.run)
     ) {
-      this.dropLine("malformed_record");
+      this.dropLine("malformed_record", nowMs);
       return;
     }
     if (rec.v !== RECORD_V) {
       if (rec.v.startsWith("canticle-receptor-record/")) {
-        this.#fail("record_version");
+        this.#fail("record_version", nowMs);
         this.#live.clear();
-      } else this.dropLine("malformed_record");
+      } else this.dropLine("malformed_record", nowMs);
       return;
     }
     if (this.#conn === "hello" || this.#conn === "landing") {
       this.#bootstrap(
         rec as Obj & { type: string; rec_seq: number; run: string },
+        nowMs,
       );
       return;
     }
@@ -282,7 +311,7 @@ export class RecordConsumer {
     if (this.snapshotState === "open") {
       // Live records above W queue behind the snapshot (§14.18.3 "The cut"): one
       // between its entries means the snapshot is not what the daemon cut.
-      this.#badSnapshot("snapshot_interrupted");
+      this.#badSnapshot(nowMs, "snapshot_interrupted");
       return;
     }
     if (this.#conn === "join") {
@@ -348,7 +377,8 @@ export class RecordConsumer {
           Array.isArray(rec.reasons) && rec.reasons.includes("no_datagrams");
         return;
       case "fatal":
-        this.#fail(reasonToken(rec.reason));
+        // The reason is the sender's: it counts as `fatal`, never as a key of its own.
+        this.#fail(reasonToken(rec.reason), nowMs, "fatal");
         return;
       case "bye":
         // A clean end: the run's items stop being deliverable now, not at local
@@ -370,10 +400,13 @@ export class RecordConsumer {
    * this connection's baseline. Anything else is `malformed_record`: the connection
    * is lost.
    */
-  #bootstrap(rec: Obj & { type: string; rec_seq: number; run: string }): void {
+  #bootstrap(
+    rec: Obj & { type: string; rec_seq: number; run: string },
+    nowMs: number,
+  ): void {
     if (this.#conn === "hello") {
       if (rec.type !== "hello")
-        return this.#badBootstrap("bootstrap_not_hello");
+        return this.#badBootstrap(nowMs, "bootstrap_not_hello");
       // A rejoin only if the binding already held records from this run.
       this.#rejoin = rec.run === this.run;
       if (!this.#rejoin) this.#beginRun(rec.run);
@@ -395,13 +428,13 @@ export class RecordConsumer {
       return;
     }
     if (rec.type !== "landing_state")
-      return this.#badBootstrap("bootstrap_not_landing_state");
+      return this.#badBootstrap(nowMs, "bootstrap_not_landing_state");
     if (rec.run !== this.run)
-      return this.#badBootstrap("bootstrap_run_mismatch");
+      return this.#badBootstrap(nowMs, "bootstrap_run_mismatch");
     if (rec.rec_seq <= this.#helloSeq)
-      return this.#badBootstrap("bootstrap_seq_order");
+      return this.#badBootstrap(nowMs, "bootstrap_seq_order");
     if (!this.#landing(rec))
-      return this.#badBootstrap("bootstrap_landing_state_fields");
+      return this.#badBootstrap(nowMs, "bootstrap_landing_state_fields");
     this.#lastSeq = rec.rec_seq;
     this.#conn = "join";
   }
@@ -424,18 +457,20 @@ export class RecordConsumer {
       this.#count("snapshot_unsolicited");
       return;
     }
-    if (!this.#snapAsked) return this.#badSnapshot("snapshot_unsolicited");
+    if (!this.#snapAsked)
+      return this.#badSnapshot(nowMs, "snapshot_unsolicited");
     if (this.#conn !== "join" && this.#conn !== "live")
-      return this.#badSnapshot("snapshot_before_bootstrap");
+      return this.#badSnapshot(nowMs, "snapshot_before_bootstrap");
     if (this.snapshotState === "complete" || this.snapshotState === "truncated")
-      return this.#badSnapshot("snapshot_after_end");
-    if (rec.run !== this.run) return this.#badSnapshot("snapshot_run_mismatch");
+      return this.#badSnapshot(nowMs, "snapshot_after_end");
+    if (rec.run !== this.run)
+      return this.#badSnapshot(nowMs, "snapshot_run_mismatch");
     if (this.#snapW === undefined) {
       if (rec.rec_seq < this.#lastSeq!)
-        return this.#badSnapshot("snapshot_watermark_behind");
+        return this.#badSnapshot(nowMs, "snapshot_watermark_behind");
       this.#snapW = rec.rec_seq;
     } else if (rec.rec_seq !== this.#snapW) {
-      return this.#badSnapshot("snapshot_watermark_changed");
+      return this.#badSnapshot(nowMs, "snapshot_watermark_changed");
     }
     if (this.#conn === "join") {
       // §14.18.3 step 2 for a snapshot that comes first: the step from the baseline
@@ -446,15 +481,16 @@ export class RecordConsumer {
     if (rec.type === "snapshot") {
       this.snapshotState = "open";
       if (rec.snap_seq !== this.#snapHeld.length + 1)
-        return this.#badSnapshot("snapshot_seq");
+        return this.#badSnapshot(nowMs, "snapshot_seq");
       this.#snapBytes += Buffer.byteLength(JSON.stringify(rec.entry ?? null));
       if (
         this.#snapHeld.length >= MAX_SNAPSHOT_ENTRIES ||
         this.#snapBytes > MAX_SNAPSHOT_BYTES
       )
-        return this.#badSnapshot("snapshot_over_cap");
+        return this.#badSnapshot(nowMs, "snapshot_over_cap");
       const entry = this.#snapshotEntry(rec, nowMs);
-      if (entry === undefined) return this.#badSnapshot("snapshot_entry");
+      if (entry === undefined)
+        return this.#badSnapshot(nowMs, "snapshot_entry");
       this.#snapHeld.push(entry);
       return;
     }
@@ -465,7 +501,7 @@ export class RecordConsumer {
       typeof rec.truncated !== "boolean" ||
       (rec.truncated && !(int(rec.omitted) && rec.omitted >= 0))
     )
-      return this.#badSnapshot("snapshot_end_mismatch");
+      return this.#badSnapshot(nowMs, "snapshot_end_mismatch");
     this.#applySnapshot(rec.truncated, nowMs);
     this.snapshotOmitted = rec.truncated ? (rec.omitted as number) : undefined;
     this.#lastSeq = this.#snapW; // ordinary rules from W + 1
@@ -499,7 +535,6 @@ export class RecordConsumer {
     const parsed = this.#parseFrame(fields, nowMs);
     if (parsed === "malformed") return undefined;
     if (parsed === undefined) return { kind: "skip" };
-    this.#count("snapshot_frames");
     return { kind: "frame", live: parsed };
   }
 
@@ -521,17 +556,22 @@ export class RecordConsumer {
       this.#live.clear();
       this.presence.clear();
     }
+    let frames = 0;
     for (const entry of held) {
-      if (entry.kind === "frame") this.#hold(entry.live, nowMs);
-      else if (entry.kind === "presence")
+      if (entry.kind === "frame") {
+        frames++;
+        this.#hold(entry.live, nowMs);
+      } else if (entry.kind === "presence")
         this.#setPresence(entry.name, entry.state);
     }
+    this.snapshotFrames = frames;
+    if (frames > 0) this.#count("snapshot_frames", frames);
     // Truncated: what the snapshot left out stays held, and is shown again.
     for (const r of this.#live.values()) delete r.carried;
   }
 
   /** The snapshot can't be trusted: discard it and lose the connection. */
-  #badSnapshot(reason?: string): void {
+  #badSnapshot(nowMs: number, reason?: string): void {
     if (reason !== undefined) {
       this.#count("malformed_record");
       this.#count(reason);
@@ -540,11 +580,11 @@ export class RecordConsumer {
     this.#snapBytes = 0;
     this.#conn = "lost";
     this.#landingSeen = false;
-    this.#fail("malformed_snapshot");
+    this.#fail("malformed_snapshot", nowMs);
   }
 
   /** `reason`: what the bootstrap record got wrong (unset: the line was already counted). */
-  #badBootstrap(reason?: string): void {
+  #badBootstrap(nowMs: number, reason?: string): void {
     if (reason !== undefined) {
       this.#count("malformed_record");
       this.#count(reason);
@@ -552,7 +592,7 @@ export class RecordConsumer {
     this.#conn = "lost";
     this.#live.clear();
     this.#landingSeen = false;
-    this.#fail("malformed_bootstrap");
+    this.#fail("malformed_bootstrap", nowMs);
   }
 
   /** A `landing_state`'s fields; false (nothing applied) when malformed. */
@@ -584,6 +624,7 @@ export class RecordConsumer {
     this.run = run;
     this.#lastSeq = undefined;
     this.#byeSeen = false;
+    this.#failedHere = false;
   }
 
   /**
@@ -592,7 +633,6 @@ export class RecordConsumer {
    * snapshot, which already hides it until it is confirmed.
    */
   #lose(clear = true): void {
-    this.#count("records_lost");
     this.#degrade("records_lost");
     if (clear) this.#live.clear();
   }
@@ -758,11 +798,17 @@ export class RecordConsumer {
   #degrade(reason: string): void {
     if (this.health !== "failed") this.health = "degraded";
     this.#reason(reason);
+    this.#count(reason);
   }
 
-  #fail(reason: string): void {
+  /** `counter`: the count to raise, when `reason` is the sender's (a `fatal`'s). */
+  #fail(reason: string, nowMs: number, counter = reason): void {
     this.health = "failed";
     this.#reason(reason);
+    this.#count(counter);
+    if (!this.#failedHere)
+      this.lastFailure = { reason, at: nowMs, run: this.run ?? null };
+    this.#failedHere = true;
   }
 
   /** One reason no longer holds; a degraded receive with none left is ok again. */
@@ -784,12 +830,16 @@ export class RecordConsumer {
   }
 
   /** The transport closed: a run that ended without `bye` is a failed receive. */
-  closed(): void {
+  closed(nowMs: number): void {
     // An interrupted snapshot is never authoritative: nothing held is applied.
     this.#snapHeld = [];
     this.#snapBytes = 0;
+    // A reconnect attempt that never opened, or carried nothing, ends no run: a
+    // crash counts once, however many attempts the restart takes.
+    if (!this.#receiving) return;
+    this.#receiving = false;
     if (!this.#byeSeen && this.run !== undefined)
-      this.#fail("exit_without_bye");
+      this.#fail("exit_without_bye", nowMs);
   }
 
   /**
@@ -805,9 +855,11 @@ export class RecordConsumer {
     for (const r of this.#live.values()) r.carried = true;
     this.#landingSeen = false;
     this.#conn = "hello";
+    this.#failedHere = false;
     this.#snapAsked = options.joinSnapshot === true;
     this.snapshotState = "not_asked";
     this.snapshotOmitted = undefined;
+    this.snapshotFrames = undefined;
     this.#snapW = undefined;
     this.#snapHeld = [];
     this.#snapBytes = 0;

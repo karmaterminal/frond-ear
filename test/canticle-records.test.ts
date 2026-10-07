@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
+import { spawn, type ChildProcess } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { createServer, type Socket } from "node:net";
+import { connect, createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -194,12 +195,12 @@ test("records: fatal fails; a closed transport without bye fails; bye is a clean
   assert.equal(a.health, "failed");
   assert.deepEqual(a.healthReasons, ["state_corrupt"]);
   const b = started();
-  b.closed();
+  b.closed(NOW);
   assert.equal(b.health, "failed");
   assert.deepEqual(b.healthReasons, ["exit_without_bye"]);
   const d = started();
   d.feed(rec("bye"), NOW);
-  d.closed();
+  d.closed(NOW);
   assert.equal(d.health, "stopped");
 });
 
@@ -346,7 +347,7 @@ test("records: a missing or mistyped mute is dropped, never read as unmuted", ()
 
 test("records: a new run's hello recovers a failed receive", () => {
   const c = started();
-  c.closed();
+  c.closed(NOW);
   assert.equal(c.health, "failed");
   c.feed(rec("hello", {}, "c3d4"), NOW);
   c.feed(rec("landing_state", { mute: null, breaker: "closed" }, "c3d4"), NOW);
@@ -394,7 +395,7 @@ test("records: bye ends the run; its items stop being deliverable while still co
   assert.equal(view.listening, false);
   assert.equal(view.ended, true);
   assert.equal(c.health, "stopped");
-  c.closed();
+  c.closed(NOW);
   assert.equal(
     c.health,
     "stopped",
@@ -514,12 +515,20 @@ test("records: sender-chosen values never grow a map without bound", () => {
       NOW,
     );
     c.feed(rec("fatal", { reason: `r${i} with spaces` }), NOW);
+    c.feed(rec("fatal", { reason: `r${i}` }), NOW);
   }
   assert.equal(c.counts.not_deliverable_other, 300);
   assert.equal(
     Object.keys(c.counts).filter((k) => k.startsWith("not_")).length,
     1,
   );
+  // A fatal's reason is the sender's: it counts under `fatal`, never as its own key.
+  assert.equal(c.counts.fatal, 600);
+  assert.deepEqual(Object.keys(c.counts).sort(), [
+    "fatal",
+    "not_deliverable_other",
+    "presence_overflow",
+  ]);
   assert.equal(c.presence.size, MAX_STATIONS);
   assert.ok(c.healthReasons.length <= 16);
   const d = started();
@@ -712,7 +721,7 @@ test("records: rejoin — seen to 120, hello(1), landing_state(150), live 151: l
   assert.equal(c.counts.records_lost ?? 0, 0);
   assert.equal(items(c).length, 0, "muted");
   // Connection lost; a retract at 130 is missed. Same run, new connection.
-  c.closed();
+  c.closed(NOW);
   c.reconnected();
   c.feed(
     at(1, () => rec("hello")),
@@ -1086,4 +1095,284 @@ test("records: binary-canticle#79's emitter output reads with nothing malformed 
   assert.equal(c.counts.not_deliverable_hop_limit, 1);
   assert.equal(c.hearView(tune, T0, true).items.length, 0); // retracted
   assert.equal(c.health, "ok");
+});
+
+// ---- status a reconnect doesn't erase (frond-ear#59, from fe#24's D36 proof)
+
+test("records: a failure a reconnect has cleared is still counted, once, and lastFailure keeps it (frond-ear#59)", () => {
+  const c = new RecordConsumer();
+  c.reconnected({ joinSnapshot: true });
+  const end = (w: number, run = RUN) =>
+    rec("snapshot_end", { watermark: w, count: 0, truncated: false }, run);
+  c.feed(
+    at(1, () => rec("hello", { join_snapshot: true })),
+    NOW,
+  );
+  c.feed(
+    at(50, () => landing()),
+    NOW,
+  );
+  c.feed(
+    at(50, () => end(50)),
+    NOW,
+  );
+  c.feed(
+    at(51, () => frame(51)),
+    NOW,
+  );
+  assert.equal(c.lastFailure, null);
+  // The host daemon is SIGKILLed: the connection ends without `bye`.
+  c.closed(NOW + 1_000);
+  assert.deepEqual(c.healthReasons, ["exit_without_bye"]);
+  // Its restart takes three reconnect attempts that never open: still one crash.
+  c.closed(NOW + 2_000);
+  c.closed(NOW + 4_000);
+  c.closed(NOW + 8_000);
+  // The new daemon's run: `hello` clears receive health, its snapshot `joined_late`.
+  c.reconnected({ joinSnapshot: true });
+  c.feed(
+    at(1, () => rec("hello", { join_snapshot: true }, "c3d4")),
+    NOW + 9_000,
+  );
+  c.feed(
+    at(2, () => landing({}, "c3d4")),
+    NOW + 9_000,
+  );
+  c.feed(
+    at(2, () => end(2, "c3d4")),
+    NOW + 9_000,
+  );
+  assert.equal(c.health, "ok");
+  assert.deepEqual(c.healthReasons, []);
+  assert.deepEqual(
+    { ...c.counts },
+    { joined_late: 2, exit_without_bye: 1, run_restarted_without_bye: 1 },
+  );
+  assert.deepEqual(c.lastFailure, {
+    reason: "exit_without_bye",
+    at: NOW + 1_000,
+    run: RUN,
+  });
+});
+
+test("records: lastFailure is a connection's first failure: a fatal's reason outlives the close it causes (frond-ear#59)", () => {
+  const c = started();
+  c.feed(rec("fatal", { reason: "state_corrupt" }), NOW + 1);
+  c.closed(NOW + 2); // the exit that follows a fatal
+  assert.deepEqual(c.healthReasons, ["state_corrupt", "exit_without_bye"]);
+  assert.deepEqual(c.lastFailure, {
+    reason: "state_corrupt",
+    at: NOW + 1,
+    run: RUN,
+  });
+  assert.equal(c.counts.fatal, 1);
+  assert.equal(c.counts.state_corrupt, undefined);
+  assert.equal(c.counts.exit_without_bye, 1);
+  // A later connection's first failure replaces it, though receive health is still
+  // `failed` from the last one (only a `hello` clears it): here an unknown major version.
+  c.reconnected();
+  c.feed(
+    { v: "canticle-receptor-record/2", type: "hello", rec_seq: 1, run: "c3d4" },
+    NOW + 3,
+  );
+  const stop = { reason: "record_version", at: NOW + 3, run: RUN };
+  assert.deepEqual(c.lastFailure, stop);
+  c.closed(NOW + 4);
+  assert.deepEqual(c.lastFailure, stop, "its own close is a consequence");
+  assert.equal(c.counts.exit_without_bye, 2);
+  // Delivery has stopped for good: a later connection's records are ignored, and so is its close.
+  c.reconnected();
+  c.feed(
+    at(1, () => rec("hello")),
+    NOW + 5,
+  );
+  c.closed(NOW + 6);
+  assert.deepEqual(c.lastFailure, stop);
+  assert.equal(c.counts.exit_without_bye, 2);
+});
+
+test("records: with one reader per run, each run's first failure is its own (frond-ear#59)", () => {
+  const c = started();
+  c.feed(rec("fatal", { reason: "bind_failed" }), NOW + 1);
+  c.closed(NOW + 2);
+  // The binding restarts the receptor: a new run on a new stream, no bootstrap.
+  c.feed(
+    at(1, () => rec("hello", {}, "c3d4")),
+    NOW + 3,
+  );
+  c.feed(
+    at(2, () => landing({}, "c3d4")),
+    NOW + 3,
+  );
+  assert.equal(c.health, "ok");
+  c.closed(NOW + 4);
+  assert.deepEqual(c.lastFailure, {
+    reason: "exit_without_bye",
+    at: NOW + 4,
+    run: "c3d4",
+  });
+  assert.equal(c.counts.exit_without_bye, 2);
+  assert.equal(c.counts.run_restarted_without_bye, 1);
+});
+
+test("records: a connection that carried only an unreadable line still ends without bye (frond-ear#59)", () => {
+  const c = started();
+  c.closed(NOW);
+  c.reconnected();
+  c.feedLine("{not json", NOW + 1); // a malformed bootstrap: the connection is lost
+  assert.equal(c.connectionLost, true);
+  c.closed(NOW + 2);
+  assert.equal(c.counts.exit_without_bye, 2);
+  assert.deepEqual(c.lastFailure, {
+    reason: "malformed_bootstrap",
+    at: NOW + 1,
+    run: RUN,
+  });
+});
+
+/**
+ * A stand-in host daemon in its own process, so a test can SIGKILL it: it unlinks a
+ * stale socket, listens, and answers each connection's first line with `lines`.
+ */
+const FAKE_DAEMON = `
+const net = require("node:net");
+const fs = require("node:fs");
+const [path, lines] = process.argv.slice(1);
+try { fs.unlinkSync(path); } catch {}
+net
+  .createServer((s) => {
+    s.on("error", () => {});
+    s.once("data", () => s.write(lines));
+  })
+  .listen(path, () => process.stdout.write("ready\\n"));
+`;
+
+async function fakeDaemon(path: string, recs: object[]): Promise<ChildProcess> {
+  const lines = recs.map((r) => `${JSON.stringify(r)}\n`).join("");
+  const child = spawn(process.execPath, ["-e", FAKE_DAEMON, path, lines], {
+    stdio: ["ignore", "pipe", "inherit"],
+  });
+  await new Promise<void>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", (code) =>
+      reject(new Error(`fake daemon exited ${code}`)),
+    );
+    child.stdout!.once("data", () => resolve());
+  });
+  return child;
+}
+
+test("record client: a SIGKILLed host daemon still shows in ear_status after the ear reconnects (frond-ear#59)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "canticle-kill-"));
+  const path = join(dir, "daemon.sock");
+  let now = NOW;
+  let attempts = 0;
+  const client = new RecordClient({
+    socketPath: path,
+    tune: { gloss: TUNE },
+    logger,
+    clock: { now: () => now },
+    timers: {
+      setTimeout: (fn: () => void) => setTimeout(fn, 5),
+      clearTimeout: (t: unknown) => clearTimeout(t as NodeJS.Timeout),
+    } as never,
+    connect: (p) => {
+      attempts += 1;
+      return connect(p);
+    },
+  });
+  const status = () =>
+    client.status() as {
+      state: string;
+      receiveHealth: string;
+      reasons: string[];
+      lastFailure: unknown;
+      joinSnapshot: string;
+      joinSnapshotFrames?: number;
+      run: string | null;
+      counts: Record<string, number>;
+    };
+  const until = async (what: string, ok: () => boolean) => {
+    const deadline = Date.now() + 5_000;
+    while (!ok()) {
+      assert.ok(Date.now() < deadline, what);
+      await new Promise((r) => setTimeout(r, 5));
+    }
+  };
+  const entryOf = (r: object) => {
+    const {
+      v: _v,
+      type: _t,
+      rec_seq: _s,
+      run: _r,
+      ...rest
+    } = r as Record<string, unknown>;
+    return rest;
+  };
+  let daemon: ChildProcess | undefined;
+  try {
+    // Run a1b2: its join snapshot brings item 40; item 51 surfaces live.
+    const item40 = entryOf(frame(40));
+    daemon = await fakeDaemon(path, [
+      at(1, () => rec("hello", { join_snapshot: true })),
+      at(50, () => landing()),
+      at(50, () => rec("snapshot", { snap_seq: 1, entry: item40 })),
+      at(50, () =>
+        rec("snapshot_end", { watermark: 50, count: 1, truncated: false }),
+      ),
+      at(51, () => frame(51)),
+    ]);
+    client.start();
+    await until(
+      "run a1b2's items",
+      () => client.hearView("gloss").items.length === 2,
+    );
+    assert.equal(status().joinSnapshotFrames, 1);
+    // SIGKILL: no `bye`, and the socket file stays behind (connect ECONNREFUSED).
+    now = NOW + 5_000;
+    daemon.kill("SIGKILL");
+    await until("the close", () => status().receiveHealth === "failed");
+    const before = attempts;
+    await until(
+      "reconnect attempts that never open",
+      () => attempts >= before + 3,
+    );
+    now = NOW + 9_000;
+    // The restarted daemon: a new run, nothing live yet.
+    daemon = await fakeDaemon(path, [
+      at(1, () => rec("hello", { join_snapshot: true }, "c2be")),
+      at(2, () => landing({}, "c2be")),
+      at(2, () =>
+        rec(
+          "snapshot_end",
+          { watermark: 2, count: 0, truncated: false },
+          "c2be",
+        ),
+      ),
+    ]);
+    await until(
+      "run c2be's complete join snapshot",
+      () => status().run === "c2be" && status().joinSnapshot === "complete",
+    );
+    const s = status();
+    assert.equal(s.state, "connected");
+    assert.equal(s.receiveHealth, "ok");
+    assert.deepEqual(s.reasons, [], "the reconnect cleared receive health…");
+    assert.deepEqual(
+      s.lastFailure,
+      { reason: "exit_without_bye", at: NOW + 5_000, run: RUN },
+      "…but not the failure",
+    );
+    assert.equal(s.joinSnapshotFrames, 0, "this connection's snapshot");
+    assert.deepEqual(s.counts, {
+      joined_late: 2,
+      snapshot_frames: 1, // the process's, across runs
+      exit_without_bye: 1,
+      run_restarted_without_bye: 1,
+    });
+  } finally {
+    client.stop();
+    daemon?.kill("SIGKILL");
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
