@@ -194,7 +194,7 @@ export function renderAmbiguousSends(
     )
     .join("; ");
   return {
-    content: `frond-ear could not confirm that ${sends.length} earlier repl${sends.length === 1 ? "y" : "ies"} reached Discord (${list}); the daemon stopped or the response was lost after the send began. Check with fetch_messages before re-sending. Re-sending a whole reply, with the identical text and reply_to, within 5 minutes of its unconfirmed send posts only what did not go out: frond-ear skips the parts Discord confirmed and reuses the unconfirmed part's nonce, so Discord de-duplicates it. A later re-send posts every part again.`,
+    content: `frond-ear could not confirm that ${sends.length} earlier repl${sends.length === 1 ? "y" : "ies"} reached Discord (${list}); the daemon stopped or the response was lost after the send began. Check with fetch_messages before re-sending. Re-sending a whole reply, with the identical text and reply_to, within 5 minutes of the first try at its unconfirmed message posts only what did not go out: frond-ear skips the parts Discord confirmed and reuses that message's nonce, so Discord de-duplicates it. A later re-send posts every part again.`,
     meta: { kind: "send_check", count: String(sends.length) },
   };
 }

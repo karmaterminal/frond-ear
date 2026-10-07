@@ -2006,6 +2006,85 @@ test("past the reuse window, a retry of a long reply is a new reply and posts ev
   }
 });
 
+test("trying a part again does not restart the window, and the error says how much of it is left (#55)", async () => {
+  const h = harness();
+  try {
+    loseResponsesTo(h, 2, 3); // part 2, then part 2 again on the retry
+    const shim = h.attach("scribe");
+    const args = { chat_id: CHANNEL, text: LONG };
+    await h.call(shim, "reply", args);
+    h.clock.advance(200_500);
+    const again = await h.call(shim, "reply", args);
+    assert.equal(
+      again.text,
+      `Discord did not confirm part 2 of 3 (fetch failed); it may already have been posted. ` +
+        `Part 1 was sent (id ${postedIds(h)[0]}). Part 3 was not sent. ` +
+        `Retrying the identical text within 1 minute 39 seconds is safe: frond-ear does not post part 1 again ` +
+        `and reuses part 2's nonce, so Discord returns the original instead of posting it twice.`,
+    );
+    h.clock.advance(99_000);
+    const last = await h.call(shim, "reply", args);
+    assert.equal(last.ok, true, last.text);
+    assert.equal(posted(h), "abc", "part 2 is de-duplicated on both retries");
+  } finally {
+    h.dispose();
+  }
+});
+
+test("a part that fails after the window has run out says a retry posts every part as new (#55)", async () => {
+  const h = harness();
+  try {
+    const refused = `Discord POST /channels/${CHANNEL}/messages failed: 403 Missing Permissions`;
+    const discordSend = h.rest.sendMessage.bind(h.rest);
+    let count = 0;
+    // fetch has no timeout: these requests hang past the window, then fail.
+    h.rest.sendMessage = async (...args) => {
+      count += 1;
+      if (count === 6) {
+        h.clock.advance(WINDOW_MS + 1_000);
+        throw new RestError(403, 50013, refused);
+      }
+      const sent = await discordSend(...args);
+      if (count === 1 || count === 3) {
+        h.clock.advance(WINDOW_MS + 1_000);
+        throw new TypeError("fetch failed");
+      }
+      return sent;
+    };
+    const shim = h.attach("scribe");
+    const short = await h.call(shim, "reply", {
+      chat_id: CHANNEL,
+      text: "hello",
+    });
+    assert.equal(
+      short.text,
+      `Discord did not confirm this send (fetch failed). The message may already have been posted. ` +
+        `It is too late to retry safely: 5 minutes have passed since this message was first tried, ` +
+        `so an identical retry posts it as new.`,
+    );
+    const args = { chat_id: CHANNEL, text: LONG };
+    const long = await h.call(shim, "reply", args);
+    assert.equal(
+      long.text,
+      `Discord did not confirm part 2 of 3 (fetch failed); it may already have been posted. ` +
+        `Part 1 was sent (id ${postedIds(h)[1]}). Part 3 was not sent. ` +
+        `It is too late to retry safely: 5 minutes have passed since part 2 was first tried, ` +
+        `so an identical retry posts every part as new.`,
+    );
+    const retry = await h.call(shim, "reply", args);
+    assert.equal(posted(h), "habab", "parts 1 and 2 post again, as warned");
+    assert.equal(
+      retry.text,
+      `${refused} (part 3 of 3). Parts 1 and 2 were sent (ids ${postedIds(h).slice(3).join(", ")}). ` +
+        `Part 3 was not posted. ` +
+        `It is too late to retry safely: 5 minutes have passed since part 3 was first tried, ` +
+        `so an identical retry posts every part as new.`,
+    );
+  } finally {
+    h.dispose();
+  }
+});
+
 test("a finished long reply is never resumed: a deliberate repeat posts every part (#55)", async () => {
   const h = harness();
   try {
@@ -2105,7 +2184,7 @@ test("a long reply cut off by a daemon kill is listed by part, and its retry pos
     );
     assert.match(
       checks[0]?.content ?? "",
-      /Re-sending a whole reply, with the identical text and reply_to, within 5 minutes of its unconfirmed send posts only what did not go out/u,
+      /Re-sending a whole reply, with the identical text and reply_to, within 5 minutes of the first try at its unconfirmed message posts only what did not go out/u,
     );
     const retry = await after.call(shim, "reply", {
       chat_id: CHANNEL,

@@ -184,17 +184,20 @@ confirmed every message; 1 when the daemon refused the send, Discord failed it o
 it, or the daemon could not be reached or gave no answer within 30 seconds; and 2 for bad usage.
 The reason goes to stderr, and for a long text it names the parts already sent. After an
 unconfirmed send or a timeout the message may still post. Retrying the identical text within 5
-minutes of the unconfirmed send cannot post anything twice: the daemon skips the parts Discord
-confirmed and reuses the unconfirmed message's nonce. A later retry, such as seat-pulse's next
-pulse 10 minutes on, posts every part again. Text that starts with `-` goes after `--`.
+minutes of the first try at the unconfirmed message cannot post anything twice: the daemon skips
+the parts Discord confirmed and reuses the unconfirmed message's nonce. An unconfirmed send's error
+says how much of the 5 minutes is left, and retrying again does not restart them. A later retry,
+such as seat-pulse's next pulse 10 minutes on, posts every part again. Text that starts with `-`
+goes after `--`.
 
 An unconfirmed send stays in `status` under `ambiguousSends` until the prune drops it, once it is
 older than `limits.retentionMs` (14 days by default). Each entry's `sessionEar` names the ear whose
 session made it, or is `null` for a script (and for a send recorded before frond-ear kept track).
 Its `part` and `parts` say which message of the reply it was (`part` counts from 0; both are `null`
-for a send recorded before frond-ear tracked replies). A session is never asked to check a script's
-send: the `send_check` notice at an ear's next attach lists only unconfirmed replies made by that
-ear's sessions, including one it has since replaced.
+for a send recorded before frond-ear tracked replies, whose nonce a retry never reuses, so retrying
+one sends a new message). A session is never asked to check a script's send: the `send_check`
+notice at an ear's next attach lists only unconfirmed replies made by that ear's sessions,
+including one it has since replaced.
 
 ## 7. Survive a reboot
 

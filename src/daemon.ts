@@ -261,28 +261,51 @@ function partsWere(numbers: readonly number[], what: string): string {
   return `${names.charAt(0).toUpperCase()}${names.slice(1)} ${numbers.length === 1 ? "was" : "were"} ${what}`;
 }
 
+/** Whole minutes and seconds, rounded down: "4 minutes 59 seconds". */
+function duration(ms: number): string {
+  const seconds = Math.floor(ms / 1_000);
+  const count = (n: number, unit: string): string =>
+    n === 0 ? "" : `${n} ${unit}${n === 1 ? "" : "s"}`;
+  return [
+    count(Math.floor(seconds / 60), "minute"),
+    count(seconds % 60, "second"),
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
 /**
  * The error a reply ends with when one of its parts fails. For a reply of
  * several parts it names the parts already sent, with their ids, and those not
- * sent, and says what an identical retry within the reuse window does (#55).
+ * sent, and says what an identical retry does (#55). `leftMs` is what is left
+ * of the reuse window, which runs from the first try at the failed part, so a
+ * retry of a retry does not restart it.
  */
 function replyFailure(
   error: unknown,
   reply: ReplyPart,
   replyTo: string | undefined,
   sentIds: readonly string[],
+  leftMs: number,
 ): Error {
-  const retry = `Retrying the identical text${replyTo ? " and reply_to" : ""} within ${SEND_DEDUPE_WINDOW_MS / 60_000} minutes`;
+  const failed = reply.part + 1;
+  const retry = `Retrying the identical text${replyTo ? " and reply_to" : ""} within ${duration(leftMs)}`;
+  const late =
+    leftMs < 1_000
+      ? `It is too late to retry safely: ${SEND_DEDUPE_WINDOW_MS / 60_000} minutes have passed since ` +
+        `${reply.parts === 1 ? "this message" : `part ${failed}`} was first tried, ` +
+        `so an identical retry posts ${reply.parts === 1 ? "it" : "every part"} as new.`
+      : undefined;
   if (reply.parts === 1) {
     if (error instanceof UnconfirmedSendError) {
       return new Error(
         `Discord did not confirm this send (${error.message}). The message may already have been posted. ` +
-          `${retry} is safe: frond-ear reuses the same nonce, so Discord returns the original instead of posting twice.`,
+          (late ??
+            `${retry} is safe: frond-ear reuses the same nonce, so Discord returns the original instead of posting twice.`),
       );
     }
     return error instanceof Error ? error : new Error(String(error));
   }
-  const failed = reply.part + 1;
   const sent = partRange(1, failed - 1);
   const sentClause =
     sent.length === 0
@@ -294,8 +317,9 @@ function replyFailure(
       `Discord did not confirm part ${failed} of ${reply.parts} (${error.message}); it may already have been posted. ` +
         sentClause +
         (unsent.length === 0 ? "" : `${partsWere(unsent, "not sent")}. `) +
-        `${retry} is safe: frond-ear ${sent.length === 0 ? "" : `does not post ${partNames(sent)} again and `}` +
-        `reuses part ${failed}'s nonce, so Discord returns the original instead of posting it twice.`,
+        (late ??
+          `${retry} is safe: frond-ear ${sent.length === 0 ? "" : `does not post ${partNames(sent)} again and `}` +
+            `reuses part ${failed}'s nonce, so Discord returns the original instead of posting it twice.`),
     );
   }
   const text =
@@ -303,7 +327,7 @@ function replyFailure(
     (sent.length === 0
       ? "Nothing was posted."
       : `${sentClause}${partsWere(partRange(failed, reply.parts), "not posted")}. ` +
-        `${retry} does not post ${partNames(sent)} again.`);
+        (late ?? `${retry} does not post ${partNames(sent)} again.`));
   return error instanceof RestError
     ? new RestError(error.status, error.code, text)
     : new Error(text);
@@ -1468,7 +1492,15 @@ export class Daemon {
           ),
         );
       } catch (error) {
-        throw replyFailure(error, reply, replyTo, ids);
+        const windowEnds =
+          this.store.latestPartBegan(reply) + SEND_DEDUPE_WINDOW_MS;
+        throw replyFailure(
+          error,
+          reply,
+          replyTo,
+          ids,
+          windowEnds - this.clock.now(),
+        );
       }
     }
     return { ids, earlier };

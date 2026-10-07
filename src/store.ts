@@ -557,6 +557,21 @@ export class EventStore {
   }
 
   /**
+   * When the latest part of this reply was first tried (0 if none was). The
+   * reuse window of resumeReply and beginSend runs from then, and trying the
+   * part again does not move it.
+   */
+  public latestPartBegan(reply: ReplyPart): number {
+    const row = this.database
+      .prepare(
+        `SELECT COALESCE(MAX(created_at), 0) AS began FROM outbound_intents
+         WHERE reply_key = ? AND reply_id = ?`,
+      )
+      .get(reply.key, reply.id) as { began: number };
+    return row.began;
+  }
+
+  /**
    * Records the intent to send one message *before* calling Discord. If an
    * earlier attempt at this part of this reply is still pending (its outcome
    * unknown: crash, timeout, lost response) and within `reuseWindowMs`, its
