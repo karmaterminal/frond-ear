@@ -2,9 +2,9 @@
 // endpoint (/mcp) and, in OAuth mode, the authorization server routes beside it. It listens
 // on loopback only; Tailscale Funnel (or any HTTPS tunnel) is what makes it public.
 //
-// Every request, in order: rate limit, Host check, Origin check (DNS-rebinding protection,
-// which Streamable HTTP requires), then the route. /mcp also needs auth before its body is
-// read. Every request gets one `connector.request` log line with no credential in it.
+// Every request, in order: rate limit (per caller), Host check, Origin check (DNS-rebinding
+// protection, which Streamable HTTP requires), then the route. /mcp also needs auth before
+// its body is read. Every request gets one `connector.request` log line with no credential.
 import {
   createServer,
   type IncomingHttpHeaders,
@@ -45,7 +45,7 @@ export interface ConnectorServerOptions {
   sessions?: boolean;
   logger: StructuredLogger;
   clock?: Clock;
-  /** Requests per minute across all callers; default 120. */
+  /** Requests per minute for each caller (and five times that for all); default 120. */
   rateLimitPerMinute?: number;
 }
 
@@ -56,6 +56,9 @@ export interface HttpReply {
   /** What an OAuth step did, for this request's log line. Never a secret. */
   note?: Record<string, unknown> | undefined;
 }
+
+/** Callers that get their own rate-limit bucket at once; the oldest is forgotten first. */
+const MAX_SOURCES = 1_000;
 
 /** A token bucket: `capacity` requests at once, refilled to that over a minute. */
 export class RateLimiter {
@@ -88,6 +91,52 @@ export class RateLimiter {
       Math.ceil(((1 - this.tokens) * 60_000) / this.capacity / 1_000),
     );
   }
+}
+
+/**
+ * One bucket per caller, so one busy caller can't starve the others (Claude among them),
+ * and one shared bucket at five times that, against many callers at once.
+ */
+export class SourceLimiter {
+  private readonly perMinute: number;
+  private readonly clock: Clock;
+  private readonly buckets = new Map<string, RateLimiter>();
+  private readonly everyone: RateLimiter;
+
+  public constructor(perMinute: number, clock: Clock = systemClock) {
+    this.perMinute = perMinute;
+    this.clock = clock;
+    this.everyone = new RateLimiter(perMinute * 5, clock);
+  }
+
+  /** Takes one token for `source`; returns 0 when allowed, else the seconds to wait. */
+  public take(source: string): number {
+    let bucket = this.buckets.get(source);
+    if (!bucket) {
+      if (this.buckets.size >= MAX_SOURCES) {
+        const oldest = this.buckets.keys().next().value;
+        if (oldest !== undefined) {
+          this.buckets.delete(oldest);
+        }
+      }
+      bucket = new RateLimiter(this.perMinute, this.clock);
+      this.buckets.set(source, bucket);
+    }
+    return bucket.take() || this.everyone.take();
+  }
+}
+
+/**
+ * Who is calling: the address Funnel saw, else the socket's. The listener is loopback-only,
+ * so a forwarded address comes from Funnel (which sets it afresh) or from the host itself;
+ * the last entry is the one the nearest proxy added.
+ */
+export function sourceOf(request: IncomingMessage): string {
+  const forwarded = firstHeader(request.headers, "x-forwarded-for")
+    ?.split(",")
+    .at(-1)
+    ?.trim();
+  return (forwarded || request.socket.remoteAddress || "unknown").slice(0, 64);
 }
 
 export function json(
@@ -182,7 +231,7 @@ export function createConnectorServer(
     ...(options.sessions === undefined ? {} : { sessions: options.sessions }),
     clock,
   });
-  const limiter = new RateLimiter(options.rateLimitPerMinute ?? 120, clock);
+  const limiter = new SourceLimiter(options.rateLimitPerMinute ?? 120, clock);
   const publicUrl = options.publicUrl ? new URL(options.publicUrl) : undefined;
   const allowedOrigins = new Set([
     ...CLAUDE_ORIGINS,
@@ -204,6 +253,18 @@ export function createConnectorServer(
       ]
     : [];
 
+  function originAllowed(origin: string): boolean {
+    // The loopback origins too, so the consent page works when opened on the host itself.
+    return (
+      allowedOrigins.has(origin) ||
+      [
+        `http://127.0.0.1:${boundPort}`,
+        `http://localhost:${boundPort}`,
+        `http://[::1]:${boundPort}`,
+      ].includes(origin.toLowerCase())
+    );
+  }
+
   function hostAllowed(host: string | undefined): boolean {
     if (!host) {
       return false;
@@ -221,6 +282,7 @@ export function createConnectorServer(
     path: string,
     query: URLSearchParams,
     facts: RequestFacts,
+    source: string,
     log: Record<string, unknown>,
   ): Promise<HttpReply> {
     const method = request.method ?? "GET";
@@ -235,7 +297,7 @@ export function createConnectorServer(
         return json(200, oauth.metadata(path));
       }
       if (path === "/authorize" && method === "GET") {
-        return oauth.authorizeGet(query);
+        return oauth.authorizeGet(query, source);
       }
       if (
         (path === "/authorize" || path === "/token" || path === "/register") &&
@@ -256,7 +318,7 @@ export function createConnectorServer(
         }
         const form = new URLSearchParams(raw);
         return path === "/authorize"
-          ? oauth.authorizePost(form)
+          ? oauth.authorizePost(form, source)
           : oauth.token(form, firstHeader(request.headers, "authorization"));
       }
     }
@@ -368,9 +430,10 @@ export function createConnectorServer(
       mcpProtocolVersion: firstHeader(request.headers, "mcp-protocol-version"),
       headers: facts.headers,
     };
+    const source = sourceOf(request);
     let reply: HttpReply;
     try {
-      const wait = limiter.take();
+      const wait = limiter.take(source);
       const origin = firstHeader(request.headers, "origin");
       if (wait > 0) {
         reply = {
@@ -379,7 +442,7 @@ export function createConnectorServer(
         };
       } else if (!hostAllowed(firstHeader(request.headers, "host"))) {
         reply = forbidden(facts.path, "Host not allowed");
-      } else if (origin !== undefined && !allowedOrigins.has(origin)) {
+      } else if (origin !== undefined && !originAllowed(origin)) {
         reply = forbidden(facts.path, "Origin not allowed");
       } else {
         reply = await route(
@@ -387,6 +450,7 @@ export function createConnectorServer(
           url.pathname,
           url.searchParams,
           facts,
+          source,
           log,
         );
         if (reply.note) {

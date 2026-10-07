@@ -12,7 +12,9 @@
 // Tokens and codes are stored only as SHA-256 digests and found by digest; the passphrase
 // and PKCE verifiers are compared with timingSafeEqual. The one exception: the newest
 // rotation's token pair is held for a minute, so a refresh that is retried or sent twice
-// at once gets the same answer. State is in memory: a restart signs everyone out.
+// at once gets the same answer. State is in memory: a restart signs everyone out. Claude's
+// next refresh gets invalid_grant, and its old client id may sign in again while
+// registration is open.
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 
 import { systemClock, type Clock } from "../types.ts";
@@ -71,6 +73,13 @@ export class BearerAuth implements Authenticator {
     if (token.length < 32) {
       throw new Error("the bearer token must be at least 32 characters");
     }
+    // What an Authorization header can carry as a bearer token (RFC 6750 b64token), so a
+    // token that could never match fails here rather than as a 401 on every request.
+    if (!/^[A-Za-z0-9\-._~+/]+=*$/u.test(token)) {
+      throw new Error(
+        "the bearer token may use only letters, digits and - . _ ~ + / (and = at the end); make one with: openssl rand -base64 33",
+      );
+    }
     this.expected = digest(token);
   }
 
@@ -96,10 +105,16 @@ export class BearerAuth implements Authenticator {
 
 // ---- OAuth ---------------------------------------------------------------------------------
 
-/** Where claude.ai, Desktop, mobile and Cowork send the browser back (claude.com docs). */
-export const CLAUDE_CALLBACKS = [
-  "https://claude.ai/api/mcp/auth_callback",
-  "https://claude.com/api/mcp/auth_callback",
+/**
+ * Where claude.ai, Desktop, mobile and Cowork send the browser back. Claude's docs name only
+ * this one ("Authentication for connectors", Callback URLs).
+ */
+export const CLAUDE_CALLBACKS = ["https://claude.ai/api/mcp/auth_callback"];
+
+/** What Claude Code declares in its client metadata: loopback, matched on any port. */
+const CLAUDE_CODE_CALLBACKS = [
+  "http://localhost/callback",
+  "http://127.0.0.1/callback",
 ];
 
 const CODE_TTL_MS = 60_000;
@@ -110,9 +125,13 @@ const REFRESH_TTL_MS = 30 * 24 * 60 * 60_000;
 const REFRESH_REPEAT_MS = 60_000;
 const MAX_CLIENTS = 100;
 const MAX_PENDING = 100;
-/** Wrong passphrases allowed per window before consent locks for the rest of it. */
+/** Open sign-in requests one caller may hold; past this its oldest goes first. */
+const MAX_PENDING_PER_SOURCE = 10;
+/** Wrong passphrases one caller may send per window before consent locks for it. */
 const CONSENT_FAILURES = 5;
 const CONSENT_WINDOW_MS = 15 * 60_000;
+/** Callers whose wrong passphrases are remembered at once. */
+const MAX_FAILURE_SOURCES = 1_000;
 
 interface Client {
   clientId: string;
@@ -124,10 +143,15 @@ interface Client {
 
 interface PendingAuthorization {
   clientId: string;
+  /** How the consent page describes the client, fixed when the request arrived. */
+  kind: "dynamic" | "configured" | "unknown";
+  clientName: string | undefined;
   redirectUri: string;
   state: string | undefined;
   codeChallenge: string;
   scope: string | undefined;
+  /** The caller that opened the request (see `source` in http.ts). */
+  source: string;
   expiresAt: number;
 }
 
@@ -238,6 +262,31 @@ function isLoopbackRedirect(uri: URL): boolean {
   );
 }
 
+/** Loopback redirects match whatever their port (RFC 8252 7.3); everything else exactly. */
+function redirectMatchesOne(registered: string, requested: string): boolean {
+  if (registered === requested) {
+    return true;
+  }
+  try {
+    const candidate = new URL(registered);
+    const asked = new URL(requested);
+    return (
+      isLoopbackRedirect(candidate) &&
+      isLoopbackRedirect(asked) &&
+      candidate.hostname === asked.hostname &&
+      candidate.pathname === asked.pathname &&
+      candidate.search === asked.search
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** A client id this server never issued is still shown and logged: keep it plain and short. */
+function plausibleClientId(clientId: string): boolean {
+  return /^[\x21-\x7e]{1,128}$/u.test(clientId);
+}
+
 /** RFC 7636 code_verifier: 43-128 characters of [A-Z a-z 0-9 - . _ ~]. */
 function pkceMatches(verifier: string, challenge: string): boolean {
   if (!/^[A-Za-z0-9\-._~]{43,128}$/u.test(verifier)) {
@@ -291,7 +340,10 @@ const PAGE_HEADERS = {
   "content-security-policy":
     "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'",
   "x-frame-options": "DENY",
-  "referrer-policy": "no-referrer",
+  // Not no-referrer: under that policy a browser sends `Origin: null` with the form's POST
+  // (Fetch, "append a request Origin header"), which the Origin check refuses. same-origin
+  // still sends no Referer to any other site.
+  "referrer-policy": "same-origin",
 };
 
 function page(
@@ -323,7 +375,8 @@ export class OAuthAuthority implements Authenticator {
   private readonly codes = new Map<string, AuthorizationCode>();
   private readonly accessTokens = new Map<string, Grant>();
   private readonly families = new Map<string, Family>();
-  private consentFailures: number[] = [];
+  /** Wrong-passphrase times per caller, so a stranger can lock only themselves out. */
+  private readonly consentFailures = new Map<string, number[]>();
 
   public constructor(options: OAuthOptions) {
     const url = new URL(options.publicUrl);
@@ -349,7 +402,10 @@ export class OAuthAuthority implements Authenticator {
       this.clients.set(clientId, {
         clientId,
         name: undefined,
-        redirectUris: [...CLAUDE_CALLBACKS],
+        redirectUris: [
+          ...CLAUDE_CALLBACKS,
+          ...(this.loopbackRedirects ? CLAUDE_CODE_CALLBACKS : []),
+        ],
         registered: "configured",
         createdAt: this.clock.now(),
       });
@@ -475,19 +531,21 @@ export class OAuthAuthority implements Authenticator {
     note.authMethod = clip(fields.token_endpoint_auth_method, 40);
     note.grants = clipList(fields.grant_types, 40);
     note.scope = clip(fields.scope);
-    const redirects = fields.redirect_uris;
-    if (
-      !Array.isArray(redirects) ||
-      redirects.length === 0 ||
-      redirects.length > 5 ||
-      !redirects.every(
-        (uri) => typeof uri === "string" && this.redirectAllowed(uri),
-      )
-    ) {
+    const requested = fields.redirect_uris;
+    // RFC 7591 3.2.1 lets the server register less than was asked: keep the URIs this
+    // server allows, and refuse only when none is left.
+    const redirects =
+      Array.isArray(requested) && requested.length <= 5
+        ? requested.filter(
+            (uri): uri is string =>
+              typeof uri === "string" && this.redirectAllowed(uri),
+          )
+        : [];
+    if (redirects.length === 0) {
       return oauthError(
         400,
         "invalid_redirect_uri",
-        `redirect_uris must be 1-5 of: ${CLAUDE_CALLBACKS.join(", ")}${this.loopbackRedirects ? ", or a loopback http URI" : ""}`,
+        `redirect_uris must be 1-5 URIs including ${CLAUDE_CALLBACKS.join(" or ")}${this.loopbackRedirects ? " or a loopback http URI" : ""}`,
       );
     }
     const grantTypes = fields.grant_types;
@@ -524,7 +582,7 @@ export class OAuthAuthority implements Authenticator {
     const client: Client = {
       clientId: `dcr-${randomBytes(12).toString("base64url")}`,
       name,
-      redirectUris: redirects as string[],
+      redirectUris: redirects,
       registered: "dynamic",
       createdAt: this.clock.now(),
     };
@@ -546,7 +604,10 @@ export class OAuthAuthority implements Authenticator {
     };
   }
 
-  /** Evicts the oldest dynamic client with no live sign-in, if the table is full. */
+  /**
+   * Evicts the oldest dynamic client with no live sign-in, if the table is full. A sign-in
+   * already under way survives: the pending request and its code carry the client id.
+   */
   private makeRoomForClient(): boolean {
     if (this.clients.size < MAX_CLIENTS) {
       return true;
@@ -566,6 +627,7 @@ export class OAuthAuthority implements Authenticator {
     return false;
   }
 
+  /** What any client may register: Claude's callback, or loopback when allowed. */
   private redirectAllowed(uri: string): boolean {
     if (CLAUDE_CALLBACKS.includes(uri)) {
       return true;
@@ -580,43 +642,25 @@ export class OAuthAuthority implements Authenticator {
     }
   }
 
-  /** Exact match, except that a loopback redirect matches whatever its port (RFC 8252 7.3). */
-  private redirectMatches(client: Client, uri: string): boolean {
-    if (client.redirectUris.includes(uri)) {
-      return true;
+  /**
+   * A known client may use its registered redirects. A client id this server has no record
+   * of (registered before a restart, or evicted) may use what a fresh registration could,
+   * since registration is open; with registration off, unknown ids are refused earlier.
+   */
+  private redirectMatches(client: Client | undefined, uri: string): boolean {
+    if (client === undefined) {
+      return this.redirectAllowed(uri);
     }
-    if (!this.loopbackRedirects) {
-      return false;
-    }
-    let requested: URL;
-    try {
-      requested = new URL(uri);
-    } catch {
-      return false;
-    }
-    if (!isLoopbackRedirect(requested)) {
-      return false;
-    }
-    return client.redirectUris.some((registered) => {
-      try {
-        const candidate = new URL(registered);
-        return (
-          isLoopbackRedirect(candidate) &&
-          candidate.hostname === requested.hostname &&
-          candidate.pathname === requested.pathname &&
-          candidate.search === requested.search
-        );
-      } catch {
-        return false;
-      }
-    });
+    return client.redirectUris.some((registered) =>
+      redirectMatchesOne(registered, uri),
+    );
   }
 
   // ---- authorization endpoint ----------------------------------------------------------
 
-  public authorizeGet(query: URLSearchParams): HttpReply {
+  public authorizeGet(query: URLSearchParams, source: string): HttpReply {
     this.prune();
-    return withNote(this.authorizeRequest(query), {
+    return withNote(this.authorizeRequest(query, source), {
       step: "authorize",
       client: clip(query.get("client_id"), 80),
       redirect: clip(query.get("redirect_uri")),
@@ -626,11 +670,11 @@ export class OAuthAuthority implements Authenticator {
     });
   }
 
-  private authorizeRequest(query: URLSearchParams): HttpReply {
+  private authorizeRequest(query: URLSearchParams, source: string): HttpReply {
     const clientId = query.get("client_id") ?? "";
     const redirectUri = query.get("redirect_uri") ?? "";
     const client = this.clients.get(clientId);
-    if (!client) {
+    if (!client && !(this.dynamicRegistration && plausibleClientId(clientId))) {
       return page(
         400,
         "Sign-in refused",
@@ -671,55 +715,77 @@ export class OAuthAuthority implements Authenticator {
     if (resource !== null && !sameResource(resource, this.resource)) {
       return fail("invalid_target", `resource must be ${this.resource}`);
     }
+    this.makeRoomForPending(source);
+    const requestId = newToken();
+    const pending: PendingAuthorization = {
+      clientId,
+      kind: client ? client.registered : "unknown",
+      clientName: client?.name,
+      redirectUri,
+      state,
+      codeChallenge: challenge,
+      scope: query.get("scope") ?? undefined,
+      source,
+      expiresAt: this.clock.now() + PENDING_TTL_MS,
+    };
+    this.pending.set(requestId, pending);
+    return this.consentPage(requestId, pending, undefined);
+  }
+
+  /**
+   * One caller can hold only a few open requests, so a stranger opening many can't push
+   * out the owner's. The global cap is a backstop against many callers.
+   */
+  private makeRoomForPending(source: string): void {
+    const mine = [...this.pending].filter(
+      ([, entry]) => entry.source === source,
+    );
+    if (mine.length >= MAX_PENDING_PER_SOURCE) {
+      this.pending.delete(mine[0]![0]);
+    }
     if (this.pending.size >= MAX_PENDING) {
       const oldest = this.pending.keys().next().value;
       if (oldest !== undefined) {
         this.pending.delete(oldest);
       }
     }
-    const requestId = newToken();
-    this.pending.set(requestId, {
-      clientId,
-      redirectUri,
-      state,
-      codeChallenge: challenge,
-      scope: query.get("scope") ?? undefined,
-      expiresAt: this.clock.now() + PENDING_TTL_MS,
-    });
-    return this.consentPage(requestId, client, redirectUri, undefined);
   }
 
   private consentPage(
     requestId: string,
-    client: Client,
-    redirectUri: string,
+    pending: PendingAuthorization,
     warning: string | undefined,
   ): HttpReply {
-    const target = new URL(redirectUri);
+    const target = new URL(pending.redirectUri);
+    const id = `<code>${htmlEscape(pending.clientId)}</code>`;
     const who =
-      client.registered === "configured"
-        ? `the pre-registered client <code>${htmlEscape(client.clientId)}</code>`
-        : `a client that registered itself as <code>${htmlEscape(client.name ?? "(no name)")}</code> (self-reported)`;
+      pending.kind === "configured"
+        ? `the pre-registered client ${id}`
+        : pending.kind === "dynamic"
+          ? `a client that registered itself as <code>${htmlEscape(pending.clientName ?? "(no name)")}</code> (self-reported)`
+          : `a client this server has no record of, ${id}, probably registered before the server restarted`;
     return page(
       warning ? 401 : 200,
       "Allow access to the frond-ear connector?",
-      `${warning ? `<p class="warn">${htmlEscape(warning)}</p>` : ""}<p>${who} asks to use <code>${htmlEscape(this.resource)}</code>.</p><p>Approving sends your browser back to <strong>${htmlEscape(target.host)}</strong> (<code>${htmlEscape(redirectUri)}</code>). Approve only if you just pressed Connect there.</p>${isLoopbackRedirect(target) ? `<p class="warn">This address is on the computer that signs in, and any program there can listen on it. Approve only if you just started this sign-in from Claude Code.</p>` : ""}<form method="post" action="/authorize"><input type="hidden" name="request" value="${requestId}"><label>Owner passphrase<br><input type="password" name="passphrase" autocomplete="current-password" autofocus></label><br><button type="submit" name="decision" value="approve">Approve</button><button type="submit" name="decision" value="deny">Deny</button></form>`,
+      `${warning ? `<p class="warn">${htmlEscape(warning)}</p>` : ""}<p>${who} asks to use <code>${htmlEscape(this.resource)}</code>.</p><p>Approving sends your browser back to <strong>${htmlEscape(target.host)}</strong> (<code>${htmlEscape(pending.redirectUri)}</code>). Approve only if you just pressed Connect there.</p>${isLoopbackRedirect(target) ? `<p class="warn">This address is on the computer that signs in, and any program there can listen on it. Approve only if you just started this sign-in from Claude Code.</p>` : ""}<form method="post" action="/authorize"><input type="hidden" name="request" value="${requestId}"><label>Owner passphrase<br><input type="password" name="passphrase" autocomplete="current-password" autofocus></label><br><button type="submit" name="decision" value="approve">Approve</button><button type="submit" name="decision" value="deny">Deny</button></form>`,
       warning ? "wrong passphrase" : "consent page",
     );
   }
 
-  public authorizePost(form: URLSearchParams): HttpReply {
+  public authorizePost(form: URLSearchParams, source: string): HttpReply {
     this.prune();
     // Read before deciding: a decision removes the pending request.
     const client = this.pending.get(form.get("request") ?? "")?.clientId;
-    return withNote(this.decideConsent(form), { step: "consent", client });
+    return withNote(this.decideConsent(form, source), {
+      step: "consent",
+      client,
+    });
   }
 
-  private decideConsent(form: URLSearchParams): HttpReply {
+  private decideConsent(form: URLSearchParams, source: string): HttpReply {
     const requestId = form.get("request") ?? "";
     const pending = this.pending.get(requestId);
-    const client = pending ? this.clients.get(pending.clientId) : undefined;
-    if (!pending || !client) {
+    if (!pending) {
       return page(
         400,
         "Sign-in expired",
@@ -736,25 +802,20 @@ export class OAuthAuthority implements Authenticator {
       });
     }
     const now = this.clock.now();
-    this.consentFailures = this.consentFailures.filter(
+    const failures = (this.consentFailures.get(source) ?? []).filter(
       (at) => now - at < CONSENT_WINDOW_MS,
     );
-    if (this.consentFailures.length >= CONSENT_FAILURES) {
+    if (failures.length >= CONSENT_FAILURES) {
       return page(
         429,
         "Too many attempts",
-        "<p>Too many wrong passphrases. Wait 15 minutes and press Connect again.</p>",
+        "<p>Too many wrong passphrases from here. Wait 15 minutes and press Connect again.</p>",
         "locked",
       );
     }
     if (!sameSecret(form.get("passphrase") ?? "", this.ownerSecret)) {
-      this.consentFailures.push(now);
-      return this.consentPage(
-        requestId,
-        client,
-        pending.redirectUri,
-        "Wrong passphrase.",
-      );
+      this.recordConsentFailure(source, [...failures, now]);
+      return this.consentPage(requestId, pending, "Wrong passphrase.");
     }
     this.pending.delete(requestId);
     const code = newToken();
@@ -766,6 +827,17 @@ export class OAuthAuthority implements Authenticator {
       expiresAt: now + CODE_TTL_MS,
     });
     return this.redirect(pending.redirectUri, { code, state: pending.state });
+  }
+
+  private recordConsentFailure(source: string, failures: number[]): void {
+    this.consentFailures.delete(source);
+    if (this.consentFailures.size >= MAX_FAILURE_SOURCES) {
+      const oldest = this.consentFailures.keys().next().value;
+      if (oldest !== undefined) {
+        this.consentFailures.delete(oldest);
+      }
+    }
+    this.consentFailures.set(source, failures);
   }
 
   private redirect(
@@ -811,7 +883,12 @@ export class OAuthAuthority implements Authenticator {
     form: URLSearchParams,
     clientId: string | undefined,
   ): HttpReply {
-    if (!clientId || !this.clients.has(clientId)) {
+    if (!clientId) {
+      return oauthError(401, "invalid_client", "client_id is required");
+    }
+    // With registration open, an id this server has no record of (from before a restart)
+    // goes on: whatever it presents fails as invalid_grant, which Claude's docs ask for.
+    if (!this.dynamicRegistration && !this.clients.has(clientId)) {
       return oauthError(401, "invalid_client", "unknown client_id");
     }
     const resource = form.get("resource");
@@ -857,9 +934,12 @@ export class OAuthAuthority implements Authenticator {
     if (!code || code.expiresAt <= this.clock.now()) {
       return oauthError(400, "invalid_grant", "unknown, used or expired code");
     }
+    // OAuth 2.1 drops redirect_uri from this request, since PKCE binds the code; a client
+    // that still sends it must send the same one (RFC 6749 4.1.3).
+    const redirectUri = form.get("redirect_uri");
     if (
       code.clientId !== clientId ||
-      code.redirectUri !== form.get("redirect_uri")
+      (redirectUri !== null && redirectUri !== code.redirectUri)
     ) {
       return oauthError(
         400,
@@ -995,6 +1075,11 @@ export class OAuthAuthority implements Authenticator {
     for (const family of this.families.values()) {
       if (family.last && now - family.last.at >= REFRESH_REPEAT_MS) {
         family.last = undefined;
+      }
+    }
+    for (const [source, failures] of this.consentFailures) {
+      if (failures.every((at) => now - at >= CONSENT_WINDOW_MS)) {
+        this.consentFailures.delete(source);
       }
     }
   }

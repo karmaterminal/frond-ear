@@ -40,9 +40,14 @@ function send(
   } = {},
 ): Promise<Answer> {
   return new Promise((resolve, reject) => {
+    // A fresh connection each time: a pooled one can outlive a server the test restarts.
     const req = httpRequest(
       url,
-      { method: options.method ?? "POST", headers: options.headers ?? {} },
+      {
+        method: options.method ?? "POST",
+        headers: options.headers ?? {},
+        agent: false,
+      },
       (res) => {
         let text = "";
         res.setEncoding("utf8");
@@ -82,8 +87,10 @@ function freePort(): Promise<number> {
 interface Started {
   base: string;
   url: string;
+  port: number;
   oauth: OAuthAuthority;
   lines: string[];
+  close(): Promise<void>;
 }
 
 async function start(
@@ -93,30 +100,54 @@ async function start(
     dynamicRegistration?: boolean;
     clientIds?: string[];
     loopbackRedirects?: boolean;
+    /** A port to come back on, as after a restart. */
+    port?: number;
   } = {},
 ): Promise<Started> {
-  const port = await freePort();
-  const base = `http://127.0.0.1:${port}`;
-  const oauth = new OAuthAuthority({
-    publicUrl: base,
-    ownerSecret: OWNER,
-    ...(options.clock ? { clock: options.clock } : {}),
-    ...(options.dynamicRegistration === undefined
-      ? {}
-      : { dynamicRegistration: options.dynamicRegistration }),
-    ...(options.clientIds ? { clientIds: options.clientIds } : {}),
-    ...(options.loopbackRedirects ? { loopbackRedirects: true } : {}),
-  });
-  const lines: string[] = [];
-  const connector = createConnectorServer({
-    tools: echoTools(),
-    auth: oauth,
-    publicUrl: base,
-    logger: new StructuredLogger((line) => lines.push(line), [OWNER]),
-  });
-  await connector.listen("127.0.0.1", port);
-  t.after(() => connector.close());
-  return { base, url: `${base}/mcp`, oauth, lines };
+  // The issuer needs the port before the server listens, so probe for a free one, and try
+  // again if something takes it in between.
+  for (let attempt = 1; ; attempt += 1) {
+    const port = options.port ?? (await freePort());
+    const base = `http://127.0.0.1:${port}`;
+    const oauth = new OAuthAuthority({
+      publicUrl: base,
+      ownerSecret: OWNER,
+      ...(options.clock ? { clock: options.clock } : {}),
+      ...(options.dynamicRegistration === undefined
+        ? {}
+        : { dynamicRegistration: options.dynamicRegistration }),
+      ...(options.clientIds ? { clientIds: options.clientIds } : {}),
+      ...(options.loopbackRedirects ? { loopbackRedirects: true } : {}),
+    });
+    const lines: string[] = [];
+    const connector = createConnectorServer({
+      tools: echoTools(),
+      auth: oauth,
+      publicUrl: base,
+      logger: new StructuredLogger((line) => lines.push(line), [OWNER]),
+    });
+    try {
+      await connector.listen("127.0.0.1", port);
+    } catch (error) {
+      if (
+        options.port === undefined &&
+        attempt < 5 &&
+        (error as { code?: string }).code === "EADDRINUSE"
+      ) {
+        continue;
+      }
+      throw error;
+    }
+    t.after(() => connector.close());
+    return {
+      base,
+      url: `${base}/mcp`,
+      port,
+      oauth,
+      lines,
+      close: () => connector.close(),
+    };
+  }
 }
 
 function pkce(): { verifier: string; challenge: string } {
@@ -180,9 +211,12 @@ function decide(
   requestId: string,
   passphrase: string,
   decision = "approve",
+  from = "198.51.100.4",
 ): Promise<Answer> {
+  // A browser sends the page's own origin with the form (see the consent page's
+  // Referrer-Policy).
   return send(`${base}/authorize`, {
-    headers: FORM,
+    headers: { ...FORM, origin: new URL(base).origin, "x-forwarded-for": from },
     body: new URLSearchParams({
       request: requestId,
       passphrase,
@@ -198,16 +232,22 @@ function token(base: string, params: Record<string, string>): Promise<Answer> {
   });
 }
 
-/** Registers, consents and exchanges the code: what Claude and the owner do together. */
+/**
+ * Registers, consents and exchanges the code: what Claude and the owner do together. Given
+ * a client id, it signs in again with that one, as Claude does with its registration.
+ */
 async function signIn(
   base: string,
+  existingClientId?: string,
 ): Promise<{ clientId: string; access: string; refresh: string }> {
-  const clientId = (await register(base)).json.client_id as string;
+  const clientId =
+    existingClientId ?? ((await register(base)).json.client_id as string);
   const { verifier, challenge } = pkce();
   const consent = await send(authorizeUrl(base, clientId, challenge), {
     method: "GET",
   });
   const approved = await decide(base, requestIdFrom(consent.text), OWNER);
+  assert.equal(approved.status, 302, approved.text);
   const code = new URL(String(approved.headers.location)).searchParams.get(
     "code",
   )!;
@@ -404,6 +444,20 @@ test("the MCP SDK's OAuth client registers, gets consent, exchanges with PKCE an
     "the page names where the browser goes next",
   );
   assert.doesNotMatch(consent.text, /any program there can listen on it/u);
+  assert.equal(
+    consent.headers["referrer-policy"],
+    "same-origin",
+    "under no-referrer a browser would send Origin: null with the form",
+  );
+  const nullOrigin = await send(`${server.base}/authorize`, {
+    headers: { ...FORM, origin: "null" },
+    body: new URLSearchParams({
+      request: requestIdFrom(consent.text),
+      passphrase: OWNER,
+      decision: "approve",
+    }).toString(),
+  });
+  assert.equal(nullOrigin.status, 403, "which the Origin check refuses");
   const approved = await decide(
     server.base,
     requestIdFrom(consent.text),
@@ -474,6 +528,49 @@ test("the MCP SDK's OAuth client registers, gets consent, exchanges with PKCE an
   assert.equal(exchanged.client, registered.client);
 });
 
+test("the stateless MCP era works with an OAuth token, and connection_info names the client", async (t) => {
+  const server = await start(t);
+  const { clientId, access } = await signIn(server.base);
+  const version = "2026-07-28";
+  const call = (headers: Record<string, string>): Promise<Answer> =>
+    send(server.url, {
+      headers: {
+        ...JSON_HEADERS,
+        "mcp-protocol-version": version,
+        "mcp-method": "tools/call",
+        "mcp-name": "connection_info",
+        ...headers,
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 7,
+        method: "tools/call",
+        params: {
+          name: "connection_info",
+          arguments: {},
+          _meta: {
+            "io.modelcontextprotocol/protocolVersion": version,
+            "io.modelcontextprotocol/clientCapabilities": {},
+          },
+        },
+      }),
+    });
+  const anonymous = await call({});
+  assert.equal(anonymous.status, 401);
+  assert.match(
+    String(anonymous.headers["www-authenticate"]),
+    /resource_metadata=/u,
+  );
+  const answer = await call({ authorization: `Bearer ${access}` });
+  assert.equal(answer.status, 200, answer.text);
+  const info = JSON.parse(answer.json.result.content[0].text);
+  assert.equal(info.era, "modern");
+  assert.equal(info.session, null);
+  assert.equal(info.auth.mode, "oauth");
+  assert.equal(info.auth.clientId, clientId);
+  assert.ok(!answer.text.includes(access), "the token is never echoed");
+});
+
 test("consent: a wrong passphrase is refused, five lock it for the window, and deny says so", async (t) => {
   const server = await start(t);
   const clientId = (await register(server.base)).json.client_id as string;
@@ -522,16 +619,79 @@ test("consent: an approved request can't be approved again", async (t) => {
   assert.equal(twice.headers.location, undefined, "no second code");
 });
 
-test("authorize: unknown clients and unregistered redirects never redirect; bad requests do, with an error", async (t) => {
+test("consent: wrong passphrases lock out only the address they came from, counting the last 15 minutes", async (t) => {
+  const clock = new FakeClock(1_000_000);
+  const server = await start(t, { clock });
+  const clientId = (await register(server.base)).json.client_id as string;
+  const openConsent = async (): Promise<string> =>
+    requestIdFrom(
+      (
+        await send(authorizeUrl(server.base, clientId, pkce().challenge), {
+          method: "GET",
+        })
+      ).text,
+    );
+  const guess = async (
+    requestId: string,
+    passphrase: string,
+  ): Promise<number> =>
+    (await decide(server.base, requestId, passphrase, "approve", "203.0.113.7"))
+      .status;
+
+  const guessed = await openConsent();
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    assert.equal(await guess(guessed, `a guess ${attempt}`), 401);
+  }
+  clock.advance(9 * 60_000);
+  assert.equal(await guess(guessed, "a fifth guess"), 401);
+  assert.equal(
+    await guess(guessed, OWNER),
+    429,
+    "five wrong within 15 minutes lock the address, even for the right passphrase",
+  );
+  const owners = await openConsent();
+  assert.equal(
+    (await decide(server.base, owners, OWNER)).status,
+    302,
+    "the owner, at another address, still signs in",
+  );
+
+  clock.advance(7 * 60_000);
+  assert.equal(
+    await guess(await openConsent(), "one more guess"),
+    401,
+    "the first four are now older than 15 minutes, so the lock is over",
+  );
+});
+
+test("authorize: unregistered redirects never redirect; an unknown client gets consent only while registration is open; bad requests redirect with an error", async (t) => {
   const server = await start(t);
   const clientId = (await register(server.base)).json.client_id as string;
   const { challenge } = pkce();
 
-  const unknown = await send(authorizeUrl(server.base, "dcr-nope", challenge), {
-    method: "GET",
-  });
-  assert.equal(unknown.status, 400);
-  assert.equal(unknown.headers.location, undefined);
+  const unknown = await send(
+    authorizeUrl(server.base, "dcr-registered-before-a-restart", challenge),
+    { method: "GET" },
+  );
+  assert.equal(
+    unknown.status,
+    200,
+    "registration is open, so an id with no record may do what a fresh one could",
+  );
+  assert.match(unknown.text, /no record of/u);
+  const unknownElsewhere = await send(
+    authorizeUrl(server.base, "dcr-registered-before-a-restart", challenge, {
+      redirect_uri: "https://evil.example/cb",
+    }),
+    { method: "GET" },
+  );
+  assert.equal(unknownElsewhere.status, 400);
+  assert.equal(unknownElsewhere.headers.location, undefined);
+  const garbled = await send(
+    authorizeUrl(server.base, "<script>", challenge, { client_id: "a b" }),
+    { method: "GET" },
+  );
+  assert.equal(garbled.status, 400, "an implausible client id is refused");
   const elsewhere = await send(
     authorizeUrl(server.base, clientId, challenge, {
       redirect_uri: "https://evil.example/cb",
@@ -568,6 +728,39 @@ test("authorize: unknown clients and unregistered redirects never redirect; bad 
     assert.equal(back.origin + back.pathname, CALLBACK);
     assert.equal(back.searchParams.get("error"), error);
   }
+});
+
+test("authorize: a stranger opening many sign-ins can't push out the owner's", async (t) => {
+  const server = await start(t);
+  const clientId = (await register(server.base)).json.client_id as string;
+  const openFrom = async (from: string): Promise<string> =>
+    requestIdFrom(
+      (
+        await send(authorizeUrl(server.base, clientId, pkce().challenge), {
+          method: "GET",
+          headers: { "x-forwarded-for": from },
+        })
+      ).text,
+    );
+  const owners = await openFrom("198.51.100.4");
+  const strangers: string[] = [];
+  for (let opened = 0; opened < 100; opened += 1) {
+    strangers.push(await openFrom("203.0.113.7"));
+  }
+  assert.equal(
+    (await decide(server.base, owners, OWNER)).status,
+    302,
+    "the owner's request is still open",
+  );
+  assert.equal(
+    (await decide(server.base, strangers[0]!, OWNER)).status,
+    400,
+    "the stranger's own oldest requests made room",
+  );
+  assert.equal(
+    (await decide(server.base, strangers.at(-1)!, OWNER)).status,
+    302,
+  );
 });
 
 test("token: PKCE, single-use codes, redirect_uri, client and resource are all checked", async (t) => {
@@ -608,20 +801,58 @@ test("token: PKCE, single-use codes, redirect_uri, client and resource are all c
   assert.match(failed.reason, /code_verifier/u);
 
   const wrongRedirect = await exchange(await freshCode(), {
-    redirect_uri: CLAUDE_CALLBACKS[1]!,
+    redirect_uri: "https://claude.ai/api/mcp/other_callback",
   });
   assert.equal(wrongRedirect.json.error, "invalid_grant");
+
+  const withoutRedirect = await token(server.base, {
+    grant_type: "authorization_code",
+    code: await freshCode(),
+    client_id: clientId,
+    code_verifier: verifier,
+  });
+  assert.equal(
+    withoutRedirect.status,
+    200,
+    "OAuth 2.1 leaves redirect_uri out of the token request",
+  );
 
   const wrongResource = await exchange(await freshCode(), {
     resource: "https://other.example/mcp",
   });
   assert.equal(wrongResource.json.error, "invalid_target");
 
-  const unknownClient = await exchange(await freshCode(), {
-    client_id: "dcr-nope",
+  const otherClient = await exchange(await freshCode(), {
+    client_id: "dcr-someone-else",
   });
-  assert.equal(unknownClient.status, 401);
-  assert.equal(unknownClient.json.error, "invalid_client");
+  assert.equal(otherClient.status, 400);
+  assert.equal(otherClient.json.error, "invalid_grant");
+  const noClient = await token(server.base, {
+    grant_type: "authorization_code",
+    code: await freshCode(),
+    code_verifier: verifier,
+  });
+  assert.equal(noClient.status, 401);
+  assert.equal(noClient.json.error, "invalid_client");
+
+  const basic = await send(`${server.base}/token`, {
+    headers: {
+      ...FORM,
+      authorization: `Basic ${Buffer.from(`${encodeURIComponent(clientId)}:`).toString("base64")}`,
+    },
+    body: new URLSearchParams({
+      grant_type: "authorization_code",
+      code: await freshCode(),
+      redirect_uri: CALLBACK,
+      code_verifier: verifier,
+    }).toString(),
+  });
+  assert.equal(
+    basic.status,
+    200,
+    "the client may name itself in a Basic header",
+  );
+  assert.equal(JSON.parse(server.lines.at(-1)!).oauth.clientVia, "basic");
 
   const code = await freshCode();
   const good = await exchange(code);
@@ -705,6 +936,13 @@ test("refresh rotates; the same refresh within a minute gets the same answer; an
   );
 
   const other = await signIn(server.base);
+  const elsewhere = await token(server.base, {
+    grant_type: "refresh_token",
+    refresh_token: other.refresh,
+    client_id: other.clientId,
+    resource: "https://other.example/mcp",
+  });
+  assert.equal(elsewhere.json.error, "invalid_target");
   const crossClient = await refresh(other.refresh, first.clientId);
   assert.equal(
     crossClient.json.error,
@@ -718,6 +956,37 @@ test("refresh rotates; the same refresh within a minute gets the same answer; an
     401,
     "a token that is not the live one, with a live family id, ends the sign-in",
   );
+});
+
+test("after a restart the old refresh token is invalid_grant, and Claude signs in again with its old client id", async (t) => {
+  const before = await start(t);
+  const old = await signIn(before.base);
+  await before.close();
+  const after = await start(t, { port: before.port });
+
+  const refreshed = await token(after.base, {
+    grant_type: "refresh_token",
+    refresh_token: old.refresh,
+    client_id: old.clientId,
+    resource: after.url,
+  });
+  assert.equal(refreshed.status, 400);
+  assert.equal(
+    refreshed.json.error,
+    "invalid_grant",
+    "a dead grant, not a dead client, so Claude starts a new sign-in",
+  );
+  assert.equal((await mcpWith(after.url, old.access)).status, 401);
+
+  const again = await signIn(after.base, old.clientId);
+  assert.equal(again.clientId, old.clientId);
+  assert.equal((await mcpWith(after.url, again.access)).status, 200);
+  const rotated = await token(after.base, {
+    grant_type: "refresh_token",
+    refresh_token: again.refresh,
+    client_id: old.clientId,
+  });
+  assert.equal(rotated.status, 200, rotated.text);
 });
 
 test("access tokens expire after an hour and codes after a minute", async (t) => {
@@ -765,6 +1034,19 @@ test("registration: only Claude's callbacks unless loopback is allowed, which ma
   });
   assert.equal(foreign.status, 400);
   assert.equal(foreign.json.error, "invalid_redirect_uri");
+  const mixed = await register(server.base, {
+    redirect_uris: ["https://evil.example/cb", CALLBACK],
+  });
+  assert.equal(mixed.status, 201, "RFC 7591 3.2.1: register less than asked");
+  assert.deepEqual(mixed.json.redirect_uris, [CALLBACK]);
+  const dropped = await send(
+    authorizeUrl(server.base, mixed.json.client_id, pkce().challenge, {
+      redirect_uri: "https://evil.example/cb",
+    }),
+    { method: "GET" },
+  );
+  assert.equal(dropped.status, 400);
+  assert.equal(dropped.headers.location, undefined);
   const loopbackRefused = await register(server.base, {
     redirect_uris: ["http://localhost:4567/callback"],
   });
@@ -816,6 +1098,60 @@ test("registration: only Claude's callbacks unless loopback is allowed, which ma
   assert.equal(otherPath.status, 400, "but not on another path");
 });
 
+test("registration: a flood of registrations can't break a sign-in under way or one that is done", async (t) => {
+  const server = await start(t);
+  const done = await signIn(server.base);
+  const clientId = (await register(server.base)).json.client_id as string;
+  const { verifier, challenge } = pkce();
+  const consent = await send(authorizeUrl(server.base, clientId, challenge), {
+    method: "GET",
+  });
+  for (let registered = 0; registered < 100; registered += 1) {
+    const flood = await send(`${server.base}/register`, {
+      headers: {
+        "content-type": "application/json",
+        "x-forwarded-for": "203.0.113.7",
+      },
+      body: JSON.stringify({ redirect_uris: [CALLBACK] }),
+    });
+    assert.equal(flood.status, 201);
+  }
+  const forgotten = await send(
+    authorizeUrl(server.base, clientId, pkce().challenge),
+    { method: "GET" },
+  );
+  assert.match(forgotten.text, /no record of/u, "the new client was evicted");
+  const kept = await send(
+    authorizeUrl(server.base, done.clientId, pkce().challenge),
+    { method: "GET" },
+  );
+  assert.match(
+    kept.text,
+    /registered itself as/u,
+    "a client with a live sign-in is never evicted",
+  );
+
+  const approved = await decide(
+    server.base,
+    requestIdFrom(consent.text),
+    OWNER,
+  );
+  assert.equal(approved.status, 302, "the request carries its client id");
+  const exchanged = await token(server.base, {
+    grant_type: "authorization_code",
+    code: new URL(String(approved.headers.location)).searchParams.get("code")!,
+    client_id: clientId,
+    code_verifier: verifier,
+  });
+  assert.equal(exchanged.status, 200, exchanged.text);
+  const refreshed = await token(server.base, {
+    grant_type: "refresh_token",
+    refresh_token: done.refresh,
+    client_id: done.clientId,
+  });
+  assert.equal(refreshed.status, 200, refreshed.text);
+});
+
 test("a pre-registered client id works with registration turned off", async (t) => {
   const server = await start(t, {
     dynamicRegistration: false,
@@ -827,6 +1163,19 @@ test("a pre-registered client id works with registration turned off", async (t) 
   );
   assert.equal(issuer.json.registration_endpoint, undefined);
   assert.equal((await register(server.base)).status, 404);
+  const stranger = await send(
+    authorizeUrl(server.base, "dcr-made-up", pkce().challenge),
+    { method: "GET" },
+  );
+  assert.equal(stranger.status, 400, "with registration off, no unknown ids");
+  assert.equal(stranger.headers.location, undefined);
+  const strangerToken = await token(server.base, {
+    grant_type: "refresh_token",
+    refresh_token: "x.y",
+    client_id: "dcr-made-up",
+  });
+  assert.equal(strangerToken.status, 401);
+  assert.equal(strangerToken.json.error, "invalid_client");
 
   const { verifier, challenge } = pkce();
   const consent = await send(
@@ -851,6 +1200,40 @@ test("a pre-registered client id works with registration turned off", async (t) 
     code_verifier: verifier,
   });
   assert.equal(exchanged.status, 200);
+});
+
+test("a pre-registered client gets Claude Code's loopback callbacks, on any port, only when loopback is allowed", async (t) => {
+  const options = { dynamicRegistration: false, clientIds: ["claude-code"] };
+  const { challenge } = pkce();
+  const ask = (base: string, redirect: string): Promise<Answer> =>
+    send(
+      authorizeUrl(base, "claude-code", challenge, { redirect_uri: redirect }),
+      { method: "GET" },
+    );
+  const loopback = await start(t, { ...options, loopbackRedirects: true });
+  for (const redirect of [
+    "http://localhost:53682/callback",
+    "http://127.0.0.1:41000/callback",
+    CALLBACK,
+  ]) {
+    assert.equal((await ask(loopback.base, redirect)).status, 200, redirect);
+  }
+  for (const redirect of [
+    "http://localhost:53682/elsewhere",
+    "http://127.0.0.1:41000/callback?x=1",
+    "http://[::1]:41000/callback",
+    "https://localhost:53682/callback",
+  ]) {
+    const refused = await ask(loopback.base, redirect);
+    assert.equal(refused.status, 400, redirect);
+    assert.equal(refused.headers.location, undefined);
+  }
+  const plain = await start(t, options);
+  assert.equal(
+    (await ask(plain.base, "http://localhost:53682/callback")).status,
+    400,
+  );
+  assert.equal((await ask(plain.base, CALLBACK)).status, 200);
 });
 
 test("the consent page escapes what a client says about itself", async (t) => {

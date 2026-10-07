@@ -22,7 +22,11 @@ import {
   parseConnectorEchoArgs,
   readSecretFile,
 } from "../src/connector/echo.ts";
-import { createConnectorServer, RateLimiter } from "../src/connector/http.ts";
+import {
+  createConnectorServer,
+  RateLimiter,
+  SourceLimiter,
+} from "../src/connector/http.ts";
 import { StructuredLogger } from "../src/logger.ts";
 import { FakeClock } from "./helpers.ts";
 
@@ -521,6 +525,20 @@ test("Host and Origin are checked on every request (DNS-rebinding protection)", 
     headers: { host: "evil.example" },
   });
   assert.equal(healthz.status, 403, "every path, not only /mcp");
+  const loopbackOrigin = await send(server.url, {
+    headers: { ...JSON_HEADERS, origin: `http://127.0.0.1:${server.port}` },
+    body: init,
+  });
+  assert.equal(
+    loopbackOrigin.status,
+    200,
+    "a page served on the host itself, such as the consent page",
+  );
+  const otherLoopbackPort = await send(server.url, {
+    headers: { ...JSON_HEADERS, origin: `http://127.0.0.1:${server.port + 1}` },
+    body: init,
+  });
+  assert.equal(otherLoopbackPort.status, 403, "only this server's own port");
 });
 
 test("bodies: size, content type, Accept, JSON and batches", async (t) => {
@@ -555,7 +573,7 @@ test("bodies: size, content type, Accept, JSON and batches", async (t) => {
   assert.match((batch.json as any).error.message, /batch/u);
 });
 
-test("the rate limit answers 429 with Retry-After once the bucket is empty", async (t) => {
+test("the rate limit is per caller, with a cap for all callers, and answers 429 with Retry-After", async (t) => {
   const clock = new FakeClock(0);
   const limiter = new RateLimiter(60, clock);
   for (let i = 0; i < 60; i += 1) {
@@ -566,13 +584,54 @@ test("the rate limit answers 429 with Retry-After once the bucket is empty", asy
   assert.equal(limiter.take(), 0);
 
   const server = await start(t, { rateLimitPerMinute: 2 });
-  await send(`http://127.0.0.1:${server.port}/healthz`, { method: "GET" });
-  await send(`http://127.0.0.1:${server.port}/healthz`, { method: "GET" });
-  const limited = await send(`http://127.0.0.1:${server.port}/healthz`, {
-    method: "GET",
-  });
+  const healthz = (from: string): Promise<Answer> =>
+    send(`http://127.0.0.1:${server.port}/healthz`, {
+      method: "GET",
+      headers: { "x-forwarded-for": from },
+    });
+  await healthz("203.0.113.7");
+  await healthz("203.0.113.7");
+  const limited = await healthz("203.0.113.7");
   assert.equal(limited.status, 429);
   assert.ok(Number(limited.headers["retry-after"]) >= 1);
+  assert.equal(
+    (await healthz("160.79.104.10")).status,
+    200,
+    "each caller has its own bucket, so one busy caller can't starve Claude",
+  );
+  assert.equal(
+    (await healthz("203.0.113.7, 160.79.104.10")).status,
+    200,
+    "the last forwarded address, the one Funnel added, is the caller",
+  );
+  assert.equal((await healthz("160.79.104.10, 203.0.113.7")).status, 429);
+
+  const sources = new SourceLimiter(2, clock);
+  for (const from of ["a", "b", "c", "d", "e"]) {
+    assert.equal(sources.take(from), 0);
+    assert.equal(sources.take(from), 0);
+  }
+  assert.ok(
+    sources.take("f") > 0,
+    "all callers together get five times one caller's share",
+  );
+  clock.advance(60_000);
+  assert.equal(sources.take("f"), 0);
+});
+
+test("bearer: a token an Authorization header can't carry is refused at startup", () => {
+  assert.throws(() => new BearerAuth("x".repeat(31)), /32 characters/u);
+  for (const token of [
+    `${"a".repeat(32)} with spaces`,
+    `${"a".repeat(32)}$dollar`,
+    `${"a".repeat(32)}=inside=`,
+  ]) {
+    assert.throws(() => new BearerAuth(token), /letters, digits/u, token);
+  }
+  assert.doesNotThrow(
+    () => new BearerAuth(`${"A".repeat(30)}-._~+/09==`),
+    "the b64token alphabet, with = only at the end",
+  );
 });
 
 test("bearer: no token or a wrong one is a 401; the right one works and is never echoed or logged", async (t) => {
