@@ -41,7 +41,7 @@ export const TOOLS = [
   {
     name: "reply",
     description:
-      'Answer on Discord. Your transcript never reaches Discord, so this is the only way to speak there. Pass the event\'s chat_id and batch_id. Only chats an ear serves are reachable: its configured channels, their threads, and DMs it has received from principals and peer agents. Text over 2000 characters goes out as several messages. Returns the sent message ids, which edit_message takes. If a send could not be confirmed (the error says so, or a kind="send_check" event lists it), check fetch_messages before sending again: re-sending the same text and reply_to within 5 minutes de-duplicates only the unconfirmed message, and any part already confirmed posts again.',
+      'Answer on Discord. Your transcript never reaches Discord, so this is the only way to speak there. Pass the event\'s chat_id and batch_id. Only chats an ear serves are reachable: its configured channels, their threads, and DMs it has received from principals and peer agents. Text over 2000 characters goes out as several messages. Returns the sent message ids, which edit_message takes. If a send could not be confirmed (the error says so, or a kind="send_check" event lists it), check fetch_messages before sending again: re-sending the same text and reply_to within 5 minutes of the first try posts only what did not go out (the error says how long is left); after that, every part posts again.',
     inputSchema: {
       type: "object",
       properties: {
