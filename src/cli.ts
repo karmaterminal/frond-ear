@@ -23,6 +23,7 @@ import {
   type CanticleSource,
 } from "./canticle/source.ts";
 import { Manifest } from "./canticle/manifest.ts";
+import { runConnectorEcho } from "./connector/echo.ts";
 import { Daemon } from "./daemon.ts";
 import { DiscordGateway } from "./gateway.ts";
 import { StructuredLogger } from "./logger.ts";
@@ -57,6 +58,9 @@ usage:
   frond-ear tap --ear <name>          stream the batches pushed to an ear's attached session (read-only;\n                                      wakes a session without channel push; a shim must be attached)
   frond-ear inject --chat <id> --author <id> [--guild <id>] [--name <n>] [--bot] [--mention] <text…>
                                       push a synthetic MESSAGE_CREATE (dry-run or FROND_EAR_ALLOW_INJECT=1)
+  frond-ear connector-echo [--public-url https://<host>] [--auth none|bearer|oauth] …
+                                      read-only echo MCP server for a claude.ai custom connector (#53);
+                                      loopback only, for Tailscale Funnel; no Discord access (docs/connector.md)
 
 environment:
   FROND_EAR_SOCKET        daemon socket (default $XDG_RUNTIME_DIR/frond-ear/daemon.sock)
@@ -460,6 +464,12 @@ async function main(): Promise<void> {
       return;
     case "copilot-extension":
       runCopilotExtension(rest);
+      return;
+    case "connector-echo":
+      process.exitCode = await runConnectorEcho(rest, {
+        stdout: process.stdout,
+        stderr: process.stderr,
+      });
       return;
     case undefined:
     case "help":
