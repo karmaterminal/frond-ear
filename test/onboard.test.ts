@@ -1,6 +1,7 @@
 // `frond-ear init` and `frond-ear doctor`. Everything runs in-process against
 // temp directories; doctor talks to a real daemon over a real unix socket.
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -19,6 +20,7 @@ import test from "node:test";
 
 import { loadConfigFile, parseConfig, runtimeOptions } from "../src/config.ts";
 import {
+  createTokenCommand,
   doctorChecks,
   resolveConfigPath,
   runDoctor,
@@ -190,6 +192,70 @@ test("init refuses to overwrite an existing config or token file without --force
     assert.doesNotThrow(() => loadConfigFile(configPath));
     assert.equal(readFileSync(tokenPath, "utf8"), `${TOKEN}\n`);
     assert.equal(statSync(tokenPath).mode & 0o777, 0o600);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+/** Runs a printed create line the way a person pastes it, with an editor that changes nothing. */
+function runCreateLine(line: string): number | null {
+  return spawnSync("sh", ["-c", line], {
+    env: { PATH: process.env.PATH ?? "", EDITOR: "true" },
+    stdio: "ignore",
+  }).status;
+}
+
+test("init without a token flag never advises emptying a token file that is already there (#57)", async () => {
+  const directory = temp();
+  try {
+    const confDir = join(directory, "conf");
+    const tokenPath = join(confDir, "token");
+    const env = { FROND_EAR_CONF_DIR: confDir };
+
+    // No token yet: init prints a create line, which makes the file 0600 and refuses it afterwards.
+    const fresh = capture(env);
+    assert.equal(
+      await runInit(
+        [...FLAGS, "--config", join(confDir, "frond-ear.json")],
+        fresh.io,
+      ),
+      0,
+      fresh.stderr(),
+    );
+    const line = createTokenCommand(tokenPath);
+    assert.ok(
+      fresh
+        .stdout()
+        .includes(`create it, then put the bot token in it:\n  ${line}\n`),
+    );
+    assert.doesNotMatch(fresh.stdout(), /install -m 600/u);
+    assert.equal(runCreateLine(line), 0);
+    assert.equal(statSync(tokenPath).mode & 0o777, 0o600);
+    writeFileSync(tokenPath, "another ear's token\n");
+    assert.notEqual(
+      runCreateLine(line),
+      0,
+      "the line must refuse an existing file",
+    );
+    assert.equal(readFileSync(tokenPath, "utf8"), "another ear's token\n");
+
+    // A token already at the default path: a notice, no create line, and the file untouched.
+    const existing = capture(env);
+    assert.equal(
+      await runInit(
+        [...FLAGS, "--config", join(directory, "second.json")],
+        existing.io,
+      ),
+      0,
+      existing.stderr(),
+    );
+    assert.match(
+      existing.stdout(),
+      /no token written; \S+ already exists and the steps below use it as it is\. If it is not this ear's own bot token/u,
+    );
+    assert.ok(!existing.stdout().includes(line));
+    assert.ok(!existing.stdout().includes("another ear's token"));
+    assert.equal(readFileSync(tokenPath, "utf8"), "another ear's token\n");
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -705,7 +771,10 @@ test("doctor: a config that does not parse, a missing token file, and no claude 
     assert.match(run.byName("config").detail, /ears must define at least one/u);
     assert.match(run.byName("config").hint ?? "", /frond-ear init/u);
     assert.match(run.byName("token").detail, /no token file/u);
-    assert.match(run.byName("token").hint ?? "", /install -m 600/u);
+    assert.equal(
+      run.byName("token").hint,
+      createTokenCommand(join(directory, "nope")),
+    );
     assert.equal(run.byName("socket dir").ok, false);
     assert.equal(run.byName("daemon").ok, false);
   } finally {

@@ -60,6 +60,17 @@ export function defaultTokenPath(env: NodeJS.ProcessEnv): string {
   return join(defaultConfDir(env), "token");
 }
 
+/**
+ * The shell line that creates a token file 0600 and opens it in $EDITOR. `set -C` makes it
+ * refuse a file that already exists: on a host shared with another seat's ear that file may be
+ * the other ear's token, which `install -m 600 /dev/null` would have emptied (#57). The create
+ * runs under `sh -c` with the path as an argument, so the line also works pasted into fish.
+ */
+export function createTokenCommand(path: string): string {
+  const file = shellWord(path);
+  return `sh -c 'umask 077; set -C; : > "$1"' sh ${file} && $EDITOR ${file}`;
+}
+
 function modeOf(path: string): number {
   return statSync(path).mode & 0o777;
 }
@@ -512,9 +523,13 @@ export async function runInit(argv: string[], io: Io): Promise<number> {
         out(`chmod 600 ${token.path}\n`);
       }
       out(`using token file ${token.path}\n`);
+    } else if (existsSync(token.path)) {
+      out(
+        `no token written; ${token.path} already exists and the steps below use it as it is. If it is not this ear's own bot token (another ear on this host may use it), re-run init with --token-file naming this ear's own file\n`,
+      );
     } else {
       out(
-        `no token written; create it with:\n  install -m 600 /dev/null ${shellWord(token.path)} && $EDITOR ${shellWord(token.path)}\n`,
+        `no token written; create it, then put the bot token in it:\n  ${createTokenCommand(token.path)}\n`,
       );
     }
     if (configPath === resolve(defaultConfigPath(io.env))) {
@@ -716,7 +731,7 @@ function tokenCheck(flag: string | undefined, env: NodeJS.ProcessEnv): Check {
       detail: `neither DISCORD_BOT_TOKEN_FILE nor DISCORD_BOT_TOKEN is set, and the daemon reads its token from nowhere else${found ? `; ${home} exists but the daemon does not look there` : ""}`,
       hint: found
         ? `export DISCORD_BOT_TOKEN_FILE=${shellWord(home)} for the daemon and for doctor`
-        : `install -m 600 /dev/null ${shellWord(home)} && $EDITOR ${shellWord(home)}, then export DISCORD_BOT_TOKEN_FILE=${shellWord(home)}`,
+        : `${createTokenCommand(home)}, then export DISCORD_BOT_TOKEN_FILE=${shellWord(home)}`,
     };
   }
   const file = resolve(path);
@@ -726,7 +741,7 @@ function tokenCheck(flag: string | undefined, env: NodeJS.ProcessEnv): Check {
       ok: false,
       required: true,
       detail: `no token file at ${file}`,
-      hint: `install -m 600 /dev/null ${shellWord(file)} && $EDITOR ${shellWord(file)}`,
+      hint: createTokenCommand(file),
     };
   }
   const mode = modeOf(file);

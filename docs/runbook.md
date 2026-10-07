@@ -136,10 +136,12 @@ A long-running session stalls on permission prompts. Allow frond-ear's tools in 
 
 ## 4. Connect Discord
 
-Stop the dry-run daemon and start it for real:
+Stop the dry-run daemon and start it for real. Skip the first line if `init` already wrote the
+token (§1). It creates the token file and refuses one that already exists: on a host shared with
+another seat's ear, that file may be the other ear's token.
 
 ```sh
-install -m 600 /dev/null ~/.config/frond-ear/token && $EDITOR ~/.config/frond-ear/token
+sh -c 'umask 077; set -C; : > "$1"' sh ~/.config/frond-ear/token && $EDITOR ~/.config/frond-ear/token
 DISCORD_BOT_TOKEN_FILE=~/.config/frond-ear/token node src/cli.ts daemon
 ```
 
