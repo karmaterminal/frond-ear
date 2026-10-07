@@ -224,7 +224,7 @@ export async function start(joinSession, config, deps = {}) {
         deliver({
           type: "event",
           batchId: null,
-          content: `frond-ear: this session no longer receives Discord events for its ear (${message.reason}). Tools still work.`,
+          content: `frond-ear: this session no longer receives Discord events for its ear (${message.reason}): another session holds it now, or the config dropped it. reply still posts as the bot, but ack and inbox mark nothing and set_attention refuses. Stop replying until you know who holds the ear (ear_status shows each ear's sessionId and shimPid).`,
           meta: { kind: "detached", reason: message.reason },
         });
         return;

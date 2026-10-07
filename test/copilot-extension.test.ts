@@ -18,6 +18,7 @@ import { pathToFileURL } from "node:url";
 import test from "node:test";
 
 import { targetAdvice } from "../src/advice.ts";
+import { detachedNotice } from "../src/render.ts";
 import { BOT, CHANNEL, GUILD, PRINCIPAL } from "./helpers.ts";
 
 const CLI = join(import.meta.dirname, "..", "src", "cli.ts");
@@ -171,7 +172,7 @@ test("copilot extension: install, attach, canary, <channel> push via session.sen
   assert.equal(canary.mode, "enqueue");
   assert.match(
     canary.prompt,
-    /^frond-ear is your own ear on Discord, run by your operator \(this session is ear "walker"\)[\s\S]*\n\n<channel source="frond-ear" kind="attach"/u,
+    /^frond-ear is your own ear on Discord \(this session is ear "walker"\)[\s\S]*\n\n<channel source="frond-ear" kind="attach"/u,
   );
   const nonce = /nonce="([^"]+)"/u.exec(canary.prompt)?.[1];
   assert.ok(nonce);
@@ -566,4 +567,16 @@ test("copilot extension: reinstall tightens an existing 0644 config.json to 0600
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test("copilot extension: its detached notice is the shim's text", () => {
+  // core.mjs cannot import render.ts, so it keeps a copy of detachedNotice.
+  const core = readFileSync(
+    join(import.meta.dirname, "..", "copilot-extension", "core.mjs"),
+    "utf8",
+  );
+  assert.ok(
+    core.includes(`\`${detachedNotice("${message.reason}")}\``),
+    "copilot-extension/core.mjs must carry detachedNotice's text verbatim",
+  );
 });

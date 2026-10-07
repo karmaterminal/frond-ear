@@ -1324,7 +1324,7 @@ test("set_attention is reduce-only: the operator's mode is a ceiling it cannot w
       ceiling: "mentions",
       effective: "mentions",
     });
-    assert.match(view.note ?? "", /exceeds the operator's ceiling/u);
+    assert.match(view.note ?? "", /exceeds the config's ceiling/u);
     h.daemon.ingest(message({ content: "ambient chatter" }));
     assert.equal(
       h.store.stateCounts("scribe").context,

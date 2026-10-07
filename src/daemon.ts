@@ -1295,7 +1295,7 @@ export class Daemon {
       {
         ...view,
         note: capped
-          ? `requested ${requested} exceeds the operator's ceiling for ${chatId}; effective mode is ${view.chats[chatId]?.effective}`
+          ? `requested ${requested} exceeds the config's ceiling for ${chatId}; effective mode is ${view.chats[chatId]?.effective}`
           : undefined,
         narrowedPending: narrowed,
       },
