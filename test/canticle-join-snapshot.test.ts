@@ -213,6 +213,7 @@ test("(5)(c) budgets and keys: snapshot frames take the live deliverability chec
   assert.deepEqual(
     { ...c.counts },
     {
+      joined_late: 1, // the bootstrap's, as every health reason counts (frond-ear#59)
       snapshot_frames: 2,
       expired_on_arrival: 1,
       not_deliverable_verified: 1,
@@ -232,7 +233,7 @@ test("(5)(d) capacity on a rejoin: a truncated snapshot is merge only; an omitte
   feed(c, frame(51, 51), frame(52, 52), presence(53, "S", "on_air"));
   assert.deepEqual(seqs(c), [51, 52]);
   // Connection lost; same run, new connection; the cap leaves 52 out.
-  c.closed();
+  c.closed(NOW);
   bootstrap(c, 150);
   assert.deepEqual(seqs(c), [], "carried items are hidden until the snapshot");
   feed(
@@ -263,7 +264,7 @@ test("(5)(d′) missed retract on rejoin, complete snapshot: F's absence removes
   feed(c, frame(51, 70), frame(52, 71), presence(53, "S", "on_air"));
   assert.deepEqual(seqs(c), [70, 71]);
   // F (70)'s retract is emitted while away; S went off air too (no presence entry).
-  c.closed();
+  c.closed(NOW);
   bootstrap(c, 150);
   feed(c, snapFrame(160, 1, 71), snapEnd(160, 1));
   assert.deepEqual(seqs(c), [71], "F left the local view");
@@ -285,10 +286,10 @@ test("(5)(e) an interrupted snapshot is never applied; the next connection asks 
   const c = new RecordConsumer();
   bootstrap(c, 50);
   feed(c, snapEnd(50, 0), frame(51, 51));
-  c.closed();
+  c.closed(NOW);
   bootstrap(c, 150);
   feed(c, snapFrame(160, 1, 155), snapPresence(160, 2, "S", "on_air"));
-  c.closed(); // connection lost before snapshot_end
+  c.closed(NOW); // connection lost before snapshot_end
   assert.deepEqual(seqs(c), []);
   assert.deepEqual(stations(c), {});
   // Next connection: the held entries are gone; only this snapshot applies.
@@ -853,4 +854,63 @@ test("join snapshot: binary-canticle#85's daemon output reads with nothing malfo
   assert.equal(c.counts.snapshot_frames, 2);
   assert.ok(!c.healthReasons.includes("joined_late"));
   assert.ok(!c.healthReasons.includes("records_lost"));
+});
+
+test("join snapshot: joinSnapshotFrames is this connection's; counts.snapshot_frames adds them up over the process (frond-ear#59)", () => {
+  // fe#24's D36 proof: a join whose snapshot carries 3 items, then a graceful host
+  // daemon restart whose new run has nothing live yet.
+  const c = new RecordConsumer();
+  bootstrap(c, 50);
+  assert.equal(c.snapshotFrames, undefined, "nothing applied yet");
+  feed(
+    c,
+    snapPresence(99, 1, "S", "on_air"),
+    snapFrame(99, 2, 60),
+    snapFrame(99, 3, 61),
+    snapFrame(99, 4, 62),
+    snapEnd(99, 4),
+  );
+  assert.equal(c.snapshotFrames, 3);
+  assert.equal(c.counts.snapshot_frames, 3);
+  feed(c, R("bye", 100));
+  c.closed(NOW);
+  const run = "f7f8";
+  const onRun = (r: R): R => ({ ...r, run });
+  c.reconnected({ joinSnapshot: true });
+  assert.equal(c.snapshotFrames, undefined, "a new connection has none yet");
+  feed(
+    c,
+    R("hello", 1, { join_snapshot: true }, run),
+    onRun(landing(2)),
+    onRun(snapEnd(2, 0)),
+  );
+  assert.equal(c.snapshotState, "complete");
+  assert.equal(c.snapshotFrames, 0, "the new run's snapshot was empty");
+  assert.equal(c.counts.snapshot_frames, 3, "the process's, across runs");
+  // A truncated snapshot counts what it applied.
+  c.closed(NOW);
+  c.reconnected({ joinSnapshot: true });
+  feed(
+    c,
+    R("hello", 1, { join_snapshot: true }, run),
+    onRun(landing(5)),
+    onRun(snapFrame(9, 1, 70)),
+    onRun(snapEnd(9, 1, 6)),
+  );
+  assert.equal(c.snapshotState, "truncated");
+  assert.equal(c.snapshotFrames, 1);
+  assert.equal(c.snapshotOmitted, 6);
+  assert.equal(c.counts.snapshot_frames, 4);
+  // One cut off before snapshot_end applied nothing, so it counts nothing.
+  c.closed(NOW);
+  c.reconnected({ joinSnapshot: true });
+  feed(
+    c,
+    R("hello", 1, { join_snapshot: true }, run),
+    onRun(landing(12)),
+    onRun(snapFrame(15, 1, 71)),
+  );
+  c.closed(NOW);
+  assert.equal(c.snapshotFrames, undefined);
+  assert.equal(c.counts.snapshot_frames, 4);
 });

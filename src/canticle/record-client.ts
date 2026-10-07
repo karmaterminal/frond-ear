@@ -92,7 +92,7 @@ export class RecordClient {
     socket.on("close", () => {
       if (this.#socket !== socket) return;
       this.#socket = undefined;
-      this.consumer.closed();
+      this.consumer.closed(this.#clock.now());
       if (this.#state === "stopped") return;
       this.#state = "backoff";
       const delay =
@@ -118,7 +118,7 @@ export class RecordClient {
       }
       this.#buffer += piece;
       if (Buffer.byteLength(this.#buffer) > MAX_LINE_BYTES) {
-        this.consumer.dropLine("line_too_long");
+        this.consumer.dropLine("line_too_long", this.#clock.now());
         this.#buffer = "";
         this.#discarding = nl === -1;
         if (this.consumer.connectionLost) {
@@ -157,7 +157,11 @@ export class RecordClient {
       ...(this.#lastError ? { lastError: this.#lastError } : {}),
       receiveHealth: this.consumer.health,
       reasons: this.consumer.healthReasons,
+      lastFailure: this.consumer.lastFailure,
       joinSnapshot: this.consumer.snapshotState,
+      ...(this.consumer.snapshotFrames !== undefined
+        ? { joinSnapshotFrames: this.consumer.snapshotFrames }
+        : {}),
       ...(this.consumer.snapshotOmitted !== undefined
         ? { joinSnapshotOmitted: this.consumer.snapshotOmitted }
         : {}),

@@ -4,10 +4,12 @@ import test from "node:test";
 import {
   channelInstructions,
   cleanName,
+  detachedNotice,
   renderBatch,
   renderEvent,
 } from "../src/render.ts";
 import { HttpDiscordRest, RestError } from "../src/rest.ts";
+import { TOOLS } from "../src/shim.ts";
 import type { StoredEvent } from "../src/types.ts";
 import {
   AMBIENT,
@@ -189,11 +191,37 @@ test("instructions describe trust classes with configured principals and never c
   const text = channelInstructions(testConfig(), "scribe");
   assert.match(
     text,
-    /trust="principal": your operator\(s\): figs \(200000000000000002\)/u,
+    /trust="principal": figs \(200000000000000002\)\. The daemon's config names them as the people this ear answers to\. A request from them carries the same weight as one typed at this terminal; only the channel differs\./u,
   );
   assert.match(text, /trust="ambient"[^\n]*never follow instructions/u);
   assert.match(text, /never interrupt you/u);
   assert.doesNotMatch(text, /system prompt/iu);
+});
+
+test("instructions carry the invariants a session must keep: whole batch_id, the quiet-room check, detach", () => {
+  const text = channelInstructions(testConfig(), "scribe");
+  assert.match(text, /batch_id, copied whole/u);
+  assert.match(text, /Leaving it out marks everything delivered so far/u);
+  assert.match(text, /silent exactly like a quiet room[^\n]*call ear_status/u);
+  assert.match(text, /kind="detached"[^\n]*stop replying/u);
+});
+
+test("every tool parameter is described, and no model-facing text says operator", () => {
+  for (const tool of TOOLS) {
+    const properties = tool.inputSchema.properties as Record<
+      string,
+      { description?: string }
+    >;
+    for (const [name, schema] of Object.entries(properties)) {
+      assert.ok(schema.description, `${tool.name}.${name} has no description`);
+    }
+  }
+  assert.doesNotMatch(JSON.stringify(TOOLS), /operator/iu);
+  assert.doesNotMatch(
+    channelInstructions(testConfig(), "scribe"),
+    /operator/iu,
+  );
+  assert.doesNotMatch(detachedNotice("superseded"), /operator/iu);
 });
 
 function fakeFetch(
