@@ -1180,15 +1180,20 @@ test("records: lastFailure is a connection's first failure: a fatal's reason out
   c.closed(NOW + 4);
   assert.deepEqual(c.lastFailure, stop, "its own close is a consequence");
   assert.equal(c.counts.exit_without_bye, 2);
-  // Delivery has stopped for good: a later connection's records are ignored, and so is its close.
+  // Delivery has stopped for good: a later connection's lines are ignored, readable or
+  // not, and so is its close.
+  const counts = { ...c.counts };
   c.reconnected();
   c.feed(
     at(1, () => rec("hello")),
     NOW + 5,
   );
+  c.feedLine("{not json", NOW + 5);
+  c.dropLine("line_too_long", NOW + 5);
+  assert.equal(c.connectionLost, false);
   c.closed(NOW + 6);
   assert.deepEqual(c.lastFailure, stop);
-  assert.equal(c.counts.exit_without_bye, 2);
+  assert.deepEqual({ ...c.counts }, counts);
 });
 
 test("records: with one reader per run, each run's first failure is its own (frond-ear#59)", () => {
@@ -1215,19 +1220,55 @@ test("records: with one reader per run, each run's first failure is its own (fro
   assert.equal(c.counts.run_restarted_without_bye, 1);
 });
 
-test("records: a connection that carried only an unreadable line still ends without bye (frond-ear#59)", () => {
+test("records: a connection the binding drops itself is no exit without bye (frond-ear#59)", () => {
   const c = started();
   c.closed(NOW);
   c.reconnected();
   c.feedLine("{not json", NOW + 1); // a malformed bootstrap: the connection is lost
   assert.equal(c.connectionLost, true);
-  c.closed(NOW + 2);
-  assert.equal(c.counts.exit_without_bye, 2);
+  c.closed(NOW + 2); // the binding's own hang-up: the host daemon is still running
+  c.reconnected();
+  c.closed(NOW + 3); // and the next connection closes before its first line
+  assert.equal(c.counts.exit_without_bye, 1);
+  assert.equal(c.counts.malformed_bootstrap, 1);
   assert.deepEqual(c.lastFailure, {
     reason: "malformed_bootstrap",
     at: NOW + 1,
     run: RUN,
   });
+  // One reader per run has no bootstrap to lose: a reader that wrote only a line the
+  // binding couldn't read, then ended, still ended without `bye`.
+  const s = started();
+  s.closed(NOW);
+  s.feedLine("{not json", NOW + 1);
+  s.closed(NOW + 2);
+  assert.equal(s.counts.exit_without_bye, 2);
+});
+
+test("records: a fatal whose reason reads record_version is a fatal: the next run is heard (frond-ear#59)", () => {
+  const c = started();
+  c.feed(rec("fatal", { reason: "record_version" }), NOW + 1);
+  assert.deepEqual(c.healthReasons, ["record_version"]);
+  assert.equal(c.counts.fatal, 1);
+  c.closed(NOW + 2);
+  // The host daemon restarts: its run's `hello` clears receive health, and it is heard.
+  c.feed(
+    at(1, () => rec("hello", {}, "c3d4")),
+    NOW + 3,
+  );
+  c.feed(
+    at(2, () => landing({}, "c3d4")),
+    NOW + 3,
+  );
+  c.feed(
+    at(3, () => ({ ...frame(3), run: "c3d4" })),
+    NOW + 3,
+  );
+  assert.equal(c.health, "ok");
+  assert.deepEqual(
+    items(c).map((i) => i.seq),
+    ["3"],
+  );
 });
 
 /**

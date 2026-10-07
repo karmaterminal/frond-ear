@@ -195,6 +195,11 @@ export class RecordConsumer {
   #failedHere = false;
   /** A line arrived since the last close: a close that follows none reports nothing. */
   #receiving = false;
+  /**
+   * An unknown major `v` stopped delivery for the process's life. Its own flag, not a
+   * health reason: a `fatal`'s reason may read `record_version` too, and reasons are capped.
+   */
+  #versionStopped = false;
   run: string | undefined;
   #lastSeq: number | undefined;
   /**
@@ -220,7 +225,7 @@ export class RecordConsumer {
   #snapBytes = 0;
   /** A truncated snapshot's `omitted`, for status and `hear`. */
   snapshotOmitted: number | undefined;
-  /** How many frames this connection's join snapshot applied, once it has (frond-ear#59). */
+  /** How many frames this connection's join snapshot brought, once applied (frond-ear#59). */
   snapshotFrames: number | undefined;
   mute: { until: number | null; by: string | null } | null = null;
   lastDatagramAt: number | undefined;
@@ -255,6 +260,7 @@ export class RecordConsumer {
 
   /** A line the transport couldn't read as a record. In a bootstrap it loses the connection. */
   dropLine(reason: string, nowMs: number): void {
+    if (this.#versionStopped) return; // ignored, like every record
     this.#receiving = true;
     this.#count(reason);
     if (this.#conn === "hello" || this.#conn === "landing")
@@ -269,12 +275,7 @@ export class RecordConsumer {
   }
 
   feed(rec: unknown, nowMs: number): void {
-    if (
-      this.health === "failed" &&
-      this.healthReasons.includes("record_version")
-    ) {
-      return; // delivery stopped for good on an unknown major version
-    }
+    if (this.#versionStopped) return; // delivery stopped for good on an unknown major version
     this.#receiving = true;
     if (this.#conn === "lost") return;
     if (
@@ -289,6 +290,7 @@ export class RecordConsumer {
     }
     if (rec.v !== RECORD_V) {
       if (rec.v.startsWith("canticle-receptor-record/")) {
+        this.#versionStopped = true;
         this.#fail("record_version", nowMs);
         this.#live.clear();
       } else this.dropLine("malformed_record", nowMs);
@@ -838,6 +840,9 @@ export class RecordConsumer {
     // crash counts once, however many attempts the restart takes.
     if (!this.#receiving) return;
     this.#receiving = false;
+    // The binding dropped this connection itself, over a bootstrap or join snapshot it
+    // couldn't read, and has counted why: the host daemon didn't exit.
+    if (this.#conn === "lost") return;
     if (!this.#byeSeen && this.run !== undefined)
       this.#fail("exit_without_bye", nowMs);
   }
