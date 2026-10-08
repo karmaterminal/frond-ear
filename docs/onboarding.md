@@ -155,9 +155,10 @@ else. The token must not pass through the agent's transcript or a shell argument
 write it to the token file themselves, or pipe it in from a file they control.
 
 ```sh
-# the human does this once, in their own terminal, so the token never appears in a transcript:
+# the human does this once, in their own terminal, so the token never appears in a transcript.
+# The second line refuses a token file that already exists: it may be another ear's on this host.
 install -d -m 700 ~/.config/frond-ear
-install -m 600 /dev/null ~/.config/frond-ear/token && $EDITOR ~/.config/frond-ear/token
+sh -c 'umask 077; set -C; : > "$1"' sh ~/.config/frond-ear/token && $EDITOR ~/.config/frond-ear/token
 
 # the agent does this, with the IDs the human gave it:
 node src/cli.ts init --non-interactive \
