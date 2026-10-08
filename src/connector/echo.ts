@@ -3,7 +3,13 @@
 // transport and auth actually need before any Discord access is built. It holds no Discord
 // token and posts nothing anywhere. `echo` returns its text; `connection_info` reports what
 // the server saw, and each request leaves one `connector.request` log line on stderr.
-import { readFileSync, statSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  openSync,
+  readFileSync,
+} from "node:fs";
 import { parseArgs } from "node:util";
 
 import { StructuredLogger } from "../logger.ts";
@@ -231,17 +237,28 @@ export function parseConnectorEchoArgs(argv: string[]): ConnectorEchoConfig {
 
 /** Reads a secret from a file only its owner can read; the value never comes from argv. */
 export function readSecretFile(path: string, what: string): string {
-  const mode = statSync(path).mode & 0o777;
-  if ((mode & 0o077) !== 0) {
-    throw new Error(
-      `${what} ${path} is mode ${mode.toString(8)}; run chmod 600 on it first`,
-    );
+  // One open, so the checks are about the file that is read. Non-blocking, so a FIFO
+  // fails the regular-file check instead of waiting for a writer.
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
+  try {
+    const stats = fstatSync(fd);
+    if (!stats.isFile()) {
+      throw new Error(`${what} ${path} is not a regular file`);
+    }
+    const mode = stats.mode & 0o777;
+    if ((mode & 0o077) !== 0) {
+      throw new Error(
+        `${what} ${path} is mode ${mode.toString(8)}; run chmod 600 on it first`,
+      );
+    }
+    const value = readFileSync(fd, "utf8").trim();
+    if (!value) {
+      throw new Error(`${what} ${path} is empty`);
+    }
+    return value;
+  } finally {
+    closeSync(fd);
   }
-  const value = readFileSync(path, "utf8").trim();
-  if (!value) {
-    throw new Error(`${what} ${path} is empty`);
-  }
-  return value;
 }
 
 export async function runConnectorEcho(

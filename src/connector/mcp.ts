@@ -441,6 +441,9 @@ export class McpEndpoint {
     }
     session.lastSeenAt = this.clock.now();
     session.requests += 1;
+    // Keep the map in least-recently-used order, so eviction takes the idlest session.
+    this.sessions.delete(sessionId);
+    this.sessions.set(sessionId, session);
     return { version: announced ?? session.version, session };
   }
 
@@ -456,8 +459,8 @@ export class McpEndpoint {
       }
     }
     while (this.sessions.size >= MAX_SESSIONS) {
-      // Map order is insertion order, and lastSeenAt only grows, so the first entry is a
-      // good-enough oldest.
+      // Each request moves its session to the end, so the first entry is the one used
+      // least recently.
       const oldest = this.sessions.keys().next().value;
       if (oldest === undefined) {
         break;

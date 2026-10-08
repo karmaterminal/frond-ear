@@ -60,16 +60,19 @@ node src/cli.ts connector-echo --public-url https://<host>.<tailnet>.ts.net [aut
 | `--allow-origin <origin>`    |                  | Accept one more `Origin` value. Repeatable.                                                                                                                  |
 | `--no-sessions`              |                  | Legacy era without sessions.                                                                                                                                 |
 
-Secrets come only from files that only their owner can read. The server refuses a file with any
-group or other permission bits, and never takes a secret from argv or the environment. Make one
-like this and give its path to the flag:
+Secrets come only from regular files that only their owner can read. The server refuses a file
+with any group or other permission bits, and never takes a secret from argv or the environment.
+Make each one like this and give its path to the flag:
 
 ```sh
 umask 077 && openssl rand -base64 33 | tr -d '\n' > ~/.config/frond-ear/connector-token
+umask 077 && openssl rand -base64 33 | tr -d '\n' > ~/.config/frond-ear/connector-owner
 ```
 
-The owner passphrase is what figs pastes on the consent page, so keep it as a POCKET key and say
-which one; never put it in a channel or an issue.
+Generate the owner passphrase this way too, rather than choosing one. The consent page is on the
+open internet, and its limits on wrong passphrases (under [oauth](#oauth)) only slow guessing
+down; 33 random bytes put the passphrase out of reach. figs pastes it on the consent page, so
+keep it as a POCKET key and say which one; never put it in a channel or an issue.
 
 Funnel forwards a bare port to `127.0.0.1` only, so a server listening on `[::1]`, or on a
 `localhost` that resolves to it, can't be reached through it.
@@ -105,11 +108,19 @@ A single-owner authorization server on the same origin, which Claude discovers f
 
 - Codes are single-use and last 60 s. Access tokens last 1 hour and refresh tokens 30 days.
 - Each refresh rotates the refresh token. The same refresh again within 60 s gets the same answer
-  (a retry, or two at once). An older refresh token after that ends the whole sign-in.
-- Five wrong passphrases from one address lock that address out of the consent page for 15
-  minutes. The owner, at another address, can still sign in.
-- One address can hold 10 open sign-in requests, and everyone together 100. Past that, the
-  oldest gives way, that address's own first.
+  (a retry, or two at once). After that, an older refresh token from the same sign-in ends the
+  whole sign-in; the last 64 are remembered. A refresh token the server never issued gets
+  `invalid_grant` and ends nothing.
+- Wrong passphrases are limited three ways:
+  - Three end that sign-in request, and Claude has to start a new one.
+  - Five from one address within 15 minutes lock that address out of the consent page until they
+    age out. The owner, at another address, can still sign in.
+  - Twenty from all addresses together within an hour lock the consent page for everyone, the
+    owner included, until they age out. A locked page counts no more guesses, so there are never
+    more than 20 wrong guesses in an hour.
+- One address can hold 10 open sign-in requests, and everyone together 100. Past its 10, an
+  address's own oldest request gives way. When all 100 are taken, the address holding the most
+  gives up its oldest, so pushing out the owner's one takes about a hundred addresses, not ten.
 - The server keeps up to 100 registered clients. A new registration pushes out the oldest one
   with no live sign-in, and a sign-in under way still finishes.
 - After a restart, Claude's refresh token gets `invalid_grant`, not `invalid_client`, so Claude
@@ -145,6 +156,11 @@ is automated.
    - In oauth mode, `curl -i -X POST https://<host>/mcp` is `401` with
      `WWW-Authenticate: Bearer resource_metadata="https://<host>/.well-known/oauth-protected-resource/mcp"`,
      and that URL returns the JSON metadata.
+   - `curl -i -H 'X-Forwarded-For: 192.0.2.1' -H 'Tailscale-Funnel-Request: ?1' https://<host>/healthz`
+     is `200 ok`, and its log line's `source` is the address you sent from, not `192.0.2.1`.
+     Funnel should replace both headers rather than pass them on, so `forwardedFor` should be
+     that address alone. The per-caller limits rely on this: if `source` is `192.0.2.1`, stop
+     and record it on #53.
 5. **Add the connector** (figs): [Customize > Connectors](https://claude.ai/customize/connectors) >
    **Add custom connector**, URL `https://<host>/mcp`, settings from the table above. For Project 95
    threads, also turn it on under the project's settings, Connectors. Connectors load when a session
@@ -171,6 +187,7 @@ is automated.
 | What Claude calls itself, and its capabilities                        | `client` in the log; `connection_info.client` and `clientCapabilities`                   |
 | Which headers arrive: `User-Agent`, `Origin`, `X-Forwarded-For`       | `ua`, `origin`, `forwardedFor` and `headers` in the log                                  |
 | Whether requests come through Funnel, from Claude's published range   | `tailscale-funnel-request: ?1` in `headers`; `forwardedFor` within 160.79.104.0/21       |
+| Whether Funnel replaces a caller's own `X-Forwarded-For`              | step 4's `192.0.2.1` request: its `forwardedFor` and `source`                            |
 | Whether Claude registers or uses the configured client, and with what | `oauth` lines with `step: "register"`: `clientName`, `redirects`, `authMethod`, `grants` |
 | Whether `resource` and `scope` arrive at `/authorize` and `/token`    | `oauth.resource`, `oauth.scope`                                                          |
 | When and how it refreshes, and whether refreshes come in pairs        | `oauth` lines with `grant: "refresh_token"` and `outcome` `rotated` or `repeated`        |
@@ -195,6 +212,7 @@ One JSON line per request, after the logger's redaction:
   "path": "/mcp",
   "remote": "127.0.0.1",
   "forwardedFor": "<caller address>",
+  "source": "<caller address>",
   "ua": "<client user agent>",
   "mcpProtocolVersion": "2025-06-18",
   "headers": [
@@ -218,13 +236,15 @@ One JSON line per request, after the logger's redaction:
 - Tool arguments and results are never logged. Neither are tokens, codes or the passphrase:
   header values whose names look like credentials are replaced by their length, and the
   configured secrets are scrubbed from every line.
+- `source` is the caller the limits count: the last `forwardedFor` address on a request Funnel
+  marked, else `remote`.
 - `session` is the first 8 hex characters of the session id.
 - OAuth routes add an `oauth` object: `step` (`register`, `authorize`, `consent` or `token`),
   `outcome`, a `reason` on failures, and what the client sent.
 
 ```sh
 jq -c 'select(.event == "connector.request")
-  | {time, method, path, status, era, version, rpc, tool, client, auth, origin, forwardedFor, oauth}' \
+  | {time, method, path, status, era, version, rpc, tool, client, auth, origin, source, oauth}' \
   ~/connector-echo.jsonl
 ```
 
@@ -236,12 +256,22 @@ jq -c 'select(.event == "connector.request")
 - **DNS rebinding.** `Host` must be the public host (with or without `:443`) or loopback with the
   bound port. A present `Origin` must be the public origin, `https://claude.ai`, `https://claude.com`,
   the server's own loopback origin, or an `--allow-origin` value. Both are checked on every route.
-- **Callers.** A caller is the last `X-Forwarded-For` address, the one Funnel set, or else the
-  socket's. A process on the host itself can claim any address; one through Funnel can't.
+- **Callers.** On a request Funnel marked with `Tailscale-Funnel-Request: ?1`, the caller is the
+  last `X-Forwarded-For` address; otherwise it is the socket's address. Funnel's HTTPS proxy
+  deletes a caller's own copies of both headers and sets them afresh (tailscale,
+  `ipn/ipnlocal/serve.go`), so a caller through Funnel can't choose its address. A process on
+  the host itself can. Use the plain `tailscale funnel --bg 8787`, never `--tls-terminated-tcp`:
+  a TCP funnel passes the caller's headers through, and every per-caller limit would be the
+  caller's to choose.
 - **Limits.** 120 requests a minute per caller and 600 across all callers (`429` with
-  `Retry-After`), 256 KiB MCP bodies, 16 KiB OAuth forms, and short socket timeouts.
+  `Retry-After`), 256 KiB MCP bodies (`413`, then the connection closes), 16 KiB OAuth forms,
+  and short socket timeouts. Up to 256 legacy sessions; the one used least recently gives way.
 - **OAuth.** One owner. Registered clients are public, so the passphrase on the consent page is
   the gate, and the page names the host the browser goes back to. Tokens and codes are stored
   only as SHA-256 digests, except the newest rotation's pair, held for 60 s.
+- **Consent phishing.** Anyone can add this public URL as a connector in their own claude.ai
+  account and send figs the sign-in link their Connect opened. The consent page can't tell that
+  from figs's own sign-in, and approving it could connect their account. Approve only right
+  after pressing Connect yourself, never from a link someone sent.
 - **Not covered.** CIMD, token persistence across restarts, and per-user identity. A single
   owner is all the facade needs; the proof decides whether CIMD is worth adding.

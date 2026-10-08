@@ -24,6 +24,11 @@ const JSON_HEADERS = {
   accept: "application/json, text/event-stream",
 };
 
+/** What Funnel adds to each request it forwards: the caller's address, and its mark. */
+function viaFunnel(from: string): Record<string, string> {
+  return { "tailscale-funnel-request": "?1", "x-forwarded-for": from };
+}
+
 interface Answer {
   status: number;
   headers: Record<string, string | string[] | undefined>;
@@ -216,7 +221,7 @@ function decide(
   // A browser sends the page's own origin with the form (see the consent page's
   // Referrer-Policy).
   return send(`${base}/authorize`, {
-    headers: { ...FORM, origin: new URL(base).origin, "x-forwarded-for": from },
+    headers: { ...FORM, origin: new URL(base).origin, ...viaFunnel(from) },
     body: new URLSearchParams({
       request: requestId,
       passphrase,
@@ -571,15 +576,40 @@ test("the stateless MCP era works with an OAuth token, and connection_info names
   assert.ok(!answer.text.includes(access), "the token is never echoed");
 });
 
-test("consent: a wrong passphrase is refused, five lock it for the window, and deny says so", async (t) => {
+test("consent: a wrong passphrase is refused, three end the sign-in, five lock the address, and deny says so", async (t) => {
   const server = await start(t);
   const clientId = (await register(server.base)).json.client_id as string;
-  const { challenge } = pkce();
-  const consent = await send(authorizeUrl(server.base, clientId, challenge), {
-    method: "GET",
-  });
-  const requestId = requestIdFrom(consent.text);
-  for (let attempt = 0; attempt < 5; attempt += 1) {
+  const openConsent = async (): Promise<string> =>
+    requestIdFrom(
+      (
+        await send(authorizeUrl(server.base, clientId, pkce().challenge), {
+          method: "GET",
+        })
+      ).text,
+    );
+
+  const first = await openConsent();
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const wrong = await decide(
+      server.base,
+      first,
+      `not the passphrase ${attempt}`,
+    );
+    assert.equal(wrong.status, 401);
+    assert.match(wrong.text, /Wrong passphrase/u);
+    assert.equal(wrong.headers.location, undefined);
+  }
+  const ended = await decide(server.base, first, "not the passphrase 2");
+  assert.equal(ended.status, 401);
+  assert.match(ended.text, /Sign-in ended/u);
+  assert.equal(
+    (await decide(server.base, first, OWNER)).status,
+    400,
+    "a sign-in that took three wrong passphrases is gone, so the right one can't save it",
+  );
+
+  const requestId = await openConsent();
+  for (let attempt = 3; attempt < 5; attempt += 1) {
     const wrong = await decide(
       server.base,
       requestId,
@@ -587,14 +617,14 @@ test("consent: a wrong passphrase is refused, five lock it for the window, and d
     );
     assert.equal(wrong.status, 401);
     assert.match(wrong.text, /Wrong passphrase/u);
-    assert.equal(wrong.headers.location, undefined);
   }
   const locked = await decide(server.base, requestId, OWNER);
   assert.equal(
     locked.status,
     429,
-    "even the right passphrase waits out the lock",
+    "five wrong from one address lock it, even for the right passphrase",
   );
+  assert.match(locked.text, /from here/u);
 
   const denied = await decide(server.base, requestId, "", "deny");
   assert.equal(denied.status, 302);
@@ -638,14 +668,14 @@ test("consent: wrong passphrases lock out only the address they came from, count
     (await decide(server.base, requestId, passphrase, "approve", "203.0.113.7"))
       .status;
 
-  const guessed = await openConsent();
+  // A new sign-in for each guess, so the three-per-sign-in limit doesn't end one first.
   for (let attempt = 0; attempt < 4; attempt += 1) {
-    assert.equal(await guess(guessed, `a guess ${attempt}`), 401);
+    assert.equal(await guess(await openConsent(), `a guess ${attempt}`), 401);
   }
   clock.advance(9 * 60_000);
-  assert.equal(await guess(guessed, "a fifth guess"), 401);
+  assert.equal(await guess(await openConsent(), "a fifth guess"), 401);
   assert.equal(
-    await guess(guessed, OWNER),
+    await guess(await openConsent(), OWNER),
     429,
     "five wrong within 15 minutes lock the address, even for the right passphrase",
   );
@@ -661,6 +691,53 @@ test("consent: wrong passphrases lock out only the address they came from, count
     await guess(await openConsent(), "one more guess"),
     401,
     "the first four are now older than 15 minutes, so the lock is over",
+  );
+});
+
+test("consent: twenty wrong passphrases in an hour, from any number of addresses, lock sign-in for everyone", async (t) => {
+  const clock = new FakeClock(1_000_000);
+  const server = await start(t, { clock });
+  const clientId = (await register(server.base)).json.client_id as string;
+  const openConsent = async (): Promise<string> =>
+    requestIdFrom(
+      (
+        await send(authorizeUrl(server.base, clientId, pkce().challenge), {
+          method: "GET",
+        })
+      ).text,
+    );
+
+  // Four from each of five addresses: no address reaches its own lock of five.
+  for (let address = 1; address <= 5; address += 1) {
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const wrong = await decide(
+        server.base,
+        await openConsent(),
+        `guess ${address}.${attempt}`,
+        "approve",
+        `203.0.113.${address}`,
+      );
+      assert.equal(wrong.status, 401);
+    }
+  }
+  const locked = await decide(server.base, await openConsent(), OWNER);
+  assert.equal(
+    locked.status,
+    429,
+    "the owner, at an address that guessed nothing, waits too",
+  );
+  assert.match(locked.text, /locked for everyone/u);
+
+  clock.advance(60 * 60_000 - 1);
+  assert.equal(
+    (await decide(server.base, await openConsent(), OWNER)).status,
+    429,
+  );
+  clock.advance(1);
+  assert.equal(
+    (await decide(server.base, await openConsent(), OWNER)).status,
+    302,
+    "an hour after the guesses, the owner signs in",
   );
 });
 
@@ -738,7 +815,7 @@ test("authorize: a stranger opening many sign-ins can't push out the owner's", a
       (
         await send(authorizeUrl(server.base, clientId, pkce().challenge), {
           method: "GET",
-          headers: { "x-forwarded-for": from },
+          headers: viaFunnel(from),
         })
       ).text,
     );
@@ -753,13 +830,48 @@ test("authorize: a stranger opening many sign-ins can't push out the owner's", a
     "the owner's request is still open",
   );
   assert.equal(
-    (await decide(server.base, strangers[0]!, OWNER)).status,
+    (await decide(server.base, strangers.at(-11)!, OWNER)).status,
     400,
-    "the stranger's own oldest requests made room",
+    "the stranger keeps only its newest ten; its own older requests made room",
   );
   assert.equal(
-    (await decide(server.base, strangers.at(-1)!, OWNER)).status,
+    (await decide(server.base, strangers.at(-10)!, OWNER)).status,
     302,
+  );
+});
+
+test("authorize: when every open sign-in is taken, the busiest address gives way, not the owner", async (t) => {
+  const server = await start(t);
+  const clientId = (await register(server.base)).json.client_id as string;
+  const openFrom = async (from: string): Promise<string> =>
+    requestIdFrom(
+      (
+        await send(authorizeUrl(server.base, clientId, pkce().challenge), {
+          method: "GET",
+          headers: viaFunnel(from),
+        })
+      ).text,
+    );
+  const owners = await openFrom("198.51.100.4");
+  // Eleven addresses at their own limit of ten: 110 requests for 100 places.
+  const firsts: string[] = [];
+  for (let address = 1; address <= 11; address += 1) {
+    for (let opened = 0; opened < 10; opened += 1) {
+      const requestId = await openFrom(`203.0.113.${address}`);
+      if (opened === 0) {
+        firsts.push(requestId);
+      }
+    }
+  }
+  assert.equal(
+    (await decide(server.base, owners, OWNER)).status,
+    302,
+    "the owner's one request is never the busiest caller's",
+  );
+  assert.equal(
+    (await decide(server.base, firsts[0]!, OWNER)).status,
+    400,
+    "a busiest caller's oldest request made room",
   );
 });
 
@@ -951,10 +1063,16 @@ test("refresh rotates; the same refresh within a minute gets the same answer; an
   );
   const forged = await refresh(`${other.refresh}x`, other.clientId);
   assert.equal(forged.json.error, "invalid_grant");
+  assert.match(forged.json.error_description, /unknown/u);
   assert.equal(
     (await mcpWith(server.url, other.access)).status,
-    401,
-    "a token that is not the live one, with a live family id, ends the sign-in",
+    200,
+    "a made-up token with a live family id is refused, but can't end the sign-in",
+  );
+  assert.equal(
+    (await refresh(other.refresh, other.clientId)).status,
+    200,
+    "the live refresh token still works",
   );
 });
 
@@ -1110,7 +1228,7 @@ test("registration: a flood of registrations can't break a sign-in under way or 
     const flood = await send(`${server.base}/register`, {
       headers: {
         "content-type": "application/json",
-        "x-forwarded-for": "203.0.113.7",
+        ...viaFunnel("203.0.113.7"),
       },
       body: JSON.stringify({ redirect_uris: [CALLBACK] }),
     });

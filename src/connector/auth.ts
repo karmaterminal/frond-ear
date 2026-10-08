@@ -127,11 +127,18 @@ const MAX_CLIENTS = 100;
 const MAX_PENDING = 100;
 /** Open sign-in requests one caller may hold; past this its oldest goes first. */
 const MAX_PENDING_PER_SOURCE = 10;
+/** Wrong passphrases one sign-in request takes before it ends. */
+const TRIES_PER_REQUEST = 3;
 /** Wrong passphrases one caller may send per window before consent locks for it. */
 const CONSENT_FAILURES = 5;
 const CONSENT_WINDOW_MS = 15 * 60_000;
+/** Wrong passphrases from all callers together per window before consent locks for all. */
+const CONSENT_FAILURES_ALL = 20;
+const CONSENT_ALL_WINDOW_MS = 60 * 60_000;
 /** Callers whose wrong passphrases are remembered at once. */
 const MAX_FAILURE_SOURCES = 1_000;
+/** Retired refresh tokens a sign-in remembers, to tell a reused one from a made-up one. */
+const MAX_RETIRED = 64;
 
 interface Client {
   clientId: string;
@@ -152,6 +159,7 @@ interface PendingAuthorization {
   scope: string | undefined;
   /** The caller that opened the request (see `source` in http.ts). */
   source: string;
+  wrongPassphrases: number;
   expiresAt: number;
 }
 
@@ -181,6 +189,8 @@ interface Family {
   scope: string | undefined;
   /** Digest of the one live refresh token. */
   current: string;
+  /** Digests of the refresh tokens this sign-in rotated past, oldest first (MAX_RETIRED). */
+  retired: string[];
   expiresAt: number;
   /** The newest rotation, held for REFRESH_REPEAT_MS. */
   last:
@@ -377,6 +387,11 @@ export class OAuthAuthority implements Authenticator {
   private readonly families = new Map<string, Family>();
   /** Wrong-passphrase times per caller, so a stranger can lock only themselves out. */
   private readonly consentFailures = new Map<string, number[]>();
+  /**
+   * Wrong-passphrase times from every caller, so many addresses can't add up to more. It
+   * holds at most CONSENT_FAILURES_ALL entries: a locked consent records no more.
+   */
+  private consentFailuresAll: number[] = [];
 
   public constructor(options: OAuthOptions) {
     const url = new URL(options.publicUrl);
@@ -726,6 +741,7 @@ export class OAuthAuthority implements Authenticator {
       codeChallenge: challenge,
       scope: query.get("scope") ?? undefined,
       source,
+      wrongPassphrases: 0,
       expiresAt: this.clock.now() + PENDING_TTL_MS,
     };
     this.pending.set(requestId, pending);
@@ -734,20 +750,30 @@ export class OAuthAuthority implements Authenticator {
 
   /**
    * One caller can hold only a few open requests, so a stranger opening many can't push
-   * out the owner's. The global cap is a backstop against many callers.
+   * out the owner's. When all callers together fill the table, the caller holding the most
+   * gives up its oldest, so pushing out the owner's one takes about MAX_PENDING strangers,
+   * each holding one.
    */
   private makeRoomForPending(source: string): void {
-    const mine = [...this.pending].filter(
-      ([, entry]) => entry.source === source,
-    );
+    const bySource = new Map<string, string[]>();
+    for (const [requestId, entry] of this.pending) {
+      const ids = bySource.get(entry.source) ?? [];
+      ids.push(requestId);
+      bySource.set(entry.source, ids);
+    }
+    const mine = bySource.get(source) ?? [];
     if (mine.length >= MAX_PENDING_PER_SOURCE) {
-      this.pending.delete(mine[0]![0]);
+      this.pending.delete(mine[0]!);
+      return;
     }
     if (this.pending.size >= MAX_PENDING) {
-      const oldest = this.pending.keys().next().value;
-      if (oldest !== undefined) {
-        this.pending.delete(oldest);
+      let busiest: string[] = [];
+      for (const ids of bySource.values()) {
+        if (ids.length > busiest.length) {
+          busiest = ids;
+        }
       }
+      this.pending.delete(busiest[0]!);
     }
   }
 
@@ -813,8 +839,31 @@ export class OAuthAuthority implements Authenticator {
         "locked",
       );
     }
+    this.consentFailuresAll = this.consentFailuresAll.filter(
+      (at) => now - at < CONSENT_ALL_WINDOW_MS,
+    );
+    if (this.consentFailuresAll.length >= CONSENT_FAILURES_ALL) {
+      // Guesses from many addresses: lock sign-in for everyone, the owner included.
+      return page(
+        429,
+        "Sign-in locked",
+        "<p>Too many wrong passphrases in the last hour, so sign-in is locked for everyone. Wait an hour and press Connect again.</p>",
+        "locked for everyone",
+      );
+    }
     if (!sameSecret(form.get("passphrase") ?? "", this.ownerSecret)) {
       this.recordConsentFailure(source, [...failures, now]);
+      this.consentFailuresAll.push(now);
+      pending.wrongPassphrases += 1;
+      if (pending.wrongPassphrases >= TRIES_PER_REQUEST) {
+        this.pending.delete(requestId);
+        return page(
+          401,
+          "Sign-in ended",
+          "<p>Three wrong passphrases ended this sign-in. Press Connect in Claude to start again.</p>",
+          "ended after wrong passphrases",
+        );
+      }
       return this.consentPage(requestId, pending, "Wrong passphrase.");
     }
     this.pending.delete(requestId);
@@ -959,6 +1008,7 @@ export class OAuthAuthority implements Authenticator {
       clientId,
       scope: code.scope,
       current: "",
+      retired: [],
       expiresAt: 0,
       last: undefined,
     };
@@ -1004,13 +1054,19 @@ export class OAuthAuthority implements Authenticator {
         "repeated",
       );
     }
-    // An older refresh token came back: someone holds a copy. End the whole sign-in.
-    this.revokeFamily(familyId);
-    return oauthError(
-      400,
-      "invalid_grant",
-      "refresh token reused; sign in again",
-    );
+    if (family.retired.includes(presentedDigest)) {
+      // A refresh token this sign-in already rotated past came back: someone holds a copy.
+      // End the whole sign-in.
+      this.revokeFamily(familyId);
+      return oauthError(
+        400,
+        "invalid_grant",
+        "refresh token reused; sign in again",
+      );
+    }
+    // Never issued here: refuse it, but leave the sign-in alone, since only the family id
+    // is needed to make one up.
+    return oauthError(400, "invalid_grant", "unknown refresh token");
   }
 
   /** Issues the family's next token pair; the refresh token it came from stops being live. */
@@ -1028,6 +1084,12 @@ export class OAuthAuthority implements Authenticator {
       family: familyId,
       expiresAt: now + ACCESS_TTL_MS,
     });
+    if (from !== undefined) {
+      family.retired.push(from);
+      if (family.retired.length > MAX_RETIRED) {
+        family.retired.shift();
+      }
+    }
     family.current = digestHex(refresh);
     family.expiresAt = now + REFRESH_TTL_MS;
     family.last =

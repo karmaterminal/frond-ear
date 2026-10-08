@@ -3,8 +3,15 @@
 // (2026-07-28) one. Nothing here touches Discord or anything beyond loopback.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { request as httpRequest } from "node:http";
+import { connect } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
@@ -27,6 +34,11 @@ import {
   RateLimiter,
   SourceLimiter,
 } from "../src/connector/http.ts";
+import {
+  McpEndpoint,
+  type Principal,
+  type RequestFacts,
+} from "../src/connector/mcp.ts";
 import { StructuredLogger } from "../src/logger.ts";
 import { FakeClock } from "./helpers.ts";
 
@@ -573,6 +585,90 @@ test("bodies: size, content type, Accept, JSON and batches", async (t) => {
   assert.match((batch.json as any).error.message, /batch/u);
 });
 
+test("a body that is too big gets its 413, then the connection closes without waiting for the rest", async (t) => {
+  const server = await start(t);
+  const head = (framing: string): string =>
+    `POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:${server.port}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\n${framing}\r\n\r\n`;
+  const chunk = "x".repeat(64 * 1024);
+  for (const [name, sent] of [
+    // A declared length over the limit is refused before any of the body is read.
+    ["declared", head(`Content-Length: ${10 * 1024 * 1024}`)],
+    // A chunked body is refused once it passes the limit; its last chunk never comes.
+    [
+      "streamed",
+      head("Transfer-Encoding: chunked") +
+        `${chunk.length.toString(16)}\r\n${chunk}\r\n`.repeat(5),
+    ],
+  ] as const) {
+    const socket = connect(server.port, "127.0.0.1");
+    t.after(() => socket.destroy());
+    socket.on("error", () => {});
+    let answer = "";
+    socket.setEncoding("utf8");
+    socket.on("data", (data: string) => (answer += data));
+    const closed = new Promise<boolean>((resolve) => {
+      // Without the close, the socket stays open until the 5 s keep-alive timeout at least.
+      const timer = setTimeout(() => resolve(false), 3_000);
+      socket.once("close", () => {
+        clearTimeout(timer);
+        resolve(true);
+      });
+    });
+    socket.write(sent);
+    assert.ok(await closed, `${name}: the server closed the connection`);
+    assert.match(answer, /^HTTP\/1\.1 413 /u, name);
+    assert.match(answer, /\r\nconnection: close\r\n/iu, name);
+  }
+});
+
+test("sessions: when the table is full, the session used least recently gives way", async () => {
+  const endpoint = new McpEndpoint({ tools: echoTools() });
+  const facts: RequestFacts = {
+    method: "POST",
+    path: "/mcp",
+    remoteAddress: "127.0.0.1",
+    headers: [],
+  };
+  const principal: Principal = { mode: "none" };
+  const open = async (): Promise<string> => {
+    const reply = await endpoint.post(
+      JSON.parse(
+        rpc("initialize", { protocolVersion: "2025-06-18", capabilities: {} }),
+      ),
+      {},
+      facts,
+      principal,
+    );
+    return reply.headers["mcp-session-id"]!;
+  };
+  const use = async (session: string): Promise<number> =>
+    (
+      await endpoint.post(
+        JSON.parse(rpc("tools/list")),
+        { "mcp-session-id": session },
+        facts,
+        principal,
+      )
+    ).status;
+
+  const claudes = await open();
+  const idle = await open();
+  // 256 fill the table (MAX_SESSIONS in mcp.ts).
+  for (let opened = 2; opened < 256; opened += 1) {
+    await open();
+  }
+  assert.equal(endpoint.sessionCount, 256);
+  assert.equal(
+    await use(claudes),
+    200,
+    "Claude's session, the oldest, is in use",
+  );
+  await open();
+  assert.equal(endpoint.sessionCount, 256);
+  assert.equal(await use(claudes), 200, "the session in use stays");
+  assert.equal(await use(idle), 404, "the session used least recently went");
+});
+
 test("the rate limit is per caller, with a cap for all callers, and answers 429 with Retry-After", async (t) => {
   const clock = new FakeClock(0);
   const limiter = new RateLimiter(60, clock);
@@ -584,10 +680,13 @@ test("the rate limit is per caller, with a cap for all callers, and answers 429 
   assert.equal(limiter.take(), 0);
 
   const server = await start(t, { rateLimitPerMinute: 2 });
-  const healthz = (from: string): Promise<Answer> =>
+  const healthz = (from: string, viaFunnel = true): Promise<Answer> =>
     send(`http://127.0.0.1:${server.port}/healthz`, {
       method: "GET",
-      headers: { "x-forwarded-for": from },
+      headers: {
+        "x-forwarded-for": from,
+        ...(viaFunnel ? { "tailscale-funnel-request": "?1" } : {}),
+      },
     });
   await healthz("203.0.113.7");
   await healthz("203.0.113.7");
@@ -605,6 +704,29 @@ test("the rate limit is per caller, with a cap for all callers, and answers 429 
     "the last forwarded address, the one Funnel added, is the caller",
   );
   assert.equal((await healthz("160.79.104.10, 203.0.113.7")).status, 429);
+
+  // Without Funnel's mark, X-Forwarded-For is whatever the caller wrote, so the socket's
+  // address is the caller: these three share one bucket.
+  assert.equal((await healthz("192.0.2.1", false)).status, 200);
+  assert.equal((await healthz("192.0.2.2", false)).status, 200);
+  assert.equal(
+    (await healthz("192.0.2.3", false)).status,
+    429,
+    "an X-Forwarded-For that Funnel didn't mark doesn't count",
+  );
+  const logged = server.lines.map(
+    (line) => JSON.parse(line) as Record<string, unknown>,
+  );
+  assert.deepEqual(
+    logged.map((record) => [record.forwardedFor, record.source]).slice(-4),
+    [
+      ["160.79.104.10, 203.0.113.7", "203.0.113.7"],
+      ["192.0.2.1", "127.0.0.1"],
+      ["192.0.2.2", "127.0.0.1"],
+      ["192.0.2.3", "127.0.0.1"],
+    ],
+    "each log line says who the server took the caller to be",
+  );
 
   const sources = new SourceLimiter(2, clock);
   for (const from of ["a", "b", "c", "d", "e"]) {
@@ -697,6 +819,7 @@ test("each request leaves one connector.request log line, without tool arguments
   assert.equal(call.era, "legacy");
   assert.equal(call.status, 200);
   assert.equal(call.client, "sdk-test");
+  assert.equal(call.source, "127.0.0.1", "the caller the limits counted");
   assert.equal(typeof call.ms, "number");
   assert.ok(Array.isArray(call.headers));
   assert.ok(!server.lines.join("\n").includes("kept-out-of-the-log"));
@@ -759,6 +882,12 @@ test("CLI flags: loopback only, https origin, and secrets only from 0600 files",
   assert.throws(() => readSecretFile(file, "token file"), /chmod 600/u);
   chmodSync(file, 0o600);
   assert.equal(readSecretFile(file, "token file"), "x".repeat(40));
+  const notAFile = join(directory, "a-directory");
+  mkdirSync(notAFile, { mode: 0o700 });
+  assert.throws(
+    () => readSecretFile(notAFile, "token file"),
+    /not a regular file/u,
+  );
 });
 
 test("CLI: connector-echo listens on loopback, answers /healthz, and stops on SIGTERM", async (t) => {

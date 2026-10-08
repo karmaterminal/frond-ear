@@ -127,15 +127,20 @@ export class SourceLimiter {
 }
 
 /**
- * Who is calling: the address Funnel saw, else the socket's. The listener is loopback-only,
- * so a forwarded address comes from Funnel (which sets it afresh) or from the host itself;
- * the last entry is the one the nearest proxy added.
+ * Who is calling. Funnel sets X-Forwarded-For to the caller's address and marks its requests
+ * with `Tailscale-Funnel-Request: ?1`, after deleting any copy the caller sent (tailscale,
+ * ipn/ipnlocal/serve.go: addProxyForwardedHeaders, addTailscaleIdentityHeaders). So the
+ * forwarded address counts only on a request Funnel marked; otherwise the socket's address
+ * does. A TCP-mode funnel passes both headers through from the caller: don't use one.
  */
 export function sourceOf(request: IncomingMessage): string {
-  const forwarded = firstHeader(request.headers, "x-forwarded-for")
-    ?.split(",")
-    .at(-1)
-    ?.trim();
+  const forwarded =
+    firstHeader(request.headers, "tailscale-funnel-request") === "?1"
+      ? firstHeader(request.headers, "x-forwarded-for")
+          ?.split(",")
+          .at(-1)
+          ?.trim()
+      : undefined;
   return (forwarded || request.socket.remoteAddress || "unknown").slice(0, 64);
 }
 
@@ -206,6 +211,14 @@ function readBody(request: IncomingMessage, limit: number): Promise<string> {
     request.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
     request.on("error", reject);
   });
+}
+
+/**
+ * Closes the connection once the reply is sent, so a client still uploading a body that is
+ * too big stops there rather than when the request times out.
+ */
+function closing(reply: HttpReply): HttpReply {
+  return { ...reply, headers: { ...reply.headers, connection: "close" } };
 }
 
 function mcpReplyToHttp(reply: McpReply): HttpReply {
@@ -431,6 +444,7 @@ export function createConnectorServer(
       headers: facts.headers,
     };
     const source = sourceOf(request);
+    log.source = source;
     let reply: HttpReply;
     try {
       const wait = limiter.take(source);
@@ -460,7 +474,9 @@ export function createConnectorServer(
     } catch (error) {
       reply =
         error instanceof BodyTooLarge
-          ? mcpReplyToHttp(protocolFailure(413, -32600, "Body too large"))
+          ? closing(
+              mcpReplyToHttp(protocolFailure(413, -32600, "Body too large")),
+            )
           : mcpReplyToHttp(protocolFailure(500, -32603, "Internal error"));
       if (!(error instanceof BodyTooLarge)) {
         log.failure = error instanceof Error ? error.name : "unknown";
