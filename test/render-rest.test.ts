@@ -224,6 +224,14 @@ test("every tool parameter is described, and no model-facing text says operator"
   assert.doesNotMatch(detachedNotice("superseded"), /operator/iu);
 });
 
+test("the reply description says what an identical re-send of an unconfirmed reply does (#55)", () => {
+  const reply = TOOLS.find((tool) => tool.name === "reply");
+  assert.match(
+    reply?.description ?? "",
+    /re-sending the same text and reply_to within 5 minutes of the first try posts only what did not go out \(the error says how long is left\); after that, every part posts again\./u,
+  );
+});
+
 function fakeFetch(
   responses: Array<{
     status: number;

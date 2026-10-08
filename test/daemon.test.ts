@@ -7,6 +7,7 @@ import test from "node:test";
 
 import { targetAdvice } from "../src/advice.ts";
 import { chunkMessage, RestError } from "../src/rest.ts";
+import { renderAmbiguousSends } from "../src/render.ts";
 import {
   AMBIENT,
   BOT,
@@ -1835,6 +1836,367 @@ test("a database from before session_ear gains it, and its unconfirmed sends go 
     }
   } finally {
     rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+// ---- retrying a long reply resumes it instead of posting it again (#55) -----
+
+/** Three parts once chunked: 1500 a's, then 1500 b's, then 1500 c's. */
+const LONG = ["a", "b", "c"].map((letter) => letter.repeat(1_500)).join("\n\n");
+const WINDOW_MS = 5 * 60_000;
+
+/** What Discord shows, one letter per message: "abc" is each part of LONG once. */
+function posted(h: helpers.Harness): string {
+  return h.rest.calls
+    .filter((call) => call.method === "send")
+    .map((call) => call.content?.charAt(0))
+    .join("");
+}
+
+function postedIds(h: helpers.Harness): string[] {
+  return h.rest.calls
+    .filter((call) => call.method === "send")
+    .map((call) => call.messageId as string);
+}
+
+/** Discord takes these posts (counted from 1, retries included), but each response is lost. */
+function loseResponsesTo(h: helpers.Harness, ...posts: number[]): void {
+  const discordSend = h.rest.sendMessage.bind(h.rest);
+  let count = 0;
+  h.rest.sendMessage = async (...args) => {
+    const sent = await discordSend(...args);
+    count += 1;
+    if (posts.includes(count)) {
+      throw new TypeError("fetch failed");
+    }
+    return sent;
+  };
+}
+
+/** Discord refuses these posts (counted from 1, retries included) outright. */
+function refusePosts(h: helpers.Harness, ...posts: number[]): void {
+  const discordSend = h.rest.sendMessage.bind(h.rest);
+  let count = 0;
+  h.rest.sendMessage = async (...args) => {
+    count += 1;
+    if (posts.includes(count)) {
+      throw new RestError(
+        403,
+        50013,
+        `Discord POST /channels/${CHANNEL}/messages failed: 403 Missing Permissions`,
+      );
+    }
+    return discordSend(...args);
+  };
+}
+
+test("a long reply retried after an unconfirmed part posts only what did not go out (#55)", async () => {
+  const h = harness();
+  try {
+    loseResponsesTo(h, 2);
+    const shim = h.attach("scribe");
+    const args = { chat_id: CHANNEL, text: LONG, reply_to: "42" };
+    const first = await h.call(shim, "reply", args);
+    assert.equal(first.ok, false);
+    const [one] = postedIds(h);
+    assert.equal(
+      first.text,
+      `Discord did not confirm part 2 of 3 (fetch failed); it may already have been posted. ` +
+        `Part 1 was sent (id ${one}). Part 3 was not sent. ` +
+        `Retrying the identical text and reply_to within 5 minutes is safe: frond-ear does not post part 1 again ` +
+        `and reuses part 2's nonce, so Discord returns the original instead of posting it twice.`,
+    );
+    assert.equal(posted(h), "ab");
+
+    h.clock.advance(WINDOW_MS - 1_000);
+    const retry = await h.call(shim, "reply", args);
+    assert.equal(retry.ok, true, retry.text);
+    assert.equal(posted(h), "abc", "parts 1 and 2 are not posted again");
+    assert.equal(
+      retry.text,
+      `sent 3 messages to ${CHANNEL} (ids ${postedIds(h).join(", ")}); ` +
+        `part 1 had gone out on an earlier try and was not posted again`,
+    );
+    assert.equal(h.rest.calls[0]?.replyTo, "42");
+    assert.deepEqual(unconfirmed(h), [], "part 2 is confirmed now");
+  } finally {
+    h.dispose();
+  }
+});
+
+test("a long reply refused partway names what went out, and a retry posts only the rest (#55)", async () => {
+  const h = harness();
+  try {
+    refusePosts(h, 1, 3);
+    const script = h.attach(undefined, { role: "cli" }); // what `frond-ear send` is
+    const args = { chat_id: CHANNEL, text: LONG };
+    const refused = `Discord POST /channels/${CHANNEL}/messages failed: 403 Missing Permissions`;
+    const first = await h.call(script, "reply", args);
+    assert.equal(first.text, `${refused} (part 1 of 3). Nothing was posted.`);
+    const second = await h.call(script, "reply", args);
+    assert.equal(
+      second.text,
+      `${refused} (part 2 of 3). Part 1 was sent (id ${postedIds(h)[0]}). Parts 2 and 3 were not posted. ` +
+        `Retrying the identical text within 5 minutes does not post part 1 again.`,
+    );
+    assert.deepEqual(unconfirmed(h), [], "a refusal is not ambiguous");
+    const third = await h.call(script, "reply", args);
+    assert.equal(third.ok, true, third.text);
+    assert.match(third.text, /part 1 had gone out on an earlier try/u);
+    assert.equal(posted(h), "abc");
+  } finally {
+    h.dispose();
+  }
+});
+
+test("a long reply resumed twice stays resumable for 5 minutes after its latest part (#55)", async () => {
+  const h = harness();
+  try {
+    loseResponsesTo(h, 2, 4); // part 2, then part 3 on the first retry
+    const shim = h.attach("scribe");
+    const args = { chat_id: CHANNEL, text: LONG };
+    await h.call(shim, "reply", args);
+    h.clock.advance(4 * 60_000);
+    const firstRetry = await h.call(shim, "reply", args);
+    const [one, two] = postedIds(h);
+    assert.equal(
+      firstRetry.text,
+      `Discord did not confirm part 3 of 3 (fetch failed); it may already have been posted. ` +
+        `Parts 1 and 2 were sent (ids ${one}, ${two}). ` +
+        `Retrying the identical text within 5 minutes is safe: frond-ear does not post parts 1 and 2 again ` +
+        `and reuses part 3's nonce, so Discord returns the original instead of posting it twice.`,
+    );
+    h.clock.advance(4 * 60_000); // 8 minutes after the reply began, 4 after part 3
+    const secondRetry = await h.call(shim, "reply", args);
+    assert.equal(secondRetry.ok, true, secondRetry.text);
+    assert.match(secondRetry.text, /parts 1 and 2 had gone out/u);
+    assert.equal(posted(h), "abc");
+  } finally {
+    h.dispose();
+  }
+});
+
+test("past the reuse window, a retry of a long reply is a new reply and posts every part (#55)", async () => {
+  const h = harness();
+  try {
+    loseResponsesTo(h, 1, 3); // part 1; then part 2 on the first retry
+    const shim = h.attach("scribe");
+    const args = { chat_id: CHANNEL, text: LONG };
+    const first = await h.call(shim, "reply", args);
+    assert.equal(
+      first.text,
+      `Discord did not confirm part 1 of 3 (fetch failed); it may already have been posted. ` +
+        `Parts 2 and 3 were not sent. ` +
+        `Retrying the identical text within 5 minutes is safe: frond-ear reuses part 1's nonce, ` +
+        `so Discord returns the original instead of posting it twice.`,
+    );
+    assert.match((await h.call(shim, "reply", args)).text, /part 2 of 3/u);
+    assert.equal(posted(h), "ab");
+    h.clock.advance(WINDOW_MS + 1_000);
+    const late = await h.call(shim, "reply", args);
+    assert.equal(late.ok, true, late.text);
+    assert.doesNotMatch(late.text, /earlier try/u);
+    assert.equal(
+      posted(h),
+      "ababc",
+      "every part posts again, as the error warned",
+    );
+  } finally {
+    h.dispose();
+  }
+});
+
+test("trying a part again does not restart the window, and the error says how much of it is left (#55)", async () => {
+  const h = harness();
+  try {
+    loseResponsesTo(h, 2, 3); // part 2, then part 2 again on the retry
+    const shim = h.attach("scribe");
+    const args = { chat_id: CHANNEL, text: LONG };
+    await h.call(shim, "reply", args);
+    h.clock.advance(200_500);
+    const again = await h.call(shim, "reply", args);
+    assert.equal(
+      again.text,
+      `Discord did not confirm part 2 of 3 (fetch failed); it may already have been posted. ` +
+        `Part 1 was sent (id ${postedIds(h)[0]}). Part 3 was not sent. ` +
+        `Retrying the identical text within 1 minute 39 seconds is safe: frond-ear does not post part 1 again ` +
+        `and reuses part 2's nonce, so Discord returns the original instead of posting it twice.`,
+    );
+    h.clock.advance(99_000);
+    const last = await h.call(shim, "reply", args);
+    assert.equal(last.ok, true, last.text);
+    assert.equal(posted(h), "abc", "part 2 is de-duplicated on both retries");
+  } finally {
+    h.dispose();
+  }
+});
+
+test("a part that fails after the window has run out says a retry posts every part as new (#55)", async () => {
+  const h = harness();
+  try {
+    const refused = `Discord POST /channels/${CHANNEL}/messages failed: 403 Missing Permissions`;
+    const discordSend = h.rest.sendMessage.bind(h.rest);
+    let count = 0;
+    // fetch has no timeout: these requests hang past the window, then fail.
+    h.rest.sendMessage = async (...args) => {
+      count += 1;
+      if (count === 6) {
+        h.clock.advance(WINDOW_MS + 1_000);
+        throw new RestError(403, 50013, refused);
+      }
+      const sent = await discordSend(...args);
+      if (count === 1 || count === 3) {
+        h.clock.advance(WINDOW_MS + 1_000);
+        throw new TypeError("fetch failed");
+      }
+      return sent;
+    };
+    const shim = h.attach("scribe");
+    const short = await h.call(shim, "reply", {
+      chat_id: CHANNEL,
+      text: "hello",
+    });
+    assert.equal(
+      short.text,
+      `Discord did not confirm this send (fetch failed). The message may already have been posted. ` +
+        `It is too late to retry safely: 5 minutes have passed since this message was first tried, ` +
+        `so an identical retry posts it as new.`,
+    );
+    const args = { chat_id: CHANNEL, text: LONG };
+    const long = await h.call(shim, "reply", args);
+    assert.equal(
+      long.text,
+      `Discord did not confirm part 2 of 3 (fetch failed); it may already have been posted. ` +
+        `Part 1 was sent (id ${postedIds(h)[1]}). Part 3 was not sent. ` +
+        `It is too late to retry safely: 5 minutes have passed since part 2 was first tried, ` +
+        `so an identical retry posts every part as new.`,
+    );
+    const retry = await h.call(shim, "reply", args);
+    assert.equal(posted(h), "habab", "parts 1 and 2 post again, as warned");
+    assert.equal(
+      retry.text,
+      `${refused} (part 3 of 3). Parts 1 and 2 were sent (ids ${postedIds(h).slice(3).join(", ")}). ` +
+        `Part 3 was not posted. ` +
+        `It is too late to retry safely: 5 minutes have passed since part 3 was first tried, ` +
+        `so an identical retry posts every part as new.`,
+    );
+  } finally {
+    h.dispose();
+  }
+});
+
+test("a finished long reply is never resumed: a deliberate repeat posts every part (#55)", async () => {
+  const h = harness();
+  try {
+    const shim = h.attach("scribe");
+    const args = { chat_id: CHANNEL, text: LONG };
+    assert.equal((await h.call(shim, "reply", args)).ok, true);
+    const again = await h.call(shim, "reply", args);
+    assert.equal(again.ok, true, again.text);
+    assert.doesNotMatch(again.text, /earlier try/u);
+    assert.equal(posted(h), "abcabc");
+  } finally {
+    h.dispose();
+  }
+});
+
+test("another reply never takes over an unfinished one's parts: another chat, reply_to or text (#55)", async () => {
+  const h = harness();
+  try {
+    loseResponsesTo(h, 2);
+    const shim = h.attach("scribe");
+    await h.call(shim, "reply", { chat_id: CHANNEL, text: LONG });
+    assert.equal(posted(h), "ab");
+    // The same text in another chat, or quoting a message, is another reply.
+    await h.call(shim, "reply", { chat_id: ROOM, text: LONG });
+    assert.equal(posted(h), "ababc");
+    assert.equal(h.rest.calls[2]?.channelId, ROOM);
+    await h.call(shim, "reply", {
+      chat_id: CHANNEL,
+      text: LONG,
+      reply_to: "43",
+    });
+    assert.equal(posted(h), "ababcabc");
+    assert.equal(h.rest.calls[5]?.replyTo, "43");
+    // Part 2 of this reply is the same text at the same index as part 2 of the
+    // first, which is still unconfirmed; it posts in its own place all the same.
+    const other = `${"z".repeat(1_500)}\n\n${"b".repeat(1_500)}`;
+    const result = await h.call(shim, "reply", {
+      chat_id: CHANNEL,
+      text: other,
+    });
+    assert.equal(result.ok, true, result.text);
+    assert.equal(posted(h), "ababcabczb");
+  } finally {
+    h.dispose();
+  }
+});
+
+test("the send_check notice names the part of a long reply, and only of a long one (#55)", () => {
+  const notice = renderAmbiguousSends([
+    { chatId: "1", preview: "a short reply", part: 0, parts: 1 },
+    { chatId: "2", preview: "the middle of a long one", part: 1, parts: 3 },
+    { chatId: "3", preview: "from before #55", part: null, parts: null },
+  ]);
+  assert.match(
+    notice.content,
+    /\(chat 1: "a short reply"; chat 2: part 2 of 3, "the middle of a long one"; chat 3: "from before #55"\)/u,
+  );
+  assert.equal(notice.meta.count, "3");
+});
+
+test("a long reply cut off by a daemon kill is listed by part, and its retry posts only the rest (#55)", async () => {
+  const h = harness();
+  const path = join(h.directory, "kill-long.db");
+  try {
+    const before = harness(testConfig(), { path });
+    const discordSend = before.rest.sendMessage.bind(before.rest);
+    let count = 0;
+    before.rest.sendMessage = async (...args) => {
+      const sent = await discordSend(...args); // Discord accepts each post...
+      count += 1;
+      if (count === 2) {
+        return new Promise<never>(() => undefined); // ...and the daemon dies before hearing back about part 2
+      }
+      return sent;
+    };
+    const shimBefore = before.attach("scribe");
+    void shimBefore.send({
+      type: "call",
+      id: 1,
+      tool: "reply",
+      args: { chat_id: CHANNEL, text: LONG },
+    });
+    for (let tick = 0; tick < 100 && count < 2; tick += 1) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    assert.equal(posted(before), "ab");
+    // SIGKILL: no shutdown, no store close, nothing else runs.
+
+    const after = harness(testConfig(), { path });
+    after.rest.sendMessage = discordSend; // same Discord on the other side
+    const shim = after.attach("scribe");
+    const checks = sendChecks(shim);
+    assert.equal(checks.length, 1);
+    assert.match(
+      checks[0]?.content ?? "",
+      new RegExp(`\\(chat ${CHANNEL}: part 2 of 3, "b{64}"\\)`, "u"),
+    );
+    assert.match(
+      checks[0]?.content ?? "",
+      /Re-sending a whole reply, with the identical text and reply_to, within 5 minutes of the first try at its unconfirmed message posts only what did not go out/u,
+    );
+    const retry = await after.call(shim, "reply", {
+      chat_id: CHANNEL,
+      text: LONG,
+    });
+    assert.equal(retry.ok, true, retry.text);
+    assert.match(retry.text, /part 1 had gone out on an earlier try/u);
+    assert.equal(posted(before), "abc", "no part is posted twice");
+    after.daemon.shutdown();
+    after.store.close();
+  } finally {
+    h.dispose();
   }
 });
 

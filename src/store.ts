@@ -82,6 +82,21 @@ export interface AmbiguousSend {
   createdAt: number;
   /** The ear whose session made it; null for a script, or a row from before #49. */
   sessionEar: string | null;
+  /** Which part of its reply it is, from 0; null for a row from before #55. */
+  part: number | null;
+  /** How many parts its reply has; null for a row from before #55. */
+  parts: number | null;
+}
+
+/** Where one Discord message sits in the reply it is part of (#55). */
+export interface ReplyPart {
+  /** A hash of the chat, reply_to and whole text, so identical replies share it. */
+  key: string;
+  /** One reply, kept across identical retries until every part is confirmed. */
+  id: string;
+  /** From 0. */
+  part: number;
+  parts: number;
 }
 
 function mapEvent(row: EventRow): StoredEvent {
@@ -192,7 +207,11 @@ export class EventStore {
         message_id TEXT,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
-        session_ear TEXT
+        session_ear TEXT,
+        reply_key TEXT,
+        reply_id TEXT,
+        part INTEGER,
+        parts INTEGER
       );
       CREATE INDEX IF NOT EXISTS outbound_intents_key
         ON outbound_intents (intent_key, state, created_at);
@@ -219,16 +238,33 @@ export class EventStore {
         value TEXT NOT NULL
       );
     `);
-    // outbound_intents shipped without session_ear; a database created before
-    // it gains the column here, and its older rows read as no session's (#49).
-    const intentColumns = this.database
-      .prepare("PRAGMA table_info(outbound_intents)")
-      .all() as Array<{ name: string }>;
-    if (!intentColumns.some((column) => column.name === "session_ear")) {
-      this.database.exec(
-        "ALTER TABLE outbound_intents ADD COLUMN session_ear TEXT",
-      );
+    // outbound_intents shipped without these columns; a database created before
+    // one of them gains it here. Its older rows read as no session's (#49) and
+    // no reply's (#55).
+    const intentColumns = new Set(
+      (
+        this.database
+          .prepare("PRAGMA table_info(outbound_intents)")
+          .all() as Array<{ name: string }>
+      ).map((column) => column.name),
+    );
+    for (const [column, type] of [
+      ["session_ear", "TEXT"],
+      ["reply_key", "TEXT"],
+      ["reply_id", "TEXT"],
+      ["part", "INTEGER"],
+      ["parts", "INTEGER"],
+    ] as const) {
+      if (!intentColumns.has(column)) {
+        this.database.exec(
+          `ALTER TABLE outbound_intents ADD COLUMN ${column} ${type}`,
+        );
+      }
     }
+    this.database.exec(`
+      CREATE INDEX IF NOT EXISTS outbound_intents_reply
+        ON outbound_intents (reply_key, reply_id, part);
+    `);
   }
 
   public close(): void {
@@ -479,16 +515,73 @@ export class EventStore {
   // ---- outbound intents (write-ahead for sends) ------------------------------------
 
   /**
+   * The reply an outgoing reply belongs to (#55). An identical reply (same
+   * `key`) whose parts were not all confirmed, and whose latest part began
+   * within `reuseWindowMs`, is resumed, so a retry posts none of its confirmed
+   * parts again. Otherwise the reply is new and gets `newId`. A finished reply
+   * is never resumed, so a deliberate repeat of the same text still posts.
+   */
+  public resumeReply(
+    key: string,
+    parts: number,
+    reuseWindowMs: number,
+    newId: string,
+  ): string {
+    const unfinished = this.database
+      .prepare(
+        `SELECT reply_id AS replyId FROM outbound_intents
+         WHERE reply_key = ?
+         GROUP BY reply_id
+         HAVING MAX(created_at) >= ?
+           AND COUNT(DISTINCT CASE WHEN state = 'sent' THEN part END) < ?
+         ORDER BY MAX(created_at) DESC LIMIT 1`,
+      )
+      .get(key, this.clock.now() - reuseWindowMs, parts) as
+      | { replyId: string }
+      | undefined;
+    return unfinished?.replyId ?? newId;
+  }
+
+  /** The message id of this part, if Discord already confirmed it for this reply. */
+  public sentPart(reply: ReplyPart): string | undefined {
+    const sent = this.database
+      .prepare(
+        `SELECT message_id AS messageId FROM outbound_intents
+         WHERE reply_key = ? AND reply_id = ? AND part = ? AND state = 'sent'
+         LIMIT 1`,
+      )
+      .get(reply.key, reply.id, reply.part) as
+      | { messageId: string }
+      | undefined;
+    return sent?.messageId;
+  }
+
+  /**
+   * When the latest part of this reply was first tried (0 if none was). The
+   * reuse window of resumeReply and beginSend runs from then, and trying the
+   * part again does not move it.
+   */
+  public latestPartBegan(reply: ReplyPart): number {
+    const row = this.database
+      .prepare(
+        `SELECT COALESCE(MAX(created_at), 0) AS began FROM outbound_intents
+         WHERE reply_key = ? AND reply_id = ?`,
+      )
+      .get(reply.key, reply.id) as { began: number };
+    return row.began;
+  }
+
+  /**
    * Records the intent to send one message *before* calling Discord. If an
-   * earlier attempt with the same key is still pending (its outcome unknown:
-   * crash, timeout, lost response) and within `reuseWindowMs`, its nonce is
-   * reused so Discord's enforce_nonce returns the original message instead of
-   * posting a duplicate. A completed send is never reused, so a deliberate
-   * repeat of the same text still posts. `sessionEar` is the ear whose session
-   * is sending, or null for any other client (a `frond-ear send` script): an
-   * unconfirmed send is put to that ear's sessions alone. A session retrying a
-   * script's pending send makes it the session's; a script's retry changes
-   * nothing.
+   * earlier attempt at this part of this reply is still pending (its outcome
+   * unknown: crash, timeout, lost response) and within `reuseWindowMs`, its
+   * nonce is reused so Discord's enforce_nonce returns the original message
+   * instead of posting a duplicate. A completed send is never reused, so a
+   * deliberate repeat of the same text still posts. `sessionEar` is the ear
+   * whose session is sending, or null for any other client (a `frond-ear send`
+   * script): an unconfirmed send is put to that ear's sessions alone. A session
+   * retrying a script's pending send makes it the session's; a script's retry
+   * changes nothing.
    */
   public beginSend(
     key: string,
@@ -497,15 +590,16 @@ export class EventStore {
     nonce: string,
     reuseWindowMs: number,
     sessionEar: string | null,
+    reply: ReplyPart,
   ): { nonce: string; reused: boolean } {
     const now = this.clock.now();
     const pending = this.database
       .prepare(
         `SELECT nonce FROM outbound_intents
-         WHERE intent_key = ? AND state = 'pending' AND created_at >= ?
+         WHERE intent_key = ? AND reply_id = ? AND state = 'pending' AND created_at >= ?
          ORDER BY created_at DESC LIMIT 1`,
       )
-      .get(key, now - reuseWindowMs) as { nonce: string } | undefined;
+      .get(key, reply.id, now - reuseWindowMs) as { nonce: string } | undefined;
     if (pending) {
       this.database
         .prepare(
@@ -518,10 +612,23 @@ export class EventStore {
     this.database
       .prepare(
         `INSERT INTO outbound_intents
-           (nonce, intent_key, chat_id, preview, state, created_at, updated_at, session_ear)
-         VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)`,
+           (nonce, intent_key, chat_id, preview, state, created_at, updated_at, session_ear,
+            reply_key, reply_id, part, parts)
+         VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(nonce, key, chatId, preview.slice(0, 80), now, now, sessionEar);
+      .run(
+        nonce,
+        key,
+        chatId,
+        preview.slice(0, 80),
+        now,
+        now,
+        sessionEar,
+        reply.key,
+        reply.id,
+        reply.part,
+        reply.parts,
+      );
     return { nonce, reused: false };
   }
 
@@ -553,7 +660,7 @@ export class EventStore {
       this.database
         .prepare(
           `SELECT nonce, chat_id AS chatId, preview, created_at AS createdAt,
-             session_ear AS sessionEar
+             session_ear AS sessionEar, part, parts
            FROM outbound_intents WHERE state = 'pending' ORDER BY created_at`,
         )
         .all() as unknown as AmbiguousSend[]
