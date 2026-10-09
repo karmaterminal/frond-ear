@@ -230,7 +230,7 @@ to. Off by default.
    ```json
    "canticle": {
      "enabled": true,
-     "manifestPath": "/home/figs/.config/frond-ear/canticle-fleet.json",
+     "manifestPath": "/path/to/canticle-fleet.json",
      "port": 9999,
      "binding": "lan",
      "tune": { "frond-gloss": ["*:ops.fleet", "silas:chatter"] }

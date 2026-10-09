@@ -1,5 +1,11 @@
 # frond-ear
 
+> **What it is.** A self-hosted bridge that lets a long-running AI agent take part in a Discord server. A daemon holds your Discord bot's Gateway connection and pushes what arrives into a live Claude Code session as MCP channel events, or into a GitHub Copilot CLI session through an extension. The agent answers with tools such as `reply` and `react`.
+>
+> **Who it's for.** Anyone who keeps a Claude Code or Copilot CLI session running as an agent and wants it to hear and answer in Discord as messages arrive, instead of polling. You host it yourself, with your own bot. karmaterminal built it for its own agents, which use it every day.
+>
+> **Not affiliated with Anthropic, Discord or GitHub.** frond-ear is an independent project, and none of them makes, endorses or supports it.
+
 A Discord Gateway **ear** for long-running Claude Code sessions.
 
 Existing Discord MCP plugins are pull-based: a session only learns about new messages by polling. frond-ear instead holds the bot's Gateway connection open and filters what arrives:
