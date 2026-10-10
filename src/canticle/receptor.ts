@@ -1,11 +1,13 @@
 // The binary-canticle receptor: one UDP listener per host, owned by the daemon,
 // fanning heard items out to the ears that tune them (frond-ear#24).
 //
-// Listen-only and silent: nothing here wakes a session or writes the Discord
-// event ledger. What's on air lives in the listener's in-memory live set (it
-// refills as stations loop); only the restart-safety state is persisted. P3
-// adds the `hear` tool that reads `live()`.
+// Listen-only: nothing here wakes a session or writes the Discord event ledger.
+// What's on air lives in the listener's in-memory live set (it refills as
+// stations loop); only the restart-safety state is persisted. The `hear` tool
+// reads `live()`, and so do the daemon's delivery modes (delivery.ts), which
+// alone decide what reaches a session unasked.
 
+import { createHash } from "node:crypto";
 import { createSocket, type Socket } from "node:dgram";
 
 import type { CanticleConfig } from "../config.ts";
@@ -15,7 +17,12 @@ import { systemClock, systemTimers } from "../types.ts";
 import { CLASSES, SCOPE_NAMES } from "./ids.ts";
 import { Listener, type ListenerEvent, type SafetyState } from "./listener.ts";
 import type { Manifest } from "./manifest.ts";
-import type { Identity } from "./wire.ts";
+import {
+  FLAG_EXERCISE,
+  FLAG_REFRESH,
+  FLAG_WAKE_DERIVED,
+  type Identity,
+} from "./wire.ts";
 
 const STATE_KEY = "canticle.listener_state";
 const TICK_MS = 1_000;
@@ -70,6 +77,28 @@ export interface LiveItem {
   ageMs: number;
   expiresInMs: number;
   copies: number;
+  /**
+   * Flag bit 1 (§14.8.1): sung during a canticle-woken turn, so it never wakes.
+   * Undefined when the source can't tell; delivery then treats it as wake-derived.
+   */
+  wakeDerived?: boolean | undefined;
+  /** Flag bit 0 (§7.9): a keyed item re-issued to stay on air. */
+  refresh?: boolean | undefined;
+  /** Flag bit 2: a drill, rendered as EXERCISE. */
+  exercise?: boolean | undefined;
+  /** SHA-256 of the body, hex, for a keyed item: how a refresh is told apart from an update (§7.9). */
+  bodyDigest?: string | undefined;
+  /**
+   * Receiver-measured age at first hearing (`heard_at − issued_at − δ̂`, floored at 0;
+   * §6.3 item 3). Undefined when the source doesn't say.
+   */
+  ageAtHearingMs?: number | undefined;
+  /**
+   * Set when the record didn't reach this binding as a live hearing: through a join
+   * snapshot after a (re)connect, or as a `resurfaced` copy after the host receptor
+   * restarted (§14.18.3, D36). Delivery marks either late.
+   */
+  origin?: "snapshot" | "resurfaced" | undefined;
 }
 
 export interface HearView {
@@ -89,6 +118,11 @@ export interface HearView {
     snapshot: import("./records.ts").JoinSnapshotState;
     omitted?: number;
   };
+  /**
+   * The host receptor's circuit breaker (§14.8.3), from record v1's `landing_state`.
+   * Not set by the embedded receptor, which has none.
+   */
+  breaker?: "closed" | "open" | "half_open";
   lastDatagramAt: number | undefined;
   stations: Array<{ name: string; presence: string }>;
   items: LiveItem[];
@@ -448,8 +482,19 @@ export class CanticleReceptor {
           0,
           now - it.issuedAt - this.#listener.clockOffset(h.kid),
         ),
+        ageAtHearingMs: Math.max(
+          0,
+          h.firstHeard - it.issuedAt - this.#listener.clockOffset(h.kid),
+        ),
         expiresInMs: Math.max(0, h.localExpiry - now),
         copies: h.copies,
+        wakeDerived: (it.flags & FLAG_WAKE_DERIVED) !== 0,
+        refresh: (it.flags & FLAG_REFRESH) !== 0,
+        exercise: (it.flags & FLAG_EXERCISE) !== 0,
+        bodyDigest:
+          it.stateKey !== undefined && it.body !== undefined
+            ? createHash("sha256").update(it.body).digest("hex")
+            : undefined,
       });
     }
     return out;

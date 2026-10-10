@@ -60,7 +60,7 @@ export interface Config {
   };
   /** Kill switch: keep ingesting, stop pushing. */
   paused: boolean;
-  /** Optional binary-canticle receptor (listen-only). Absent or disabled: no socket. */
+  /** Optional binary-canticle receptor. Absent or disabled: no socket, nothing heard or pushed. */
   canticle?: CanticleConfig;
 }
 
@@ -82,6 +82,72 @@ export interface CanticleConfig {
   source: "embedded" | "host-daemon";
   /** The host daemon's socket (default $XDG_RUNTIME_DIR/canticle/daemon.sock). */
   hostSocket: string;
+  /**
+   * Station key ids (16 hex digits) whose records may be pushed to a session at all
+   * (frond-ear#65, 🍃's boundary). Every other station stays readable with `hear` only.
+   */
+  wakeKeys: string[];
+  /** Global mute: no canticle push to any ear, whatever its delivery says. */
+  muted: boolean;
+  /** Per ear, what reaches its session unasked. An ear left out is `off`. */
+  delivery: Record<string, CanticleEarDelivery>;
+}
+
+/** `off`: `hear` only. `digest`: a radio report per window. `immediate`: each new record. */
+export type CanticleMode = "off" | "digest" | "immediate";
+
+export interface CanticleEarDelivery {
+  /** The ceiling for every station this ear hears; the session can only narrow it. */
+  mode: CanticleMode;
+  /**
+   * Per-station ceilings, instead of `mode`, by station name or key id (lowercase hex).
+   * A key id outlasts a manifest rename; where a station's key id and name both have an
+   * entry, the narrower holds.
+   */
+  stations: Record<string, CanticleMode>;
+  /** How often a digest report goes out, at most. */
+  windowMs: number;
+  /** How long immediate waits to coalesce a burst into one push. */
+  debounceMs: number;
+  /**
+   * Immediate's freshness bound (RFC-0001 §14.10 item 9): a record heard longer ago than
+   * this, or already older than this when first heard, goes into the next report instead,
+   * marked late. More than `debounceMs`, and at most item 9's 120 s.
+   */
+  maxAgeMs: number;
+  /** A report carries the records (`records`) or only counts, gaps and repeats per stream. */
+  style: "records" | "counts";
+  /** Records per push, at most; the rest wait for the next one. */
+  maxItems: number;
+  /** Records waiting per station:stream, at most; the oldest go first. */
+  bufferPerStream: number;
+  /**
+   * Pushes per rolling hour, at most; past it, records wait. By default 60, or one per
+   * window when `windowMs` is under a minute (at most 360), so a busy band's reports fit.
+   */
+  maxPushesPerHour: number;
+}
+
+/** RFC-0001 §14.10: wakes are coalesced over at least 5 s. */
+export const CANTICLE_MIN_COALESCE_MS = 5_000;
+
+/** The most pushes an ear may get in an hour, from `immediate` and reports together. */
+const CANTICLE_MAX_PUSHES_PER_HOUR = 360;
+
+/** Whether this ear has any canticle delivery other than `off` in its config. */
+export function canticleDelivers(
+  canticle: CanticleConfig | undefined,
+  ear: string,
+): boolean {
+  const delivery =
+    canticle?.enabled && Object.hasOwn(canticle.delivery, ear)
+      ? canticle.delivery[ear]
+      : undefined;
+  return (
+    delivery !== undefined &&
+    (delivery.mode !== "off" ||
+      Object.values(delivery.stations).some((mode) => mode !== "off"))
+  );
 }
 
 export interface WakeBudget {
@@ -213,6 +279,32 @@ function parseCanticle(
   if (typeof hostSocket !== "string" || hostSocket === "") {
     throw new Error("canticle.hostSocket must be a path");
   }
+  const wakeKeys = [
+    ...new Set(
+      stringArray(value.wakeKeys, "canticle.wakeKeys").map((key) => {
+        if (!KEY_ID.test(key)) {
+          throw new Error(
+            `canticle.wakeKeys: ${JSON.stringify(key)} must be a station key id (16 hex digits)`,
+          );
+        }
+        return key.toLowerCase();
+      }),
+    ),
+  ];
+  if (value.muted !== undefined && typeof value.muted !== "boolean") {
+    throw new Error("canticle.muted must be true or false");
+  }
+  const deliveryInput = value.delivery ?? {};
+  if (!isObject(deliveryInput)) {
+    throw new Error("canticle.delivery must be an object of ear -> delivery");
+  }
+  const delivery: Record<string, CanticleEarDelivery> = {};
+  for (const [ear, input] of Object.entries(deliveryInput)) {
+    if (!Object.hasOwn(ears, ear)) {
+      throw new Error(`canticle.delivery.${ear}: no such ear`);
+    }
+    delivery[ear] = parseDelivery(input, `canticle.delivery.${ear}`);
+  }
   return {
     enabled,
     manifestPath:
@@ -223,6 +315,99 @@ function parseCanticle(
     tune,
     source,
     hostSocket,
+    wakeKeys,
+    muted: value.muted === true,
+    delivery,
+  };
+}
+
+/** A station key id: SHA-256(public key)[0:8] in hex, the `key=` of a banner (§5.1). */
+export const CANTICLE_KEY_ID = /^[0-9a-f]{16}$/iu;
+const KEY_ID = CANTICLE_KEY_ID;
+/** A station name a tune can name on its own (the station half of `TUNE`). */
+export const CANTICLE_STATION = /^[a-z][a-z0-9-]{0,30}$/u;
+
+function canticleMode(value: unknown, name: string): CanticleMode {
+  if (value !== "off" && value !== "digest" && value !== "immediate") {
+    throw new Error(`${name} must be off, digest or immediate`);
+  }
+  return value;
+}
+
+/** One ear's `canticle.delivery` entry; a bare string is its `mode`. */
+function parseDelivery(value: unknown, name: string): CanticleEarDelivery {
+  const input = isObject(value) ? value : { mode: value };
+  const stationsInput = input.stations ?? {};
+  if (!isObject(stationsInput)) {
+    throw new Error(`${name}.stations must be an object of station -> mode`);
+  }
+  const stations: Record<string, CanticleMode> = {};
+  for (const [station, mode] of Object.entries(stationsInput)) {
+    if (!CANTICLE_STATION.test(station) && !KEY_ID.test(station)) {
+      throw new Error(
+        `${name}.stations: ${JSON.stringify(station)} must be a station name (lowercase letters, digits and -) or key id (16 hex digits)`,
+      );
+    }
+    const scope = KEY_ID.test(station) ? station.toLowerCase() : station;
+    if (Object.hasOwn(stations, scope)) {
+      throw new Error(
+        `${name}.stations: ${JSON.stringify(scope)} appears twice (key ids ignore case)`,
+      );
+    }
+    stations[scope] = canticleMode(mode, `${name}.stations.${station}`);
+  }
+  const style = input.style ?? "records";
+  if (style !== "records" && style !== "counts") {
+    throw new Error(`${name}.style must be records or counts`);
+  }
+  const bounded = (key: string, fallback: number, min: number, max: number) => {
+    const number = integer(input[key], fallback, `${name}.${key}`, min);
+    if (number > max) {
+      throw new Error(`${name}.${key} must be at most ${max}`);
+    }
+    return number;
+  };
+  const debounceMs = bounded(
+    "debounceMs",
+    CANTICLE_MIN_COALESCE_MS,
+    CANTICLE_MIN_COALESCE_MS,
+    60_000,
+  );
+  // At most RFC-0001 §14.10 item 9's bound on age at first hearing (stale_after[alarm]).
+  const maxAgeMs = bounded("maxAgeMs", 30_000, 10_000, 120_000);
+  if (maxAgeMs <= debounceMs) {
+    throw new Error(
+      `${name}.maxAgeMs must be more than debounceMs: a burst's first record waits debounceMs, so it would be too old for immediate`,
+    );
+  }
+  const windowMs = bounded(
+    "windowMs",
+    60_000,
+    CANTICLE_MIN_COALESCE_MS,
+    3_600_000,
+  );
+  return {
+    mode: canticleMode(input.mode ?? "off", `${name}.mode`),
+    stations,
+    windowMs,
+    debounceMs,
+    maxAgeMs,
+    style,
+    // RFC-0001 §14.6.5's dose by default (5 items per turn), and at most twice it; each
+    // push's size is capped by limits.maxNotificationChars as well.
+    maxItems: bounded("maxItems", 5, 1, 10),
+    bufferPerStream: bounded("bufferPerStream", 32, 1, 256),
+    // A report per window must fit the hour on a busy band, as far as the cap allows
+    // (ear_status warns when it can't).
+    maxPushesPerHour: bounded(
+      "maxPushesPerHour",
+      Math.min(
+        CANTICLE_MAX_PUSHES_PER_HOUR,
+        Math.max(60, Math.ceil(3_600_000 / windowMs)),
+      ),
+      1,
+      CANTICLE_MAX_PUSHES_PER_HOUR,
+    ),
   };
 }
 

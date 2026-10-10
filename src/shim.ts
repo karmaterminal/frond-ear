@@ -153,7 +153,7 @@ export const TOOLS = [
   {
     name: "set_attention",
     description:
-      "Choose what you hear. Narrow a chat (chat_id) or everything (omit chat_id) to room, mentions or silent; the mode in the daemon's config is the ceiling, so this can only reduce. Silence is total: nothing, principal included, breaks through, and held messages wait in inbox. mode=configured clears your choice. ttl_seconds is optional; without it the choice lasts until you change it. Only the session holding the ear can set it. Returns the effective modes.",
+      "Choose what you hear. Narrow a chat (chat_id) or everything (omit chat_id) to room, mentions or silent; the mode in the daemon's config is the ceiling, so this can only reduce. Silence is total: nothing, principal included, breaks through, and held messages wait in inbox. Silence for everything also mutes canticle pushes, for good: a canticle record first heard during it is never pushed, even after the silence lifts (hear still reads it while it is live). mode=configured clears your choice. ttl_seconds is optional; without it the choice lasts until you change it. Only the session holding the ear can set it. Returns the effective modes.",
     inputSchema: {
       type: "object",
       properties: {
@@ -165,6 +165,35 @@ export const TOOLS = [
         },
         chat_id: { ...chatId, description: "Limit to one chat; omit for all" },
         ttl_seconds: { type: "number", description: "Optional expiry" },
+      },
+      required: ["mode"],
+    },
+  },
+  {
+    name: "set_canticle_delivery",
+    description:
+      "Choose how binary-canticle broadcasts reach you unasked: immediate (each new record a few seconds after it is heard; one heard too long ago, or already old when first heard, goes into the next report instead, marked late), digest (a \"what's on the radio\" report at most once per window) or mute, for one station or, with station omitted, every station; a station's own choice beats the one for every station. The daemon's config is the ceiling (immediate, then digest, then mute), so this can only narrow. A mute at any scope wins, set_attention silence for everything included, and it is for good: a record first heard during a mute is never pushed, even after the mute lifts (hear still reads it while it is live). mode=configured clears your choice (every choice when station is omitted). ttl_seconds is optional; without it the choice lasts until you change it. Each scope holds one choice, as with set_attention: a new one replaces it, and when its ttl lapses the config applies again, style included. Only records from allowlisted station keys are ever pushed; the rest stay readable with hear. Only the session holding the ear can set it. Returns the effective modes.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        mode: {
+          type: "string",
+          enum: ["immediate", "digest", "mute", "configured"],
+          description:
+            "immediate: each new record, coalesced over a few seconds (a stale one goes into the next report, marked late); digest: one report per window; mute: nothing pushed, then or later (hear still reads); configured: clear your choice",
+        },
+        station: {
+          type: "string",
+          description:
+            "One station, by the name hear shows or by its key id (the key= of a hear banner, which outlasts a rename); omit for every station",
+        },
+        ttl_seconds: { type: "number", description: "Optional expiry" },
+        style: {
+          type: "string",
+          enum: ["records", "counts"],
+          description:
+            "The report's form, for the whole ear: records (each record with its banner) or counts (counts, skipped seqs and repeats per stream, no text). Omit to keep it",
+        },
       },
       required: ["mode"],
     },

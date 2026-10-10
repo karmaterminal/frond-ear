@@ -228,6 +228,8 @@ export class RecordConsumer {
   /** How many frames this connection's join snapshot brought, once applied (frond-ear#59). */
   snapshotFrames: number | undefined;
   mute: { until: number | null; by: string | null } | null = null;
+  /** The receptor's circuit breaker, from its latest `landing_state` (§14.8.3). */
+  breaker: "closed" | "open" | "half_open" | undefined;
   lastDatagramAt: number | undefined;
   noDatagrams = false;
   readonly presence = new Map<string, string>();
@@ -537,6 +539,7 @@ export class RecordConsumer {
     const parsed = this.#parseFrame(fields, nowMs);
     if (parsed === "malformed") return undefined;
     if (parsed === undefined) return { kind: "skip" };
+    parsed.item.origin = "snapshot";
     return { kind: "frame", live: parsed };
   }
 
@@ -545,9 +548,12 @@ export class RecordConsumer {
    * presence table and surfaced set become the snapshot's, so an item absent from it
    * leaves the local view (that is all absence does: no `retract`, nothing settled).
    * Truncated: merge only; absence means nothing, and what was carried stays, until a
-   * `retract`. Snapshot frames count toward nothing (§14.6 rate, budget, salience) and
-   * wake nothing, like `dedup: resurfaced`: this binding keeps no such quantity and
-   * `hear` is pull-only, so holding them in the live set is all delivery is here.
+   * `retract`. Snapshot frames count toward nothing (§14.6 rate, budget, salience), like
+   * `dedup: resurfaced`: this binding keeps no such quantity, so holding them in the live
+   * set is all this does. Whether one reaches a session is the delivery modes' call
+   * (delivery.ts): they push a record at most once, by identity, so a snapshot frame
+   * already pushed is never pushed again, and one never pushed goes out once (a
+   * departure from D36's "no wake", for frond-ear#65's exactly-once after a dropped link).
    */
   #applySnapshot(truncated: boolean, nowMs: number): void {
     const held = this.#snapHeld;
@@ -615,6 +621,7 @@ export class RecordConsumer {
     this.mute = isObj(mute)
       ? { until: mute.until as number | null, by: mute.by as string | null }
       : null;
+    this.breaker = rec.breaker as "closed" | "open" | "half_open";
     return true;
   }
 
@@ -733,6 +740,12 @@ export class RecordConsumer {
     const body = isObj(rec.body) ? rec.body : undefined;
     const text = body && str(body.text) ? body.text : undefined;
     const ref = isObj(rec.body_ref) ? rec.body_ref : undefined;
+    // §14.18.3 `flags`. An absent or mistyped `wake_derived` stays unknown, and
+    // delivery never wakes on an unknown (fail closed); the others only label.
+    const flags = isObj(rec.flags) ? rec.flags : {};
+    const heardAt = int(times.heard_at) ? times.heard_at : nowMs;
+    // δ̂ (the local clock minus the station's, §14.18.3 `times`), for when `age_ms` is missing.
+    const offset = int(times.offset_ms) ? times.offset_ms : 0;
     const item: LiveItem = {
       station: station.name,
       key: f.key_id,
@@ -744,7 +757,7 @@ export class RecordConsumer {
       hop: rec.hop,
       purpose: str(rec.purpose) ? rec.purpose : undefined,
       issuedAt: times.issued_at,
-      heardAt: int(times.heard_at) ? times.heard_at : nowMs,
+      heardAt,
       expiresAt: times.expires_at,
       bodyBytes:
         text === undefined && body && int(body.size) ? body.size : undefined,
@@ -765,8 +778,27 @@ export class RecordConsumer {
       ageMs: int(times.age_ms)
         ? times.age_ms
         : Math.max(0, nowMs - times.issued_at),
+      // `age_ms` is the receptor's age at first hearing (§6.3 item 3); without it, the
+      // first hearing less `issued_at`, corrected by δ̂, is the best there is.
+      ageAtHearingMs: Math.max(
+        0,
+        int(times.age_ms) ? times.age_ms : heardAt - times.issued_at - offset,
+      ),
+      // A copy re-heard after the host receptor restarted (§14.18.3); a join snapshot's
+      // entries are marked where they are read.
+      ...(rec.dedup === "resurfaced" ? { origin: "resurfaced" as const } : {}),
       expiresInMs: times.local_expiry_at - nowMs,
       copies: 1,
+      wakeDerived:
+        typeof flags.wake_derived === "boolean"
+          ? flags.wake_derived
+          : undefined,
+      refresh: flags.refresh === true,
+      exercise: flags.exercise === true,
+      bodyDigest:
+        str(rec.state_key) && body && str(body.sha256)
+          ? body.sha256.toLowerCase()
+          : undefined,
     };
     return {
       idem: rec.idem,
@@ -907,6 +939,7 @@ export class RecordConsumer {
       listening: listening && live,
       ...(this.health === "stopped" ? { ended: true } : {}),
       blind,
+      ...(this.breaker !== undefined ? { breaker: this.breaker } : {}),
       lastDatagramAt: this.lastDatagramAt,
       ...(this.joinedLate
         ? {

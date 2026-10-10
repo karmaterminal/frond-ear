@@ -5,7 +5,8 @@
 // Discord message text, so heard text can't counterfeit the banner, a channel
 // tag or a harness frame. Provenance comes from the manifest and the verified
 // frame, never from the payload; missing provenance reads "unavailable".
-// `body_ref` is shown, never fetched (§9.6). Nothing here wakes a session.
+// `body_ref` is shown, never fetched (§9.6). Nothing here wakes a session; the
+// delivery modes (delivery.ts) render their pushes with the same `renderItem`.
 
 import { randomBytes } from "node:crypto";
 
@@ -22,17 +23,17 @@ const STALE_AFTER_MS: Readonly<Record<string, number>> = {
 /** Largest |ms| a Date can hold; past it toISOString throws. */
 const MAX_DATE_MS = 8.64e15;
 
-const iso = (ms: number) =>
+export const iso = (ms: number) =>
   Number.isFinite(ms) && Math.abs(ms) <= MAX_DATE_MS
     ? new Date(ms).toISOString().replace(/\.\d{3}Z$/u, "Z")
     : "unavailable";
-const secs = (ms: number) =>
+export const secs = (ms: number) =>
   Number.isFinite(ms)
     ? `${Math.max(0, Math.round(ms / 1_000))}s`
     : "unavailable";
 
 /** An unquoted banner value: one token, so it can't open a second `key=value`. */
-function token(value: unknown): string {
+export function token(value: unknown): string {
   // Missing provenance reads "unavailable", never a guess (§14.13).
   if (value === undefined || value === null) return "unavailable";
   if (cleanText(String(value)).trim() === "") return "unavailable";
@@ -89,6 +90,16 @@ function wrapped(item: LiveItem, payload: string): string[] {
   ];
 }
 
+export interface ItemOptions {
+  /** The §14.9 landing mode the banner names: `silent` for `hear`, `silent-wake` for a push. */
+  mode?: "silent" | "silent-wake";
+  /**
+   * A push's `late:` line, when the record wasn't heard live just now (delivery.ts writes
+   * it from the record's times; no payload reaches it). Goes under the timing line.
+   */
+  late?: string | undefined;
+}
+
 /**
  * `textChars`, when below the payload's length, shows only that many source
  * characters and says so on an unquoted line inside the wrapper (every payload
@@ -98,13 +109,14 @@ export function renderItem(
   item: LiveItem,
   nowMs?: number,
   textChars?: number,
+  options: ItemOptions = {},
 ): string {
   const age = item.ageMs;
   const stale = STALE_AFTER_MS[item.class];
   const aged = stale !== undefined && age > stale;
   const lines = [
     [
-      "[canticle:heard] delivery=station-broadcast mode=silent",
+      `[canticle:heard] delivery=station-broadcast mode=${options.mode ?? "silent"}`,
       `class=${token(item.class)}`,
       `scope=${token(item.scope)}`,
       `station="${token(item.station)}"`,
@@ -116,6 +128,7 @@ export function renderItem(
       `hop=${digits(item.hop)}`,
       `root=${token(item.root)}`,
       ...(item.stateKey ? [`state_key=${token(item.stateKey)}`] : []),
+      ...(item.exercise ? ["EXERCISE"] : []),
     ].join(" "),
     [
       `issued=${iso(item.issuedAt)}`,
@@ -125,8 +138,11 @@ export function renderItem(
       `age=${secs(age)}`,
       `expires_in=${secs(item.expiresInMs)}`,
       ...(item.copies > 1 ? [`copies=${digits(item.copies)}`] : []),
+      ...(item.refresh ? ["refresh"] : []),
+      ...(item.wakeDerived === true ? ["wake_derived"] : []),
       ...(aged ? ["aged"] : []),
     ].join(" "),
+    ...(options.late !== undefined ? [options.late] : []),
   ];
   if (item.purpose) {
     lines.push(
@@ -277,7 +293,7 @@ export function renderHear(view: HearView, options: HearOptions): string {
 }
 
 /** The `joined_late` line (RFC-0001 §14.18.3 "Join snapshot"): blind, but saying so. */
-function joinedLate(late: NonNullable<HearView["joinedLate"]>): string {
+export function joinedLate(late: NonNullable<HearView["joinedLate"]>): string {
   const why =
     late.snapshot === "truncated"
       ? `its join snapshot was truncated (${digits(late.omitted)} omitted)`
@@ -290,7 +306,7 @@ function joinedLate(late: NonNullable<HearView["joinedLate"]>): string {
 }
 
 /** The on-air line, cut to about `budget` chars with a count of the rest. */
-function onAir(stations: HearView["stations"], budget: number): string {
+export function onAir(stations: HearView["stations"], budget: number): string {
   const parts = stations.map((s) => `${token(s.name)}=${token(s.presence)}`);
   let line = `on air: ${parts.join(", ")}`;
   for (let n = parts.length - 1; line.length > budget && n >= 0; n -= 1) {
