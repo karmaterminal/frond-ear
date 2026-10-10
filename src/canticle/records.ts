@@ -539,6 +539,7 @@ export class RecordConsumer {
     const parsed = this.#parseFrame(fields, nowMs);
     if (parsed === "malformed") return undefined;
     if (parsed === undefined) return { kind: "skip" };
+    parsed.item.origin = "snapshot";
     return { kind: "frame", live: parsed };
   }
 
@@ -742,6 +743,7 @@ export class RecordConsumer {
     // §14.18.3 `flags`. An absent or mistyped `wake_derived` stays unknown, and
     // delivery never wakes on an unknown (fail closed); the others only label.
     const flags = isObj(rec.flags) ? rec.flags : {};
+    const heardAt = int(times.heard_at) ? times.heard_at : nowMs;
     const item: LiveItem = {
       station: station.name,
       key: f.key_id,
@@ -753,7 +755,7 @@ export class RecordConsumer {
       hop: rec.hop,
       purpose: str(rec.purpose) ? rec.purpose : undefined,
       issuedAt: times.issued_at,
-      heardAt: int(times.heard_at) ? times.heard_at : nowMs,
+      heardAt,
       expiresAt: times.expires_at,
       bodyBytes:
         text === undefined && body && int(body.size) ? body.size : undefined,
@@ -774,6 +776,15 @@ export class RecordConsumer {
       ageMs: int(times.age_ms)
         ? times.age_ms
         : Math.max(0, nowMs - times.issued_at),
+      // `age_ms` is the receptor's age at first hearing (§6.3 item 3); without it, the
+      // two clocks' difference is the best there is.
+      ageAtHearingMs: Math.max(
+        0,
+        int(times.age_ms) ? times.age_ms : heardAt - times.issued_at,
+      ),
+      // A copy re-heard after the host receptor restarted (§14.18.3); a join snapshot's
+      // entries are marked where they are read.
+      ...(rec.dedup === "resurfaced" ? { origin: "resurfaced" as const } : {}),
       expiresInMs: times.local_expiry_at - nowMs,
       copies: 1,
       wakeDerived:

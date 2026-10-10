@@ -93,6 +93,11 @@ function wrapped(item: LiveItem, payload: string): string[] {
 export interface ItemOptions {
   /** The §14.9 landing mode the banner names: `silent` for `hear`, `silent-wake` for a push. */
   mode?: "silent" | "silent-wake";
+  /**
+   * A push's `late:` line, when the record wasn't heard live just now (delivery.ts writes
+   * it from the record's times; no payload reaches it). Goes under the timing line.
+   */
+  late?: string | undefined;
 }
 
 /**
@@ -137,6 +142,7 @@ export function renderItem(
       ...(item.wakeDerived === true ? ["wake_derived"] : []),
       ...(aged ? ["aged"] : []),
     ].join(" "),
+    ...(options.late !== undefined ? [options.late] : []),
   ];
   if (item.purpose) {
     lines.push(

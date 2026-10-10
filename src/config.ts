@@ -99,12 +99,22 @@ export type CanticleMode = "off" | "digest" | "immediate";
 export interface CanticleEarDelivery {
   /** The ceiling for every station this ear hears; the session can only narrow it. */
   mode: CanticleMode;
-  /** Per-station ceilings, by station name, instead of `mode`. */
+  /**
+   * Per-station ceilings, instead of `mode`, by station name or key id (lowercase hex).
+   * A key id outlasts a manifest rename; where a station's key id and name both have an
+   * entry, the narrower holds.
+   */
   stations: Record<string, CanticleMode>;
   /** How often a digest report goes out, at most. */
   windowMs: number;
   /** How long immediate waits to coalesce a burst into one push. */
   debounceMs: number;
+  /**
+   * Immediate's freshness bound (RFC-0001 §14.10 item 9): a record heard longer ago than
+   * this, or already older than this when first heard, goes into the next report instead,
+   * marked late. More than `debounceMs`, and at most item 9's 120 s.
+   */
+  maxAgeMs: number;
   /** A report carries the records (`records`) or only counts, gaps and repeats per stream. */
   style: "records" | "counts";
   /** Records per push, at most; the rest wait for the next one. */
@@ -305,7 +315,9 @@ function parseCanticle(
   };
 }
 
-const KEY_ID = /^[0-9a-f]{16}$/iu;
+/** A station key id: SHA-256(public key)[0:8] in hex, the `key=` of a banner (§5.1). */
+export const CANTICLE_KEY_ID = /^[0-9a-f]{16}$/iu;
+const KEY_ID = CANTICLE_KEY_ID;
 /** A station name a tune can name on its own (the station half of `TUNE`). */
 export const CANTICLE_STATION = /^[a-z][a-z0-9-]{0,30}$/u;
 
@@ -325,12 +337,18 @@ function parseDelivery(value: unknown, name: string): CanticleEarDelivery {
   }
   const stations: Record<string, CanticleMode> = {};
   for (const [station, mode] of Object.entries(stationsInput)) {
-    if (!CANTICLE_STATION.test(station)) {
+    if (!CANTICLE_STATION.test(station) && !KEY_ID.test(station)) {
       throw new Error(
-        `${name}.stations: ${JSON.stringify(station)} must be a station name (lowercase letters, digits and -)`,
+        `${name}.stations: ${JSON.stringify(station)} must be a station name (lowercase letters, digits and -) or key id (16 hex digits)`,
       );
     }
-    stations[station] = canticleMode(mode, `${name}.stations.${station}`);
+    const scope = KEY_ID.test(station) ? station.toLowerCase() : station;
+    if (Object.hasOwn(stations, scope)) {
+      throw new Error(
+        `${name}.stations: ${JSON.stringify(scope)} appears twice (key ids ignore case)`,
+      );
+    }
+    stations[scope] = canticleMode(mode, `${name}.stations.${station}`);
   }
   const style = input.style ?? "records";
   if (style !== "records" && style !== "counts") {
@@ -343,20 +361,31 @@ function parseDelivery(value: unknown, name: string): CanticleEarDelivery {
     }
     return number;
   };
+  const debounceMs = bounded(
+    "debounceMs",
+    CANTICLE_MIN_COALESCE_MS,
+    CANTICLE_MIN_COALESCE_MS,
+    60_000,
+  );
+  // At most RFC-0001 §14.10 item 9's bound on age at first hearing (stale_after[alarm]).
+  const maxAgeMs = bounded("maxAgeMs", 30_000, 10_000, 120_000);
+  if (maxAgeMs <= debounceMs) {
+    throw new Error(
+      `${name}.maxAgeMs must be more than debounceMs: a burst's first record waits debounceMs, so it would be too old for immediate`,
+    );
+  }
   return {
     mode: canticleMode(input.mode ?? "off", `${name}.mode`),
     stations,
     windowMs: bounded("windowMs", 60_000, CANTICLE_MIN_COALESCE_MS, 3_600_000),
-    debounceMs: bounded(
-      "debounceMs",
-      CANTICLE_MIN_COALESCE_MS,
-      CANTICLE_MIN_COALESCE_MS,
-      600_000,
-    ),
+    debounceMs,
+    maxAgeMs,
     style,
-    maxItems: bounded("maxItems", 10, 1, 50),
+    // RFC-0001 §14.6.5's dose by default (5 items per turn), and at most twice it; each
+    // push's size is capped by limits.maxNotificationChars as well.
+    maxItems: bounded("maxItems", 5, 1, 10),
     bufferPerStream: bounded("bufferPerStream", 32, 1, 256),
-    maxPushesPerHour: bounded("maxPushesPerHour", 60, 1, 3_600),
+    maxPushesPerHour: bounded("maxPushesPerHour", 60, 1, 360),
   };
 }
 

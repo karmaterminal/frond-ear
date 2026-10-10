@@ -55,6 +55,10 @@ interface Song {
   digest?: string;
   ttlMs?: number;
   dedup?: "first" | "resurfaced";
+  /** The station's key id, when a manifest renamed the station. */
+  key?: string;
+  /** How old the record already was when the host receptor first heard it. */
+  age?: number;
 }
 
 /**
@@ -128,7 +132,7 @@ class Host {
   fields(seq: number, o: Song = {}): R {
     const now = this.now;
     const station = o.station ?? "ops";
-    const key = KEYS[station] ?? OPS;
+    const key = o.key ?? KEYS[station] ?? OPS;
     const epoch = o.epoch ?? 7;
     const stream = o.stream ?? "ops.fleet";
     const ttl = o.ttlMs ?? 300_000;
@@ -151,11 +155,11 @@ class Host {
       hop: o.hop ?? 0,
       ...(o.stateKey !== undefined ? { state_key: o.stateKey } : {}),
       times: {
-        issued_at: now - 1_000,
+        issued_at: now - (o.age ?? 1_000),
         expires_at: now + ttl + 5_000,
         heard_at: now - 500,
         local_expiry_at: now + ttl,
-        age_ms: 1_000,
+        age_ms: o.age ?? 1_000,
       },
       admission: "verified",
       disposition: "surface",
@@ -290,6 +294,7 @@ interface DeliveryStatus {
   warning?: string;
   windowMs: number;
   debounceMs: number;
+  maxAgeMs: number;
   waiting: number;
   nextPushAt: number | null;
   held: string | null;
@@ -1062,8 +1067,9 @@ test("CQ: presence, a sign-off, a pluck and a rejoin survive a dropped link; wha
     assert.deepEqual(order(report.content), ["ops:ops.fleet/4"]);
     assert.match(
       report.content,
-      /^ops:ops\.fleet: 1 new record \(item 7\/4\), 1 seq skipped:$/mu,
+      /^ops:ops\.fleet: 1 new record \(item 7\/4\), 1 seq skipped, 1 late:$/mu,
     );
+    assert.match(report.content, /^late: heard 42s ago \(snapshot\)$/mu);
     assert.match(
       report.content,
       /^on air: ops=EQUIPPED_SPEAKING, alpha=UNOBSERVABLE:signed_off$/mu,
@@ -1081,6 +1087,228 @@ test("CQ: presence, a sign-off, a pluck and a rejoin survive a dropped link; wha
     assert.deepEqual(order(pushes(shim)[2]!.content), ["alpha:ops.fleet/1"]);
   } finally {
     h.dispose();
+  }
+});
+
+test("freshness: a join-snapshot record older than maxAgeMs is not pushed immediately but goes into the next report, marked late; a fresh one is pushed immediately, marked as a snapshot", async () => {
+  const { h, host } = setup({ mode: "immediate", windowMs: 10_000 });
+  try {
+    const shim = h.attach("scribe");
+    host.sing(1);
+    h.timers.advance(6_000);
+    assert.equal(pushes(shim).length, 1);
+    assert.doesNotMatch(pushes(shim)[0]!.content, /^late:/mu, "heard just now");
+
+    host.drop();
+    host.sing(2); // the host daemon hears it while our link is down
+    h.timers.advance(40_000);
+    host.sing(3);
+    h.timers.advance(2_000);
+    host.rejoin(); // its join snapshot brings back 2, heard 42 s ago, and 3, heard 2 s ago
+    h.timers.advance(6_000);
+    assert.equal(pushes(shim).length, 2);
+    const fresh = pushes(shim)[1]!;
+    assert.equal(fresh.meta.delivery, "immediate");
+    assert.deepEqual(order(fresh.content), ["ops:ops.fleet/3"]);
+    assert.match(fresh.content, /^late: heard 9s ago \(snapshot\)$/mu);
+    assert.equal(status(h).counts.routed_late, 1);
+
+    h.timers.advance(5_000); // the report's window opened when 2 left immediate
+    assert.equal(pushes(shim).length, 3);
+    const report = pushes(shim)[2]!;
+    assert.equal(report.meta.delivery, "report");
+    assert.deepEqual(order(report.content), ["ops:ops.fleet/2"]);
+    assert.match(report.content, /^late: heard 54s ago \(snapshot\)$/mu);
+    assert.match(
+      report.content,
+      /^ops:ops\.fleet: 1 new record \(item 7\/2\), 1 out of order, 1 late:$/mu,
+    );
+    assert.equal(status(h).counts.records_pushed_late, 2);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("freshness: a record already older than maxAgeMs when first heard goes into the next report, marked late; a fresh resurfaced copy is pushed immediately, marked resurfaced", async () => {
+  const { h, host } = setup({ mode: "immediate", windowMs: 10_000 });
+  try {
+    const shim = h.attach("scribe");
+    host.sing(1, { age: 300_000 }); // issued five minutes before the host first heard it
+    host.sing(1, { stream: "ops.deploy", dedup: "resurfaced" });
+    h.timers.advance(6_000);
+    assert.equal(pushes(shim).length, 1);
+    const now = pushes(shim)[0]!;
+    assert.deepEqual(order(now.content), ["ops:ops.deploy/1"]);
+    assert.match(now.content, /^late: heard 7s ago \(resurfaced\)$/mu);
+    h.timers.advance(5_000);
+    assert.equal(pushes(shim).length, 2);
+    const report = pushes(shim)[1]!;
+    assert.equal(report.meta.delivery, "report");
+    assert.deepEqual(order(report.content), ["ops:ops.fleet/1"]);
+    assert.match(
+      report.content,
+      /^late: heard 12s ago, 300s old when first heard$/mu,
+    );
+    assert.deepEqual(status(h).counts, {
+      routed_late: 1,
+      pushes: 1,
+      reports: 1,
+      records_pushed: 2,
+      records_pushed_late: 2,
+    });
+  } finally {
+    h.dispose();
+  }
+});
+
+test("freshness: a report held past windowMs + maxAgeMs marks the records it held late, and only those", async () => {
+  const { h, host } = setup({ mode: "digest", windowMs: 10_000 });
+  try {
+    host.sing(1);
+    h.timers.advance(49_000); // the report is due at 11 s, but no session holds the ear
+    assert.equal(status(h).held, "no_session");
+    host.sing(2);
+    const shim = h.attach("scribe");
+    h.timers.advance(2_000);
+    assert.equal(pushes(shim).length, 1);
+    const report = pushes(shim)[0]!.content;
+    assert.deepEqual(order(report), ["ops:ops.fleet/1", "ops:ops.fleet/2"]);
+    assert.equal(
+      report.match(/^late:.*$/gmu)?.join("|"),
+      "late: heard 51s ago",
+    );
+    assert.match(
+      report,
+      /^ops:ops\.fleet: 2 new records \(items 7\/1 to 7\/2\), 1 late:$/mu,
+    );
+  } finally {
+    h.dispose();
+  }
+});
+
+test("stations by key id: a ceiling or a mute by key id outlasts a manifest rename; where a key id and a name both match, the narrower holds", async () => {
+  const { h, host } = setup({
+    mode: "immediate",
+    windowMs: 10_000,
+    stations: {
+      [OPS.toUpperCase()]: "digest",
+      ops: "immediate",
+      alpha: "digest",
+      [ALPHA]: "immediate",
+    },
+  });
+  try {
+    const shim = h.attach("scribe");
+    host.sing(1); // digest by its key id, narrower than its name's immediate
+    host.sing(1, { station: "alpha" }); // digest by its name, narrower than its key id's
+    h.timers.advance(6_000);
+    assert.equal(pushes(shim).length, 0, "neither goes immediate");
+    host.sing(2, { station: "ops-renamed", key: OPS }); // a new name, the same key
+    h.timers.advance(5_000);
+    assert.equal(pushes(shim).length, 1);
+    assert.equal(pushes(shim)[0]!.meta.delivery, "report");
+    assert.deepEqual(order(pushes(shim)[0]!.content), [
+      "alpha:ops.fleet/1",
+      "ops-renamed:ops.fleet/2",
+      "ops:ops.fleet/1",
+    ]);
+
+    // A mute by key id, as hear's key= shows it, holds across a rename as well.
+    const muted = JSON.parse(
+      (
+        await h.call(shim, "set_canticle_delivery", {
+          mode: "mute",
+          station: ALPHA.toUpperCase(),
+        })
+      ).text,
+    ) as {
+      stations: Record<string, { ceiling: string; mode: string }>;
+      choices: Array<{ scope: string; mode: string }>;
+    };
+    assert.deepEqual(muted.choices, [
+      { scope: ALPHA, mode: "mute", expiresAt: null },
+    ]);
+    // Each scope as config or the session names it.
+    assert.deepEqual(muted.stations, {
+      [ALPHA]: { ceiling: "immediate", mode: "mute" },
+      [OPS]: { ceiling: "digest", mode: "digest" },
+      alpha: { ceiling: "digest", mode: "digest" },
+      ops: { ceiling: "immediate", mode: "immediate" },
+    });
+    host.sing(2, { station: "alpha" });
+    host.sing(3, { station: "alpha-renamed", key: ALPHA });
+    h.timers.advance(11_000);
+    assert.equal(pushes(shim).length, 1);
+    assert.equal(status(h).counts.muted, 2);
+    await h.call(shim, "set_canticle_delivery", {
+      mode: "configured",
+      station: ALPHA,
+    });
+    // Renamed, alpha keeps its key id's ceiling and leaves its old name's behind.
+    host.sing(4, { station: "alpha-renamed", key: ALPHA });
+    h.timers.advance(6_000);
+    assert.equal(pushes(shim)[1]!.meta.delivery, "immediate");
+    assert.deepEqual(order(pushes(shim)[1]!.content), [
+      "alpha-renamed:ops.fleet/4",
+    ]);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("dedupe: a record heard again with a later local expiry keeps its tombstone until then, through a frond-ear restart too", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "frond-ear-canticle-"));
+  const path = join(directory, "ear.db");
+  try {
+    const first = setup({ mode: "immediate" }, {}, {}, { path });
+    try {
+      const shim = first.h.attach("scribe");
+      first.host.sing(1, { ttlMs: 60_000 }); // its tombstone lasts until 1_065_000
+      first.h.timers.advance(6_000);
+      assert.equal(pushes(shim).length, 1);
+      first.h.timers.advance(44_000);
+      // The host receptor restarts and hears it again, with a later local expiry.
+      first.host.start("c3d4");
+      first.host.sing(1, { ttlMs: 60_000, dedup: "resurfaced" });
+      first.h.timers.advance(30_000); // past the first tombstone, while the copy is fresh
+      assert.equal(pushes(shim).length, 1);
+    } finally {
+      first.h.dispose();
+    }
+    const second = setup({ mode: "immediate" }, {}, {}, { path });
+    try {
+      second.h.clock.value = 1_080_000;
+      const shim = second.h.attach("scribe");
+      second.host.sing(1, { ttlMs: 30_000, dedup: "resurfaced" });
+      second.h.timers.advance(10_000);
+      assert.equal(
+        pushes(shim).length,
+        0,
+        "the store kept the later tombstone",
+      );
+
+      // Settling one record again only ever lengthens its tombstone.
+      const row = (expiresAt: number) => ({
+        identity: "x",
+        outcome: "pushed" as const,
+        refreshKey: null,
+        digest: null,
+        expiresAt,
+      });
+      for (const at of [2_000_000, 3_000_000, 2_500_000]) {
+        second.h.store.settleCanticle("scribe", [row(at)]);
+      }
+      assert.equal(
+        second.h.store
+          .canticleSettled(second.h.clock.now())
+          .find((settled) => settled.identity === "x")?.expiresAt,
+        3_000_000,
+      );
+    } finally {
+      second.h.dispose();
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
   }
 });
 
@@ -1147,25 +1375,49 @@ test("withdraw: a record plucked while it waits is never pushed, however long it
   }
 });
 
-test("holds: the hourly push budget holds records until the hour has room", async () => {
-  const { h, host } = setup({ mode: "immediate", maxPushesPerHour: 1 });
+test("holds: the hourly push budget holds records until the hour has room, through a frond-ear restart; one held past maxAgeMs goes out in a report, marked late", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "frond-ear-canticle-"));
+  const path = join(directory, "ear.db");
+  const delivery = {
+    mode: "immediate",
+    windowMs: 10_000,
+    maxPushesPerHour: 1,
+  };
   try {
-    const shim = h.attach("scribe");
-    host.sing(1, { ttlMs: 7_200_000 });
-    h.timers.advance(6_000);
-    assert.equal(pushes(shim).length, 1);
-    host.sing(2, { ttlMs: 7_200_000 });
-    h.timers.advance(10_000);
-    assert.equal(status(h).held, "push_budget");
-    assert.equal(status(h).pushesLastHour, 1);
-    // The first push went out at 1_006_000; the hour has room again an hour after it.
-    h.timers.advance(4_605_000 - h.clock.now());
-    assert.equal(pushes(shim).length, 1, "a second short of the hour");
-    h.timers.advance(1_000);
-    assert.equal(pushes(shim).length, 2);
-    assert.deepEqual(order(pushes(shim)[1]!.content), ["ops:ops.fleet/2"]);
+    const first = setup(delivery, {}, {}, { path });
+    try {
+      const shim = first.h.attach("scribe");
+      first.host.sing(1, { ttlMs: 7_200_000 });
+      first.h.timers.advance(6_000);
+      assert.equal(pushes(shim).length, 1);
+    } finally {
+      first.h.dispose();
+    }
+    const { h, host } = setup(delivery, {}, {}, { path });
+    try {
+      h.clock.value = 1_010_000;
+      const shim = h.attach("scribe");
+      host.sing(2, { ttlMs: 7_200_000 });
+      h.timers.advance(10_000);
+      assert.equal(status(h).held, "push_budget", "the restart kept the hour");
+      assert.equal(status(h).pushesLastHour, 1);
+      assert.equal(status(h).lastPushAt, 1_006_000);
+      h.timers.advance(30_000);
+      assert.equal(status(h).counts.routed_late, 1);
+      // The first push went out at 1_006_000; the hour has room again an hour after it.
+      h.timers.advance(4_605_000 - h.clock.now());
+      assert.equal(pushes(shim).length, 0, "a second short of the hour");
+      h.timers.advance(1_000);
+      assert.equal(pushes(shim).length, 1);
+      const report = pushes(shim)[0]!;
+      assert.equal(report.meta.delivery, "report");
+      assert.deepEqual(order(report.content), ["ops:ops.fleet/2"]);
+      assert.match(report.content, /^late: heard 3597s ago$/mu);
+    } finally {
+      h.dispose();
+    }
   } finally {
-    h.dispose();
+    rmSync(directory, { recursive: true, force: true });
   }
 });
 
@@ -1176,12 +1428,21 @@ test("config: delivery entries, wakeKeys and muted parse with their defaults and
       stations: {},
       windowMs: 60_000,
       debounceMs: 5_000,
+      maxAgeMs: 30_000,
       style: "records",
-      maxItems: 10,
+      maxItems: 5,
       bufferPerStream: 32,
       maxPushesPerHour: 60,
     },
   });
+  assert.deepEqual(
+    canticleConfig({
+      mode: "digest",
+      stations: { [OPS.toUpperCase()]: "immediate", alpha: "off" },
+    }).canticle!.delivery.scribe!.stations,
+    { [OPS]: "immediate", alpha: "off" },
+    "a key id is kept in lowercase",
+  );
   assert.equal(
     canticleConfig("immediate").canticle!.delivery.scribe!.mode,
     "immediate",
@@ -1234,12 +1495,39 @@ test("config: delivery entries, wakeKeys and muted parse with their defaults and
     /debounceMs must be an integer >= 5000/u,
   );
   assert.throws(
-    bad({ mode: "digest", maxItems: 51 }),
-    /maxItems must be at most 50/u,
+    bad({ mode: "immediate", debounceMs: 60_001 }),
+    /debounceMs must be at most 60000/u,
+  );
+  assert.throws(
+    bad({ mode: "immediate", maxAgeMs: 9_999 }),
+    /maxAgeMs must be an integer >= 10000/u,
+  );
+  assert.throws(
+    bad({ mode: "immediate", maxAgeMs: 120_001 }),
+    /maxAgeMs must be at most 120000/u,
+  );
+  assert.throws(
+    bad({ mode: "immediate", debounceMs: 30_000 }),
+    /maxAgeMs must be more than debounceMs/u,
+  );
+  assert.throws(
+    bad({ mode: "digest", maxItems: 11 }),
+    /maxItems must be at most 10/u,
+  );
+  assert.throws(
+    bad({ mode: "digest", maxPushesPerHour: 361 }),
+    /maxPushesPerHour must be at most 360/u,
   );
   assert.throws(
     bad({ mode: "digest", stations: { "Ops!": "digest" } }),
-    /must be a station name/u,
+    /must be a station name \(lowercase letters, digits and -\) or key id/u,
+  );
+  assert.throws(
+    bad({
+      mode: "digest",
+      stations: { [OPS]: "digest", [OPS.toUpperCase()]: "off" },
+    }),
+    /appears twice \(key ids ignore case\)/u,
   );
   assert.throws(
     bad({ mode: "digest", stations: { ops: "loud" } }),
@@ -1279,6 +1567,7 @@ test("set_canticle_delivery: only the attached session may choose, and only well
     const cases: Array<[R, RegExp]> = [
       [{ mode: "loud" }, /mode must be immediate, digest, mute or configured/u],
       [{ mode: "mute", station: "Ops" }, /station must be one station's name/u],
+      [{ mode: "mute", station: "0a1b2c3d" }, /or its key id \(16 hex digits/u],
       [{ mode: "digest", style: "poem" }, /style must be records or counts/u],
       [
         { mode: "digest", station: "ops", style: "counts" },
@@ -1342,6 +1631,7 @@ test("ear_status shows the ear's delivery and warns when no key may wake it; the
       "canticle.wakeKeys is empty, so nothing is pushed: every station stays hear-only",
     );
     assert.equal(s.windowMs, 60_000);
+    assert.equal(s.maxAgeMs, 30_000);
     assert.equal(s.held, null);
     const welcome = shim.connection.received.find(
       (message) => message.type === "welcome",
@@ -1349,6 +1639,10 @@ test("ear_status shows the ear's delivery and warns when no key may wake it; the
     assert.match(
       welcome?.instructions ?? "",
       /binary-canticle broadcasts from allowlisted stations also reach you unasked, as kind="canticle" events/u,
+    );
+    assert.match(
+      welcome?.instructions ?? "",
+      /A banner with a late: line is a record not heard live just now/u,
     );
   } finally {
     h.dispose();
@@ -1480,6 +1774,21 @@ test("embedded receptor: an allowlisted key's signed item is pushed once, its re
     assert.match(
       pushes(shim)[1]!.content,
       /^- test1:chatter: 1 new record \(item 1\/3\), 1 seq skipped, 2 repeats caught$/mu,
+    );
+
+    // Back to immediate: 4, issued at T0, is first heard 32 s later, so it is too old for
+    // an immediate push and goes into the next report (a 5 s window here), marked late.
+    await h.call(shim, "set_canticle_delivery", { mode: "configured" });
+    receptor.receive(signed(4));
+    h.timers.advance(5_000);
+    assert.equal(pushes(shim).length, 2);
+    h.timers.advance(1_000);
+    assert.equal(pushes(shim).length, 3);
+    assert.equal(pushes(shim)[2]!.meta.delivery, "report");
+    assert.deepEqual(order(pushes(shim)[2]!.content), ["test1:chatter/4"]);
+    assert.match(
+      pushes(shim)[2]!.content,
+      /^late: heard \d+s ago, 32s old when first heard$/mu,
     );
     receptor.stop();
   } finally {

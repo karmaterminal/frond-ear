@@ -15,7 +15,7 @@ import { join } from "node:path";
 
 import { DELIVERY_PROOF, targetAdvice } from "./advice.ts";
 import { CanticleDelivery } from "./canticle/delivery.ts";
-import { CANTICLE_STATION, type Config } from "./config.ts";
+import { CANTICLE_KEY_ID, CANTICLE_STATION, type Config } from "./config.ts";
 import type { StructuredLogger } from "./logger.ts";
 import {
   WakeLimiter,
@@ -1473,12 +1473,21 @@ export class Daemon {
     ) {
       throw new Error("mode must be immediate, digest, mute or configured");
     }
-    const station = stringArg(args, "station");
-    if (station !== undefined && !CANTICLE_STATION.test(station)) {
+    const named = stringArg(args, "station");
+    if (
+      named !== undefined &&
+      !CANTICLE_STATION.test(named) &&
+      !CANTICLE_KEY_ID.test(named)
+    ) {
       throw new Error(
-        "station must be one station's name as hear shows it (lowercase letters, digits and -); omit it for every station",
+        "station must be one station's name as hear shows it (lowercase letters, digits and -) or its key id (16 hex digits, the key= of a hear banner); omit it for every station",
       );
     }
+    // A key id is kept in lowercase, as config keeps it, so one station has one scope.
+    const station =
+      named !== undefined && CANTICLE_KEY_ID.test(named)
+        ? named.toLowerCase()
+        : named;
     const style = stringArg(args, "style");
     if (style !== undefined && style !== "records" && style !== "counts") {
       throw new Error("style must be records or counts");

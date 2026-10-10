@@ -88,6 +88,17 @@ export interface LiveItem {
   exercise?: boolean | undefined;
   /** SHA-256 of the body, hex, for a keyed item: how a refresh is told apart from an update (§7.9). */
   bodyDigest?: string | undefined;
+  /**
+   * Receiver-measured age at first hearing (`heard_at − issued_at − δ̂`, floored at 0;
+   * §6.3 item 3). Undefined when the source doesn't say.
+   */
+  ageAtHearingMs?: number | undefined;
+  /**
+   * Set when the record didn't reach this binding as a live hearing: through a join
+   * snapshot after a (re)connect, or as a `resurfaced` copy after the host receptor
+   * restarted (§14.18.3, D36). Delivery marks either late.
+   */
+  origin?: "snapshot" | "resurfaced" | undefined;
 }
 
 export interface HearView {
@@ -470,6 +481,10 @@ export class CanticleReceptor {
         ageMs: Math.max(
           0,
           now - it.issuedAt - this.#listener.clockOffset(h.kid),
+        ),
+        ageAtHearingMs: Math.max(
+          0,
+          h.firstHeard - it.issuedAt - this.#listener.clockOffset(h.kid),
         ),
         expiresInMs: Math.max(0, h.localExpiry - now),
         copies: h.copies,

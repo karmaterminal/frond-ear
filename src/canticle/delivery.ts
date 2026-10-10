@@ -118,6 +118,8 @@ interface Waiting {
   item: LiveItem;
   /** Its local expiry, as first seen: never later, since remaining life never resets. */
   expiresAt: number;
+  /** Too old for `immediate` (`maxAgeMs`): it goes into the next report, marked late. */
+  routed?: true;
 }
 
 /** Where pushes left off, per ear; saved with each push's tombstones. */
@@ -128,6 +130,50 @@ interface Cursor {
   after: Partial<Record<Cadence, string>>;
   /** Per station:stream, the last record pushed, as `key:epoch:seq`. */
   streams: Record<string, string>;
+  /** When each push of the last hour went out, so a restart keeps `maxPushesPerHour`. */
+  pushes: number[];
+}
+
+/** Receiver-measured age at first hearing, or issued_at to heard_at when the source can't say. */
+const ageAtHearing = (item: LiveItem) =>
+  item.ageAtHearingMs ?? Math.max(0, item.heardAt - item.issuedAt);
+
+/**
+ * Fresh enough to push the moment it is heard (RFC-0001 §14.10 item 9, per ear): heard at
+ * most `maxAgeMs` ago, and at most `maxAgeMs` old when first heard.
+ */
+const fresh = (item: LiveItem, maxAgeMs: number, now: number) =>
+  now - item.heardAt <= maxAgeMs && ageAtHearing(item) <= maxAgeMs;
+
+/**
+ * A pushed record's `late:` banner line, or undefined when it isn't late. It is late when
+ * it came back through a join snapshot or as a resurfaced copy, when it was too old for
+ * `immediate`, when it was already older than `maxAgeMs` when first heard, or when a
+ * report carries it more than `windowMs + maxAgeMs` after it was heard.
+ */
+function lateLine(
+  waiting: Waiting,
+  cadence: Cadence,
+  delivery: CanticleEarDelivery,
+  now: number,
+): string | undefined {
+  const { item } = waiting;
+  const since = now - item.heardAt;
+  const old = ageAtHearing(item);
+  const allowed =
+    (cadence === "digest" ? delivery.windowMs : 0) + delivery.maxAgeMs;
+  if (
+    item.origin === undefined &&
+    waiting.routed !== true &&
+    old <= delivery.maxAgeMs &&
+    since <= allowed
+  ) {
+    return undefined;
+  }
+  return [
+    `late: heard ${secs(since)} ago${item.origin !== undefined ? ` (${item.origin})` : ""}`,
+    ...(old > delivery.maxAgeMs ? [`${secs(old)} old when first heard`] : []),
+  ].join(", ");
 }
 
 interface Missed {
@@ -147,14 +193,27 @@ interface EarState {
   waiting: Map<string, Waiting>;
   perStream: Map<string, number>;
   due: Partial<Record<Cadence, number>>;
-  /** When each push in the last hour went out. */
-  pushes: number[];
   lastPushAt: number | undefined;
   held: string | undefined;
   missed: Map<string, Missed>;
   counts: Record<string, number>;
   cursor: Cursor;
 }
+
+/**
+ * Whose mode is asked: a record's station, which a ceiling or a choice can name by key id
+ * (lowercase hex, which outlasts a manifest rename) or by name; one scope as config or
+ * the tool spells it; or, undefined, the ear as a whole.
+ */
+type Target = { key: string; station: string } | string | undefined;
+
+/** The scopes a target answers to. */
+const scopesOf = (target: Target): string[] =>
+  target === undefined
+    ? []
+    : typeof target === "string"
+      ? [target]
+      : [target.key.toLowerCase(), target.station];
 
 /** One ear's effective modes, from its config ceiling and the session's choices. */
 class Modes {
@@ -172,22 +231,30 @@ class Modes {
     this.muted = muted;
   }
 
-  ceiling(station: string | undefined): CanticleMode {
-    return station !== undefined &&
-      Object.hasOwn(this.#delivery.stations, station)
-      ? (this.#delivery.stations[station] ?? "off")
-      : this.#delivery.mode;
+  /**
+   * A station's ceiling: its entry in `stations`, by key id or by name (the narrower,
+   * when both have one), else the ear's `mode`.
+   */
+  ceiling(target: Target): CanticleMode {
+    let ceiling: CanticleMode | undefined;
+    for (const scope of scopesOf(target)) {
+      if (!Object.hasOwn(this.#delivery.stations, scope)) continue;
+      const mode = this.#delivery.stations[scope] ?? "off";
+      if (ceiling === undefined || RANK[mode] < RANK[ceiling]) ceiling = mode;
+    }
+    return ceiling ?? this.#delivery.mode;
   }
 
   /** A station's mode; `undefined` for the ear as a whole. Narrowest wins: mute always does. */
-  of(station: string | undefined): DeliveryMode {
-    const ceiling = this.ceiling(station);
+  of(target: Target): DeliveryMode {
+    const ceiling = this.ceiling(target);
     if (ceiling === "off") return "off";
     if (this.muted !== undefined) return "mute";
+    const scopes = scopesOf(target);
     let mode: DeliveryMode = ceiling;
     for (const choice of this.#choices) {
       if (
-        (choice.scope === "*" || choice.scope === station) &&
+        (choice.scope === "*" || scopes.includes(choice.scope)) &&
         RANK[choice.mode] < RANK[mode]
       ) {
         mode = choice.mode;
@@ -363,9 +430,18 @@ export class CanticleDelivery {
         waiting.item = item;
         continue;
       }
-      const seen = state.seen.get(id);
-      if (seen?.gen === state.gen || this.#isSettled(ear, id, now)) continue;
       const expiresAt = now + item.expiresInMs;
+      const seen = state.seen.get(id);
+      const settled = this.#settled.get(ear)?.get(id) ?? 0;
+      if (settled > now) {
+        // Heard again with a later local expiry (a restarted receptor's new δ̂, RFC
+        // §14.6.3): the tombstone follows it, so the record is never pushed twice.
+        if (settled < expiresAt + SETTLE_SKEW_MS) {
+          this.#lengthen(ear, id, expiresAt + SETTLE_SKEW_MS);
+        }
+        continue;
+      }
+      if (seen?.gen === state.gen) continue;
       this.#see(state, id, expiresAt + SETTLE_SKEW_MS);
       const passed = this.#passOver(item, keys, modes);
       if (passed !== undefined) {
@@ -404,10 +480,25 @@ export class CanticleDelivery {
       }
     }
     if (muted.length > 0) this.#settle(ear, muted);
+    // §14.10 item 9, per ear: what immediate would push once it is no longer fresh (heard
+    // too long ago, or already old when first heard) goes into the next report instead,
+    // marked late. It stays there, whatever the modes do next.
+    for (const waiting of state.waiting.values()) {
+      if (
+        waiting.routed !== true &&
+        modes.of(waiting.item) === "immediate" &&
+        !fresh(waiting.item, delivery.maxAgeMs, now)
+      ) {
+        waiting.routed = true;
+        this.#count(state, "routed_late");
+      }
+    }
     state.held = undefined;
     for (const cadence of CADENCES) {
       const group = [...state.waiting.values()].filter(
-        (waiting) => modes.of(waiting.item.station) === cadence,
+        (waiting) =>
+          (waiting.routed === true ? "digest" : modes.of(waiting.item)) ===
+          cadence,
       );
       if (group.length === 0) {
         delete state.due[cadence];
@@ -446,7 +537,7 @@ export class CanticleDelivery {
     if (!keys.has(item.key.toLowerCase())) return "not_allowlisted";
     if (item.hop !== 0) return "relayed";
     if (item.wakeDerived !== false) return "wake_derived";
-    const mode = modes.of(item.station);
+    const mode = modes.of(item);
     if (mode === "off") return "off";
     if (mode === "mute") return "muted";
     return undefined;
@@ -465,8 +556,9 @@ export class CanticleDelivery {
     if (view.breaker !== undefined && view.breaker !== "closed") {
       return `breaker_${view.breaker}`;
     }
-    state.pushes = state.pushes.filter((at) => at > now - HOUR_MS);
-    if (state.pushes.length >= delivery.maxPushesPerHour) return "push_budget";
+    const { cursor } = state;
+    cursor.pushes = cursor.pushes.filter((at) => at > now - HOUR_MS);
+    if (cursor.pushes.length >= delivery.maxPushesPerHour) return "push_budget";
     return undefined;
   }
 
@@ -505,6 +597,11 @@ export class CanticleDelivery {
     const ordered =
       start > 0 ? [...ready.slice(start), ...ready.slice(0, start)] : ready;
     const report = cadence === "digest" ? state.cursor.report + 1 : undefined;
+    const late = new Map<Waiting, string>();
+    for (const waiting of ordered) {
+      const line = lateLine(waiting, cadence, delivery, now);
+      if (line !== undefined) late.set(waiting, line);
+    }
     const rendered = render({
       cadence,
       style: cadence === "digest" ? modes.style : "records",
@@ -516,6 +613,7 @@ export class CanticleDelivery {
       delivery,
       maxChars: config.limits.maxNotificationChars,
       waitingElsewhere: state.waiting.size - group.length,
+      late,
     });
     if (rendered.pushed.length === 0) {
       // Not even one stream's line fits limits.maxNotificationChars. Nothing is pushed or
@@ -535,6 +633,11 @@ export class CanticleDelivery {
       ordered.length,
     );
     if (report !== undefined) cursor.report = report;
+    // Saved with the push, so a restart keeps maxPushesPerHour.
+    cursor.pushes = [
+      ...state.cursor.pushes.filter((at) => at > now - HOUR_MS),
+      now,
+    ];
     this.#settle(
       ear,
       rendered.pushed.map((waiting) => ({
@@ -547,10 +650,11 @@ export class CanticleDelivery {
     state.cursor = cursor;
     for (const waiting of rendered.pushed) this.#unwait(state, waiting);
     state.missed.clear();
-    state.pushes.push(now);
     state.lastPushAt = now;
     this.#count(state, cadence === "digest" ? "reports" : "pushes");
     this.#count(state, "records_pushed", rendered.pushed.length);
+    const pushedLate = rendered.pushed.filter((w) => late.has(w)).length;
+    if (pushedLate > 0) this.#count(state, "records_pushed_late", pushedLate);
     this.#deps.store.increment("canticle_pushes");
     this.#deps.store.increment(
       "canticle_records_pushed",
@@ -569,18 +673,18 @@ export class CanticleDelivery {
   #state(ear: string): EarState {
     let state = this.#ears.get(ear);
     if (state === undefined) {
+      const cursor = this.#loadCursor(ear);
       state = {
         seen: new Map(),
         gen: 0,
         waiting: new Map(),
         perStream: new Map(),
         due: {},
-        pushes: [],
-        lastPushAt: undefined,
+        lastPushAt: cursor.pushes.at(-1),
         held: undefined,
         missed: new Map(),
         counts: {},
-        cursor: this.#loadCursor(ear),
+        cursor,
       };
       this.#ears.set(ear, state);
     }
@@ -603,6 +707,10 @@ export class CanticleDelivery {
             report: cursor.report!,
             after: cursor.after,
             streams: cursor.streams,
+            // Saved before the push budget was: the hour starts empty, as it used to.
+            pushes: Array.isArray(cursor.pushes)
+              ? cursor.pushes.filter((at) => Number.isSafeInteger(at))
+              : [],
           };
         }
       } catch {
@@ -610,7 +718,7 @@ export class CanticleDelivery {
       }
       this.#deps.logger.log("warn", "canticle.cursor_unreadable", { ear });
     }
-    return { report: 0, after: {}, streams: {} };
+    return { report: 0, after: {}, streams: {}, pushes: [] };
   }
 
   #modes(ear: string, config: Config, now: number): Modes {
@@ -688,10 +796,6 @@ export class CanticleDelivery {
     state.counts[name] = (state.counts[name] ?? 0) + by;
   }
 
-  #isSettled(ear: string, id: string, now: number): boolean {
-    return (this.#settled.get(ear)?.get(id) ?? 0) > now;
-  }
-
   #refreshOfPushed(ear: string, item: LiveItem, now: number): boolean {
     const key = refreshKey(item);
     return (
@@ -727,6 +831,12 @@ export class CanticleDelivery {
         row.expiresAt,
       );
     }
+  }
+
+  /** Only the record's own tombstone: a refresh seed keeps the expiry it was settled with. */
+  #lengthen(ear: string, id: string, until: number): void {
+    this.#deps.store.lengthenCanticle(ear, id, until);
+    this.#settled.get(ear)?.set(id, until);
   }
 
   #remember(
@@ -850,11 +960,13 @@ export class CanticleDelivery {
         : {}),
       windowMs: delivery.windowMs,
       debounceMs: delivery.debounceMs,
+      maxAgeMs: delivery.maxAgeMs,
       waiting: state.waiting.size,
       nextPushAt: due.length > 0 ? Math.min(...due) : null,
       held: state.held ?? null,
       lastPushAt: state.lastPushAt ?? null,
-      pushesLastHour: state.pushes.filter((at) => at > now - HOUR_MS).length,
+      pushesLastHour: state.cursor.pushes.filter((at) => at > now - HOUR_MS)
+        .length,
       maxPushesPerHour: delivery.maxPushesPerHour,
       reports: state.cursor.report,
       counts: { ...state.counts },
@@ -886,7 +998,7 @@ function advance(
   const after = { ...cursor.after };
   if (pushed.length < offered) after[cadence] = pushed.at(-1)!.stream;
   else delete after[cadence];
-  return { report: cursor.report, after, streams };
+  return { report: cursor.report, after, streams, pushes: cursor.pushes };
 }
 
 function byStream(records: readonly Waiting[]): Map<string, Waiting[]> {
@@ -902,13 +1014,13 @@ function byStream(records: readonly Waiting[]): Map<string, Waiting[]> {
 /**
  * Walks one stream's pushed records (in report order) from its cursor: `gaps` counts
  * seqs skipped between pushed records of one key and epoch (lost on air, plucked, never
- * surfaced, or hear-only); `late` counts records at or behind the cursor, caught on a
- * later loop. `last` is the new cursor position.
+ * surfaced, or hear-only); `behind` counts records at or behind the cursor, heard out of
+ * order (after a later seq was pushed). `last` is the new cursor position.
  */
 function progress(
   from: string | undefined,
   records: readonly Waiting[],
-): { gaps: number; late: number; last: string | undefined } {
+): { gaps: number; behind: number; last: string | undefined } {
   let prev: { key: string; epoch: number; seq: bigint } | undefined;
   if (from !== undefined) {
     const [key, epoch, seq] = from.split(":");
@@ -917,14 +1029,14 @@ function progress(
     }
   }
   let gaps = 0;
-  let late = 0;
+  let behind = 0;
   for (const { item } of records) {
     const seq = seqOf(item);
     if (seq === undefined) continue;
     const key = item.key.toLowerCase();
     if (prev && prev.key === key && prev.epoch === item.epoch) {
       if (seq <= prev.seq) {
-        late += 1;
+        behind += 1;
         continue;
       }
       gaps += Number(seq - prev.seq - 1n);
@@ -933,7 +1045,7 @@ function progress(
   }
   return {
     gaps,
-    late,
+    behind,
     last: prev && `${prev.key}:${prev.epoch}:${prev.seq}`,
   };
 }
@@ -950,6 +1062,8 @@ interface RenderInput {
   maxChars: number;
   /** Records waiting under the other cadence, for the footer. */
   waitingElsewhere: number;
+  /** The `late:` line of each record that is late (see `lateLine`). */
+  late: ReadonlyMap<Waiting, string>;
 }
 
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
@@ -964,8 +1078,10 @@ function streamLine(
   from: string | undefined,
   missed: Missed | undefined,
   counts: boolean,
+  lateLines: ReadonlyMap<Waiting, string>,
 ): string {
-  const { gaps, late } = progress(from, records);
+  const { gaps, behind } = progress(from, records);
+  const late = records.filter((record) => lateLines.has(record)).length;
   const first = records[0]!.item;
   const last = records.at(-1)!.item;
   const repeats = records.reduce(
@@ -975,7 +1091,8 @@ function streamLine(
   const parts = [
     `${plural(records.length, "new record")} (${records.length === 1 ? `item ${position(first)}` : `items ${position(first)} to ${position(last)}`})`,
     ...(gaps > 0 ? [`${plural(gaps, "seq")} skipped`] : []),
-    ...(late > 0 ? [`${late} caught late`] : []),
+    ...(behind > 0 ? [`${behind} out of order`] : []),
+    ...(late > 0 ? [`${late} late`] : []),
     // Only a source that counts copies (the embedded receptor) can show repeats; record
     // v1 reports them as a health counter, so none here never means "none heard".
     ...(counts && repeats > 0 ? [`${plural(repeats, "repeat")} caught`] : []),
@@ -1084,6 +1201,7 @@ function render(input: RenderInput): {
             input.cursor.streams[stream],
             input.missed.get(stream),
             true,
+            input.late,
           ),
         ),
         ...foot(
@@ -1119,7 +1237,7 @@ function render(input: RenderInput): {
         [
           ...(cadence === "digest"
             ? [
-                `${streamLine(stream, records, input.cursor.streams[stream], input.missed.get(stream), false)}:`,
+                `${streamLine(stream, records, input.cursor.streams[stream], input.missed.get(stream), false, input.late)}:`,
               ]
             : []),
           texts.join("\n\n"),
@@ -1141,7 +1259,10 @@ function render(input: RenderInput): {
   const taken: Array<{ waiting: Waiting; text: string }> = [];
   for (const waiting of ordered.slice(0, delivery.maxItems)) {
     const text = (chars?: number) =>
-      renderItem(waiting.item, view.now, chars, { mode: "silent-wake" });
+      renderItem(waiting.item, view.now, chars, {
+        mode: "silent-wake",
+        late: input.late.get(waiting),
+      });
     const whole = text();
     if (fits([...taken, { waiting, text: whole }])) {
       taken.push({ waiting, text: whole });

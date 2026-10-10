@@ -582,7 +582,8 @@ export class EventStore {
 
   /**
    * Settles records for one ear and saves its delivery cursor, in one transaction, before
-   * anything is pushed: a crash between the two loses a push, never repeats one.
+   * anything is pushed: a crash between the two loses a push, never repeats one. Settling
+   * a record again only ever lengthens its tombstone, as the in-memory copy does.
    */
   public settleCanticle(
     ear: string,
@@ -594,7 +595,8 @@ export class EventStore {
         `INSERT INTO canticle_settled
            (ear, identity, outcome, refresh_key, digest, settled_at, expires_at)
          VALUES (?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(ear, identity) DO NOTHING`,
+         ON CONFLICT(ear, identity) DO UPDATE SET
+           expires_at = MAX(canticle_settled.expires_at, excluded.expires_at)`,
       );
       for (const row of rows) {
         insert.run(
@@ -613,7 +615,24 @@ export class EventStore {
     });
   }
 
-  /** `scope` is a station name, or "*" for every station the ear hears. */
+  /**
+   * A settled record heard again with a later local expiry: its tombstone lasts until
+   * then. Never shortened; the outcome and refresh seed stay as they were settled.
+   */
+  public lengthenCanticle(
+    ear: string,
+    identity: string,
+    expiresAt: number,
+  ): void {
+    this.database
+      .prepare(
+        `UPDATE canticle_settled SET expires_at = MAX(expires_at, ?)
+         WHERE ear = ? AND identity = ?`,
+      )
+      .run(expiresAt, ear, identity);
+  }
+
+  /** `scope` is a station name or key id (lowercase), or "*" for every station the ear hears. */
   public setCanticleAttention(
     ear: string,
     scope: string,
