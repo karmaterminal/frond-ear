@@ -121,12 +121,18 @@ export interface CanticleEarDelivery {
   maxItems: number;
   /** Records waiting per station:stream, at most; the oldest go first. */
   bufferPerStream: number;
-  /** Pushes per rolling hour, at most; past it, records wait. */
+  /**
+   * Pushes per rolling hour, at most; past it, records wait. By default 60, or one per
+   * window when `windowMs` is under a minute (at most 360), so a busy band's reports fit.
+   */
   maxPushesPerHour: number;
 }
 
 /** RFC-0001 §14.10: wakes are coalesced over at least 5 s. */
 export const CANTICLE_MIN_COALESCE_MS = 5_000;
+
+/** The most pushes an ear may get in an hour, from `immediate` and reports together. */
+const CANTICLE_MAX_PUSHES_PER_HOUR = 360;
 
 /** Whether this ear has any canticle delivery other than `off` in its config. */
 export function canticleDelivers(
@@ -374,10 +380,16 @@ function parseDelivery(value: unknown, name: string): CanticleEarDelivery {
       `${name}.maxAgeMs must be more than debounceMs: a burst's first record waits debounceMs, so it would be too old for immediate`,
     );
   }
+  const windowMs = bounded(
+    "windowMs",
+    60_000,
+    CANTICLE_MIN_COALESCE_MS,
+    3_600_000,
+  );
   return {
     mode: canticleMode(input.mode ?? "off", `${name}.mode`),
     stations,
-    windowMs: bounded("windowMs", 60_000, CANTICLE_MIN_COALESCE_MS, 3_600_000),
+    windowMs,
     debounceMs,
     maxAgeMs,
     style,
@@ -385,7 +397,17 @@ function parseDelivery(value: unknown, name: string): CanticleEarDelivery {
     // push's size is capped by limits.maxNotificationChars as well.
     maxItems: bounded("maxItems", 5, 1, 10),
     bufferPerStream: bounded("bufferPerStream", 32, 1, 256),
-    maxPushesPerHour: bounded("maxPushesPerHour", 60, 1, 360),
+    // A report per window must fit the hour on a busy band, as far as the cap allows
+    // (ear_status warns when it can't).
+    maxPushesPerHour: bounded(
+      "maxPushesPerHour",
+      Math.min(
+        CANTICLE_MAX_PUSHES_PER_HOUR,
+        Math.max(60, Math.ceil(3_600_000 / windowMs)),
+      ),
+      1,
+      CANTICLE_MAX_PUSHES_PER_HOUR,
+    ),
   };
 }
 

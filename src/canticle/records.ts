@@ -744,6 +744,8 @@ export class RecordConsumer {
     // delivery never wakes on an unknown (fail closed); the others only label.
     const flags = isObj(rec.flags) ? rec.flags : {};
     const heardAt = int(times.heard_at) ? times.heard_at : nowMs;
+    // δ̂ (the local clock minus the station's, §14.18.3 `times`), for when `age_ms` is missing.
+    const offset = int(times.offset_ms) ? times.offset_ms : 0;
     const item: LiveItem = {
       station: station.name,
       key: f.key_id,
@@ -777,10 +779,10 @@ export class RecordConsumer {
         ? times.age_ms
         : Math.max(0, nowMs - times.issued_at),
       // `age_ms` is the receptor's age at first hearing (§6.3 item 3); without it, the
-      // two clocks' difference is the best there is.
+      // first hearing less `issued_at`, corrected by δ̂, is the best there is.
       ageAtHearingMs: Math.max(
         0,
-        int(times.age_ms) ? times.age_ms : heardAt - times.issued_at,
+        int(times.age_ms) ? times.age_ms : heardAt - times.issued_at - offset,
       ),
       // A copy re-heard after the host receptor restarted (§14.18.3); a join snapshot's
       // entries are marked where they are read.

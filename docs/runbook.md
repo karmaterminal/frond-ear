@@ -288,20 +288,20 @@ and `source` still need a restart.
 }
 ```
 
-| Field                | Default        | Meaning                                                                                                                                                                                                                                            |
-| -------------------- | -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `wakeKeys`           | `[]`           | Station key ids (16 hex digits, the `key=` of a `hear` banner) whose records may be pushed. Empty: nothing is pushed, and `ear_status` warns. Leave out the seat's own station key, or it hears itself.                                            |
-| `muted`              | `false`        | `true` mutes every push to every ear.                                                                                                                                                                                                              |
-| `delivery.<ear>`     | absent (`off`) | The ear's ceiling. A bare string (`"digest"`) sets `mode` alone.                                                                                                                                                                                   |
-| `….mode`             | `off`          | `immediate`, `digest` or `off`, for every station.                                                                                                                                                                                                 |
-| `….stations`         | `{}`           | `station → mode`, overriding `mode` for that station. A station can be named by its key id (16 hex digits, the `key=` of a `hear` banner), which outlasts a manifest rename; where its key id and its name both have an entry, the narrower holds. |
-| `….windowMs`         | `60000`        | `digest`: at most one report per window, 5 s to 1 h. The window opens when a record starts waiting.                                                                                                                                                |
-| `….debounceMs`       | `5000`         | `immediate`: a burst is coalesced over this long, 5 s (RFC §14.10) to 1 min, and less than `maxAgeMs`.                                                                                                                                             |
-| `….maxAgeMs`         | `30000`        | `immediate` pushes only a record heard at most this long ago and at most this old when first heard (RFC §14.10 item 9). Any other goes into the next report instead, marked late. 10 s to 2 min (item 9's 120 s).                                  |
-| `….style`            | `records`      | `digest`: `records` (each record behind its banner) or `counts` (per stream: how many, seqs skipped, repeats caught; no payloads).                                                                                                                 |
-| `….maxItems`         | `5`            | Records per push, 1 to 10 (RFC §14.6.5's dose is 5). The rest wait for the next push.                                                                                                                                                              |
-| `….bufferPerStream`  | `32`           | Records waiting per `station:stream`, 1 to 256. When it is full the oldest is dropped, and the next push says so.                                                                                                                                  |
-| `….maxPushesPerHour` | `60`           | Pushes to the ear per hour, 1 to 360. Past it, records wait. The count survives a restart.                                                                                                                                                         |
+| Field                | Default        | Meaning                                                                                                                                                                                                                                                                                              |
+| -------------------- | -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `wakeKeys`           | `[]`           | Station key ids (16 hex digits, the `key=` of a `hear` banner) whose records may be pushed. Empty: nothing is pushed, and `ear_status` warns. Leave out the seat's own station key, or it hears itself.                                                                                              |
+| `muted`              | `false`        | `true` mutes every push to every ear.                                                                                                                                                                                                                                                                |
+| `delivery.<ear>`     | absent (`off`) | The ear's ceiling. A bare string (`"digest"`) sets `mode` alone.                                                                                                                                                                                                                                     |
+| `….mode`             | `off`          | `immediate`, `digest` or `off`, for every station.                                                                                                                                                                                                                                                   |
+| `….stations`         | `{}`           | `station → mode`, overriding `mode` for that station. A station can be named by its key id (16 hex digits, the `key=` of a `hear` banner), which outlasts a manifest rename; where its key id and its name both have an entry, the narrower holds.                                                   |
+| `….windowMs`         | `60000`        | `digest`: at most one report per window, 5 s to 1 h. The window opens when a record starts waiting.                                                                                                                                                                                                  |
+| `….debounceMs`       | `5000`         | `immediate`: a burst is coalesced over this long, 5 s (RFC §14.10) to 1 min, and less than `maxAgeMs`.                                                                                                                                                                                               |
+| `….maxAgeMs`         | `30000`        | `immediate` pushes only a record heard at most this long ago and at most this old when first heard (RFC §14.10 item 9). Any other goes into the next report instead, marked late. 10 s to 2 min (item 9's 120 s).                                                                                    |
+| `….style`            | `records`      | `digest`: `records` (each record behind its banner) or `counts` (per stream: how many, seqs skipped, repeats caught; no payloads).                                                                                                                                                                   |
+| `….maxItems`         | `5`            | Records per push, 1 to 10 (RFC §14.6.5's dose is 5). The rest wait for the next push.                                                                                                                                                                                                                |
+| `….bufferPerStream`  | `32`           | Records waiting per `station:stream`, 1 to 256. When it is full the oldest is dropped, and the next push says so.                                                                                                                                                                                    |
+| `….maxPushesPerHour` | `60` or more   | Pushes to the ear per hour, from `immediate` and reports together, 1 to 360: 60 by default, or one per window when `windowMs` is under a minute, so a busy band's reports fit the hour. `ear_status` warns when it is less than one per window. Past it, records wait. The count survives a restart. |
 
 **What the session gets.** Channel events with `kind="canticle"` and `delivery="immediate"` (the new records of
 the last few seconds) or `delivery="report"` (a "what's on the radio" report, `report=<n>`). They sit outside the
@@ -318,7 +318,9 @@ report a cap cut short says how many records wait, and the next one starts after
 `late: heard 12s ago, 300s old when first heard`. Every record from a join snapshot or a `resurfaced` copy gets
 one. So does every record `immediate` sent to a report because it was too old (see `maxAgeMs`), and any record a
 report carries more than `windowMs + maxAgeMs` after it was heard. A late record tells the session what was so
-then, not what is so now; the channel instructions say so.
+then, not what is so now; the channel instructions say so. Pushes don't keep the station's order either: after a
+rejoin, `immediate` can push seq N+1 while N, too old for `immediate`, waits for the next report. Each banner's
+seq gives the station's order, not the time a push arrives.
 
 Every push fits `limits.maxNotificationChars`. A record too big for it alone is cut inside its wrapper. Below
 about 1,000 characters no banner fits, so a push gives counts instead; when even those run over, it drops the
@@ -328,20 +330,24 @@ stream's counts line fits, nothing is pushed or taken as delivered: the records 
 **The session's choice.** `set_canticle_delivery` sets `immediate`, `digest` or `mute` for one station (by name,
 or by key id to outlast a rename) or (without `station`) all of them, optionally for `ttl_seconds`; `configured`
 clears the choice, and `style` picks the report's form. The config is the ceiling, so the session can only narrow
-it. Each scope holds one choice, as with `set_attention`: a new one replaces it, and when its `ttl_seconds`
-lapses the config applies again, style included. A mute at any scope wins: the session's, an ear-wide
-`set_attention` silence, or `canticle.muted`. It is for good: a record first heard under a mute is never pushed,
-even after the mute lifts, and both tools say so. `hear` still reads it while it is live.
+it. A station's own choice beats the one for every station, as a chat's own `set_attention` choice beats `*`:
+with every station at `digest` and one at `immediate`, that one goes `immediate`. Each scope holds one choice, as
+with `set_attention`: a new one replaces it, and when its `ttl_seconds` lapses the config applies again, style
+included. A mute at any scope wins: the session's, an ear-wide `set_attention` silence, or `canticle.muted`. It
+is for good: a record first heard under a mute is never pushed, even after the mute lifts, and both tools say so.
+`hear` still reads it while it is live.
 
 **Exactly once.** A record is told apart by its identity, never its text: RFC §7.4's tuple of key id, epoch,
 stream and seq, which record v1's `idem` spells out (the stream by name, one to one with its id, §5.4). The same
 words under a new seq are new speech, and a retransmission is not. A pushed record keeps a tombstone in the store
 until its local expiry plus 5 s (RFC §14.18.5), so no retransmission, `resurfaced` record, join snapshot or
 frond-ear restart pushes it twice, and digest and immediate never both push it. A record heard again with a later
-local expiry (a restarted receptor's new δ̂, §14.6.3) keeps its tombstone until then. A refresh re-issue with the
-same body as a pushed record is not pushed (§7.9). A record first heard under a mute is never pushed, even after
-the mute lifts or frond-ear restarts. A config reload re-reads what is on air, as a restart does, and a key taken
-off `wakeKeys` holds back what it had waiting.
+local expiry (a restarted receptor's new δ̂, §14.6.3) keeps its tombstone until then. Once a tombstone has
+lapsed, though, a receptor that hears the record again as new (after a restart, with a later local expiry) can
+have it pushed once more, still within §14.18.5's bound; it is marked late if it is older than `maxAgeMs` by
+then. A refresh re-issue with the same body as a pushed record is not pushed (§7.9). A record first heard under a
+mute is never pushed, even after the mute lifts or frond-ear restarts. A config reload re-reads what is on air,
+as a restart does, and a key taken off `wakeKeys` holds back what it had waiting.
 
 **Holds.** Nothing is pushed while the daemon is paused, the ear has no session, the host daemon's breaker is
 open or half-open (§14.18.4), or the hour's pushes are spent: records wait while they are on air. In `immediate`,
@@ -351,13 +357,13 @@ what is on air: what was pushed stays pushed, and a record sung meanwhile goes o
 
 **Check it.** `ear_status` shows `ears[].canticleDelivery`: the `ceiling` and effective `mode`, `style`, any
 `muted` reason, per-station modes (each scope as config or the session names it), the session's `choices`,
-`wakeKeys` (a count) and any `warning`, `windowMs`, `debounceMs`, `maxAgeMs`, `waiting`, `nextPushAt`, `held`
-(`paused`, `no_session`, `breaker_open`, `breaker_half_open` or `push_budget`), `lastPushAt`, `pushesLastHour`,
-`reports`, and `counts`: what was pushed (`pushes`, `reports`, `records_pushed`, and of those
-`records_pushed_late`), sent from `immediate` to a report for its age (`routed_late`), passed over
-(`not_allowlisted`, `relayed`, `wake_derived`, `off`, `muted`, `refresh_collapsed`), went off air unpushed
-(`off_air_unpushed`) or was dropped from a full buffer (`dropped`), and pushes that didn't fit at all
-(`too_big`).
+`wakeKeys` (a count) and any `warning` (no `wakeKeys`, or `maxPushesPerHour` under one report per window),
+`windowMs`, `debounceMs`, `maxAgeMs`, `waiting`, `nextPushAt`, `held` (`paused`, `no_session`, `breaker_open`,
+`breaker_half_open` or `push_budget`), `lastPushAt`, `pushesLastHour`, `reports`, and `counts`: what was pushed
+(`pushes`, `reports`, `records_pushed`, and of those `records_pushed_late`), sent from `immediate` to a report
+for its age (`routed_late`), passed over (`not_allowlisted`, `relayed`, `wake_derived`, `off`, `muted`,
+`refresh_collapsed`), went off air unpushed (`off_air_unpushed`) or was dropped from a full buffer (`dropped`),
+and pushes that didn't fit at all (`too_big`).
 
 **Departures from RFC-0001.** The frond settled these modes on #65 (2026-10-10). Where they go past RFC-0001,
 the RFC hasn't been amended to match yet (binary-canticle#100 tracks the amendment):

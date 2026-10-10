@@ -10,7 +10,8 @@
 //   station:stream, the records in seq order (or, with style `counts`, counts, gaps and
 //   repeats per stream), and a cursor, so the next report goes on where this one stopped;
 // - the attached session narrows either with `set_canticle_delivery`, for one station or
-//   the whole ear, down to mute, with an optional TTL. The config is the ceiling.
+//   the whole ear, down to mute, with an optional TTL. The config is the ceiling, and a
+//   station's own choice beats the one for every station, as with `set_attention`.
 // Mute always wins: a mute at any scope (a station, the ear, an ear-wide `set_attention`
 // silence, `canticle.muted`) passes over every record first heard while it holds, and drops
 // what was waiting; a record a mute passed over is never pushed after it lifts. Dedupe is
@@ -245,22 +246,33 @@ class Modes {
     return ceiling ?? this.#delivery.mode;
   }
 
-  /** A station's mode; `undefined` for the ear as a whole. Narrowest wins: mute always does. */
+  /**
+   * A station's mode; `undefined` for the ear as a whole. The session's choice for the
+   * station (by key id or name: the narrower, when both have one) beats its choice for
+   * every station, as with `set_attention`, and the ceiling caps it. Mute always wins.
+   */
   of(target: Target): DeliveryMode {
     const ceiling = this.ceiling(target);
     if (ceiling === "off") return "off";
     if (this.muted !== undefined) return "mute";
     const scopes = scopesOf(target);
-    let mode: DeliveryMode = ceiling;
+    let station: DeliveryMode | undefined;
+    let ear: DeliveryMode | undefined;
     for (const choice of this.#choices) {
-      if (
-        (choice.scope === "*" || scopes.includes(choice.scope)) &&
-        RANK[choice.mode] < RANK[mode]
+      if (choice.scope === "*") {
+        ear = choice.mode;
+      } else if (
+        scopes.includes(choice.scope) &&
+        (station === undefined || RANK[choice.mode] < RANK[station])
       ) {
-        mode = choice.mode;
+        station = choice.mode;
       }
     }
-    return mode;
+    if (ear === "mute") return "mute";
+    const chosen = station ?? ear;
+    return chosen !== undefined && RANK[chosen] < RANK[ceiling]
+      ? chosen
+      : ceiling;
   }
 
   get style(): ReportStyle {
@@ -949,15 +961,23 @@ export class CanticleDelivery {
     const state = this.#state(ear);
     const now = this.#deps.clock.now();
     const due = Object.values(state.due);
+    const reportsPerHour = Math.ceil(HOUR_MS / delivery.windowMs);
+    const warnings = [
+      ...(config.canticle!.wakeKeys.length === 0
+        ? [
+            "canticle.wakeKeys is empty, so nothing is pushed: every station stays hear-only",
+          ]
+        : []),
+      ...(delivery.maxPushesPerHour < reportsPerHour
+        ? [
+            `maxPushesPerHour (${delivery.maxPushesPerHour}) is less than one report per windowMs (${reportsPerHour} an hour): on a band busy all hour, reports are held once the hour's pushes are spent`,
+          ]
+        : []),
+    ];
     return {
       ...this.view(ear),
       wakeKeys: config.canticle!.wakeKeys.length,
-      ...(config.canticle!.wakeKeys.length === 0
-        ? {
-            warning:
-              "canticle.wakeKeys is empty, so nothing is pushed: every station stays hear-only",
-          }
-        : {}),
+      ...(warnings.length > 0 ? { warning: warnings.join("; ") } : {}),
       windowMs: delivery.windowMs,
       debounceMs: delivery.debounceMs,
       maxAgeMs: delivery.maxAgeMs,

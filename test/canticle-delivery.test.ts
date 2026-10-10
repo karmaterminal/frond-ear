@@ -59,6 +59,8 @@ interface Song {
   key?: string;
   /** How old the record already was when the host receptor first heard it. */
   age?: number;
+  /** Merged over `times`; a field set to `undefined` is left out. */
+  times?: R;
 }
 
 /**
@@ -154,13 +156,16 @@ class Host {
       scope: "lan",
       hop: o.hop ?? 0,
       ...(o.stateKey !== undefined ? { state_key: o.stateKey } : {}),
-      times: {
-        issued_at: now - (o.age ?? 1_000),
-        expires_at: now + ttl + 5_000,
-        heard_at: now - 500,
-        local_expiry_at: now + ttl,
-        age_ms: o.age ?? 1_000,
-      },
+      times: Object.fromEntries(
+        Object.entries({
+          issued_at: now - (o.age ?? 1_000),
+          expires_at: now + ttl + 5_000,
+          heard_at: now - 500,
+          local_expiry_at: now + ttl,
+          age_ms: o.age ?? 1_000,
+          ...o.times,
+        }).filter(([, value]) => value !== undefined),
+      ),
       admission: "verified",
       disposition: "surface",
       dedup: o.dedup ?? "first",
@@ -1312,6 +1317,123 @@ test("dedupe: a record heard again with a later local expiry keeps its tombstone
   }
 });
 
+test("choices: a station's own choice beats the one for every station, as with set_attention; the config caps both, and a mute at any scope still wins", async () => {
+  const { h, host } = setup({
+    mode: "immediate",
+    windowMs: 10_000,
+    stations: { alpha: "digest" },
+  });
+  try {
+    const shim = h.attach("scribe");
+    const choose = async (args: R) =>
+      JSON.parse((await h.call(shim, "set_canticle_delivery", args)).text) as {
+        mode: string;
+        note?: string;
+        stations: Record<string, { ceiling: string; mode: string }>;
+      };
+    assert.equal((await choose({ mode: "digest" })).mode, "digest");
+    const ops = await choose({ mode: "immediate", station: "ops" });
+    assert.equal(ops.note, undefined, "nothing caps ops's own choice");
+    assert.deepEqual(ops.stations.ops, {
+      ceiling: "immediate",
+      mode: "immediate",
+    });
+    const alpha = await choose({ mode: "immediate", station: "alpha" });
+    assert.equal(
+      alpha.note,
+      "requested immediate exceeds the config's ceiling for alpha; effective mode is digest",
+    );
+    host.sing(1); // ops: its own choice, immediate
+    host.sing(1, { station: "alpha" }); // alpha: held to digest by the config
+    h.timers.advance(6_000);
+    assert.equal(pushes(shim).length, 1);
+    assert.equal(pushes(shim)[0]!.meta.delivery, "immediate");
+    assert.deepEqual(order(pushes(shim)[0]!.content), ["ops:ops.fleet/1"]);
+    h.timers.advance(5_000);
+    assert.equal(pushes(shim).length, 2);
+    assert.equal(pushes(shim)[1]!.meta.delivery, "report");
+    assert.deepEqual(order(pushes(shim)[1]!.content), ["alpha:ops.fleet/1"]);
+
+    // A mute for every station still wins over ops's own choice.
+    const muted = await choose({ mode: "mute" });
+    assert.deepEqual(muted.stations.ops, {
+      ceiling: "immediate",
+      mode: "mute",
+    });
+    host.sing(2);
+    h.timers.advance(11_000);
+    assert.equal(pushes(shim).length, 2);
+    assert.equal(status(h).counts.muted, 1);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("choices by key id and by name: where the session's choices name one station both ways, the narrower holds", async () => {
+  const { h, host } = setup({ mode: "immediate", windowMs: 10_000 });
+  try {
+    const shim = h.attach("scribe");
+    // Choices are kept in scope order, a key id before its name: the narrower is the
+    // first for ops and the last for alpha.
+    for (const [station, mode] of [
+      [OPS, "digest"],
+      ["ops", "immediate"],
+      [ALPHA, "immediate"],
+      ["alpha", "digest"],
+    ]) {
+      await h.call(shim, "set_canticle_delivery", { mode, station });
+    }
+    host.sing(1);
+    host.sing(1, { station: "alpha" });
+    h.timers.advance(6_000);
+    assert.equal(pushes(shim).length, 0, "neither goes immediate");
+    h.timers.advance(5_000);
+    assert.equal(pushes(shim).length, 1);
+    assert.equal(pushes(shim)[0]!.meta.delivery, "report");
+    assert.deepEqual(order(pushes(shim)[0]!.content), [
+      "alpha:ops.fleet/1",
+      "ops:ops.fleet/1",
+    ]);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("freshness: a record v1 frame without age_ms is aged from heard_at less issued_at, corrected by its offset_ms", async () => {
+  const { h, host } = setup({ mode: "immediate", windowMs: 10_000 });
+  try {
+    const shim = h.attach("scribe");
+    const heard = host.now - 500;
+    // 40 s apart on the two clocks, but the station's clock runs 20 s behind ours
+    // (δ̂ = +20 s): 20 s old when first heard, fresh enough for immediate.
+    host.sing(1, {
+      times: {
+        age_ms: undefined,
+        offset_ms: 20_000,
+        issued_at: heard - 40_000,
+      },
+    });
+    // The same gap with clocks that agree: 40 s old when first heard, so it waits for
+    // the next report, marked late.
+    host.sing(2, { times: { age_ms: undefined, issued_at: heard - 40_000 } });
+    h.timers.advance(6_000);
+    assert.equal(pushes(shim).length, 1);
+    assert.equal(pushes(shim)[0]!.meta.delivery, "immediate");
+    assert.deepEqual(order(pushes(shim)[0]!.content), ["ops:ops.fleet/1"]);
+    assert.doesNotMatch(pushes(shim)[0]!.content, /late:/u);
+    h.timers.advance(5_000);
+    assert.equal(pushes(shim).length, 2);
+    assert.equal(pushes(shim)[1]!.meta.delivery, "report");
+    assert.deepEqual(order(pushes(shim)[1]!.content), ["ops:ops.fleet/2"]);
+    assert.match(
+      pushes(shim)[1]!.content,
+      /late: heard \d+s ago, 40s old when first heard/u,
+    );
+  } finally {
+    h.dispose();
+  }
+});
+
 test("holds: with no session, while paused and while the host breaker isn't closed, records wait and go out once; one that goes off air first is counted, never pushed late", async () => {
   const { h, host } = setup({ mode: "immediate" });
   try {
@@ -1435,6 +1557,18 @@ test("config: delivery entries, wakeKeys and muted parse with their defaults and
       maxPushesPerHour: 60,
     },
   });
+  // The push budget follows a window shorter than a minute, as far as its cap allows, so
+  // a busy band's reports fit the hour; one set outright stays as set.
+  const budget = (delivery: R) =>
+    canticleConfig(delivery).canticle!.delivery.scribe!.maxPushesPerHour;
+  assert.equal(budget({ mode: "digest", windowMs: 30_000 }), 120);
+  assert.equal(budget({ mode: "digest", windowMs: 10_000 }), 360);
+  assert.equal(budget({ mode: "digest", windowMs: 5_000 }), 360);
+  assert.equal(budget({ mode: "digest", windowMs: 120_000 }), 60);
+  assert.equal(
+    budget({ mode: "digest", windowMs: 30_000, maxPushesPerHour: 60 }),
+    60,
+  );
   assert.deepEqual(
     canticleConfig({
       mode: "digest",
@@ -1664,6 +1798,25 @@ test("ear_status shows the ear's delivery and warns when no key may wake it; the
   } finally {
     plain.dispose();
   }
+  // A push budget under one report per window warns: on a band busy all hour, reports
+  // would be held. The default for a short window fits it, where the cap allows.
+  const budgetWarning = (delivery: R, canticle: R = {}) => {
+    const { h: ear } = setup(delivery, canticle);
+    try {
+      return status(ear).warning;
+    } finally {
+      ear.dispose();
+    }
+  };
+  assert.equal(budgetWarning({ mode: "digest", windowMs: 30_000 }), undefined);
+  assert.equal(
+    budgetWarning({ mode: "digest", windowMs: 30_000, maxPushesPerHour: 60 }),
+    "maxPushesPerHour (60) is less than one report per windowMs (120 an hour): on a band busy all hour, reports are held once the hour's pushes are spent",
+  );
+  assert.equal(
+    budgetWarning({ mode: "immediate", windowMs: 5_000 }, { wakeKeys: [] }),
+    "canticle.wakeKeys is empty, so nothing is pushed: every station stays hear-only; maxPushesPerHour (360) is less than one report per windowMs (720 an hour): on a band busy all hour, reports are held once the hour's pushes are spent",
+  );
 });
 
 // The embedded receptor: signed datagrams in, through the listener, to the same pushes.
