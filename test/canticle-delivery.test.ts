@@ -69,6 +69,8 @@ class Host {
   /** What this run has on air (idem → frame fields), and each station's presence. */
   readonly onAir = new Map<string, R>();
   readonly stations = new Map<string, string>();
+  /** The `station:stream` pairs the ear follows (`canticle.tune`). */
+  tune: string[] = TUNE;
   #seq = 0;
   readonly #clock: { now(): number };
 
@@ -103,6 +105,11 @@ class Host {
 
   landing(extra: R = {}): void {
     this.#emit("landing_state", { mute: null, breaker: "closed", ...extra });
+  }
+
+  /** Receive health; `no_datagrams` makes every station read unknown. */
+  health(reasons: string[]): void {
+    this.#emit("health", { last_datagram_at: this.now, reasons });
   }
 
   presence(name: string, state: string): void {
@@ -230,7 +237,7 @@ class Host {
   }
 
   view() {
-    return this.consumer.hearView(TUNE, this.now, this.listening);
+    return this.consumer.hearView(this.tune, this.now, this.listening);
   }
 }
 
@@ -726,7 +733,7 @@ test("dedupe: by record identity, never text, within a window, across windows an
   }
 });
 
-test("dedupe: tombstones, mutes and the report cursor survive a frond-ear restart on the same store", async () => {
+test("dedupe: tombstones, a standing mute and the report cursor survive a frond-ear restart on the same store", async () => {
   const directory = mkdtempSync(join(tmpdir(), "frond-ear-canticle-"));
   const path = join(directory, "ear.db");
   try {
@@ -744,11 +751,15 @@ test("dedupe: tombstones, mutes and the report cursor survive a frond-ear restar
       first.host.sing(3); // passed over by the mute
       first.h.timers.advance(2_000);
       assert.equal(status(first.h).counts.muted, 1);
+      await first.h.call(shim, "set_canticle_delivery", {
+        mode: "mute",
+        station: "alpha",
+      }); // no TTL: it stands
     } finally {
       first.h.dispose();
     }
-    // The daemon comes back after the mute has lapsed; the host daemon still has 1, 2
-    // and 3 on air, and now 4.
+    // The daemon comes back after the ear-wide mute has lapsed; alpha's still stands. The
+    // host daemon still has 1, 2 and 3 on air, and now ops's 4 and alpha's 1.
     const second = setup(
       { mode: "digest", windowMs: 10_000 },
       {},
@@ -759,8 +770,15 @@ test("dedupe: tombstones, mutes and the report cursor survive a frond-ear restar
       second.h.clock.value = 1_030_000;
       const shim = second.h.attach("scribe");
       for (const seq of [1, 2, 3, 4]) second.host.sing(seq);
+      second.host.sing(1, { station: "alpha" });
       second.h.timers.advance(11_000);
       assert.equal(pushes(shim).length, 1);
+      assert.equal(status(second.h).stations.alpha?.mode, "mute");
+      assert.deepEqual(status(second.h).counts, {
+        muted: 1,
+        reports: 1,
+        records_pushed: 1,
+      });
       const report = pushes(shim)[0]!;
       assert.equal(report.meta.report, "2");
       assert.deepEqual(order(report.content), ["ops:ops.fleet/4"]);
@@ -814,6 +832,90 @@ test("reload: a new config re-reads what is on air; what a mute passed over stay
     h.timers.advance(6_000);
     assert.equal(pushes(shim).length, 2);
     assert.deepEqual(order(pushes(shim)[1]!.content), ["ops:ops.fleet/2"]);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("reload: a key taken off the allowlist holds back what it had waiting; a shorter window applies to what waits; a pass-over read again isn't counted again", async () => {
+  const { h, host } = setup({ mode: "digest", windowMs: 600_000 });
+  try {
+    const shim = h.attach("scribe");
+    host.sing(1, { station: "alpha" });
+    host.sing(1);
+    host.sing(1, { station: "stray" }); // never allowlisted
+    h.timers.advance(2_000);
+    assert.equal(status(h).waiting, 2);
+    assert.deepEqual(status(h).counts, { not_allowlisted: 1 });
+
+    // alpha's key comes off the allowlist and the window shortens to 10 s: alpha's
+    // waiting record is held back and never pushed; ops's goes out in the new window.
+    h.daemon.reloadConfig(
+      canticleConfig({ mode: "digest", windowMs: 10_000 }, { wakeKeys: [OPS] }),
+    );
+    h.timers.advance(11_000);
+    assert.equal(pushes(shim).length, 1);
+    assert.deepEqual(order(pushes(shim)[0]!.content), ["ops:ops.fleet/1"]);
+    h.timers.advance(60_000);
+    assert.equal(pushes(shim).length, 1);
+    assert.equal(status(h).waiting, 0);
+    assert.deepEqual(status(h).counts, {
+      not_allowlisted: 2,
+      reports: 1,
+      records_pushed: 1,
+    });
+  } finally {
+    h.dispose();
+  }
+});
+
+test("caps: a push that doesn't fit limits.maxNotificationChars drops its optional lines first, and claims no record it can't show", async () => {
+  // A station and stream as long as a banner shows them (64 characters each).
+  const station = "s".repeat(64);
+  const stream = ["o", "p", "q", "r"].map((c) => c.repeat(31)).join(".");
+  const tune = [...TUNE, `*:${stream}`];
+  const { h, host } = setup(
+    { mode: "digest", windowMs: 10_000 },
+    { tune: { scribe: tune } },
+    { limits: { maxNotificationChars: 500 } },
+  );
+  host.tune = tune;
+  try {
+    const shim = h.attach("scribe");
+    // No banner fits 500 characters, so the report gives counts; with the blind line
+    // and the on-air line it would run over, so those two go and the record's line stays.
+    host.health(["no_datagrams"]);
+    host.sing(1);
+    h.timers.advance(11_000);
+    const report = pushes(shim)[0]!;
+    assert.ok(report.content.length <= 500, `${report.content.length} chars`);
+    assert.match(
+      report.content,
+      /^- ops:ops\.fleet: 1 new record \(item 7\/1\)$/mu,
+    );
+    assert.doesNotMatch(report.content, /on air:|no datagram/u);
+
+    // Not even one stream's line fits: nothing is pushed, and nothing is settled.
+    host.sing(1, { station, stream });
+    host.sing(3, { station, stream });
+    h.timers.advance(11_000);
+    assert.equal(pushes(shim).length, 1);
+    assert.equal(status(h).waiting, 2);
+    assert.equal(status(h).counts.too_big, 1);
+    // A bigger limit, and they go out once.
+    h.daemon.reloadConfig(
+      canticleConfig(
+        { mode: "digest", windowMs: 10_000 },
+        { tune: { scribe: tune } },
+        { limits: { maxNotificationChars: 6_000 } },
+      ),
+    );
+    h.timers.advance(11_000);
+    assert.equal(pushes(shim).length, 2);
+    assert.equal(pushes(shim)[1]!.meta.count, "2");
+    h.timers.advance(60_000);
+    assert.equal(pushes(shim).length, 2);
+    assert.equal(status(h).counts.records_pushed, 3);
   } finally {
     h.dispose();
   }
@@ -1181,6 +1283,10 @@ test("set_canticle_delivery: only the attached session may choose, and only well
       [
         { mode: "digest", station: "ops", style: "counts" },
         /style applies to the whole ear; omit station/u,
+      ],
+      [
+        { mode: "configured", style: "counts" },
+        /configured clears the choice, style included/u,
       ],
       [
         { mode: "mute", ttl_seconds: 0 },

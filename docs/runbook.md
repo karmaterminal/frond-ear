@@ -296,7 +296,7 @@ and `source` still need a restart.
 | `….mode`             | `off`          | `immediate`, `digest` or `off`, for every station.                                                                                                                                                      |
 | `….stations`         | `{}`           | `station → mode`, overriding `mode` for that station.                                                                                                                                                   |
 | `….windowMs`         | `60000`        | `digest`: at most one report per window, 5 s to 1 h. The window opens when a record starts waiting.                                                                                                     |
-| `….debounceMs`       | `5000`         | `immediate`: a burst is coalesced over this long, at least 5 s (RFC §14.10).                                                                                                                            |
+| `….debounceMs`       | `5000`         | `immediate`: a burst is coalesced over this long, 5 s (RFC §14.10) to 10 min.                                                                                                                           |
 | `….style`            | `records`      | `digest`: `records` (each record behind its banner) or `counts` (per stream: how many, seqs skipped, repeats caught; no payloads).                                                                      |
 | `….maxItems`         | `10`           | Records per push, 1 to 50. The rest wait for the next push.                                                                                                                                             |
 | `….bufferPerStream`  | `32`           | Records waiting per `station:stream`, 1 to 256. When it is full the oldest is dropped, and the next push says so.                                                                                       |
@@ -312,17 +312,24 @@ late, what went off air before a push could carry it, and what a full buffer dro
 says how many records wait, and the next one starts after the last stream it covered (`continues after …`), so a
 busy stream can't starve the rest. The cursor survives restarts.
 
+Every push fits `limits.maxNotificationChars`. A record too big for it alone is cut inside its wrapper. Below
+about 1,000 characters no banner fits, so a push gives counts instead; when even those run over, it drops the
+notes about the listener and the on-air line, and sums up in one line what other streams missed. If not even one
+stream's counts line fits, nothing is pushed or taken as delivered: the records wait, and `counts.too_big` grows.
+
 **The session's choice.** `set_canticle_delivery` sets `immediate`, `digest` or `mute` for one station or
 (without `station`) all of them, optionally for `ttl_seconds`; `configured` clears the choice, and `style` picks
-the report's form. The config is the ceiling, so the session can only narrow it. A mute at any scope wins: the
-session's, an ear-wide `set_attention` silence, or `canticle.muted`.
+the report's form. The config is the ceiling, so the session can only narrow it. Each scope holds one choice, as
+with `set_attention`: a new one replaces it, and when its `ttl_seconds` lapses the config applies again, style
+included. A mute at any scope wins: the session's, an ear-wide `set_attention` silence, or `canticle.muted`.
 
 **Exactly once.** A record is told apart by its identity (key, epoch, stream, seq), never its text: the same
 words under a new seq are new speech, and a retransmission is not. A pushed record keeps a tombstone in the
 store until its local expiry plus 5 s (RFC §14.18.5), so no retransmission, `resurfaced` record, join snapshot
 or frond-ear restart pushes it twice, and digest and immediate never both push it. A refresh re-issue with the
 same body as a pushed record is not pushed (§7.9). A record first heard under a mute is never pushed, even after
-the mute lifts or frond-ear restarts. A config reload re-reads what is on air, as a restart does.
+the mute lifts or frond-ear restarts. A config reload re-reads what is on air, as a restart does, and a key
+taken off `wakeKeys` holds back what it had waiting.
 
 **Holds.** Nothing is pushed while the daemon is paused, the ear has no session, the host daemon's breaker is
 open or half-open (§14.18.4), or the hour's pushes are spent: records wait while they are on air. A record that
@@ -334,7 +341,8 @@ snapshot brings back what is on air: what was pushed stays pushed, and a record 
 `nextPushAt`, `held` (`paused`, `no_session`, `breaker_open`, `breaker_half_open` or `push_budget`),
 `lastPushAt`, `pushesLastHour`, `reports`, and `counts`: what was pushed (`pushes`, `reports`,
 `records_pushed`), passed over (`not_allowlisted`, `relayed`, `wake_derived`, `off`, `muted`,
-`refresh_collapsed`), went off air unpushed (`off_air_unpushed`) or was dropped from a full buffer (`dropped`).
+`refresh_collapsed`), went off air unpushed (`off_air_unpushed`) or was dropped from a full buffer (`dropped`),
+and pushes that didn't fit at all (`too_big`).
 
 **Departures from RFC-0001.** The frond settled these modes on #65 (2026-10-10). Where they go past RFC-0001,
 the RFC hasn't been amended to match yet:

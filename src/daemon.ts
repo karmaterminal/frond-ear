@@ -1486,6 +1486,11 @@ export class Daemon {
     if (style !== undefined && station !== undefined) {
       throw new Error("style applies to the whole ear; omit station");
     }
+    if (style !== undefined && mode === "configured") {
+      throw new Error(
+        "configured clears the choice, style included; omit style, or pick a mode with it",
+      );
+    }
     let expiresAt: number | null = null;
     const ttl = args.ttl_seconds;
     if (ttl !== undefined && ttl !== null) {
