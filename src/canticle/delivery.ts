@@ -68,7 +68,10 @@ const RANK: Readonly<Record<DeliveryMode, number>> = {
   immediate: 2,
 };
 
-/** A record's identity, `key:epoch:stream:seq`: what dedupe compares, never the text. */
+/**
+ * A record's identity, `key:epoch:stream:seq`: RFC §7.4's identity tuple, with the stream
+ * by name (one to one with its id, §5.4). What dedupe compares, never the text.
+ */
 export function identity(item: LiveItem): string {
   return `${item.key.toLowerCase()}:${item.epoch}:${item.stream}:${item.seq}`;
 }
