@@ -8,7 +8,7 @@ Existing Discord MCP plugins are pull-based: a session only learns about new mes
 - keeps unmentioned room chatter as context
 - breaks bot-to-bot loops
 
-It then **pushes** the result into a live Claude Code session as [channel](https://code.claude.com/docs/en/channels) events. Events that arrive while Claude is busy wait for its next turn, and they are never typed in as if they were user input. Claude answers through the shim's ten tools: `reply`, `react` and `edit_message` post; `fetch_messages`, `inbox`, `fetch_attachment` and `hear` read; `ack` marks events seen; `set_attention` narrows what it hears; and `ear_status` checks that the ear works.
+It then **pushes** the result into a live Claude Code session as [channel](https://code.claude.com/docs/en/channels) events. Events that arrive while Claude is busy wait for its next turn, and they are never typed in as if they were user input. Claude answers through the shim's eleven tools: `reply`, `react` and `edit_message` post; `fetch_messages`, `inbox`, `fetch_attachment` and `hear` read; `ack` marks events seen; `set_attention` and `set_canticle_delivery` narrow what it hears; and `ear_status` checks that the ear works.
 
 ```
 Discord ──ws──▶ frond-ear daemon ──unix socket──▶ frond-ear shim ──stdio (MCP channel)──▶ Claude Code

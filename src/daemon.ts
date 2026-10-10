@@ -14,7 +14,8 @@ import {
 import { join } from "node:path";
 
 import { DELIVERY_PROOF, targetAdvice } from "./advice.ts";
-import type { Config } from "./config.ts";
+import { CanticleDelivery } from "./canticle/delivery.ts";
+import { CANTICLE_STATION, type Config } from "./config.ts";
 import type { StructuredLogger } from "./logger.ts";
 import {
   WakeLimiter,
@@ -63,7 +64,10 @@ export interface DaemonOptions {
   gatewayStatus?: () => object;
   /** The binary-canticle receptor's status, when one is running. */
   canticleStatus?: () => object;
-  /** What an ear hears on its tuned canticle streams (the `hear` tool), when a receptor runs. */
+  /**
+   * What an ear hears on its tuned canticle streams, when a receptor runs: the `hear`
+   * tool reads it, and so do the delivery modes that push to a session (frond-ear#65).
+   */
   canticleHear?: (ear: string) => HearView;
   /** Directory for `fetch_attachment` (one subdirectory per ear). Absent: the tool is off. */
   attachmentsDir?: string;
@@ -367,6 +371,8 @@ export class Daemon {
   private stopped = false;
   private timerDue: number | undefined;
   private sweepTimer: unknown;
+  /** Canticle's push to sessions (frond-ear#65); present whenever a receptor runs. */
+  private readonly canticle: CanticleDelivery | undefined;
 
   public constructor(options: DaemonOptions) {
     this.options = options;
@@ -387,6 +393,39 @@ export class Daemon {
     // can attach and flush.
     this.reconcileRouting();
     this.sweepAttachments();
+    const hear = options.canticleHear;
+    this.canticle = hear
+      ? new CanticleDelivery({
+          config: () => this.config,
+          hear,
+          store: this.store,
+          clock: this.clock,
+          timers: this.timers,
+          logger: this.logger,
+          attached: (ear) => this.attached.has(ear),
+          push: (ear, notification) => this.pushNotice(ear, notification),
+          silenced: (ear) =>
+            this.store
+              .attentionOverrides(ear, this.clock.now())
+              .some((item) => item.scope === "*" && item.mode === "silent"),
+        })
+      : undefined;
+    this.canticle?.start();
+  }
+
+  /**
+   * A notice outside the Discord ledger (no batch_id, nothing to confirm or mark seen):
+   * to the ear's attached session, and to its taps, which see what the session is sent.
+   */
+  private pushNotice(
+    ear: string,
+    notification: { content: string; meta: Record<string, string> },
+  ): void {
+    const event = { type: "event", batchId: null, ...notification } as const;
+    this.attached.get(ear)?.connection.send(event);
+    for (const tap of this.taps.get(ear) ?? []) {
+      tap.connection.send(event);
+    }
   }
 
   /**
@@ -439,6 +478,7 @@ export class Daemon {
     this.reconcileRouting();
     this.prune();
     this.tick();
+    this.canticle?.reconfigured();
   }
 
   /** Prunes against the *current* retention policy (it can change on reload). */
@@ -1238,6 +1278,8 @@ export class Daemon {
       }
       case "set_attention":
         return this.setAttention(client, args);
+      case "set_canticle_delivery":
+        return this.setCanticleDelivery(client, args);
       case "hear": {
         const ear = this.readableEar(client, args);
         if (!this.options.canticleHear) {
@@ -1402,6 +1444,71 @@ export class Daemon {
       null,
       2,
     );
+  }
+
+  /**
+   * The attached session chooses how canticle reaches it (frond-ear#65), as with
+   * set_attention: the config's delivery is the ceiling, so it can only narrow, down to
+   * mute, for one station or the whole ear, with an optional TTL.
+   */
+  private setCanticleDelivery(
+    client: Client,
+    args: Record<string, unknown>,
+  ): string {
+    const ear = client.ear;
+    if (!ear || !this.isAttachedSession(client, ear)) {
+      throw new Error(
+        "only the session attached to an ear can set its canticle delivery",
+      );
+    }
+    if (!this.canticle || !this.config.canticle?.enabled) {
+      return "canticle is not enabled on this daemon (config canticle.enabled).";
+    }
+    const mode = stringArg(args, "mode", true);
+    if (
+      mode !== "immediate" &&
+      mode !== "digest" &&
+      mode !== "mute" &&
+      mode !== "configured"
+    ) {
+      throw new Error("mode must be immediate, digest, mute or configured");
+    }
+    const station = stringArg(args, "station");
+    if (station !== undefined && !CANTICLE_STATION.test(station)) {
+      throw new Error(
+        "station must be one station's name as hear shows it (lowercase letters, digits and -); omit it for every station",
+      );
+    }
+    const style = stringArg(args, "style");
+    if (style !== undefined && style !== "records" && style !== "counts") {
+      throw new Error("style must be records or counts");
+    }
+    if (style !== undefined && station !== undefined) {
+      throw new Error("style applies to the whole ear; omit station");
+    }
+    let expiresAt: number | null = null;
+    const ttl = args.ttl_seconds;
+    if (ttl !== undefined && ttl !== null) {
+      const seconds = Number(ttl);
+      if (!Number.isSafeInteger(seconds) || seconds < 1) {
+        throw new Error("ttl_seconds must be a positive integer");
+      }
+      expiresAt = this.clock.now() + seconds * 1_000;
+    }
+    const view = this.canticle.choose(
+      ear,
+      station ?? "*",
+      mode,
+      expiresAt,
+      style,
+    );
+    this.store.increment("canticle_delivery_changes");
+    this.logger.log("info", "canticle.delivery_chosen", {
+      ear,
+      scope: station ?? "*",
+      mode,
+    });
+    return JSON.stringify(view, null, 2);
   }
 
   /** Configured ceiling narrowed by the session's own choice. */
@@ -1701,6 +1808,7 @@ export class Daemon {
       .map(([name, ear]) => {
         const record = this.store.ear(name);
         const client = this.attached.get(name);
+        const canticleDelivery = this.canticle?.status(name);
         return {
           name,
           target: ear.target,
@@ -1722,6 +1830,7 @@ export class Daemon {
           lastEventAt: this.store.lastEventAt(name),
           nextFlushAt: this.store.nextDue(name) ?? null,
           attention: this.attentionView(name),
+          ...(canticleDelivery ? { canticleDelivery } : {}),
         };
       });
     return {
@@ -1755,6 +1864,7 @@ export class Daemon {
       this.timers.clearTimeout(this.sweepTimer);
       this.sweepTimer = undefined;
     }
+    this.canticle?.stop();
     let drained = true;
     if (this.inFlight.size > 0) {
       let timeout: NodeJS.Timeout | undefined;

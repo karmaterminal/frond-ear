@@ -138,6 +138,9 @@ const config = (over: Partial<CanticleConfig> = {}): CanticleConfig => ({
   tune: { gloss: ["*:chatter"], other: ["test2:chatter"] },
   source: "embedded",
   hostSocket: "/nonexistent/canticle.sock",
+  wakeKeys: [],
+  muted: false,
+  delivery: {},
   ...over,
 });
 
@@ -273,6 +276,9 @@ test("config: canticle defaults and validation", () => {
     tune: { gloss: ["*:ops.fleet"] },
     source: "embedded",
     hostSocket: c.canticle!.hostSocket,
+    wakeKeys: [],
+    muted: false,
+    delivery: {},
   });
   const bad = (canticle: unknown) => () => parseConfig({ ...base, canticle });
   assert.throws(bad({ enabled: true }), /manifestPath is required/);

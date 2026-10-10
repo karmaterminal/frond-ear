@@ -98,6 +98,10 @@ export interface Item {
 }
 
 export const FLAG_REFRESH = 1;
+/** Sung during a canticle-woken turn (§14.8.1): never wake-eligible. */
+export const FLAG_WAKE_DERIVED = 2;
+/** A drill (§14.7.6): rendered as EXERCISE. */
+export const FLAG_EXERCISE = 4;
 
 export interface Pluck {
   epoch: number;

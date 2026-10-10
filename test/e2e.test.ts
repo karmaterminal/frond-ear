@@ -197,6 +197,7 @@ test("dry-run daemon + channel shim + MCP client: inject → <channel> notificat
     "react",
     "reply",
     "set_attention",
+    "set_canticle_delivery",
   ]);
 
   // Attach canary arrives; acking it registers the ear.

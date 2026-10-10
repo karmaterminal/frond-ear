@@ -194,9 +194,11 @@ holds an ear.
 
 Optional, and off: the daemon builds no canticle source unless its config has a `canticle` block
 with `"enabled": true` (and never under `--dry-run`), and nothing in `init` or `doctor` touches
-it. When on, it is listen-only: nothing heard wakes a session or enters the Discord ledger. An ear
-hears only the `station:stream` pairs its `canticle.tune` lists, and the session reads them with
-the `hear` tool. Where frond-ear is the host's one canticle listener it binds its own
+it. When on, it listens only, and nothing heard enters the Discord ledger. An ear hears only the
+`station:stream` pairs its `canticle.tune` lists, and the session reads them with the `hear` tool.
+Nothing heard reaches a session unasked unless its ear has a `canticle.delivery` entry; even then,
+only records from station keys on `canticle.wakeKeys` are pushed
+([runbook § Delivery modes](runbook.md#delivery-modes)). Where frond-ear is the host's one canticle listener it binds its own
 (`canticle.source: "embedded"`, the default). On a **shared host** (one where another harness,
 such as an OpenClaw prince, also hears canticle) it binds nothing and reads record v1 from
 binary-canticle's host daemon (`"host-daemon"`); the embedded listener refuses to bind while a

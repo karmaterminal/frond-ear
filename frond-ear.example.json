@@ -58,6 +58,19 @@
     "binding": "lan",
     "tune": {
       "frond-scribe": ["*:ops.fleet"]
+    },
+    "wakeKeys": [],
+    "muted": false,
+    "delivery": {
+      "frond-scribe": {
+        "mode": "digest",
+        "windowMs": 60000,
+        "debounceMs": 5000,
+        "style": "records",
+        "maxItems": 10,
+        "bufferPerStream": 32,
+        "maxPushesPerHour": 60
+      }
     }
   }
 }

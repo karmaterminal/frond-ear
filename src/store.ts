@@ -88,6 +88,34 @@ export interface AmbiguousSend {
   parts: number | null;
 }
 
+/**
+ * A canticle record settled for one ear (frond-ear#65): its tombstone refuses a repeat
+ * until `expiresAt`, the record's local expiry plus skew (RFC-0001 §14.18.5).
+ */
+export interface CanticleSettled {
+  ear: string;
+  /** `key:epoch:stream:seq`: the record's identity, never its text. */
+  identity: string;
+  /**
+   * `pushed` to the session, `collapsed` as a refresh of a pushed record (§7.9), or
+   * `passed` over by a mute, so it is never pushed after the mute lifts.
+   */
+  outcome: "pushed" | "collapsed" | "passed";
+  /** For a keyed record, `[key, stream, state_key]` as JSON: what a refresh re-issues. */
+  refreshKey: string | null;
+  /** The body's SHA-256, for a keyed record. */
+  digest: string | null;
+  expiresAt: number;
+}
+
+/** A session's own canticle delivery choice for a station, or "*" for all of them. */
+export interface CanticleChoice {
+  scope: string;
+  mode: "mute" | "digest" | "immediate";
+  style: "records" | "counts" | null;
+  expiresAt: number | null;
+}
+
 /** Where one Discord message sits in the reply it is part of (#55). */
 export interface ReplyPart {
   /** A hash of the chat, reply_to and whole text, so identical replies share it. */
@@ -236,6 +264,27 @@ export class EventStore {
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL,
         value TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS canticle_settled (
+        ear TEXT NOT NULL,
+        identity TEXT NOT NULL,
+        outcome TEXT NOT NULL CHECK (outcome IN ('pushed', 'collapsed', 'passed')),
+        refresh_key TEXT,
+        digest TEXT,
+        settled_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        PRIMARY KEY (ear, identity)
+      );
+      CREATE INDEX IF NOT EXISTS canticle_settled_expiry
+        ON canticle_settled (expires_at);
+      CREATE TABLE IF NOT EXISTS canticle_attention (
+        ear TEXT NOT NULL,
+        scope TEXT NOT NULL,
+        mode TEXT NOT NULL CHECK (mode IN ('mute', 'digest', 'immediate')),
+        style TEXT CHECK (style IN ('records', 'counts')),
+        set_at INTEGER NOT NULL,
+        expires_at INTEGER,
+        PRIMARY KEY (ear, scope)
       );
     `);
     // outbound_intents shipped without these columns; a database created before
@@ -510,6 +559,106 @@ export class EventStore {
       );
     }
     return 0;
+  }
+
+  // ---- canticle delivery (frond-ear#65) ---------------------------------------------
+
+  /**
+   * Every ear's settled canticle records whose tombstone still holds: pushed to the
+   * session, collapsed as a refresh of one that was, or passed over by a mute. Expired
+   * ones are removed first.
+   */
+  public canticleSettled(now: number): CanticleSettled[] {
+    this.database
+      .prepare("DELETE FROM canticle_settled WHERE expires_at <= ?")
+      .run(now);
+    return this.database
+      .prepare(
+        `SELECT ear, identity, outcome, refresh_key AS refreshKey, digest,
+           expires_at AS expiresAt FROM canticle_settled`,
+      )
+      .all() as unknown as CanticleSettled[];
+  }
+
+  /**
+   * Settles records for one ear and saves its delivery cursor, in one transaction, before
+   * anything is pushed: a crash between the two loses a push, never repeats one.
+   */
+  public settleCanticle(
+    ear: string,
+    rows: ReadonlyArray<Omit<CanticleSettled, "ear">>,
+    cursor?: { name: string; value: string },
+  ): void {
+    this.transaction(() => {
+      const insert = this.database.prepare(
+        `INSERT INTO canticle_settled
+           (ear, identity, outcome, refresh_key, digest, settled_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(ear, identity) DO NOTHING`,
+      );
+      for (const row of rows) {
+        insert.run(
+          ear,
+          row.identity,
+          row.outcome,
+          row.refreshKey,
+          row.digest,
+          this.clock.now(),
+          row.expiresAt,
+        );
+      }
+      if (cursor) {
+        this.setRuntimeState(cursor.name, cursor.value);
+      }
+    });
+  }
+
+  /** `scope` is a station name, or "*" for every station the ear hears. */
+  public setCanticleAttention(
+    ear: string,
+    scope: string,
+    mode: "mute" | "digest" | "immediate",
+    style: "records" | "counts" | null,
+    expiresAt: number | null,
+  ): void {
+    this.database
+      .prepare(
+        `INSERT INTO canticle_attention (ear, scope, mode, style, set_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(ear, scope) DO UPDATE SET mode = excluded.mode, style = excluded.style,
+           set_at = excluded.set_at, expires_at = excluded.expires_at`,
+      )
+      .run(ear, scope, mode, style, this.clock.now(), expiresAt);
+  }
+
+  /** Clears one scope, or every canticle choice of the ear when scope is omitted. */
+  public clearCanticleAttention(ear: string, scope?: string): number {
+    const result =
+      scope === undefined
+        ? this.database
+            .prepare("DELETE FROM canticle_attention WHERE ear = ?")
+            .run(ear)
+        : this.database
+            .prepare(
+              "DELETE FROM canticle_attention WHERE ear = ? AND scope = ?",
+            )
+            .run(ear, scope);
+    return Number(result.changes);
+  }
+
+  /** The ear's active canticle choices; expired ones are removed as they are read. */
+  public canticleAttention(ear: string, now: number): CanticleChoice[] {
+    this.database
+      .prepare(
+        "DELETE FROM canticle_attention WHERE ear = ? AND expires_at IS NOT NULL AND expires_at <= ?",
+      )
+      .run(ear, now);
+    return this.database
+      .prepare(
+        `SELECT scope, mode, style, expires_at AS expiresAt FROM canticle_attention
+           WHERE ear = ? ORDER BY scope`,
+      )
+      .all(ear) as unknown as CanticleChoice[];
   }
 
   // ---- outbound intents (write-ahead for sends) ------------------------------------
@@ -1147,6 +1296,10 @@ export class EventStore {
            AND NOT EXISTS (SELECT 1 FROM events WHERE events.batch_id = batches.id)`,
         )
         .run(cutoff);
+      // A canticle tombstone outlives its record only by skew, whatever the retention.
+      this.database
+        .prepare("DELETE FROM canticle_settled WHERE expires_at <= ?")
+        .run(this.clock.now());
       return events;
     });
   }

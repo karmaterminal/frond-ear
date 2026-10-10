@@ -220,12 +220,13 @@ yourself, and how to get back from a lost checkout, a lost home directory, or a 
 ## 8. Hear binary-canticle (optional)
 
 frond-ear can listen to [binary-canticle](https://github.com/karmaterminal/binary-canticle) stations: signed,
-looping, short-lived items on `station:stream` (RFC-0001). It's **listen-only and silent**. Heard items never
-wake the session and never enter the Discord ledger; the session reads them with the `hear` tool when it wants
-to. Off by default.
+looping, short-lived items on `station:stream` (RFC-0001). It's **listen-only**, and **silent unless an ear opts
+in**: heard items never enter the Discord ledger, the session reads them with the `hear` tool when it wants to,
+and only an ear with a `canticle.delivery` entry has any pushed to it ([Delivery modes](#delivery-modes)). Off
+by default.
 
 1. Get the fleet manifest (unsigned in v0, a local file). The ear never fetches one.
-2. Add to the config and restart the daemon (canticle config isn't hot-reloaded):
+2. Add to the config and restart the daemon (canticle's source and `tune` aren't hot-reloaded):
 
    ```json
    "canticle": {
@@ -269,6 +270,82 @@ to. Off by default.
 spike's `canticle sing --control <station.sock> --stream ops.fleet --class advisory --ctype 1 --state-key <seat>
 --text "…"`, so a prince going dark is explained without anyone asking. One `state_key` per seat means a newer
 status supersedes the older one.
+
+### Delivery modes
+
+By default nothing heard reaches a session unasked (frond-ear#65). An ear opts in with a `canticle.delivery`
+entry, and even then only records from station keys on `canticle.wakeKeys`, sung at hop 0 and not wake-derived
+(RFC §14.8.1), are pushed. Every other record stays `hear`-only, and its station still shows on the on-air line,
+so a station calling CQ is seen whether or not it may wake anyone. These fields reload with the config; `tune`
+and `source` still need a restart.
+
+```json
+"canticle": {
+  "wakeKeys": ["0123456789abcdef"],
+  "delivery": {
+    "frond-gloss": { "mode": "digest", "stations": { "silas": "immediate" } }
+  }
+}
+```
+
+| Field                | Default        | Meaning                                                                                                                                                                                                 |
+| -------------------- | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `wakeKeys`           | `[]`           | Station key ids (16 hex digits, the `key=` of a `hear` banner) whose records may be pushed. Empty: nothing is pushed, and `ear_status` warns. Leave out the seat's own station key, or it hears itself. |
+| `muted`              | `false`        | `true` mutes every push to every ear.                                                                                                                                                                   |
+| `delivery.<ear>`     | absent (`off`) | The ear's ceiling. A bare string (`"digest"`) sets `mode` alone.                                                                                                                                        |
+| `….mode`             | `off`          | `immediate`, `digest` or `off`, for every station.                                                                                                                                                      |
+| `….stations`         | `{}`           | `station → mode`, overriding `mode` for that station.                                                                                                                                                   |
+| `….windowMs`         | `60000`        | `digest`: at most one report per window, 5 s to 1 h. The window opens when a record starts waiting.                                                                                                     |
+| `….debounceMs`       | `5000`         | `immediate`: a burst is coalesced over this long, at least 5 s (RFC §14.10).                                                                                                                            |
+| `….style`            | `records`      | `digest`: `records` (each record behind its banner) or `counts` (per stream: how many, seqs skipped, repeats caught; no payloads).                                                                      |
+| `….maxItems`         | `10`           | Records per push, 1 to 50. The rest wait for the next push.                                                                                                                                             |
+| `….bufferPerStream`  | `32`           | Records waiting per `station:stream`, 1 to 256. When it is full the oldest is dropped, and the next push says so.                                                                                       |
+| `….maxPushesPerHour` | `60`           | Pushes to the ear per hour, 1 to 3600. Past it, records wait.                                                                                                                                           |
+
+**What the session gets.** Channel events with `kind="canticle"` and `delivery="immediate"` (the new records of
+the last few seconds) or `delivery="report"` (a "what's on the radio" report, `report=<n>`). They sit outside
+the Discord ledger: no `batch_id`, nothing to `ack`. Each record carries the `[canticle:heard]` banner `hear`
+shows, with `mode=silent-wake`, and its payload quoted inside an `EXTERNAL_UNTRUSTED_CONTENT` wrapper. A report
+gives the on-air line, then each `station:stream` in order with its records in seq order, under a line that counts
+them and says what it skipped since the last report (seqs lost on air, plucked or `hear`-only), what was caught
+late, what went off air before a push could carry it, and what a full buffer dropped. A report a cap cut short
+says how many records wait, and the next one starts after the last stream it covered (`continues after …`), so a
+busy stream can't starve the rest. The cursor survives restarts.
+
+**The session's choice.** `set_canticle_delivery` sets `immediate`, `digest` or `mute` for one station or
+(without `station`) all of them, optionally for `ttl_seconds`; `configured` clears the choice, and `style` picks
+the report's form. The config is the ceiling, so the session can only narrow it. A mute at any scope wins: the
+session's, an ear-wide `set_attention` silence, or `canticle.muted`.
+
+**Exactly once.** A record is told apart by its identity (key, epoch, stream, seq), never its text: the same
+words under a new seq are new speech, and a retransmission is not. A pushed record keeps a tombstone in the
+store until its local expiry plus 5 s (RFC §14.18.5), so no retransmission, `resurfaced` record, join snapshot
+or frond-ear restart pushes it twice, and digest and immediate never both push it. A refresh re-issue with the
+same body as a pushed record is not pushed (§7.9). A record first heard under a mute is never pushed, even after
+the mute lifts or frond-ear restarts. A config reload re-reads what is on air, as a restart does.
+
+**Holds.** Nothing is pushed while the daemon is paused, the ear has no session, the host daemon's breaker is
+open or half-open (§14.18.4), or the hour's pushes are spent: records wait while they are on air. A record that
+goes off air or is plucked first is never pushed, and the next push counts it. After a dropped link the join
+snapshot brings back what is on air: what was pushed stays pushed, and a record sung meanwhile goes out once.
+
+**Check it.** `ear_status` shows `ears[].canticleDelivery`: the `ceiling` and effective `mode`, `style`, any
+`muted` reason, per-station modes, the session's `choices`, `wakeKeys` (a count) and any `warning`, `waiting`,
+`nextPushAt`, `held` (`paused`, `no_session`, `breaker_open`, `breaker_half_open` or `push_budget`),
+`lastPushAt`, `pushesLastHour`, `reports`, and `counts`: what was pushed (`pushes`, `reports`,
+`records_pushed`), passed over (`not_allowlisted`, `relayed`, `wake_derived`, `off`, `muted`,
+`refresh_collapsed`), went off air unpushed (`off_air_unpushed`) or was dropped from a full buffer (`dropped`).
+
+**Departures from RFC-0001.** The frond settled these modes on #65 (2026-10-10). Where they go past RFC-0001,
+the RFC hasn't been amended to match yet:
+
+| RFC                 | It says                                                                                                               | frond-ear                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| ------------------- | --------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| §14.10              | Only `alarm` may wake, when all 11 conditions hold; until S3 passes, deployments behave as if nothing wakes.          | Any class from an allowlisted key is pushed. Kept: verified and not under the host daemon's MUTE, an allowlist (in place of the alarm capability), the ear's opt-in, hop 0 and not wake-derived, coalescing of at least 5 s, and the breaker. Not applied: the class rule, the session, host and token budgets (a per-ear cap on pushes per hour instead), the freshness bound (an aged record is pushed, marked `aged`), host prerequisites and proofreading. |
+| §14.12, BC-1        | No ambient delivery to a session with an off-host channel route, such as Discord, until §23.2 question 22 is settled. | A frond-ear session has a Discord route by design. Pushes come behind the banner and wrapper; frond-ear can't taint what the session does next.                                                                                                                                                                                                                                                                                                                |
+| §14.16 item 3 (A11) | Chatter, ambient and advisory items land after a random per-session delay.                                            | No delay beyond the debounce or window.                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| §14.18.3 (D36)      | Join-snapshot entries and `resurfaced` records never wake a session.                                                  | One already pushed is never pushed again; one never pushed goes out once, so each record is heard once across a dropped link (#65).                                                                                                                                                                                                                                                                                                                            |
+| §14.18.4            | A half-open breaker allows a wake within its allowance.                                                               | Half-open holds, as open does.                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 
 ## Troubleshooting
 

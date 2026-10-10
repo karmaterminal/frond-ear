@@ -165,8 +165,9 @@ async function runDaemon(argv: string[]): Promise<void> {
     });
     gateway.start();
   }
-  // Listen-only and silent: heard items stay in the receptor's live set; nothing
-  // reaches a session until P3's `hear` tool. Canticle config changes need a restart.
+  // Heard items stay in the receptor's live set. `hear` reads them, and the daemon
+  // pushes them only where canticle.delivery and canticle.wakeKeys allow (frond-ear#65).
+  // Delivery settings reload with the config; the rest of canticle needs a restart.
   canticle?.start();
 
   let reloadTimer: NodeJS.Timeout | undefined;

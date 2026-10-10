@@ -167,6 +167,7 @@ export class RecordClient {
         : {}),
       run: this.consumer.run ?? null,
       mute: this.consumer.mute,
+      breaker: this.consumer.breaker ?? null,
       counts: { ...this.consumer.counts },
       stations: Object.fromEntries(this.consumer.presence),
     };
