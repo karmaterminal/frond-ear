@@ -367,7 +367,7 @@ test("a session that starts listening after initialize still gets the attach can
   assert.equal(injected.stdout.trim(), "inserted");
 
   // Like Claude Code 2.1.296: the client sends notifications/initialized, lists tools, and
-  // registers its channel handler only afterwards (8 to 24 ms later there; 200 ms here).
+  // registers its channel handler only afterwards (tens of ms later there; 200 ms here).
   // A notification that arrives before that is dropped, as the SDK drops one with no handler.
   await client.connect(
     new StdioClientTransport({

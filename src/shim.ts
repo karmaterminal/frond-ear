@@ -23,8 +23,8 @@ export const SHIM_VERSION = "0.1.0";
 /**
  * How long channel events wait after `notifications/initialized`. Claude Code sends that before
  * it registers its channel handler and drops a notification that arrives first: 2.1.296
- * registers 8 to 24 ms later, so an attach canary or backlog sent at once was lost while its
- * batch read as offered (#70).
+ * registers tens of milliseconds later, so an attach canary or backlog sent at once was lost
+ * while its batch read as offered (#70).
  */
 const CHANNEL_SETTLE_MS = 2_000;
 
