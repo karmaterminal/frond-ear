@@ -301,3 +301,114 @@ test("dry-run daemon + channel shim + MCP client: inject → <channel> notificat
     1,
   );
 });
+
+test("a session that starts listening after initialize still gets the attach canary and the backlog (#70)", async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "frond-ear-e2e-late-"));
+  const socket = join(directory, "run", "daemon.sock");
+  const configPath = join(directory, "frond-ear.json");
+  writeFileSync(
+    configPath,
+    JSON.stringify({
+      botUserId: BOT,
+      principals: [PRINCIPAL],
+      labels: { [PRINCIPAL]: "figs" },
+      ears: {
+        scribe: {
+          target: "claude-channel",
+          attachCanary: true,
+          channels: { [CHANNEL]: "mentions" },
+        },
+      },
+      defaults: { quietWindowMs: 300, maxDelayMs: 2_000, priorityQuietMs: 100 },
+    }),
+  );
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    FROND_EAR_CONFIG: configPath,
+    FROND_EAR_DATABASE: join(directory, "state", "ear.db"),
+    FROND_EAR_SOCKET: socket,
+    FROND_EAR_BOT_USER_ID: BOT,
+  };
+  delete env.DISCORD_BOT_TOKEN;
+  delete env.DISCORD_BOT_TOKEN_FILE;
+  const daemon = spawn(process.execPath, [CLI, "daemon", "--dry-run"], {
+    env,
+    stdio: ["ignore", "ignore", "ignore"],
+  });
+  const client = new Client(
+    { name: "late-listener", version: "0.0.0" },
+    { capabilities: {} },
+  );
+  t.after(async () => {
+    await client.close().catch(() => undefined);
+    daemon.kill("SIGTERM");
+    await new Promise((resolve) => daemon.once("close", resolve));
+    rmSync(directory, { recursive: true, force: true });
+  });
+  await waitFor(() => (existsSync(socket) ? true : undefined), "daemon socket");
+
+  // A mention arrives while no session is attached: the backlog the next session gets.
+  const injected = await run(
+    [
+      "inject",
+      "--chat",
+      CHANNEL,
+      "--guild",
+      GUILD,
+      "--author",
+      PRINCIPAL,
+      "--name",
+      "figs",
+      "--mention",
+      "while you were away",
+    ],
+    env,
+  );
+  assert.equal(injected.stdout.trim(), "inserted");
+
+  // Like Claude Code 2.1.296: the client sends notifications/initialized, lists tools, and
+  // registers its channel handler only afterwards (8 to 24 ms later there; 200 ms here).
+  // A notification that arrives before that is dropped, as the SDK drops one with no handler.
+  await client.connect(
+    new StdioClientTransport({
+      command: process.execPath,
+      args: [CLI, "shim"],
+      env: {
+        ...(env as Record<string, string>),
+        FROND_EAR_EAR: "scribe",
+        CLAUDE_CODE_SESSION_ID: "session-late",
+      },
+      stderr: "ignore",
+    }),
+  );
+  await client.listTools();
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  const notifications: ChannelNotification[] = [];
+  client.fallbackNotificationHandler = async (notification) => {
+    if (notification.method === "notifications/claude/channel") {
+      notifications.push(notification.params as unknown as ChannelNotification);
+    }
+  };
+
+  const canary = await waitFor(
+    () => notifications.find((item) => item.meta.kind === "attach"),
+    "attach canary",
+  );
+  const backlog = await waitFor(
+    () => notifications.find((item) => item.meta.kind === "mention"),
+    "the mention held while no session was attached",
+  );
+  assert.match(backlog.content, /while you were away/u);
+  const ack = await client.callTool({
+    name: "ack",
+    arguments: { nonce: canary.meta.nonce },
+  });
+  assert.notEqual(ack.isError, true);
+  const status = JSON.parse(
+    (
+      (await client.callTool({ name: "ear_status", arguments: {} }))
+        .content as Array<{ text: string }>
+    )[0]?.text ?? "{}",
+  ) as { ears: Array<{ registered: boolean }> };
+  assert.equal(status.ears[0]?.registered, true);
+});
