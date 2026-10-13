@@ -273,6 +273,7 @@ export interface ShimOptions {
   reconnectMs?: number;
   initializeWaitMs?: number;
   callTimeoutMs?: number;
+  channelSettleMs?: number;
 }
 
 export class ChannelShim {
@@ -368,6 +369,9 @@ export class ChannelShim {
           resolve({ ok: false, text: "frond-ear daemon connection lost" });
         }
         this.calls.clear();
+        // Held events were never written, so their batches are unoffered: the daemon queues
+        // them again and pushes them anew when this shim re-attaches.
+        this.pendingEvents.length = 0;
         if (wasConnected) {
           this.log("daemon connection lost; reconnecting");
         }
@@ -561,7 +565,7 @@ export class ChannelShim {
             for (const event of this.pendingEvents.splice(0)) {
               this.emitEvent(event);
             }
-          }, CHANNEL_SETTLE_MS);
+          }, this.options.channelSettleMs ?? CHANNEL_SETTLE_MS);
         }
         return;
       case "ping":

@@ -44,9 +44,14 @@ PIN=$(git rev-parse HEAD) tools/clean-install/receipt.sh all
 `PIN` is the commit under test (the default is this checkout's HEAD). The receipt lands in
 `${FE_RECEIPT:-${TMPDIR:-/tmp}/frond-ear-receipt}/receipt/`: `transcript.md`, whose teardown
 section quotes Claude Code's own log of the shim's MCP traffic, and the daemon and stand-in logs.
-The next `setup` deletes it, so copy it out first. `all` tears everything down, even when a step
+The next `setup` deletes it, so copy it out first. The script sources a state file from that
+workspace and deletes directories in it, so it refuses one that is not yours, that others can
+write, or that holds files `setup` did not make. `all` tears everything down, even when a step
 fails; `KEEP=1` leaves a failed run up to look at, and `receipt.sh screen` prints the session's
 pane.
+
+A step passes on what the person asked for, not on any activity: `event` and `away` each wait
+for the one-word answer their message asks for (`pong`, then `backlog`).
 
 **Claude Code's login.** The session needs a working `claude` login, which frond-ear never sees.
 Where `claude` is set up outside HOME, as in the hosted container the first records came from, it

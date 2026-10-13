@@ -11,8 +11,9 @@
 #   tools/clean-install/receipt.sh screen      print the session's pane (emails redacted)
 #
 # Environment: PIN, the commit under test (default: HEAD of this checkout); FE_RECEIPT, the
-# workspace (default: ${TMPDIR:-/tmp}/frond-ear-receipt); WAIT, seconds a session step waits
-# (default 240); KEEP=1 skips the teardown after a failed `all`.
+# workspace (default: ${TMPDIR:-/tmp}/frond-ear-receipt; setup makes it 0700, and an existing one
+# must be yours and empty, or made by setup); WAIT, seconds a session step waits (default 240);
+# KEEP=1 skips the teardown after a failed `all`.
 set -u
 DEV=$(cd "$(dirname "$0")/../.." && pwd)
 W=${FE_RECEIPT:-${TMPDIR:-/tmp}/frond-ear-receipt}
@@ -26,7 +27,18 @@ PRINCIPAL=200000000000000002
 CHANNEL=700000000000000007
 EAR=trial
 TMUX_SERVER=fe-receipt
+MARK=$W/.frond-ear-receipt
 
+# The workspace holds a state file this script sources and directories it deletes, so it must
+# be the caller's own: a real directory, writable by nobody else, and empty or made by setup.
+if [ -e "$W" ] || [ -L "$W" ]; then
+  if [ -L "$W" ] || [ ! -d "$W" ] || [ ! -O "$W" ] ||
+    [ -n "$(find "$W" -maxdepth 0 \( -perm -g+w -o -perm -o+w \))" ] ||
+    { [ ! -e "$MARK" ] && [ -n "$(ls -A "$W")" ]; }; then
+    echo "FE_RECEIPT=$W is not a receipt workspace of yours (yours, writable only by you, and empty or made by setup); choose another" >&2
+    exit 2
+  fi
+fi
 [ -f "$STATE" ] && . "$STATE"
 
 save() { printf '%s=%q\n' "$1" "$2" >>"$STATE"; }
@@ -39,7 +51,11 @@ clean() {
     EDITOR="$ROOT/human/fake-editor" "$@"
 }
 
-scrub() { sed -E -e "s#$ROOT#\$ROOT#g" -e 's/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/<email>/g'; }
+# The disposable root, the caller's HOME and login, and anything shaped like an email address.
+scrub() {
+  sed -E -e "s#$ROOT#\$ROOT#g" -e "$([ ${#HOME} -gt 1 ] && printf 's#%s#~caller#g' "$HOME")" \
+    -e 's/^(USER|LOGNAME)=.*/\1=<login>/' -e 's/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/<email>/g'
+}
 
 # record TITLE CWD SCRIPT: runs SCRIPT under bash in the disposable environment and appends the
 # commands, their output and the exit status to the transcript. Returns the exit status.
@@ -81,8 +97,9 @@ ear() {
 }
 ear_is() { ear | node -e 'const e = JSON.parse(require("fs").readFileSync(0, "utf8")); process.exit(process.argv.slice(1).every((k) => k.startsWith("!") ? !e[k.slice(1)] : e[k]) ? 0 : 1);' "$@"; }
 gateway_connected() { ear | grep -q '"gateway":"connected"'; }
-posts() { fake /control/state | node -e 'console.log(JSON.parse(require("fs").readFileSync(0, "utf8")).posts.length)'; }
-posts_at_least() { [ "$(posts)" -ge "$1" ]; }
+posted() { # posted WORD: the bot answered in the channel with WORD and nothing else
+  fake /control/state | node -e 'const [word, channel] = process.argv.slice(1); const { posts } = JSON.parse(require("fs").readFileSync(0, "utf8")); process.exit(posts.some((p) => p.channel_id === channel && p.content.trim().toLowerCase().replace(/[.!]+$/u, "") === word) ? 0 : 1);' "$1" "$CHANNEL"
+}
 
 tm() { TMUX_TMPDIR="$ROOT/run" tmux -L "$TMUX_SERVER" "$@"; }
 pane() { tm capture-pane -p -t trial 2>/dev/null; }
@@ -171,6 +188,10 @@ start_daemon() { # start_daemon LOGFILE: the daemon line init printed, pointed a
 }
 
 daemon_pid() { pgrep -n -f "$ROOT/home/frond-ear/src/cli.ts daemon$"; }
+daemon_exited() { ! kill -0 "$DAEMON_SUBSHELL" 2>/dev/null; }
+# ours PID TEXT: PID is still a process this receipt started (its command line holds TEXT), so a
+# PID left in the state file by an interrupted run never stops someone else's process.
+ours() { [ -n "$1" ] && ps -o args= -p "$1" 2>/dev/null | grep -qF -- "$2"; }
 
 ledger() { # ledger TITLE: the ear's status, as the session's owner would read it
   record "$1" "$ROOT/home/frond-ear" \
@@ -216,6 +237,7 @@ step() {
       echo "FE_RECEIPT is too long for a unix socket path under it; use a shorter one" >&2
       return 1
     }
+    mkdir -p "$W" && chmod 700 "$W" && : >"$MARK" || return 1
     tm kill-server 2>/dev/null
     rm -rf "$ROOT" "$STATE" "$R"
     mkdir -p "$ROOT/home" "$ROOT/run" "$ROOT/human" "$R" || return 1
@@ -313,6 +335,11 @@ sh -c '"'"'umask 077; set -C; : > "$1"'"'"' sh ~/.config/frond-ear/token && $EDI
     note '## 4. Daemon'
     note "The daemon runs as \`init\` printed it (its step 1), with two variables in front that point it at the loopback stand-in for Discord: \`DISCORD_GATEWAY_URL=ws://127.0.0.1:$PORT/gateway DISCORD_API_BASE=http://127.0.0.1:$PORT/api/v10\`. The stand-in starts with the bot's Message Content Intent off, as in a portal where nobody turned it on."
     start_daemon "$R/daemon-1.log" || return 1
+    wait_for 30 "the daemon to exit" daemon_exited || {
+      kill -TERM "$(daemon_pid)" 2>/dev/null
+      note '**The daemon was still running 30 s after Discord refused the intent; the receipt stopped it.**'
+      return 1
+    }
     wait "$DAEMON_SUBSHELL"
     local code=$?
     {
@@ -329,8 +356,9 @@ sh -c '"'"'umask 077; set -C; : > "$1"'"'"' sh ~/.config/frond-ear/token && $EDI
 
   daemon)
     start_daemon "$R/daemon-2.log" || return 1
-    wait_for 30 "the gateway to connect" gateway_connected || return 1
+    wait_for 10 "the daemon process" daemon_pid || return 1
     save DAEMON_PID "$(daemon_pid)"
+    wait_for 30 "the gateway to connect" gateway_connected || return 1
     record "repaired: daemon up, gateway connected" "$ROOT/home/frond-ear" \
       'node src/cli.ts status | node -e '"'"'const s=JSON.parse(require("fs").readFileSync(0,"utf8")); console.log(JSON.stringify({gateway: s.gateway.state, ears: s.ears.map(e => ({name: e.name, attached: e.attached, registered: e.registered}))}, null, 1))'"'"''
     ;;
@@ -386,11 +414,11 @@ sh -c '"'"'umask 077; set -C; : > "$1"'"'"' sh ~/.config/frond-ear/token && $EDI
     note '## 9. One inbound message, one outbound reply'
     note "The stand-in delivers one MESSAGE_CREATE over the Gateway: the principal ($PRINCIPAL) mentions the bot in channel $CHANNEL."
     note "Inbound dispatched: \`$(inbound 'receipt check: please answer in this channel with exactly the word pong')\`"
-    wait_for "$WAIT" "a reply at the stand-in" posts_at_least 1 || note "**No reply within ${WAIT} s.**"
+    wait_for "$WAIT" "the reply pong at the stand-in" posted pong || note "**No \`pong\` within ${WAIT} s.**"
     sleep 10
     discord_record "what the stand-in for Discord received (10 s after the first post)"
     ledger "the ledger: what the ear holds for the session"
-    posts_at_least 1
+    posted pong
     ;;
 
   away)
@@ -406,11 +434,11 @@ sh -c '"'"'umask 077; set -C; : > "$1"'"'"' sh ~/.config/frond-ear/token && $EDI
     printf '\n```console\n$ cd ~/trial-session && %s\n```\n' "$line" >>"$T"
     launch_session "$line" || return 1
     wait_for "$WAIT" "the ear to register again" ear_is attached registered || note "**Not registered within ${WAIT} s.**"
-    wait_for "$WAIT" "a reply to the waiting message" posts_at_least 2 || note "**No reply to the waiting message within ${WAIT} s.**"
+    wait_for "$WAIT" "the reply backlog at the stand-in" posted backlog || note "**No \`backlog\` within ${WAIT} s.**"
     sleep 10
     discord_record "what the stand-in for Discord received"
     ledger "the ledger after the session came back"
-    ear_is attached registered && posts_at_least 2
+    ear_is attached registered && posted backlog
     ;;
 
   teardown)
@@ -432,8 +460,9 @@ sh -c '"'"'umask 077; set -C; : > "$1"'"'"' sh ~/.config/frond-ear/token && $EDI
         printf '```\n'
       } | scrub >>"$T"
     done
-    local pid=${DAEMON_PID:-}
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    local pid=${DAEMON_PID:-$(daemon_pid)}
+    ours "$pid" "$ROOT/home/frond-ear/src/cli.ts daemon" || pid=""
+    if [ -n "$pid" ]; then
       kill -TERM "$pid"
       for _ in $(seq 1 20); do
         kill -0 "$pid" 2>/dev/null || break
@@ -445,7 +474,7 @@ sh -c '"'"'umask 077; set -C; : > "$1"'"'"' sh ~/.config/frond-ear/token && $EDI
       grep -E 'daemon\.draining|daemon\.stopped' "$R/daemon-2.log" 2>/dev/null
       printf '[daemon process gone: %s]\n```\n' "$([ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && echo no || echo yes)"
     } | scrub >>"$T"
-    [ -n "${FAKE_PID:-}" ] && kill "$FAKE_PID" 2>/dev/null
+    ours "${FAKE_PID:-}" "$W/fake.port" && kill "$FAKE_PID" 2>/dev/null
     sleep 1
     local left
     left=$(pgrep -af "$ROOT")
