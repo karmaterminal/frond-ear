@@ -1,8 +1,8 @@
 # frond-ear clean-install receipt
 
-- Started: 2026-10-13T17:35:41Z
-- Commit under test: `92e9c43d2d9dc05d61a68cf537a794e1ecfd4e9a`
-- Harness: `tools/clean-install/` at `92e9c43d2d9dc05d61a68cf537a794e1ecfd4e9a`
+- Started: 2026-10-13T18:13:11Z
+- Commit under test: `706a168cd646b6ebcc7ed458cd29a50aa0c9c310`
+- Harness: `tools/clean-install/` at `706a168cd646b6ebcc7ed458cd29a50aa0c9c310`
 - `$ROOT`: a fresh directory, deleted at teardown. `$ROOT/home` is HOME.
 
 ## 0. What the disposable environment holds
@@ -11,7 +11,7 @@ Every command below runs under `env -i` with only the variables listed here, as 
 
 ### environment (env -i: only these variables)
 
-17:35:41Z · cwd `$ROOT/home`
+18:13:11Z · cwd `$ROOT/home`
 
 ```console
 $ env | sort
@@ -21,13 +21,13 @@ GIT_CONFIG_NOSYSTEM=1
 GIT_TERMINAL_PROMPT=0
 HOME=$ROOT/home
 LANG=C.UTF-8
-LOGNAME=root
+LOGNAME=<login>
 PATH=/opt/node22/bin:/usr/bin:/bin
 PWD=$ROOT/home
 SHELL=/bin/bash
 SHLVL=1
 TERM=xterm-256color
-USER=root
+USER=<login>
 XDG_RUNTIME_DIR=$ROOT/run
 _=/usr/bin/env
 [exit 0]
@@ -35,7 +35,7 @@ _=/usr/bin/env
 
 ### HOME is empty: no git, gh, frond-ear or Claude Code config
 
-17:35:41Z · cwd `$ROOT/home`
+18:13:11Z · cwd `$ROOT/home`
 
 ```console
 $ ls -A ~; git config --list --show-origin 2>/dev/null || echo "(no git config)"; if command -v gh >/dev/null; then gh auth status 2>&1 | head -2; else echo "(no gh on PATH)"; fi; test -e ~/.config || echo "(no ~/.config)"; test -e ~/.claude.json || echo "(no ~/.claude.json)"
@@ -47,7 +47,7 @@ $ ls -A ~; git config --list --show-origin 2>/dev/null || echo "(no git config)"
 
 ### toolchain
 
-17:35:41Z · cwd `$ROOT/home`
+18:13:11Z · cwd `$ROOT/home`
 
 ```console
 $ node --version; git --version; claude --version
@@ -59,7 +59,7 @@ git version 2.43.0
 
 ### unauthenticated GitHub, straight from this environment (no proxy, no credentials)
 
-17:35:41Z · cwd `$ROOT/home`
+18:13:12Z · cwd `$ROOT/home`
 
 ```console
 $ for repo in frond-ear binary-canticle scribe-prince-shared frond-scribe; do printf "%-22s " "$repo"; git ls-remote "https://github.com/karmaterminal/$repo" HEAD 2>&1 | head -1; done
@@ -74,7 +74,7 @@ frond-scribe           fatal: could not read Username for 'https://github.com': 
 
 ### the README's clone line
 
-17:35:42Z · cwd `$ROOT/home`
+18:13:12Z · cwd `$ROOT/home`
 
 ```console
 $ git clone https://github.com/karmaterminal/frond-ear && cd frond-ear && git rev-parse HEAD
@@ -87,12 +87,12 @@ The repository is not public yet (#35), so the clone fails without credentials. 
 
 ### stand-in: clone the bundle of the pinned commit
 
-17:35:42Z · cwd `$ROOT/home`
+18:13:12Z · cwd `$ROOT/home`
 
 ```console
 $ git clone -q ../frond-ear.bundle frond-ear && cd frond-ear && git rev-parse HEAD && git log -1 --format="%cI %s" && node -p "require(\"./package.json\").version"
-92e9c43d2d9dc05d61a68cf537a794e1ecfd4e9a
-2026-10-13T17:35:35+00:00 tools: a clean-install receipt for a stranger's install (#70)
+706a168cd646b6ebcc7ed458cd29a50aa0c9c310
+2026-10-13T18:13:02+00:00 shim and receipt: fixes from the #71 review pass
 0.1.0
 [exit 0]
 ```
@@ -103,7 +103,7 @@ The person writes the token (docs/onboarding.md), so it never passes through the
 
 ### person: create the 0600 token file and write the token
 
-17:35:42Z · cwd `$ROOT/home`
+18:13:12Z · cwd `$ROOT/home`
 
 ```console
 $ install -d -m 700 ~/.config/frond-ear
@@ -114,7 +114,7 @@ $ sh -c 'umask 077; set -C; : > "$1"' sh ~/.config/frond-ear/token && $EDITOR ~/
 
 ### agent: init --non-interactive, with synthetic IDs
 
-17:35:42Z · cwd `$ROOT/home/frond-ear`
+18:13:12Z · cwd `$ROOT/home/frond-ear`
 
 ```console
 $ node src/cli.ts init --non-interactive --bot-user-id 100000000000000001 --principal 200000000000000002:tester --ear trial --channel 700000000000000007 --mention-pattern '\btrial\b' --token-file ~/.config/frond-ear/token
@@ -138,14 +138,14 @@ next steps:
        { "permissions": { "allow": ["mcp__frond-ear"] } }
 
 docs/onboarding.md is the full contract.
-(node:8110) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(node:20054) ExperimentalWarning: SQLite is an experimental feature and might change at any time
 (Use `node --trace-warnings ...` to show where the warning was created)
 [exit 0]
 ```
 
 ### the two files init wrote, and their modes
 
-17:35:42Z · cwd `$ROOT/home`
+18:13:13Z · cwd `$ROOT/home`
 
 ```console
 $ stat -c "%a %n" ~/.config/frond-ear ~/.config/frond-ear/*; cat ~/.config/frond-ear/frond-ear.json
@@ -187,11 +187,11 @@ $ stat -c "%a %n" ~/.config/frond-ear ~/.config/frond-ear/*; cat ~/.config/frond
 
 ### failure: doctor without the two exports
 
-17:35:42Z · cwd `$ROOT/home/frond-ear`
+18:13:13Z · cwd `$ROOT/home/frond-ear`
 
 ```console
 $ node src/cli.ts doctor
-(node:8147) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(node:20097) ExperimentalWarning: SQLite is an experimental feature and might change at any time
 (Use `node --trace-warnings ...` to show where the warning was created)
 frond-ear doctor
   ✓ node: node 22.22.0
@@ -212,13 +212,13 @@ Repair: the two `export` lines from the README, which `init` also prints in fron
 
 ### repaired: doctor with the exports (socket and daemon stay ✗ until the daemon runs)
 
-17:35:42Z · cwd `$ROOT/home/frond-ear`
+18:13:13Z · cwd `$ROOT/home/frond-ear`
 
 ```console
 $ export FROND_EAR_CONFIG="$HOME/.config/frond-ear/frond-ear.json"
 $ export DISCORD_BOT_TOKEN_FILE="$HOME/.config/frond-ear/token"
 $ node src/cli.ts doctor
-(node:8168) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(node:20121) ExperimentalWarning: SQLite is an experimental feature and might change at any time
 (Use `node --trace-warnings ...` to show where the warning was created)
 frond-ear doctor
   ✓ node: node 22.22.0
@@ -235,25 +235,25 @@ frond-ear doctor
 
 ## 4. Daemon
 
-The daemon runs as `init` printed it (its step 1), with two variables in front that point it at the loopback stand-in for Discord: `DISCORD_GATEWAY_URL=ws://127.0.0.1:45361/gateway DISCORD_API_BASE=http://127.0.0.1:45361/api/v10`. The stand-in starts with the bot's Message Content Intent off, as in a portal where nobody turned it on.
+The daemon runs as `init` printed it (its step 1), with two variables in front that point it at the loopback stand-in for Discord: `DISCORD_GATEWAY_URL=ws://127.0.0.1:43171/gateway DISCORD_API_BASE=http://127.0.0.1:43171/api/v10`. The stand-in starts with the bot's Message Content Intent off, as in a portal where nobody turned it on.
 
 ### failure: the daemon exits when Discord refuses the intent
 
 ```console
 $ FROND_EAR_CONFIG=$ROOT/home/.config/frond-ear/frond-ear.json DISCORD_BOT_TOKEN_FILE=$ROOT/home/.config/frond-ear/token /opt/node22/bin/node $ROOT/home/frond-ear/src/cli.ts daemon
-{"time":"2026-10-13T17:35:44.351Z","level":"error","event":"gateway.fatal_close","closeCode":4014}
-{"time":"2026-10-13T17:35:44.351Z","level":"error","event":"daemon.exit_gateway_fatal","closeCode":4014}
-{"time":"2026-10-13T17:35:44.355Z","level":"info","event":"daemon.stopped","code":1,"drained":true}
+{"time":"2026-10-13T18:13:14.799Z","level":"error","event":"gateway.fatal_close","closeCode":4014}
+{"time":"2026-10-13T18:13:14.799Z","level":"error","event":"daemon.exit_gateway_fatal","closeCode":4014}
+{"time":"2026-10-13T18:13:14.805Z","level":"info","event":"daemon.stopped","code":1,"drained":true}
 [exit 1]
 ```
 
 ### doctor names the daemon as down
 
-17:35:44Z · cwd `$ROOT/home/frond-ear`
+18:13:15Z · cwd `$ROOT/home/frond-ear`
 
 ```console
 $ export FROND_EAR_CONFIG="$HOME/.config/frond-ear/frond-ear.json" DISCORD_BOT_TOKEN_FILE="$HOME/.config/frond-ear/token"; node src/cli.ts doctor | grep -E -A1 "daemon|gateway|socket"
-(node:8219) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(node:20180) ExperimentalWarning: SQLite is an experimental feature and might change at any time
 (Use `node --trace-warnings ...` to show where the warning was created)
   ✓ socket dir: $ROOT/run/frond-ear is mode 0700
   ✗ socket: $ROOT/run/frond-ear/daemon.sock does not exist
@@ -268,11 +268,11 @@ Repair: the runbook's troubleshooting table reads "Daemon exits with close code 
 
 ### repaired: daemon up, gateway connected
 
-17:35:44Z · cwd `$ROOT/home/frond-ear`
+18:13:16Z · cwd `$ROOT/home/frond-ear`
 
 ```console
 $ node src/cli.ts status | node -e 'const s=JSON.parse(require("fs").readFileSync(0,"utf8")); console.log(JSON.stringify({gateway: s.gateway.state, ears: s.ears.map(e => ({name: e.name, attached: e.attached, registered: e.registered}))}, null, 1))'
-(node:8276) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(node:20243) ExperimentalWarning: SQLite is an experimental feature and might change at any time
 (Use `node --trace-warnings ...` to show where the warning was created)
 {
  "gateway": "connected",
@@ -291,13 +291,13 @@ $ node src/cli.ts status | node -e 'const s=JSON.parse(require("fs").readFileSyn
 
 ### doctor: every required check passes; no session is attached yet (advisory)
 
-17:35:44Z · cwd `$ROOT/home/frond-ear`
+18:13:17Z · cwd `$ROOT/home/frond-ear`
 
 ```console
 $ export FROND_EAR_CONFIG="$HOME/.config/frond-ear/frond-ear.json"
 $ export DISCORD_BOT_TOKEN_FILE="$HOME/.config/frond-ear/token"
 $ node src/cli.ts doctor
-(node:8304) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(node:20274) ExperimentalWarning: SQLite is an experimental feature and might change at any time
 (Use `node --trace-warnings ...` to show where the warning was created)
 frond-ear doctor
   ✓ node: node 22.22.0
@@ -320,7 +320,7 @@ In the one project directory whose session owns the ear, the `claude mcp add` li
 
 ### claude mcp add (as init printed it)
 
-17:35:45Z · cwd `$ROOT/home/trial-session`
+18:13:17Z · cwd `$ROOT/home/trial-session`
 
 ```console
 $ claude mcp add -s local frond-ear -e FROND_EAR_EAR=trial -- /opt/node22/bin/node $ROOT/home/frond-ear/src/cli.ts shim
@@ -331,7 +331,7 @@ File modified: $ROOT/home/.claude.json [project: $ROOT/home/trial-session]
 
 ### what it registered (read from ~/.claude.json; never by running claude mcp list or get)
 
-17:35:45Z · cwd `$ROOT/home/trial-session`
+18:13:17Z · cwd `$ROOT/home/trial-session`
 
 ```console
 $ node -e 'const c=JSON.parse(require("fs").readFileSync(process.env.HOME+"/.claude.json","utf8")); console.log(JSON.stringify(c.projects[process.cwd()].mcpServers, null, 1))'
@@ -355,7 +355,7 @@ Step 5 of init's output: allow the ear's tools. The `deny` list is this receipt'
 
 ### let the tools run unattended (.claude/settings.local.json)
 
-17:35:45Z · cwd `$ROOT/home/trial-session`
+18:13:17Z · cwd `$ROOT/home/trial-session`
 
 ```console
 $ mkdir -p .claude && printf "%s\n" "{ \"permissions\": { \"allow\": [\"mcp__frond-ear\"], \"deny\": [\"Bash\", \"Edit\", \"Write\", \"NotebookEdit\", \"WebFetch\", \"WebSearch\"] } }" > .claude/settings.local.json && cat .claude/settings.local.json
@@ -369,11 +369,11 @@ Before #70 the runbook's registration lines named the example config's ear, `fro
 
 ### the shim with FROND_EAR_EAR=frond-scribe
 
-17:35:45Z · cwd `$ROOT/home/trial-session`
+18:13:17Z · cwd `$ROOT/home/trial-session`
 
 ```console
 $ (printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"receipt","version":"0"}}}'; sleep 3) | FROND_EAR_EAR=frond-scribe node ~/frond-ear/src/cli.ts shim >/dev/null
-(node:8428) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(node:20372) ExperimentalWarning: SQLite is an experimental feature and might change at any time
 (Use `node --trace-warnings ...` to show where the warning was created)
 frond-ear shim: unknown ear "frond-scribe"; configured: trial
 [exit 0]
@@ -397,7 +397,7 @@ On attach the daemon pushes a `<channel kind="attach">` event that asks the sess
 
 ### status: the ear is attached and registered
 
-17:36:00Z · cwd `$ROOT/home/frond-ear`
+18:13:33Z · cwd `$ROOT/home/frond-ear`
 
 ```console
 $ node src/cli.ts status 2>/dev/null | node -e 'const s=JSON.parse(require("fs").readFileSync(0,"utf8")); const e=s.ears[0]; console.log(JSON.stringify({name: e.name, attached: e.attached, registered: e.registered, delivery: e.delivery, generation: e.generation, events: e.events, ambiguousSends: s.ambiguousSends}, null, 1))'
@@ -423,13 +423,13 @@ $ node src/cli.ts status 2>/dev/null | node -e 'const s=JSON.parse(require("fs")
 
 ### doctor: every check passes, the ear's advisories included
 
-17:36:00Z · cwd `$ROOT/home/frond-ear`
+18:13:33Z · cwd `$ROOT/home/frond-ear`
 
 ```console
 $ export FROND_EAR_CONFIG="$HOME/.config/frond-ear/frond-ear.json"
 $ export DISCORD_BOT_TOKEN_FILE="$HOME/.config/frond-ear/token"
 $ node src/cli.ts doctor
-(node:8971) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(node:20897) ExperimentalWarning: SQLite is an experimental feature and might change at any time
 (Use `node --trace-warnings ...` to show where the warning was created)
 frond-ear doctor
   ✓ node: node 22.22.0
@@ -439,7 +439,7 @@ frond-ear doctor
   ✓ socket: $ROOT/run/frond-ear/daemon.sock is mode 0600
   ✓ daemon: answered status over $ROOT/run/frond-ear/daemon.sock
   ✓ gateway: state connected
-  ✓ ear trial: attached: a shim is attached (session b46a4661-e2b5-4605-b639-24d3f26415bc)
+  ✓ ear trial: attached: a shim is attached (session c5955ebe-c288-484d-bf18-a12a5a51eae3)
   ✓ ear trial: registered: delivery confirmed: the session acked the attach canary or used a pushed batch_id in its token form (status does not say which)
   ✓ claude: /opt/node22/bin/claude on PATH. Whether the shim is registered with it is NOT probed: `claude mcp list` starts a shim, and the newest attach takes the ear
 all 10 checks passed
@@ -495,7 +495,7 @@ Inbound dispatched: `{"id":"1400000000000000000","seq":2,"sockets":1}`
 
 ### the ledger: what the ear holds for the session
 
-17:36:16Z · cwd `$ROOT/home/frond-ear`
+18:13:57Z · cwd `$ROOT/home/frond-ear`
 
 ```console
 $ node src/cli.ts status 2>/dev/null | node -e 'const s=JSON.parse(require("fs").readFileSync(0,"utf8")); const e=s.ears[0]; console.log(JSON.stringify({name: e.name, attached: e.attached, registered: e.registered, delivery: e.delivery, generation: e.generation, events: e.events, ambiguousSends: s.ambiguousSends}, null, 1))'
@@ -527,7 +527,7 @@ Session exited. Inbound dispatched while no session is attached: `{"id":"1400000
 
 ### the ledger: the message waits for the next session
 
-17:36:21Z · cwd `$ROOT/home/frond-ear`
+18:14:03Z · cwd `$ROOT/home/frond-ear`
 
 ```console
 $ node src/cli.ts status 2>/dev/null | node -e 'const s=JSON.parse(require("fs").readFileSync(0,"utf8")); const e=s.ears[0]; console.log(JSON.stringify({name: e.name, attached: e.attached, registered: e.registered, delivery: e.delivery, generation: e.generation, events: e.events, ambiguousSends: s.ambiguousSends}, null, 1))'
@@ -613,7 +613,7 @@ Startup prompts answered as a person would: development channels: 1 (local devel
 
 ### the ledger after the session came back
 
-17:36:39Z · cwd `$ROOT/home/frond-ear`
+18:14:20Z · cwd `$ROOT/home/frond-ear`
 
 ```console
 $ node src/cli.ts status 2>/dev/null | node -e 'const s=JSON.parse(require("fs").readFileSync(0,"utf8")); const e=s.ears[0]; console.log(JSON.stringify({name: e.name, attached: e.attached, registered: e.registered, delivery: e.delivery, generation: e.generation, events: e.events, ambiguousSends: s.ambiguousSends}, null, 1))'
@@ -643,7 +643,7 @@ The Claude Code session exited (`/exit`).
 
 ### the ear after the session left
 
-17:36:41Z · cwd `$ROOT/home/frond-ear`
+18:14:22Z · cwd `$ROOT/home/frond-ear`
 
 ```console
 $ node src/cli.ts status 2>/dev/null | node -e 'const e=JSON.parse(require("fs").readFileSync(0,"utf8")).ears[0]; console.log(JSON.stringify({name: e.name, attached: e.attached, delivery: e.delivery}))'
@@ -653,7 +653,7 @@ $ node src/cli.ts status 2>/dev/null | node -e 'const e=JSON.parse(require("fs")
 
 ### remove the MCP registration
 
-17:36:41Z · cwd `$ROOT/home/trial-session`
+18:14:23Z · cwd `$ROOT/home/trial-session`
 
 ```console
 $ claude mcp remove -s local frond-ear
@@ -667,30 +667,30 @@ File modified: $ROOT/home/.claude.json [project: $ROOT/home/trial-session]
 From `~/.cache/claude-cli-nodejs/*/mcp-logs-frond-ear/`. A channel notification that arrives before the `Channel notifications registered` line finds no handler and is dropped without a line of its own.
 
 ```console
-2026-10-13T17:35:54.015Z Successfully connected (transport: stdio) in 367ms
-2026-10-13T17:35:54.029Z Channel notifications registered
-2026-10-13T17:35:56.026Z notifications/claude/channel: frond-ear ear "trial" attached to this session (attach 1). T…
-2026-10-13T17:35:59.944Z Calling MCP tool: ack
-2026-10-13T17:36:02.576Z notifications/claude/channel: [17:36:01Z] tester / tester (id 200000000000000002, principa…
-2026-10-13T17:36:05.503Z Calling MCP tool: reply
-2026-10-13T17:36:17.720Z Sending SIGINT to MCP server process
+2026-10-13T18:13:25.980Z Successfully connected (transport: stdio) in 326ms
+2026-10-13T18:13:25.993Z Channel notifications registered
+2026-10-13T18:13:27.991Z notifications/claude/channel: frond-ear ear "trial" attached to this session (attach 1). T…
+2026-10-13T18:13:32.488Z Calling MCP tool: ack
+2026-10-13T18:13:35.579Z notifications/claude/channel: [18:13:34Z] tester / tester (id 200000000000000002, principa…
+2026-10-13T18:13:46.633Z Calling MCP tool: reply
+2026-10-13T18:13:58.956Z Sending SIGINT to MCP server process
 ```
 
 ```console
-2026-10-13T17:36:24.115Z Successfully connected (transport: stdio) in 271ms
-2026-10-13T17:36:24.158Z Channel notifications registered
-2026-10-13T17:36:26.129Z notifications/claude/channel: frond-ear ear "trial" attached to this session (attach 2). T…
-2026-10-13T17:36:26.135Z notifications/claude/channel: [17:36:18Z] tester / tester (id 200000000000000002, principa…
-2026-10-13T17:36:27.844Z Calling MCP tool: ack
-2026-10-13T17:36:28.473Z Calling MCP tool: reply
-2026-10-13T17:36:40.817Z Sending SIGINT to MCP server process
+2026-10-13T18:14:05.471Z Successfully connected (transport: stdio) in 322ms
+2026-10-13T18:14:05.485Z Channel notifications registered
+2026-10-13T18:14:07.482Z notifications/claude/channel: frond-ear ear "trial" attached to this session (attach 2). T…
+2026-10-13T18:14:07.488Z notifications/claude/channel: [18:14:00Z] tester / tester (id 200000000000000002, principa…
+2026-10-13T18:14:08.915Z Calling MCP tool: ack
+2026-10-13T18:14:09.629Z Calling MCP tool: reply
+2026-10-13T18:14:21.976Z Sending SIGINT to MCP server process
 ```
 
 ### stop the daemon (SIGTERM)
 
 ```console
-{"time":"2026-10-13T17:36:42.436Z","level":"info","event":"daemon.draining","inFlight":0}
-{"time":"2026-10-13T17:36:42.441Z","level":"info","event":"daemon.stopped","code":0,"drained":true}
+{"time":"2026-10-13T18:14:23.663Z","level":"info","event":"daemon.draining","inFlight":0}
+{"time":"2026-10-13T18:14:23.668Z","level":"info","event":"daemon.stopped","code":0,"drained":true}
 [daemon process gone: yes]
 ```
 
@@ -706,4 +706,4 @@ before: ~/.config/frond-ear: absent; FROND_EAR_EAR in ~/.claude.json: 0
 after:  ~/.config/frond-ear: absent; FROND_EAR_EAR in ~/.claude.json: 0
 ```
 
-- Finished: 2026-10-13T17:36:44Z
+- Finished: 2026-10-13T18:14:25Z

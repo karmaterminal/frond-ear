@@ -10,12 +10,15 @@ harness wrote it (Prettier leaves these files alone).
 
 ## Runs
 
-Both runs used the harness at `92e9c43`, Node 22.22.0 and Claude Code 2.1.296.
+Both runs used Node 22.22.0 and Claude Code 2.1.296.
 
-| Commit under test                                                                                    | Product code              | Result                                                                                                      |
-| ---------------------------------------------------------------------------------------------------- | ------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| [`42f7f67e3ed6813fdf552a5bf10bf17acc8370b7`](42f7f67e3ed6813fdf552a5bf10bf17acc8370b7/transcript.md) | `main` before the #70 fix | Install, doctor, daemon and one reply pass. The attach canary is lost, and so is a message held while away. |
-| [`92e9c43d2d9dc05d61a68cf537a794e1ecfd4e9a`](92e9c43d2d9dc05d61a68cf537a794e1ecfd4e9a/transcript.md) | the #70 fix               | Every step passes.                                                                                          |
+| Commit under test                                                                                    | Product code              | Harness                                  | Result                                                                                                      |
+| ---------------------------------------------------------------------------------------------------- | ------------------------- | ---------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| [`42f7f67e3ed6813fdf552a5bf10bf17acc8370b7`](42f7f67e3ed6813fdf552a5bf10bf17acc8370b7/transcript.md) | `main` before the #70 fix | `92e9c43`, one step at a time, `WAIT=90` | Install, doctor, daemon and one reply pass. The attach canary is lost, and so is a message held while away. |
+| [`706a168cd646b6ebcc7ed458cd29a50aa0c9c310`](706a168cd646b6ebcc7ed458cd29a50aa0c9c310/transcript.md) | the #70 fix               | `706a168`, `receipt.sh all`              | Every step passes.                                                                                          |
+
+The run before the fix went step by step (`receipt.sh STEP` for each step in order), so it carried
+on past its failed `canary` and `away` steps, where `all` would have stopped and torn down.
 
 ## What they show
 
@@ -30,7 +33,7 @@ Both runs used the harness at `92e9c43`, Node 22.22.0 and Claude Code 2.1.296.
   shows no attach canary, so the ear stays unregistered. The session registered only when it used a
   pushed `batch_id` to answer the first message. The message that waited while the session was away
   then went to `offered`, never reached the model, and was never answered.
-- **At `92e9c43`, the shim holds events for 2 s after `notifications/initialized`.** Each notification
+- **At `706a168`, the shim holds events for 2 s after `notifications/initialized`.** Each notification
   arrives about 2 s after Claude Code's `Channel notifications registered` line. The session acks the
   canary, `doctor` passes all 10 checks, and the waiting message is answered once the session is back.
 - **Teardown leaves nothing running.** The disposable root is deleted, and the caller's own frond-ear
