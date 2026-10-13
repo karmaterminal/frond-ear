@@ -841,6 +841,9 @@ test("doctor resolves config and token exactly as the daemon does, and names a h
       (token.hint ?? "").includes(`DISCORD_BOT_TOKEN_FILE=${homeToken}`),
       token.hint,
     );
+    // The daemon's fix starts it on the config that exists, not the missing default (#70).
+    const startHint = byName(stranded, "daemon").hint ?? "";
+    assert.ok(startHint.includes(`FROND_EAR_CONFIG=${homeConfig} `), startHint);
 
     // The env the daemon would get: both pass, and the config names where it came from.
     const named = {

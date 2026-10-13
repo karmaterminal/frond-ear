@@ -660,24 +660,37 @@ export function resolveConfigPath(
   };
 }
 
+/** init's ~/.config file, when the daemon's default path has no config and that file exists. */
+function strandedConfig(
+  source: ConfigSource,
+  env: NodeJS.ProcessEnv,
+): string | undefined {
+  const home = resolve(defaultConfigPath(env));
+  return source.daemonDefault &&
+    home !== source.path &&
+    !existsSync(source.path) &&
+    existsSync(home)
+    ? home
+    : undefined;
+}
+
 function configCheck(
   source: ConfigSource,
   env: NodeJS.ProcessEnv,
 ): { check: Check; ears: string[] } {
   const { path, from } = source;
   if (!existsSync(path)) {
-    const home = resolve(defaultConfigPath(env));
-    const stranded = source.daemonDefault && home !== path && existsSync(home);
+    const stranded = strandedConfig(source, env);
     return {
       check: {
         name: "config",
         ok: false,
         required: true,
         detail: stranded
-          ? `no config at ${path} (${from}). ${home} exists, but a daemon started here without FROND_EAR_CONFIG will not load it: the daemon has no fallback to that path`
+          ? `no config at ${path} (${from}). ${stranded} exists, but a daemon started here without FROND_EAR_CONFIG will not load it: the daemon has no fallback to that path`
           : `no config at ${path} (${from})`,
         hint: stranded
-          ? `export FROND_EAR_CONFIG=${shellWord(home)} for the daemon and for doctor (init prints it in front of every command), or pass --config to check that file`
+          ? `export FROND_EAR_CONFIG=${shellWord(stranded)} for the daemon and for doctor (init prints it in front of every command), or pass --config to check that file`
           : "run `frond-ear init`, or point FROND_EAR_CONFIG / --config at the file",
       },
       ears: [],
@@ -932,7 +945,6 @@ export async function doctorChecks(
 ): Promise<Check[]> {
   const checks: Check[] = [nodeCheck()];
   const source = resolveConfigPath(values.config, env, cwd);
-  const configPath = source.path;
   const { check: config, ears: configuredEars } = configCheck(source, env);
   checks.push(config);
   const token = tokenCheck(values["token-file"], env);
@@ -940,7 +952,9 @@ export async function doctorChecks(
   const tokenPath = resolve(
     values["token-file"] ?? env.DISCORD_BOT_TOKEN_FILE ?? defaultTokenPath(env),
   );
-  const startHint = `start the daemon: FROND_EAR_CONFIG=${shellWord(configPath)} DISCORD_BOT_TOKEN_FILE=${shellWord(tokenPath)} ${shellWord(process.execPath)} ${shellWord(CLI)} daemon  (or ops/install-systemd.sh)`;
+  // The config that exists: init's ~/.config file when the daemon's default path has none.
+  const startConfig = strandedConfig(source, env) ?? source.path;
+  const startHint = `start the daemon: FROND_EAR_CONFIG=${shellWord(startConfig)} DISCORD_BOT_TOKEN_FILE=${shellWord(tokenPath)} ${shellWord(process.execPath)} ${shellWord(CLI)} daemon  (or ops/install-systemd.sh)`;
   checks.push(...socketChecks(env, startHint));
 
   let status: Status | undefined;
