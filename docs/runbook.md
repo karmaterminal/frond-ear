@@ -103,11 +103,12 @@ Start the daemon in dry-run mode. It makes no Discord connection, prints the out
 node src/cli.ts daemon --dry-run
 ```
 
-Register the shim for a throwaway directory only, with `local` scope, so no other session claims the ear:
+Register the shim for a throwaway directory only, with `local` scope, so no other session claims the ear.
+`<ear>` is the ear's name in the config, the one you gave `init` (which prints this line filled in):
 
 ```sh
 mkdir -p /tmp/ear-trial && cd /tmp/ear-trial
-claude mcp add -s local frond-ear -e FROND_EAR_EAR=frond-scribe -- node /abs/path/to/frond-ear/src/cli.ts shim
+claude mcp add -s local frond-ear -e FROND_EAR_EAR=<ear> -- node /abs/path/to/frond-ear/src/cli.ts shim
 claude --dangerously-load-development-channels server:frond-ear
 ```
 
@@ -123,8 +124,6 @@ Claude Code asks you to confirm the development-channel flag. Then:
    The idle session should wake, and its `reply` should appear on the daemon's stderr as `dry-run send → …`.
 3. **Busy, no interrupt.** Give Claude a long task, inject again, and confirm the event is picked up at the next turn without interrupting the current one.
 4. **Debounce.** Inject several messages into a `room` channel in quick succession. They should arrive as **one** notification.
-
-Record the results in the live checklist on karmaterminal/frond-ear#6.
 
 ## 3. Let the tools run unattended
 
@@ -152,13 +151,13 @@ Check that `node src/cli.ts status` shows `"gateway": {"state": "connected"}`. T
 - post a reply to one of the bot's messages;
 - post a message from an OpenClaw peer bot.
 
-## 5. Attach frond-scribe
+## 5. Attach the long-running session
 
-Only one Claude session should claim an ear. In frond-scribe's working directory, run:
+Only one Claude session should claim an ear. In that session's working directory, run:
 
 ```sh
-claude mcp add -s local frond-ear -e FROND_EAR_EAR=frond-scribe -- node /abs/path/to/frond-ear/src/cli.ts shim
-claude --resume <frond-scribe session id> --dangerously-load-development-channels server:frond-ear
+claude mcp add -s local frond-ear -e FROND_EAR_EAR=<ear> -- node /abs/path/to/frond-ear/src/cli.ts shim
+claude --resume <session id> --dangerously-load-development-channels server:frond-ear
 ```
 
 - **Why `--resume`:** it keeps the session's full history. The development-channel flag only has to be present when the process launches.
@@ -176,8 +175,8 @@ claude --resume <frond-scribe session id> --dangerously-load-development-channel
 | Post from a script      | `node src/cli.ts send --chat <id> "<text>"`, below                                  |
 
 **Posting from a script.** `frond-ear send --chat <id> <text…>` posts the text as the daemon's
-bot, for scripts such as seat-pulse's outage alerts (`frond-fleet:scribe-seat-survival` in
-scribe-prince-shared). It finds the daemon the way `status` does: `FROND_EAR_SOCKET` (default
+bot, for scripts such as a watchdog that posts an outage alert when a host goes down. It finds
+the daemon the way `status` does: `FROND_EAR_SOCKET` (default
 `$XDG_RUNTIME_DIR/frond-ear/daemon.sock`), or `FROND_EAR_TCP` with `FROND_EAR_TOKEN_FILE`, never
 `FROND_EAR_CONFIG`. It goes through the daemon's `reply` tool, so the daemon keeps the token, sends
 only to chats an ear serves, and splits text longer than 2000 characters into several messages. A
@@ -189,7 +188,7 @@ unconfirmed send or a timeout the message may still post. Retrying the identical
 minutes of the first try at the unconfirmed message cannot post anything twice: the daemon skips
 the parts Discord confirmed and reuses the unconfirmed message's nonce. An unconfirmed send's error
 says how much of the 5 minutes is left, and retrying again does not restart them. A later retry,
-such as seat-pulse's next pulse 10 minutes on, posts every part again. Text that starts with `-`
+such as the watchdog's next pulse 10 minutes on, posts every part again. Text that starts with `-`
 goes after `--`.
 
 An unconfirmed send stays in `status` under `ambiguousSends` until the prune drops it, once it is
@@ -382,12 +381,14 @@ the RFC hasn't been amended to match yet (binary-canticle#100 tracks the amendme
 
 Start with `node src/cli.ts doctor`, with `FROND_EAR_CONFIG` and `DISCORD_BOT_TOKEN_FILE` set to what the daemon uses (§1): it checks config, token, socket, daemon, gateway and each ear, and prints a fix line for every ✗.
 
-| Symptom                                       | Likely cause                                                                                                                                                                                                      |
-| --------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `registered: false`, no events in the session | Claude Code was started without `--dangerously-load-development-channels server:frond-ear`; or org policy blocks channels; or `MCP_PROTOCOL_NEGOTIATION=auto` on the v2 runtime (unset it or set it to `legacy`). |
-| `registered: false` on a Copilot ear          | The extension is not installed for that ear, or Copilot was started without `--experimental`. If the ear is attached, look in the Copilot session for `frond-ear: could not deliver batch` (a refused push).      |
-| Copilot tools are stale after an upgrade      | The install copies the tool schemas: an old one lacks newer tools, or (before #30) takes a numeric `batch_id`. Re-run `node src/cli.ts copilot-extension --ear <name>` with the daemon's socket or TCP env (§1).  |
-| Shim reports "daemon is not reachable"        | The daemon isn't running, or the shim's `FROND_EAR_SOCKET` doesn't match the daemon's.                                                                                                                            |
-| Daemon exits with close code 4014             | Message Content Intent is not enabled for the bot.                                                                                                                                                                |
-| Daemon exits with close code 4004             | The bot token is wrong.                                                                                                                                                                                           |
-| Every session claims the ear                  | `FROND_EAR_EAR` was set in a user-scope MCP config. Use `local` or project scope for the one session that owns the ear.                                                                                           |
+| Symptom                                       | Likely cause                                                                                                                                                                                                                                                    |
+| --------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `registered: false`, no events in the session | Claude Code was started without `--dangerously-load-development-channels server:frond-ear`; or org policy blocks channels; or `MCP_PROTOCOL_NEGOTIATION=auto` on the v2 runtime (unset it or set it to `legacy`).                                               |
+| `registered: false`, later events do arrive   | The attach canary was lost: a shim from before the #70 fix sent it, and any backlog, before Claude Code was listening (2.1.296 starts just after `initialize`). Update frond-ear. Until then, the session registers the first time it uses a pushed `batch_id`. |
+| `attached: false` while the session runs      | `FROND_EAR_EAR` names an ear the config does not have; the shim logs `unknown ear` to Claude Code's MCP log. Register it with the ear's name from the config (§2).                                                                                              |
+| `registered: false` on a Copilot ear          | The extension is not installed for that ear, or Copilot was started without `--experimental`. If the ear is attached, look in the Copilot session for `frond-ear: could not deliver batch` (a refused push).                                                    |
+| Copilot tools are stale after an upgrade      | The install copies the tool schemas: an old one lacks newer tools, or (before #30) takes a numeric `batch_id`. Re-run `node src/cli.ts copilot-extension --ear <name>` with the daemon's socket or TCP env (§1).                                                |
+| Shim reports "daemon is not reachable"        | The daemon isn't running, or the shim's `FROND_EAR_SOCKET` doesn't match the daemon's.                                                                                                                                                                          |
+| Daemon exits with close code 4014             | Message Content Intent is not enabled for the bot.                                                                                                                                                                                                              |
+| Daemon exits with close code 4004             | The bot token is wrong.                                                                                                                                                                                                                                         |
+| Every session claims the ear                  | `FROND_EAR_EAR` was set in a user-scope MCP config. Use `local` or project scope for the one session that owns the ear.                                                                                                                                         |
