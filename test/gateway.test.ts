@@ -108,6 +108,27 @@ test("disconnect/restart persists sequence and resumes the durable session", () 
   }
 });
 
+test("stop leaves the session resumable: it never closes with 1000 or 1001", () => {
+  // Discord invalidates a session whose connection the client closes with 1000 or
+  // 1001; any other close code leaves it resumable for a few minutes. A daemon that
+  // stops (systemctl restart, a reboot) must be able to resume and get the replay.
+  const store = new EventStore(":memory:", new FakeClock());
+  const { gateway, sockets } = gatewayWith(store);
+  gateway.start();
+  gateway.handlePayload({
+    op: 0,
+    t: "READY",
+    s: 1,
+    d: { session_id: "session-1", resume_gateway_url: "wss://resume.example" },
+  });
+  gateway.stop();
+  const code = sockets[0]?.closeCode;
+  assert.equal(sockets[0]?.closed, true);
+  assert.ok(code !== undefined && code !== 1_000 && code !== 1_001, `${code}`);
+  assert.equal(store.gatewayState().sessionId, "session-1");
+  store.close();
+});
+
 test("identify requests GUILDS, guild messages, DMs and message content", () => {
   const store = new EventStore(":memory:", new FakeClock());
   const { gateway, sockets } = gatewayWith(store);

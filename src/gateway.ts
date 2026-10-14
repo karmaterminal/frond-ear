@@ -116,7 +116,9 @@ export class DiscordGateway {
     this.generation += 1;
     this.statusValue.state = "stopped";
     this.clearTimers();
-    this.socket?.close(1_000);
+    // Not 1000 or 1001: Discord invalidates a session closed with either, so a restarted
+    // daemon could not resume it and would never get what was sent while it was down (#70).
+    this.socket?.close(4_000);
     this.socket = undefined;
   }
 
