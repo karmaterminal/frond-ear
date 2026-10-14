@@ -8,11 +8,18 @@
 //   node tools/clean-install/fake-discord.ts --port-file F --log F --bot ID --token-file F
 //     [--guild ID] [--message-content-intent on|off]
 //
+// Sessions behave as Discord's do. A client that closes its connection with 1000 or 1001 ends its
+// session; any other end (another code, or a dropped connection) leaves it resumable. A RESUME
+// (op 6) of a live session gets every dispatch after the client's sequence, then RESUMED; a
+// RESUME of an ended or expired session gets op 9 with d: false; a wrong token is closed 4004.
+//
 // Control endpoints (plain HTTP, loopback only):
-//   GET  /control/state     everything it saw: identifies, closes, dispatches, posts, reactions
-//   POST /control/intent    {"enabled": bool}: the portal's Message Content Intent switch
-//   POST /control/inbound   {"channel", "author", "username", "content", "mention"}: one
-//                           MESSAGE_CREATE to every connected Gateway client
+//   GET  /control/state            everything it saw: identifies, resumes, closes, dispatches,
+//                                  posts, reactions
+//   POST /control/intent           {"enabled": bool}: the portal's Message Content Intent switch
+//   POST /control/inbound          {"channel", "author", "username", "content", "mention"}: one
+//                                  MESSAGE_CREATE to every connected Gateway client
+//   POST /control/expire-sessions  forgets every session issued so far, so none can be resumed
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import {
   createServer,
@@ -72,7 +79,16 @@ const state = {
     tokenMatches: boolean;
     asksMessageContent: boolean;
   }>,
-  resumes: [] as Array<{ from: number; tokenMatches: boolean }>,
+  /** Sessions a RESUME may name: issued by READY, and neither ended nor expired. */
+  sessions: [] as string[],
+  /** Sessions ended by the client's own 1000 or 1001 close. */
+  ended: [] as Array<{ session: string; code: number }>,
+  resumes: [] as Array<{
+    session: string;
+    from: number;
+    tokenMatches: boolean;
+    accepted: boolean;
+  }>,
   closes: [] as number[],
   dispatches: [] as Dispatch[],
   posts: [] as Post[],
@@ -80,6 +96,8 @@ const state = {
   restCalls: [] as Array<{ method: string; path: string; authOk: boolean }>,
 };
 const sockets = new Set<WebSocket>();
+/** The session each connection holds, by READY or by an accepted RESUME. */
+const sessionOf = new Map<WebSocket, string>();
 let nextId = 1_400_000_000_000_000_000n;
 let port = 0;
 
@@ -101,7 +119,12 @@ function dispatch(t: string, d: Record<string, unknown>): Dispatch {
 function onGatewayMessage(socket: WebSocket, raw: string): void {
   const payload = JSON.parse(raw) as {
     op: number;
-    d?: { token?: unknown; intents?: unknown; seq?: unknown };
+    d?: {
+      token?: unknown;
+      intents?: unknown;
+      session_id?: unknown;
+      seq?: unknown;
+    };
   };
   if (payload.op === 1) {
     socket.send(JSON.stringify({ op: 11 }));
@@ -125,13 +148,16 @@ function onGatewayMessage(socket: WebSocket, raw: string): void {
       socket.close(4014, "Disallowed intent(s).");
       return;
     }
+    const session = `receipt-session-${state.connections}`;
+    state.sessions.push(session);
+    sessionOf.set(socket, session);
     socket.send(
       JSON.stringify(
         dispatch("READY", {
           v: 10,
           user: { id: BOT, username: "receipt-bot", bot: true },
           guilds: [{ id: GUILD, unavailable: true }],
-          session_id: `receipt-session-${state.connections}`,
+          session_id: session,
           resume_gateway_url: `ws://127.0.0.1:${port}/gateway`,
         }),
       ),
@@ -139,10 +165,23 @@ function onGatewayMessage(socket: WebSocket, raw: string): void {
     return;
   }
   if (payload.op === 6) {
+    const session = String(payload.d?.session_id ?? "");
     const from = Number(payload.d?.seq ?? 0);
     const tokenMatches = payload.d?.token === TOKEN;
-    state.resumes.push({ from, tokenMatches });
-    log("gateway.resume", { from, tokenMatches });
+    const accepted = tokenMatches && state.sessions.includes(session);
+    state.resumes.push({ session, from, tokenMatches, accepted });
+    log("gateway.resume", { session, from, tokenMatches, accepted });
+    if (!tokenMatches) {
+      state.closes.push(4004);
+      log("gateway.close", { code: 4004, reason: "Authentication failed." });
+      socket.close(4004, "Authentication failed.");
+      return;
+    }
+    if (!accepted) {
+      socket.send(JSON.stringify({ op: 9, d: false }));
+      return;
+    }
+    sessionOf.set(socket, session);
     for (const item of state.dispatches.filter((entry) => entry.s > from)) {
       socket.send(JSON.stringify(item));
     }
@@ -158,6 +197,13 @@ wss.on("connection", (socket: WebSocket, request: IncomingMessage) => {
   socket.on("close", (code: number) => {
     sockets.delete(socket);
     log("gateway.closed", { code });
+    const session = sessionOf.get(socket);
+    sessionOf.delete(socket);
+    if (session && (code === 1000 || code === 1001)) {
+      state.sessions = state.sessions.filter((entry) => entry !== session);
+      state.ended.push({ session, code });
+      log("gateway.session_ended", { session, code });
+    }
   });
   socket.send(JSON.stringify({ op: 10, d: { heartbeat_interval: 41_250 } }));
   socket.on("message", (raw: Buffer) => onGatewayMessage(socket, String(raw)));
@@ -279,6 +325,13 @@ function control(
     state.messageContentIntent = body.enabled === true;
     log("control.intent", { messageContentIntent: state.messageContentIntent });
     send(response, 200, { messageContentIntent: state.messageContentIntent });
+    return;
+  }
+  if (path === "/control/expire-sessions" && request.method === "POST") {
+    const expired = state.sessions.length;
+    state.sessions = [];
+    log("control.expire_sessions", { expired });
+    send(response, 200, { expired });
     return;
   }
   if (path === "/control/inbound" && request.method === "POST") {

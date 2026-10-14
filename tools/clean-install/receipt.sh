@@ -7,7 +7,8 @@
 #                                              down even on failure
 #   tools/clean-install/receipt.sh STEP        one step: setup isolation fetch init doctor-pre
 #                                              discord daemon-fail daemon doctor-post register
-#                                              wrong-ear launch canary event away teardown
+#                                              wrong-ear launch canary event away reboot
+#                                              cold cold-expired teardown
 #   tools/clean-install/receipt.sh screen      print the session's pane (emails redacted)
 #
 # Environment: PIN, the commit under test (default: HEAD of this checkout); FE_RECEIPT, the
@@ -101,6 +102,23 @@ posted() { # posted WORD: the bot answered in the channel with WORD and nothing 
   fake /control/state | node -e 'const [word, channel] = process.argv.slice(1); const { posts } = JSON.parse(require("fs").readFileSync(0, "utf8")); process.exit(posts.some((p) => p.channel_id === channel && p.content.trim().toLowerCase().replace(/[.!]+$/u, "") === word) ? 0 : 1);' "$1" "$CHANNEL"
 }
 
+answered_once() { # answered_once WORD...: the bot answered with each WORD exactly once
+  fake /control/state | node -e 'const [channel, ...words] = process.argv.slice(1); const { posts } = JSON.parse(require("fs").readFileSync(0, "utf8")); const said = posts.filter((p) => p.channel_id === channel).map((p) => p.content.trim().toLowerCase().replace(/[.!]+$/u, "")); process.exit(words.every((word) => said.filter((x) => x === word).length === 1) ? 0 : 1);' "$CHANNEL" "$@"
+}
+none_twice() { # none_twice: no answer was posted twice in the channel
+  fake /control/state | node -e 'const channel = process.argv[1]; const said = JSON.parse(require("fs").readFileSync(0, "utf8")).posts.filter((p) => p.channel_id === channel).map((p) => p.content.trim().toLowerCase().replace(/[.!]+$/u, "")); process.exit(new Set(said).size === said.length ? 0 : 1);' "$CHANNEL"
+}
+resumed() { # resumed SESSION: the stand-in accepted the daemon's latest RESUME, and it named SESSION
+  fake /control/state | node -e 'const r = JSON.parse(require("fs").readFileSync(0, "utf8")).resumes.at(-1); process.exit(r && r.accepted && r.session === process.argv[1] ? 0 : 1);' "$1"
+}
+held() { # held N: the ear holds N events for its next session
+  ear | node -e 'process.exit(JSON.parse(require("fs").readFileSync(0, "utf8")).events.queued === Number(process.argv[1]) ? 0 : 1);' "$1"
+}
+at_least() { # at_least KEY N: the stand-in for Discord has seen at least N of KEY (identifies, resumes)
+  fake /control/state | node -e 'const [key, n] = process.argv.slice(1); process.exit(JSON.parse(require("fs").readFileSync(0, "utf8"))[key].length >= Number(n) ? 0 : 1);' "$1" "$2"
+}
+count_of() { fake /control/state | node -e 'console.log(JSON.parse(require("fs").readFileSync(0, "utf8"))[process.argv[1]].length)' "$1"; }
+
 tm() { TMUX_TMPDIR="$ROOT/run" tmux -L "$TMUX_SERVER" "$@"; }
 pane() { tm capture-pane -p -t trial 2>/dev/null; }
 press() { # press KEY: one key, then up to 5 s for the pane to change
@@ -188,6 +206,13 @@ start_daemon() { # start_daemon LOGFILE: the daemon line init printed, pointed a
 }
 
 daemon_pid() { pgrep -n -f "$ROOT/home/frond-ear/src/cli.ts daemon$"; }
+restart_daemon() { # restart_daemon LOGFILE: the host is back, and the daemon starts as before
+  start_daemon "$1" || return 1
+  save DAEMON_LOG "$1"
+  wait_for 10 "the daemon process" daemon_pid || return 1
+  save DAEMON_PID "$(daemon_pid)"
+  wait_for 30 "the gateway to connect" gateway_connected
+}
 daemon_exited() { ! kill -0 "$DAEMON_SUBSHELL" 2>/dev/null; }
 # ours PID TEXT: PID is still a process this receipt started (its command line holds TEXT), so a
 # PID left in the state file by an interrupted run never stops someone else's process.
@@ -195,7 +220,68 @@ ours() { [ -n "$1" ] && ps -o args= -p "$1" 2>/dev/null | grep -qF -- "$2"; }
 
 ledger() { # ledger TITLE: the ear's status, as the session's owner would read it
   record "$1" "$ROOT/home/frond-ear" \
-    'node src/cli.ts status 2>/dev/null | node -e '"'"'const s=JSON.parse(require("fs").readFileSync(0,"utf8")); const e=s.ears[0]; console.log(JSON.stringify({name: e.name, attached: e.attached, registered: e.registered, delivery: e.delivery, generation: e.generation, events: e.events, ambiguousSends: s.ambiguousSends}, null, 1))'"'"''
+    'node src/cli.ts status 2>/dev/null | node -e '"'"'const s=JSON.parse(require("fs").readFileSync(0,"utf8")); const e=s.ears[0]; console.log(JSON.stringify({name: e.name, attached: e.attached, registered: e.registered, delivery: e.delivery, generation: e.generation, sessionId: e.sessionId, events: e.events, ambiguousSends: s.ambiguousSends}, null, 1))'"'"''
+}
+
+gateway_session() { # the daemon's Gateway session id, as `status` reports it
+  (cd "$ROOT/home/frond-ear" && clean node src/cli.ts status 2>/dev/null) |
+    node -e 'console.log(JSON.parse(require("fs").readFileSync(0, "utf8")).gateway.sessionId)'
+}
+gateway_record() { # gateway_record TITLE: the daemon's Gateway session, as `status` reports it
+  record "$1" "$ROOT/home/frond-ear" \
+    'node src/cli.ts status 2>/dev/null | node -e '"'"'const g=JSON.parse(require("fs").readFileSync(0,"utf8")).gateway; console.log(JSON.stringify({state: g.state, sessionId: g.sessionId, lastSequence: g.lastSequence, lastError: g.lastError}))'"'"''
+}
+
+# descendants PID: every process under PID, deepest first.
+descendants() {
+  ps -e -o pid=,ppid= | awk -v root="$1" '{ parent[$1] = $2 } END { for (p in parent) { d = 0; for (q = p; (q in parent) && q != root && q > 1; q = parent[q]) d++; if (q == root && p != root) print d, p } }' | sort -rn | cut -d' ' -f2
+}
+
+# host_down TERM|KILL: the host goes down, and every process of the ear and the session with it.
+# TERM is an orderly shutdown: SIGTERM, as systemd sends at shutdown, then SIGKILL to whatever is
+# left after 20 s, as systemd does once its stop timeout passes. KILL is a power cut: SIGKILL, so no
+# process runs another instruction. Then $XDG_RUNTIME_DIR, a tmpfs that a reboot empties, is
+# emptied (its contents only). HOME is the disk. The stand-in for Discord stays up.
+host_down() {
+  local signal=$1 server daemon pids list alive title escalate="" ticks=2
+  server=$(tm display-message -p -t trial '#{pid}' 2>/dev/null)
+  daemon=$(daemon_pid)
+  [ -n "$server" ] && [ -n "$daemon" ] || {
+    echo "host_down: no session or no daemon is running" >&2
+    return 1
+  }
+  pids=$(echo $(descendants "$server") "$server" "$daemon")
+  list=${pids// /,}
+  alive="ps -o pid=,stat= -p $list | awk '\$2 !~ /^Z/'"
+  title="power cut: SIGKILL to every one of them at once"
+  if [ "$signal" = TERM ]; then
+    ticks=40
+    title="shutdown: SIGTERM to every one of them, as systemd sends at shutdown, and 20 s to exit"
+    escalate="[ -z \"\$($alive)\" ] || { echo 'still running after 20 s: SIGKILL, as systemd sends when its stop timeout passes'; kill -KILL $pids 2>/dev/null; sleep 1; }
+"
+  fi
+  record "the host's processes: the session's tmux server and everything under it, and the ear's daemon" "$ROOT/home" \
+    "ps -o pid=,args= -p $list"
+  record "$title, then \$XDG_RUNTIME_DIR emptied as a reboot empties it" "$ROOT/home" \
+    "kill -$signal $pids
+for _ in \$(seq $ticks); do sleep 0.5; [ -z \"\$($alive)\" ] && break; done
+$escalate[ -z \"\$($alive)\" ] || { echo still running; $alive; exit 1; }
+echo '(none of them is left)'
+find \"\${XDG_RUNTIME_DIR:?}\" -mindepth 1 -delete && ls -A \"\$XDG_RUNTIME_DIR\" && echo '(\$XDG_RUNTIME_DIR is empty)'"
+}
+
+# resume_session DOCTOR_OUT: the person resumes the session exactly as `doctor` prints it.
+resume_session() {
+  RAW_OUT="$1" doctor "doctor after the restart: the ear is detached, and its fix resumes the session it recorded"
+  local line
+  line=$(grep -m1 -oE 'claude --resume [^ ;]+ --dangerously-load-development-channels server:frond-ear' "$1")
+  [ -n "$line" ] || {
+    note '**`doctor` printed no `claude --resume` line: the ear recorded no session id.**'
+    return 1
+  }
+  note 'The person resumes that session exactly as `doctor` printed it; the registration from §6 is unchanged:'
+  printf '\n```console\n$ cd ~/trial-session && %s\n```\n' "$line" >>"$T"
+  launch_session "$line"
 }
 
 doctor() { # doctor TITLE
@@ -213,7 +299,7 @@ inbound() { # inbound TEXT: the principal mentions the bot in the channel
 discord_record() { # discord_record TITLE: what the stand-in for Discord received
   {
     printf '\n### %s\n\n```json\n' "$1"
-    fake /control/state | node -e 'const s=JSON.parse(require("fs").readFileSync(0,"utf8")); console.log(JSON.stringify({identifies: s.identifies, closes: s.closes, inbound: s.dispatches.filter(d => d.t === "MESSAGE_CREATE").map(d => ({seq: d.s, id: d.d.id, content: d.d.content})), posts: s.posts.map(p => ({channel: p.channel_id, content: p.content, replyTo: p.replyTo, nonce: p.nonce !== null})), reactions: s.reactions, rest: s.restCalls.reduce((a, c) => { const k = c.method + " " + c.path.replace(/\d{17,20}/gu, ":id") + (c.authOk ? "" : " (bad auth)"); a[k] = (a[k] ?? 0) + 1; return a; }, {})}, null, 1))'
+    fake /control/state | node -e 'const s=JSON.parse(require("fs").readFileSync(0,"utf8")); console.log(JSON.stringify({identifies: s.identifies, resumes: s.resumes, ended: s.ended, closes: s.closes, inbound: s.dispatches.filter(d => d.t === "MESSAGE_CREATE").map(d => ({seq: d.s, id: d.d.id, content: d.d.content})), posts: s.posts.map(p => ({channel: p.channel_id, content: p.content, replyTo: p.replyTo, nonce: p.nonce !== null})), reactions: s.reactions, rest: s.restCalls.reduce((a, c) => { const k = c.method + " " + c.path.replace(/\d{17,20}/gu, ":id") + (c.authOk ? "" : " (bad auth)"); a[k] = (a[k] ?? 0) + 1; return a; }, {})}, null, 1))'
     printf '```\n'
   } >>"$T"
 }
@@ -356,6 +442,7 @@ sh -c '"'"'umask 077; set -C; : > "$1"'"'"' sh ~/.config/frond-ear/token && $EDI
 
   daemon)
     start_daemon "$R/daemon-2.log" || return 1
+    save DAEMON_LOG "$R/daemon-2.log"
     wait_for 10 "the daemon process" daemon_pid || return 1
     save DAEMON_PID "$(daemon_pid)"
     wait_for 30 "the gateway to connect" gateway_connected || return 1
@@ -423,7 +510,7 @@ sh -c '"'"'umask 077; set -C; : > "$1"'"'"' sh ~/.config/frond-ear/token && $EDI
 
   away)
     note '## 10. A message that waits while no session is attached'
-    note 'Not the cold restart or resume receipt (out of scope here): the session leaves and comes back while the daemon keeps running, which is where the canary and any backlog were lost before #70.'
+    note 'Not a restart (§11 to §13 are): the session leaves and comes back while the daemon keeps running, which is where the canary and any backlog were lost before #70.'
     exit_session
     wait_for 30 "the ear to detach" ear_is '!attached' || return 1
     note "Session exited. Inbound dispatched while no session is attached: \`$(inbound 'receipt check: while you were away. please answer in this channel with exactly the word backlog')\`"
@@ -441,8 +528,78 @@ sh -c '"'"'umask 077; set -C; : > "$1"'"'"' sh ~/.config/frond-ear/token && $EDI
     ear_is attached registered && posted backlog
     ;;
 
+  reboot | cold)
+    local session word
+    session=$(gateway_session)
+    if [ "$1" = reboot ]; then
+      word=rebooted
+      note '## 11. Reboot'
+      note "#70's item 5, with this receipt's own session and ear: no real host is rebooted. The reboot happens inside the disposable root. Every process of the ear and the session gets SIGTERM, as systemd sends at shutdown, and has 20 s to exit: the daemon drains and closes its Gateway connection itself. Then \`\$XDG_RUNTIME_DIR\`, a tmpfs that a reboot empties, is emptied. HOME stands for the disk: it keeps the ear's SQLite ledger and Claude Code's conversation. The stand-in for Discord stays up, as Discord does, and treats sessions as Discord does: a client that closes its connection with 1000 or 1001 ends its session, and any other end leaves it resumable."
+    else
+      word=resumed
+      note '## 12. Power cut'
+      note 'The same, but the power is cut: every process of the ear and the session gets SIGKILL at once, with no drain, no `/exit` and no shutdown handler. The stand-in sees the connection drop at once, where Discord would notice the missed heartbeats.'
+    fi
+    gateway_record "before: the daemon's Gateway session and the last sequence it has stored"
+    ledger "before: the ear and the session that holds it"
+    host_down "$([ "$1" = reboot ] && echo TERM || echo KILL)" || return 1
+    note "While the host is down, a message arrives: \`$(inbound "receipt check: sent while the host was down. please answer in this channel with exactly the word $word")\`"
+    note 'The host comes back. The daemon starts as it did before, the way its systemd unit would at boot.'
+    restart_daemon "$R/daemon-$1.log" || return 1
+    if wait_for 30 "the daemon to resume its Gateway session" resumed "$session"; then
+      note "The daemon resumed its Gateway session \`$session\` (RESUME, op 6), and the stand-in replayed what was sent while the host was down."
+    else
+      note "**The daemon did not resume its Gateway session \`$session\`.** What the stand-in answered is in its record below."
+    fi
+    wait_for 30 "the message sent while the host was down to be held" held 1 || note "**The message sent while the host was down is not held for the session.**"
+    gateway_record "after the restart: the daemon's Gateway session"
+    ledger "the ledger: what the ear holds for the session"
+    resume_session "$R/doctor-$1.out" || return 1
+    wait_for "$WAIT" "the ear to register again" ear_is attached registered || note "**Not registered within ${WAIT} s.**"
+    wait_for "$WAIT" "the reply $word at the stand-in" posted "$word" || note "**No \`$word\` within ${WAIT} s.**"
+    sleep 10
+    discord_record "what the stand-in for Discord received"
+    ledger "the ledger after the restart"
+    none_twice || note '**An answer was posted twice.**'
+    resumed "$session" && ear_is attached registered && posted "$word" && none_twice
+    ;;
+
+  cold-expired)
+    note '## 13. Power cut, after Discord has dropped the session'
+    note 'The same power cut, but the host stays down longer than Discord keeps a Gateway session resumable, which Discord'"'"'s Gateway documentation puts at a few minutes. The stand-in forgets every session it issued, so it answers the RESUME the way Discord answers one for an expired session: op 9, Invalid Session, `d: false`. This step passes when the ear and the session are back and no answer was posted twice. It waits a minute for an answer to the message sent while the host was down, and records whether one came.'
+    local session identifies
+    session=$(gateway_session)
+    identifies=$(count_of identifies)
+    gateway_record "before: the daemon's Gateway session and the last sequence it has stored"
+    host_down KILL || return 1
+    note "Discord drops the session while the host is down: \`$(fake /control/expire-sessions -XPOST)\`"
+    note "While the host is down, a message arrives: \`$(inbound 'receipt check: sent while the host was down for longer. please answer in this channel with exactly the word expired')\`"
+    note 'The host comes back, and the daemon starts as before.'
+    restart_daemon "$R/daemon-cold-expired.log" || return 1
+    wait_for 30 "the daemon to identify afresh" at_least identifies $((identifies + 1)) || return 1
+    sleep 2
+    gateway_record "after the restart: the daemon's Gateway session"
+    if [ "$(gateway_session)" != "$session" ]; then
+      note "A new Gateway session: the stand-in refused the RESUME of \`$session\` (op 9), and the daemon identified afresh (IDENTIFY, op 2)."
+    else
+      note "**The daemon still holds the Gateway session it had before the power cut** (\`$session\`)."
+    fi
+    ledger "the ledger: what the ear holds for the session"
+    resume_session "$R/doctor-cold-expired.out" || return 1
+    wait_for "$WAIT" "the ear to register again" ear_is attached registered || note "**Not registered within ${WAIT} s.**"
+    if wait_for 60 "the reply expired at the stand-in" posted expired; then
+      note 'The message sent while the host was down was answered.'
+    else
+      note '**Lost: the message sent while the host was down.** After a refused RESUME, Discord replays nothing, and frond-ear does not read channel history when it identifies afresh. The message never reached the ear: it is not in the ledger, and nothing tells the session about it. It is still in the channel'"'"'s history, where `fetch_messages` reads.'
+    fi
+    discord_record "what the stand-in for Discord received"
+    ledger "the ledger after the restart"
+    none_twice || note '**An answer was posted twice.**'
+    ear_is attached registered && none_twice
+    ;;
+
   teardown)
-    note '## 11. Teardown'
+    note '## 14. Teardown'
     exit_session
     note 'The Claude Code session exited (`/exit`).'
     [ -d "$ROOT/home/frond-ear" ] && record "the ear after the session left" "$ROOT/home/frond-ear" \
@@ -471,7 +628,7 @@ sh -c '"'"'umask 077; set -C; : > "$1"'"'"' sh ~/.config/frond-ear/token && $EDI
     fi
     {
       printf '\n### stop the daemon (SIGTERM)\n\n```console\n'
-      grep -E 'daemon\.draining|daemon\.stopped' "$R/daemon-2.log" 2>/dev/null
+      grep -E 'daemon\.draining|daemon\.stopped' "${DAEMON_LOG:-$R/daemon-2.log}" 2>/dev/null
       printf '[daemon process gone: %s]\n```\n' "$([ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && echo no || echo yes)"
     } | scrub >>"$T"
     ours "${FAKE_PID:-}" "$W/fake.port" && kill "$FAKE_PID" 2>/dev/null
@@ -514,7 +671,7 @@ real_home_state() {
 }
 
 STEPS="setup isolation fetch init doctor-pre discord daemon-fail daemon doctor-post register
-  wrong-ear launch canary event away"
+  wrong-ear launch canary event away reboot cold cold-expired"
 if [ "${1:-}" = all ]; then
   from=${2:-setup}
   case " $(echo $STEPS) " in
