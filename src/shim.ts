@@ -20,6 +20,14 @@ export const SUPPORTED_PROTOCOL_VERSIONS = [
 
 export const SHIM_VERSION = "0.1.0";
 
+/**
+ * How long channel events wait after `notifications/initialized`. Claude Code sends that before
+ * it registers its channel handler and drops a notification that arrives first: 2.1.296
+ * registers tens of milliseconds later, so an attach canary or backlog sent at once was lost
+ * while its batch read as offered (#70).
+ */
+const CHANNEL_SETTLE_MS = 2_000;
+
 const batchId = {
   type: "string",
   description:
@@ -265,6 +273,7 @@ export interface ShimOptions {
   reconnectMs?: number;
   initializeWaitMs?: number;
   callTimeoutMs?: number;
+  channelSettleMs?: number;
 }
 
 export class ChannelShim {
@@ -273,7 +282,9 @@ export class ChannelShim {
   private connected = false;
   private welcome: Extract<DaemonMessage, { type: "welcome" }> | undefined;
   private welcomeWaiters: Array<() => void> = [];
-  private initialized = false;
+  /** True once the client can be expected to handle channel notifications. */
+  private listening = false;
+  private settleTimer: NodeJS.Timeout | undefined;
   private readonly pendingEvents: Array<
     Extract<DaemonMessage, { type: "event" }>
   > = [];
@@ -319,6 +330,9 @@ export class ChannelShim {
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
     }
+    if (this.settleTimer) {
+      clearTimeout(this.settleTimer);
+    }
     this.daemon?.close();
   }
 
@@ -355,6 +369,9 @@ export class ChannelShim {
           resolve({ ok: false, text: "frond-ear daemon connection lost" });
         }
         this.calls.clear();
+        // Held events were never written, so their batches are unoffered: the daemon queues
+        // them again and pushes them anew when this shim re-attaches.
+        this.pendingEvents.length = 0;
         if (wasConnected) {
           this.log("daemon connection lost; reconnecting");
         }
@@ -381,11 +398,7 @@ export class ChannelShim {
         }
         return;
       case "event":
-        if (this.initialized) {
-          this.emitEvent(message);
-        } else {
-          this.pendingEvents.push(message);
-        }
+        this.deliver(message);
         return;
       case "result":
         this.calls.get(message.id)?.({ ok: message.ok, text: message.text });
@@ -393,7 +406,7 @@ export class ChannelShim {
         return;
       case "detached":
         this.log(`ear detached: ${message.reason}`);
-        this.emitEvent({
+        this.deliver({
           type: "event",
           batchId: null,
           content: detachedNotice(message.reason),
@@ -402,6 +415,14 @@ export class ChannelShim {
         return;
       default:
         return;
+    }
+  }
+
+  private deliver(event: Extract<DaemonMessage, { type: "event" }>): void {
+    if (this.listening) {
+      this.emitEvent(event);
+    } else {
+      this.pendingEvents.push(event);
     }
   }
 
@@ -536,9 +557,15 @@ export class ChannelShim {
         return;
       }
       case "notifications/initialized":
-        this.initialized = true;
-        for (const event of this.pendingEvents.splice(0)) {
-          this.emitEvent(event);
+        // Events wait out the settle period (CHANNEL_SETTLE_MS) until the client listens.
+        if (!this.listening && !this.settleTimer) {
+          this.settleTimer = setTimeout(() => {
+            this.settleTimer = undefined;
+            this.listening = true;
+            for (const event of this.pendingEvents.splice(0)) {
+              this.emitEvent(event);
+            }
+          }, this.options.channelSettleMs ?? CHANNEL_SETTLE_MS);
         }
         return;
       case "ping":
