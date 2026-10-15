@@ -15,25 +15,25 @@ attach canary and answers a message.
 
 ## What it runs
 
-| Step           | What it proves                                                                                                                                                                             |
-| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `isolation`    | What the environment holds, and what GitHub answers without credentials                                                                                                                    |
-| `fetch`        | The README's clone line, as written. While the repository is private it fails, and a bundle of the commit under test stands in                                                             |
-| `init`         | The person writes the 0600 token file; `init --non-interactive` writes the config                                                                                                          |
-| `doctor-pre`   | Failure and repair: `doctor` without, then with, the two `export` lines                                                                                                                    |
-| `daemon-fail`  | Failure and repair: Discord refuses the Message Content Intent (close 4014), the daemon exits 1, and `doctor` says so                                                                      |
-| `daemon`       | The daemon, started exactly as `init` printed it, connects                                                                                                                                 |
-| `doctor-post`  | Every required check passes                                                                                                                                                                |
-| `register`     | `claude mcp add`, exactly as `init` printed it, and the tool allow rule                                                                                                                    |
-| `wrong-ear`    | Failure: a registration that names an ear the config does not have                                                                                                                         |
-| `launch`       | Claude Code with the channel flag; the harness answers its startup prompts as a person would                                                                                               |
-| `canary`       | The session acks the attach canary: `attached` and `registered` are both true, and `doctor` passes                                                                                         |
-| `event`        | One inbound mention reaches the session and one reply reaches Discord                                                                                                                      |
-| `away`         | The session leaves, a message arrives, and the session comes back (`--continue`): it gets the canary and the message. Not a cold restart                                                   |
-| `reboot`       | #70 item 5: an orderly reboot (SIGTERM, as systemd sends) and a message while the host is down; the daemon resumes its Gateway session and the session is resumed. Nothing lost or doubled |
-| `cold`         | The same with a power cut: SIGKILL to every process at once                                                                                                                                |
-| `cold-expired` | A power cut after Discord has dropped the session (RESUME refused, op 9): the ear comes back. Records what became of the message sent while down                                           |
-| `teardown`     | The session exits, the registration is removed, the daemon stops on SIGTERM, nothing is left running, and the root is deleted                                                              |
+| Step           | What it proves                                                                                                                                                                                                |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `isolation`    | What the environment holds, and what GitHub answers without credentials                                                                                                                                       |
+| `fetch`        | The README's clone line, as written. While the repository is private it fails, and a bundle of the commit under test stands in                                                                                |
+| `init`         | The person writes the 0600 token file; `init --non-interactive` writes the config                                                                                                                             |
+| `doctor-pre`   | Failure and repair: `doctor` without, then with, the two `export` lines                                                                                                                                       |
+| `daemon-fail`  | Failure and repair: Discord refuses the Message Content Intent (close 4014), the daemon exits 1, and `doctor` says so                                                                                         |
+| `daemon`       | The daemon, started exactly as `init` printed it, connects                                                                                                                                                    |
+| `doctor-post`  | Every required check passes                                                                                                                                                                                   |
+| `register`     | `claude mcp add`, exactly as `init` printed it, and the tool allow rule                                                                                                                                       |
+| `wrong-ear`    | Failure: a registration that names an ear the config does not have                                                                                                                                            |
+| `launch`       | Claude Code with the channel flag; the harness answers its startup prompts as a person would                                                                                                                  |
+| `canary`       | The session acks the attach canary: `attached` and `registered` are both true, and `doctor` passes                                                                                                            |
+| `event`        | One inbound mention reaches the session and one reply reaches Discord                                                                                                                                         |
+| `away`         | The session leaves, a message arrives, and the session comes back (`--continue`): it gets the canary and the message. Not a cold restart                                                                      |
+| `reboot`       | #70 item 5: an orderly reboot (SIGTERM, as systemd sends) and a message while the host is down; the daemon resumes its Gateway session and the session is resumed. Nothing lost or doubled                    |
+| `cold`         | The same with a power cut: SIGKILL to every process at once                                                                                                                                                   |
+| `cold-expired` | A power cut after Discord has dropped the session (RESUME refused, op 9): the daemon identifies afresh and reads the message sent while down back from the channel's history, and the session answers it once |
+| `teardown`     | The session exits, the registration is removed, the daemon stops on SIGTERM, nothing is left running, and the root is deleted                                                                                 |
 
 ## Run it
 
@@ -56,8 +56,8 @@ pane.
 A step passes on what the person asked for, not on any activity: `event`, `away`, `reboot` and
 `cold` each wait for the one-word answer their message asks for (`pong`, `backlog`, `rebooted`,
 then `resumed`), and `reboot` and `cold` also need the daemon's Gateway session resumed.
-`cold-expired` passes when the ear and the session are back and no answer was posted twice; it
-waits a minute for `expired` and records whether it came.
+`cold-expired` waits for `expired` too, and needs the message read back from the channel's
+history: it is held for the session after the restart, and a `catch_up` event says so.
 
 `reboot`, `cold` and `cold-expired` take the host down inside the disposable root; no host is
 rebooted (#70 forbids it). An orderly reboot sends SIGTERM to every process of the ear and the

@@ -32,8 +32,10 @@ import {
   renderBatch,
   renderAmbiguousSends,
   renderCanary,
+  renderCatchUp,
   renderDigest,
   renderEvent,
+  type CatchUpChat,
 } from "./render.ts";
 import type { DiscordRest } from "./rest.ts";
 import { chunkMessage, RestError } from "./rest.ts";
@@ -108,6 +110,24 @@ const SEND_DEDUPE_WINDOW_MS = 5 * 60 * 1_000;
 const DELIVERY_CONFIRM_GRACE_MS = 2 * 60 * 1_000;
 
 export type IngestOutcome = "inserted" | "duplicate" | "rejected";
+
+/** What a read-back did, for ear_status. */
+interface CatchUpRun {
+  at: string;
+  chats: Array<{ ear: string; chat: CatchUpChat }>;
+  skipped: Array<{ ear: string; chatId: string }>;
+}
+
+/** Rejections that mean no ear hears the chat, so it has no anchor to move. */
+const UNROUTED = new Set(["channel_not_bound", "dm_not_routed"]);
+
+/** Read-back entries kept for an ear whose session has not attached since. */
+const CATCH_UP_KEPT = 100;
+
+/** Whether snowflake `a` is newer than `b`. They are digit strings, so a longer one is newer. */
+function newerId(a: string, b: string): boolean {
+  return a.length === b.length ? a > b : a.length > b.length;
+}
 
 function stringArg(
   args: Record<string, unknown>,
@@ -371,6 +391,15 @@ export class Daemon {
   private stopped = false;
   private timerDue: number | undefined;
   private sweepTimer: unknown;
+  /** A read-back is running; a second one owed meanwhile runs after it. */
+  private catchingUp = false;
+  private catchUpAgain = false;
+  /**
+   * Fresh Gateway sessions since the daemon started. A chat read before the latest one
+   * began may have missed what came between, so it stays owed.
+   */
+  private sessionsStarted = 0;
+  private lastCatchUp: CatchUpRun | undefined;
   /** Canticle's push to sessions (frond-ear#65); present whenever a receptor runs. */
   private readonly canticle: CanticleDelivery | undefined;
 
@@ -533,6 +562,11 @@ export class Daemon {
   }
 
   public ingest(message: unknown): IngestOutcome {
+    return this.ingestMessage(message, false);
+  }
+
+  /** `readBack`: the message was read from channel history after an outage, not heard live. */
+  private ingestMessage(message: unknown, readBack: boolean): IngestOutcome {
     if (!isDiscordMessage(message)) {
       this.store.increment("rejected_invalid_payload");
       return "rejected";
@@ -542,7 +576,10 @@ export class Daemon {
       threadParent: (id) => this.store.threadParent(id),
       attention: (ear, chatId, time) =>
         this.store.attentionFor(ear, chatId, time),
+      // A read-back admits a chat's messages together, so they flush as one batch: one wake,
+      // whatever they hold. They spend none of the budget live traffic needs.
       wakeBudgetExhausted: (kind, chatId, time) =>
+        !readBack &&
         (kind === "bot" ? this.botLimiter : this.ambientLimiter).recordAndCheck(
           chatId,
           time,
@@ -551,11 +588,31 @@ export class Daemon {
     });
     if (!classification.accept) {
       this.store.increment(`rejected_${classification.reason}`);
+      // Still heard: the bot's own replies and refused senders move the chat's anchor too, so
+      // a read-back never fetches them again.
+      if (
+        !UNROUTED.has(classification.reason) &&
+        this.earForChat(message.channel_id)
+      ) {
+        this.store.advanceAnchor(
+          message.channel_id,
+          message.guild_id ?? null,
+          message.id,
+        );
+      }
       return "rejected";
     }
-    const outcome = this.store.atomically(() =>
-      this.admit(message, classification),
-    );
+    // The anchor moves in the same transaction as the admission, so it never passes a
+    // message the ledger does not hold.
+    const outcome = this.store.atomically(() => {
+      const admitted = this.admit(message, classification);
+      this.store.advanceAnchor(
+        message.channel_id,
+        message.guild_id ?? null,
+        message.id,
+      );
+      return admitted;
+    });
     if (outcome === "duplicate") {
       this.store.increment("duplicates");
       // A crash between insert and scheduling is impossible now (one
@@ -646,6 +703,252 @@ export class Daemon {
       this.logger.log("warn", "ear.overflow", { ear: route.ear, dropped });
     }
     return "inserted";
+  }
+
+  // ---- read-back after a fresh Gateway session -------------------------------------
+
+  /**
+   * The Gateway started a fresh session (READY after IDENTIFY), so Discord replays nothing
+   * sent before it: every chat the ear has heard owes a read-back of what came after its
+   * anchor. Runs before the session's first dispatch, so nothing heard live can move a chat
+   * past what it owes.
+   */
+  public gatewayReady(): void {
+    this.sessionsStarted += 1;
+    if (this.config.limits.catchUpMessages > 0) {
+      const owed = this.store.oweCatchUp();
+      if (owed > 0) {
+        this.logger.log("info", "ear.catch_up_owed", { chats: owed });
+      }
+    }
+    this.startCatchUp();
+  }
+
+  /**
+   * The Gateway resumed its session, and Discord replayed what was missed. Only a read-back
+   * left unfinished (the daemon stopped part-way through one) is still owed.
+   */
+  public gatewayResumed(): void {
+    this.startCatchUp();
+  }
+
+  private startCatchUp(): void {
+    if (this.closing) {
+      return;
+    }
+    if (this.catchingUp) {
+      this.catchUpAgain = true;
+      return;
+    }
+    this.catchingUp = true;
+    const run: Promise<void> = this.catchUp()
+      .catch((error: unknown) => {
+        // Chats not settled yet stay owed, and the next session reads them back.
+        this.logger.log("error", "ear.catch_up_failed", {
+          reason: error instanceof Error ? error.name : "unknown",
+        });
+      })
+      .finally(() => {
+        this.inFlight.delete(run);
+        this.catchingUp = false;
+        if (this.catchUpAgain) {
+          this.catchUpAgain = false;
+          this.startCatchUp();
+        }
+      });
+    this.inFlight.add(run);
+  }
+
+  /**
+   * Reads each owed chat's newest page of history (one request of `limits.catchUpMessages`
+   * messages), then ingests those newer than its anchor, oldest first, as if heard live. The
+   * ledger's unique message id makes one already held, or heard live meanwhile, a duplicate.
+   * A full page that never reaches the anchor may leave older messages out: the session is
+   * told where they are, so a gap is never silent.
+   */
+  private async catchUp(): Promise<void> {
+    const limit = this.config.limits.catchUpMessages;
+    const pages: Array<{
+      ear: string;
+      owed: { chatId: string; guildId: string | null; after: string };
+      /** Fresh sessions so far when the page was requested. */
+      started: number;
+      page: unknown[] | { failed: string };
+    }> = [];
+    const skipped: Array<{ ear: string; chatId: string }> = [];
+    const started = this.sessionsStarted;
+    for (const owed of this.store.owedCatchUps()) {
+      if (this.closing) {
+        return;
+      }
+      const ear = this.earForChat(owed.chatId);
+      if (!ear || limit === 0) {
+        this.store.settleCatchUp(owed.chatId);
+      } else if (pages.length === this.config.limits.catchUpChats) {
+        skipped.push({ ear, chatId: owed.chatId });
+      } else {
+        const requested = this.sessionsStarted;
+        try {
+          const page = await this.rest.fetchMessages(owed.chatId, { limit });
+          pages.push({
+            ear,
+            owed,
+            started: requested,
+            page: Array.isArray(page) ? page : [],
+          });
+        } catch (error) {
+          const failed =
+            error instanceof RestError
+              ? `Discord answered ${error.status}`
+              : "Discord did not answer";
+          pages.push({ ear, owed, started: requested, page: { failed } });
+        }
+      }
+    }
+    // Stopping: every chat read so far stays owed, and the next session reads it back.
+    if (this.closing || (pages.length === 0 && skipped.length === 0)) {
+      return;
+    }
+    // From here on nothing awaits, so the notice reaches the session before any batch of
+    // what was read back can flush.
+    const run: CatchUpRun = {
+      at: new Date(this.clock.now()).toISOString(),
+      chats: [],
+      skipped,
+    };
+    // A fresh session that began after a chat's page was requested owes that chat what was
+    // sent in between, so it stays owed and the next run reads it again.
+    const settle = (chatId: string, since: number): void => {
+      if (this.sessionsStarted === since) {
+        this.store.settleCatchUp(chatId);
+      }
+    };
+    try {
+      for (const { ear, owed, started: since, page } of pages) {
+        if (!Array.isArray(page)) {
+          run.chats.push({
+            ear,
+            chat: { chatId: owed.chatId, read: 0, ...page },
+          });
+          this.store.increment("catch_up_failed");
+          this.logger.log("warn", "ear.catch_up_failed", {
+            ear,
+            chatId: owed.chatId,
+            reason: page.failed,
+          });
+          settle(owed.chatId, since);
+          continue;
+        }
+        const chat = this.readBack(owed, page, limit);
+        settle(owed.chatId, since);
+        if (chat.read > 0 || chat.missing) {
+          run.chats.push({ ear, chat });
+        }
+        this.logger.log("info", "ear.caught_up", {
+          ear,
+          chatId: owed.chatId,
+          read: chat.read,
+          truncated: chat.missing !== undefined,
+        });
+      }
+      for (const { chatId } of skipped) {
+        settle(chatId, started);
+      }
+    } finally {
+      this.lastCatchUp = run;
+      const ears = new Set([
+        ...run.chats.map((entry) => entry.ear),
+        ...run.skipped.map((entry) => entry.ear),
+      ]);
+      for (const ear of ears) {
+        this.reportCatchUp(
+          ear,
+          run.chats
+            .filter((entry) => entry.ear === ear)
+            .map((entry) => entry.chat),
+          run.skipped
+            .filter((entry) => entry.ear === ear)
+            .map((entry) => entry.chatId),
+        );
+      }
+    }
+  }
+
+  /** Ingests one chat's page of history: what is newer than its anchor, oldest first. */
+  private readBack(
+    owed: { chatId: string; guildId: string | null; after: string },
+    page: unknown[],
+    limit: number,
+  ): CatchUpChat {
+    const messages = page.filter(
+      (item): item is DiscordMessage =>
+        isDiscordMessage(item) &&
+        SNOWFLAKE.test(item.id) &&
+        item.channel_id === owed.chatId,
+    );
+    const newer = messages
+      .filter((item) => newerId(item.id, owed.after))
+      .sort((a, b) => (newerId(a.id, b.id) ? 1 : newerId(b.id, a.id) ? -1 : 0));
+    let read = 0;
+    for (const item of newer) {
+      // A history page has no guild_id (only the Gateway's MESSAGE_CREATE carries one), and
+      // a message without one routes as a DM: the anchor kept the chat's.
+      const message = owed.guildId ? { ...item, guild_id: owed.guildId } : item;
+      if (this.ingestMessage(message, true) === "inserted") {
+        read += 1;
+      }
+    }
+    if (read > 0) {
+      this.store.increment("catch_up_read", read);
+    }
+    // A full page that never reached the anchor: there may be more before its oldest message.
+    const oldest = newer[0];
+    if (page.length >= limit && newer.length === messages.length && oldest) {
+      this.store.increment("catch_up_truncated");
+      return {
+        chatId: owed.chatId,
+        read,
+        missing: { after: owed.after, before: oldest.id },
+      };
+    }
+    return { chatId: owed.chatId, read };
+  }
+
+  /** Tells the ear's session now, or at its next attach when none holds the ear. */
+  private reportCatchUp(
+    ear: string,
+    chats: CatchUpChat[],
+    skipped: string[],
+  ): void {
+    if (this.attached.has(ear)) {
+      this.pushNotice(ear, renderCatchUp(chats, skipped));
+      this.logger.log("info", "ear.catch_up_told", {
+        ear,
+        chats: chats.length,
+        skipped: skipped.length,
+      });
+      return;
+    }
+    const pending = this.pendingCatchUp(ear);
+    this.store.setRuntimeState(
+      `catch_up.pending.${ear}`,
+      JSON.stringify({
+        chats: [...pending.chats, ...chats].slice(-CATCH_UP_KEPT),
+        skipped: [...pending.skipped, ...skipped].slice(-CATCH_UP_KEPT),
+      }),
+    );
+  }
+
+  /** Read-backs no session of this ear has been told of yet. */
+  private pendingCatchUp(ear: string): {
+    chats: CatchUpChat[];
+    skipped: string[];
+  } {
+    const saved = this.store.runtimeState(`catch_up.pending.${ear}`);
+    if (!saved) {
+      return { chats: [], skipped: [] };
+    }
+    return JSON.parse(saved) as { chats: CatchUpChat[]; skipped: string[] };
   }
 
   // ---- scheduling ----------------------------------------------------------------
@@ -1026,6 +1329,20 @@ export class Daemon {
         type: "event",
         batchId: null,
         ...renderAmbiguousSends(ambiguous),
+      });
+    }
+    const caughtUp = this.pendingCatchUp(ear);
+    if (caughtUp.chats.length > 0 || caughtUp.skipped.length > 0) {
+      client.connection.send({
+        type: "event",
+        batchId: null,
+        ...renderCatchUp(caughtUp.chats, caughtUp.skipped),
+      });
+      this.store.clearRuntimeState(`catch_up.pending.${ear}`);
+      this.logger.log("info", "ear.catch_up_told", {
+        ear,
+        chats: caughtUp.chats.length,
+        skipped: caughtUp.skipped.length,
       });
     }
     if (nonce) {
@@ -1853,6 +2170,23 @@ export class Daemon {
       canticle: this.options.canticleStatus?.() ?? { state: "disabled" },
       ears,
       ambiguousSends: this.store.ambiguousSends(this.sendsInFlight),
+      catchUp: {
+        owed: this.store.owedCatchUps().length,
+        running: this.catchingUp,
+        last: this.lastCatchUp
+          ? {
+              at: this.lastCatchUp.at,
+              chats: this.lastCatchUp.chats
+                .filter(
+                  (entry) => onlyEar === undefined || entry.ear === onlyEar,
+                )
+                .map(({ ear, chat }) => ({ ear, ...chat })),
+              skipped: this.lastCatchUp.skipped.filter(
+                (entry) => onlyEar === undefined || entry.ear === onlyEar,
+              ),
+            }
+          : null,
+      },
       botLoopCooling: this.botLimiter.cooling(this.clock.now()),
       ambientWakeCooling: this.ambientLimiter.cooling(this.clock.now()),
       counters: this.store.counters(),

@@ -57,6 +57,13 @@ export interface Config {
     maxAttachmentBytes: number;
     maxPendingPerEar: number;
     retentionMs: number;
+    /**
+     * Messages read back per chat when a Gateway session could not be resumed (one REST page,
+     * so at most 100); 0 turns the read-back off.
+     */
+    catchUpMessages: number;
+    /** Chats read back then, the most recently active first. */
+    catchUpChats: number;
   };
   /** Kill switch: keep ingesting, stop pushing. */
   paused: boolean;
@@ -588,6 +595,25 @@ export function parseConfig(candidate: unknown): Config {
     };
   };
   const limitsInput = isObject(candidate.limits) ? candidate.limits : {};
+  // Discord returns at most 100 messages per history request, and a read-back is one request
+  // per chat.
+  const catchUpMessages = integer(
+    limitsInput.catchUpMessages,
+    50,
+    "limits.catchUpMessages",
+  );
+  if (catchUpMessages > 100) {
+    throw new Error("limits.catchUpMessages must be at most 100");
+  }
+  const catchUpChats = integer(
+    limitsInput.catchUpChats,
+    25,
+    "limits.catchUpChats",
+    1,
+  );
+  if (catchUpChats > 100) {
+    throw new Error("limits.catchUpChats must be at most 100");
+  }
   return {
     botUserId: candidate.botUserId,
     principals: snowflakes(candidate.principals, "principals"),
@@ -639,6 +665,8 @@ export function parseConfig(candidate: unknown): Config {
         "limits.retentionMs",
         1,
       ),
+      catchUpMessages,
+      catchUpChats,
     },
     paused: candidate.paused === true,
     ...canticleField(parseCanticle(candidate.canticle, ears)),

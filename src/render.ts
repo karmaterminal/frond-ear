@@ -179,6 +179,60 @@ export function renderDigest(
   };
 }
 
+/** One chat read back after a Gateway session could not be resumed. */
+export interface CatchUpChat {
+  chatId: string;
+  /** Messages read back into the ledger. */
+  read: number;
+  /**
+   * The page was full before it reached the last message heard: messages after `after` and
+   * before `before` were not read back.
+   */
+  missing?: { after: string; before: string };
+  /** Why the chat's history could not be read. */
+  failed?: string;
+}
+
+/** Chats a catch_up notice names one by one; gaps and failures come first. */
+const CATCH_UP_LISTED = 20;
+
+export function renderCatchUp(
+  chats: CatchUpChat[],
+  skipped: string[],
+): Notification {
+  const read = chats.reduce((sum, chat) => sum + chat.read, 0);
+  const ordered = [
+    ...chats.filter((chat) => chat.missing || chat.failed !== undefined),
+    ...chats.filter((chat) => !chat.missing && chat.failed === undefined),
+  ];
+  const lines = ordered.slice(0, CATCH_UP_LISTED).map((chat) => {
+    if (chat.failed !== undefined) {
+      return `chat ${chat.chatId}: not read back (${cleanName(chat.failed)}); fetch_messages with this chat_id reads it.`;
+    }
+    const count = `${chat.read} message${chat.read === 1 ? "" : "s"} read back`;
+    return chat.missing
+      ? `chat ${chat.chatId}: ${count}, but older ones may be missing, back to message ${chat.missing.after} (the last one heard before): fetch_messages with this chat_id and before=${chat.missing.before} reads them.`
+      : `chat ${chat.chatId}: ${count}.`;
+  });
+  const unlisted = ordered.length - lines.length;
+  if (unlisted > 0) {
+    lines.push(
+      `${unlisted} more chat${unlisted === 1 ? " was" : "s were"} read back in full.`,
+    );
+  }
+  if (skipped.length > 0) {
+    const named = skipped.slice(0, 5).map((chatId) => `chat ${chatId}`);
+    const more = skipped.length - named.length;
+    lines.push(
+      `Past limits.catchUpChats, ${skipped.length} less recently active chat${skipped.length === 1 ? " was" : "s were"} not read back: ${named.join(", ")}${more > 0 ? ` and ${more} more` : ""}. fetch_messages reads any of them.`,
+    );
+  }
+  return {
+    content: `frond-ear could not resume its Discord session, so it started a new one and read back from channel history what was sent while it was disconnected. ${lines.join(" ")} What was read back is handled like any message heard live, each with the time it was sent: what would have woken you arrives as an event, and room chatter comes as context with the next one.`,
+    meta: { kind: "catch_up", count: String(read) },
+  };
+}
+
 export function renderAmbiguousSends(
   sends: Array<{
     chatId: string;
@@ -247,7 +301,7 @@ export function channelInstructions(
     "",
     'Your transcript does not reach Discord. To answer, call reply with the chat_id from the event (reply_to=a message_id only when quoting an earlier message). Pass the event\'s batch_id, copied whole, to reply, react, edit_message, fetch_messages or ack: exactly what you acted on is marked seen (a later batch that arrived meanwhile stays unseen), and the whole id proves that events reach you. Leaving it out marks everything delivered so far. Use react for lightweight acknowledgement and edit_message for progress updates on messages you sent in that chat. If you read events and choose not to respond, call ack(chat_id, batch_id) so they are marked seen. inbox lists anything you have not acted on; fetch_messages reads channel history. kind="room" events are debounced room chatter; you do not need to answer every one.',
     "",
-    'An ear whose events never reach you is silent exactly like a quiet room: after a restart, resume or compaction, or a long quiet, call ear_status and check that your ear\'s delivery is "confirmed". A kind="detached" event means another session took this ear, or the config dropped it: stop replying until you know who holds it.',
+    'An ear whose events never reach you is silent exactly like a quiet room: after a restart, resume or compaction, or a long quiet, call ear_status and check that your ear\'s delivery is "confirmed". A kind="detached" event means another session took this ear, or the config dropped it: stop replying until you know who holds it. A kind="catch_up" event says what frond-ear read back from channel history after a disconnection it could not resume, and where older messages may still be missing.',
     "",
     "Your attention is yours to set: set_attention narrows a chat, or everything, to mentions or silence (optionally for ttl_seconds), and nothing, principals included, breaks through a silence you chose. Held messages stay in inbox. The daemon's config is only a ceiling on what you can hear.",
     "",

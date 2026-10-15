@@ -152,6 +152,20 @@ function mapEvent(row: EventRow): StoredEvent {
 
 const PENDING_STATES = "('context', 'queued', 'stored')";
 const UNSEEN_STATES = "('context', 'queued', 'stored', 'offered')";
+/**
+ * Events in the order Discord sent them. Message ids are snowflakes, which grow with time;
+ * they are digit strings, so a longer one is newer. Admission order differs only for
+ * messages read back after an outage, which arrive after newer ones heard live.
+ */
+const OLDEST_FIRST = "length(message_id), message_id, id";
+const NEWEST_FIRST = "length(message_id) DESC, message_id DESC, id DESC";
+/** The chats whose anchors the prune keeps, the most recently active. */
+const MAX_ANCHORS = 1_000;
+
+/** SQL that is true when snowflake `a` is newer than snowflake `b`. */
+function newerSnowflake(a: string, b: string): string {
+  return `(length(${a}) > length(${b}) OR (length(${a}) = length(${b}) AND ${a} > ${b}))`;
+}
 
 export class EventStore {
   private readonly database: DatabaseSync;
@@ -251,6 +265,13 @@ export class EventStore {
       CREATE TABLE IF NOT EXISTS dm_channels (
         channel_id TEXT PRIMARY KEY,
         user_id TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS chat_anchors (
+        chat_id TEXT PRIMARY KEY,
+        guild_id TEXT,
+        message_id TEXT NOT NULL,
+        catch_up_after TEXT,
+        updated_at INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS counters (
         name TEXT PRIMARY KEY,
@@ -371,6 +392,10 @@ export class EventStore {
       .run(name, value);
   }
 
+  public clearRuntimeState(name: string): void {
+    this.database.prepare("DELETE FROM runtime_state WHERE name = ?").run(name);
+  }
+
   /** A runtime_state entry's write-ahead records since it was last checkpointed, oldest first. */
   public runtimeJournal(name: string): string[] {
     const rows = this.database
@@ -458,6 +483,72 @@ export class EventStore {
       .prepare("SELECT parent_id FROM thread_parents WHERE thread_id = ?")
       .get(threadId) as { parent_id: string } | undefined;
     return row?.parent_id;
+  }
+
+  // ---- chat anchors: what a fresh Gateway session owes ----------------------
+
+  /**
+   * Records the newest message heard in a chat. Only ever moves forward, so reading back
+   * older messages leaves it where it is.
+   */
+  public advanceAnchor(
+    chatId: string,
+    guildId: string | null,
+    messageId: string,
+  ): void {
+    this.database
+      .prepare(
+        `INSERT INTO chat_anchors (chat_id, guild_id, message_id, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(chat_id) DO UPDATE SET
+           guild_id = COALESCE(excluded.guild_id, chat_anchors.guild_id),
+           message_id = excluded.message_id, updated_at = excluded.updated_at
+         WHERE ${newerSnowflake("excluded.message_id", "chat_anchors.message_id")}`,
+      )
+      .run(chatId, guildId, messageId, this.clock.now());
+  }
+
+  /**
+   * A Gateway session started afresh, so Discord replays nothing from before it: every chat
+   * heard so far owes a read-back of what came after its anchor. A chat still owed one from
+   * an earlier session keeps that older starting point.
+   */
+  public oweCatchUp(): number {
+    return Number(
+      this.database
+        .prepare(
+          `UPDATE chat_anchors SET catch_up_after = message_id
+           WHERE catch_up_after IS NULL`,
+        )
+        .run().changes,
+    );
+  }
+
+  /** Chats owed a read-back, the most recently active first. */
+  public owedCatchUps(): Array<{
+    chatId: string;
+    guildId: string | null;
+    after: string;
+  }> {
+    return this.database
+      .prepare(
+        `SELECT chat_id AS chatId, guild_id AS guildId, catch_up_after AS after
+         FROM chat_anchors WHERE catch_up_after IS NOT NULL
+         ORDER BY length(message_id) DESC, message_id DESC`,
+      )
+      .all() as Array<{
+      chatId: string;
+      guildId: string | null;
+      after: string;
+    }>;
+  }
+
+  public settleCatchUp(chatId: string): void {
+    this.database
+      .prepare(
+        "UPDATE chat_anchors SET catch_up_after = NULL WHERE chat_id = ?",
+      )
+      .run(chatId);
   }
 
   public recordDmChannel(channelId: string, userId: string): void {
@@ -1007,7 +1098,7 @@ export class EventStore {
         `UPDATE events SET state = 'expired', updated_at = ?
          WHERE id IN (
            SELECT id FROM events WHERE ear = ? AND chat_id = ? AND state = 'context'
-           ORDER BY created_at DESC, id DESC LIMIT -1 OFFSET ?
+           ORDER BY ${NEWEST_FIRST} LIMIT -1 OFFSET ?
          )`,
       )
       .run(this.clock.now(), ear, chatId, limit);
@@ -1039,7 +1130,7 @@ export class EventStore {
           `UPDATE events SET state = 'dropped', due_at = NULL, updated_at = ?
            WHERE id IN (
              SELECT id FROM events WHERE ear = ? AND state = ?
-             ORDER BY created_at, id LIMIT ?
+             ORDER BY ${OLDEST_FIRST} LIMIT ?
            )`,
         )
         .run(this.clock.now(), ear, state, excess);
@@ -1077,7 +1168,7 @@ export class EventStore {
       const rows = this.database
         .prepare(
           `SELECT * FROM events WHERE ear = ? AND chat_id = ? AND state IN ('queued', 'context')
-           ORDER BY created_at, id`,
+           ORDER BY ${OLDEST_FIRST}`,
         )
         .all(ear, chatId) as unknown as EventRow[];
       if (!rows.some((row) => row.state === "queued")) {
@@ -1244,13 +1335,13 @@ export class EventStore {
       ? this.database
           .prepare(
             `SELECT * FROM events WHERE ear = ? AND state IN ${UNSEEN_STATES}
-               ORDER BY created_at DESC, id DESC LIMIT ?`,
+               ORDER BY ${NEWEST_FIRST} LIMIT ?`,
           )
           .all(ear, limit)
       : this.database
           .prepare(
             `SELECT * FROM events WHERE ear = ? AND chat_id = ? AND state IN ${UNSEEN_STATES}
-               ORDER BY created_at DESC, id DESC LIMIT ?`,
+               ORDER BY ${NEWEST_FIRST} LIMIT ?`,
           )
           .all(ear, chatId, limit)) as unknown as EventRow[];
     return rows.map(mapEvent).reverse();
@@ -1315,6 +1406,17 @@ export class EventStore {
            AND NOT EXISTS (SELECT 1 FROM events WHERE events.batch_id = batches.id)`,
         )
         .run(cutoff);
+      // One row per chat ever heard, so keep only the most recently active ones. A chat
+      // quiet for longer than the rest owes little after an outage, and a read-back takes
+      // at most limits.catchUpChats of them anyway.
+      this.database
+        .prepare(
+          `DELETE FROM chat_anchors WHERE chat_id NOT IN (
+             SELECT chat_id FROM chat_anchors
+             ORDER BY length(message_id) DESC, message_id DESC LIMIT ?
+           )`,
+        )
+        .run(MAX_ANCHORS);
       // A canticle tombstone outlives its record only by skew, whatever the retention.
       this.database
         .prepare("DELETE FROM canticle_settled WHERE expires_at <= ?")

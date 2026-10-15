@@ -47,7 +47,9 @@
     "maxMessageChars": 4000,
     "maxNotificationChars": 6000,
     "maxPendingPerEar": 500,
-    "retentionMs": 1209600000
+    "retentionMs": 1209600000,
+    "catchUpMessages": 50,
+    "catchUpChats": 25
   },
   "paused": false,
   "canticle": {
