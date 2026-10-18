@@ -67,8 +67,19 @@ An ear can serve a Copilot CLI session instead of a Claude Code one (`target: "c
 
 Copilot extensions are experimental. An extension reloads on `/clear`, which is just a re-attach. A `source: "system"` message is still a user-message event tagged as system, not a separate channel type, and the trust model is unchanged: trust comes from verified author IDs in the element's attributes, never from text.
 
+## claude.ai custom connector (#53, echo step)
+
+`node src/cli.ts connector-echo` runs a read-only MCP server for a claude.ai custom connector, so
+a claude.ai web session can reach a seat through Tailscale Funnel. This first step has **no
+Discord access**: its tools are `echo` and `connection_info`, and it exists to prove which MCP
+transport and auth the connector actually uses, with one log line per request. It listens on
+loopback only and takes no auth, a bearer token, or a single-owner OAuth sign-in.
+[`docs/connector.md`](docs/connector.md) has the flags, the claude.ai dialog settings for each
+auth mode, and the proof steps for the seat and figs. The Discord facade is a later PR.
+
 ## Docs
 
 - [`docs/spike/2026-09-claude-channel-gateway.md`](docs/spike/2026-09-claude-channel-gateway.md) explains the design: an assessment of prior work, Claude Code channels, the OpenClaw patterns it borrows, and the trust model and its limits.
 - [`docs/runbook.md`](docs/runbook.md) covers setup and operation.
+- [`docs/connector.md`](docs/connector.md) covers the claude.ai connector's echo step (#53).
 - The roadmap is epic karmaterminal/frond-ear#2.

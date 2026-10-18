@@ -33,3 +33,4 @@ frond-ear is a Discord Gateway daemon that pushes debounced, trust-classified ev
 - **Ledger states.** Events move `context|queued → offered → seen`, or `stored → seen` for silent channels. Only tool activity from the model marks events `seen`. A tool action acknowledges only confirmed batches up to the `batch_id` it names, or up to the latest confirmed batch when the call starts. A batch offered later stays unseen. Admission (insert, schedule, caps) is one transaction.
 - **Outbound IDs.** Every Discord ID from a tool is validated as a snowflake, and every REST path segment is URL-encoded. `edit_message` only edits messages frond-ear sent in that same chat.
 - **Bot token.** It exists only in the daemon.
+- **The claude.ai connector** (`src/connector/`, #53). It listens on loopback only, takes secrets only from 0600 files, and never logs tool arguments or credentials. The echo step has no Discord access; the facade will get its own bot token, never an ear's.
