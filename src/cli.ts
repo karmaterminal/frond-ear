@@ -161,6 +161,8 @@ async function runDaemon(argv: string[]): Promise<void> {
       onMessage: (message) => {
         daemon.ingest(message);
       },
+      onReady: () => daemon.gatewayReady(),
+      onResumed: () => daemon.gatewayResumed(),
       onThread: (threadId, parentId) => daemon.recordThread(threadId, parentId),
       onFatal: (code) => {
         logger.log("error", "daemon.exit_gateway_fatal", { closeCode: code });

@@ -7,22 +7,27 @@ knowing which tier you are actually in before you start reinstalling things.
 
 ## What is durable, and what is not
 
-| Thing                       | Where it lives                           | Survives a reboot?                      |
-| --------------------------- | ---------------------------------------- | --------------------------------------- |
-| Held and delivered messages | `$XDG_STATE_HOME/frond-ear/frond-ear.db` | yes                                     |
-| Messages sent while down    | Discord, replayed on a Gateway resume    | if the daemon is back in a few minutes  |
-| The daemon process          | systemd `--user` unit                    | yes, if installed and linger is on      |
-| Config                      | `~/.config/frond-ear/frond-ear.json`     | yes, but it is yours to back up         |
-| Bot token                   | `~/.config/frond-ear/token` (0600)       | yes, but it is yours to back up         |
-| The socket                  | `$XDG_RUNTIME_DIR/frond-ear/daemon.sock` | no, and it should not — it is recreated |
-| The attached Claude session | the session itself                       | **no** — always a deliberate relaunch   |
+| Thing                       | Where it lives                                                           | Survives a reboot?                                                               |
+| --------------------------- | ------------------------------------------------------------------------ | -------------------------------------------------------------------------------- |
+| Held and delivered messages | `$XDG_STATE_HOME/frond-ear/frond-ear.db`                                 | yes                                                                              |
+| Messages sent while down    | Discord: replayed on a Gateway resume, or read back from channel history | yes, up to `limits.catchUpMessages` per chat when the outage outlasts the resume |
+| The daemon process          | systemd `--user` unit                                                    | yes, if installed and linger is on                                               |
+| Config                      | `~/.config/frond-ear/frond-ear.json`                                     | yes, but it is yours to back up                                                  |
+| Bot token                   | `~/.config/frond-ear/token` (0600)                                       | yes, but it is yours to back up                                                  |
+| The socket                  | `$XDG_RUNTIME_DIR/frond-ear/daemon.sock`                                 | no, and it should not — it is recreated                                          |
+| The attached Claude session | the session itself                                                       | **no** — always a deliberate relaunch                                            |
 
 Two consequences worth internalising. First, the queue outlives the daemon: stopping the service
 does not drop what the ear is holding for you, and neither does a reboot. What reached Discord
 while the daemon was down is different: Discord replays it when the daemon resumes its Gateway
 session, which Discord allows for a few minutes after the connection ends. After a longer outage
-Discord refuses the resume (op 9), and frond-ear does not read the channels' history to make up
-for it: the session sees those messages only if it reads a chat with `fetch_messages`. Second,
+Discord refuses the resume (op 9), so the daemon identifies afresh and reads each chat's history
+back from the last message it heard there. It reads one page per chat: the newest
+`limits.catchUpMessages` messages (50 by default), in the `limits.catchUpChats` most recently
+active chats (25). What it reads back is held and delivered like any message heard live. A
+`catch_up` event tells the session what was read back, and where older messages may still be
+missing, with the `fetch_messages` call that reads them. Only chats the ear had already heard
+are read back: a thread created, or a DM first opened, while the daemon was down is not. Second,
 nothing can reattach your Claude session for you, because the development-channel flag is only
 read at launch. Every tier below ends at the same last step.
 

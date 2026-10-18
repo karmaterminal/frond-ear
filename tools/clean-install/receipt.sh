@@ -118,6 +118,9 @@ at_least() { # at_least KEY N: the stand-in for Discord has seen at least N of K
   fake /control/state | node -e 'const [key, n] = process.argv.slice(1); process.exit(JSON.parse(require("fs").readFileSync(0, "utf8"))[key].length >= Number(n) ? 0 : 1);' "$1" "$2"
 }
 count_of() { fake /control/state | node -e 'console.log(JSON.parse(require("fs").readFileSync(0, "utf8"))[process.argv[1]].length)' "$1"; }
+told_catch_up() { # told_catch_up LOGFILE: the daemon told the ear's session what it read back
+  grep -qF '"event":"ear.catch_up_told","ear":"'"$EAR"'"' "$1"
+}
 
 tm() { TMUX_TMPDIR="$ROOT/run" tmux -L "$TMUX_SERVER" "$@"; }
 pane() { tm capture-pane -p -t trial 2>/dev/null; }
@@ -223,6 +226,11 @@ ledger() { # ledger TITLE: the ear's status, as the session's owner would read i
     'node src/cli.ts status 2>/dev/null | node -e '"'"'const s=JSON.parse(require("fs").readFileSync(0,"utf8")); const e=s.ears[0]; console.log(JSON.stringify({name: e.name, attached: e.attached, registered: e.registered, delivery: e.delivery, generation: e.generation, sessionId: e.sessionId, events: e.events, ambiguousSends: s.ambiguousSends}, null, 1))'"'"''
 }
 
+catch_up_record() { # catch_up_record TITLE: the daemon's read-back of channel history, as `status` reports it
+  record "$1" "$ROOT/home/frond-ear" \
+    'node src/cli.ts status 2>/dev/null | node -e '"'"'const s=JSON.parse(require("fs").readFileSync(0,"utf8")); console.log(JSON.stringify({catchUp: s.catchUp, read: s.counters.catch_up_read ?? 0, truncated: s.counters.catch_up_truncated ?? 0}, null, 1))'"'"''
+}
+
 gateway_session() { # the daemon's Gateway session id, as `status` reports it
   (cd "$ROOT/home/frond-ear" && clean node src/cli.ts status 2>/dev/null) |
     node -e 'console.log(JSON.parse(require("fs").readFileSync(0, "utf8")).gateway.sessionId)'
@@ -299,7 +307,7 @@ inbound() { # inbound TEXT: the principal mentions the bot in the channel
 discord_record() { # discord_record TITLE: what the stand-in for Discord received
   {
     printf '\n### %s\n\n```json\n' "$1"
-    fake /control/state | node -e 'const s=JSON.parse(require("fs").readFileSync(0,"utf8")); console.log(JSON.stringify({identifies: s.identifies, resumes: s.resumes, ended: s.ended, closes: s.closes, inbound: s.dispatches.filter(d => d.t === "MESSAGE_CREATE").map(d => ({seq: d.s, id: d.d.id, content: d.d.content})), posts: s.posts.map(p => ({channel: p.channel_id, content: p.content, replyTo: p.replyTo, nonce: p.nonce !== null})), reactions: s.reactions, rest: s.restCalls.reduce((a, c) => { const k = c.method + " " + c.path.replace(/\d{17,20}/gu, ":id") + (c.authOk ? "" : " (bad auth)"); a[k] = (a[k] ?? 0) + 1; return a; }, {})}, null, 1))'
+    fake /control/state | node -e 'const s=JSON.parse(require("fs").readFileSync(0,"utf8")); console.log(JSON.stringify({identifies: s.identifies, resumes: s.resumes, ended: s.ended, closes: s.closes, inbound: s.dispatches.filter(d => d.t === "MESSAGE_CREATE").map(d => ({seq: d.s, id: d.d.id, content: d.d.content})), posts: s.posts.map(p => ({channel: p.channel_id, content: p.content, replyTo: p.replyTo, nonce: p.nonce !== null})), reactions: s.reactions, rest: s.restCalls.reduce((a, c) => { const k = c.method + " " + (c.path + (c.query ?? "")).replace(/\d{17,20}/gu, ":id") + (c.authOk ? "" : " (bad auth)"); a[k] = (a[k] ?? 0) + 1; return a; }, {})}, null, 1))'
     printf '```\n'
   } >>"$T"
 }
@@ -566,7 +574,7 @@ sh -c '"'"'umask 077; set -C; : > "$1"'"'"' sh ~/.config/frond-ear/token && $EDI
 
   cold-expired)
     note '## 13. Power cut, after Discord has dropped the session'
-    note 'The same power cut, but the host stays down longer than Discord keeps a Gateway session resumable, which Discord'"'"'s Gateway documentation puts at a few minutes. The stand-in forgets every session it issued, so it answers the RESUME the way Discord answers one for an expired session: op 9, Invalid Session, `d: false`. This step passes when the ear and the session are back and no answer was posted twice. It waits a minute for an answer to the message sent while the host was down, and records whether one came.'
+    note 'The same power cut, but the host stays down longer than Discord keeps a Gateway session resumable, which Discord'"'"'s Gateway documentation puts at a few minutes. The stand-in forgets every session it issued, so it answers the RESUME the way Discord answers one for an expired session: op 9, Invalid Session, `d: false`, and replays nothing. The daemon identifies afresh, and reads back from the channel'"'"'s history what came after the newest message it had heard there. This step passes when the message sent while the host was down is held for the session after the restart, the session is told of the read-back (a `catch_up` event), and it answers the message once.'
     local session identifies
     session=$(gateway_session)
     identifies=$(count_of identifies)
@@ -584,18 +592,23 @@ sh -c '"'"'umask 077; set -C; : > "$1"'"'"' sh ~/.config/frond-ear/token && $EDI
     else
       note "**The daemon still holds the Gateway session it had before the power cut** (\`$session\`)."
     fi
+    wait_for 30 "the message sent while the host was down to be read back and held" held 1 || note "**The message sent while the host was down is not held for the session.**"
+    catch_up_record "the read-back: what the daemon read from the channel's history after identifying afresh"
     ledger "the ledger: what the ear holds for the session"
     resume_session "$R/doctor-cold-expired.out" || return 1
     wait_for "$WAIT" "the ear to register again" ear_is attached registered || note "**Not registered within ${WAIT} s.**"
-    if wait_for 60 "the reply expired at the stand-in" posted expired; then
-      note 'The message sent while the host was down was answered.'
-    else
-      note '**Lost: the message sent while the host was down.** After a refused RESUME, Discord replays nothing, and frond-ear does not read channel history when it identifies afresh. The message never reached the ear: it is not in the ledger, and nothing tells the session about it. It is still in the channel'"'"'s history, where `fetch_messages` reads.'
-    fi
+    wait_for "$WAIT" "the reply expired at the stand-in" posted expired || note "**No \`expired\` within ${WAIT} s.**"
+    sleep 10
+    {
+      printf '\n### the daemon'"'"'s log of the read-back\n\n```console\n'
+      grep -E 'ear\.catch_up_|ear\.caught_up' "$R/daemon-cold-expired.log"
+      printf '```\n'
+    } | scrub >>"$T"
     discord_record "what the stand-in for Discord received"
     ledger "the ledger after the restart"
+    told_catch_up "$R/daemon-cold-expired.log" || note '**The session was not told of the read-back.**'
     none_twice || note '**An answer was posted twice.**'
-    ear_is attached registered && none_twice
+    ear_is attached registered && posted expired && told_catch_up "$R/daemon-cold-expired.log" && none_twice
     ;;
 
   teardown)

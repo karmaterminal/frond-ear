@@ -199,6 +199,8 @@ export function harness(
     env?: NodeJS.ProcessEnv;
     /** The TCP shared token, for a test that serves this daemon over listenTcp. */
     token?: string;
+    /** Channel history, newest first, for fetch_messages and the read-back. */
+    history?: (channelId: string, limit: number) => DiscordMessage[];
   } = {},
 ): Harness {
   const clock = new FakeClock();
@@ -208,7 +210,7 @@ export function harness(
     options.path ?? join(directory, "ear.db"),
     clock,
   );
-  const rest = new RecordingRest();
+  const rest = new RecordingRest(options.history);
   const logs: string[] = [];
   const daemon = new Daemon({
     config,

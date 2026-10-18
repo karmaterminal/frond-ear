@@ -64,6 +64,14 @@ export interface GatewayOptions {
   store: GatewayStore;
   logger: StructuredLogger;
   onMessage: (message: DiscordMessage) => void;
+  /**
+   * A session started afresh (READY after IDENTIFY): Discord replays nothing sent before it.
+   * Runs before the session is stored and before any of its dispatches; a throw fences the
+   * stream, so the next connection identifies afresh and calls it again.
+   */
+  onReady?: () => void;
+  /** A session resumed (RESUMED): Discord has replayed what was missed. */
+  onResumed?: () => void;
   onThread?: (threadId: string, parentId: string) => void;
   onFatal?: (closeCode: number) => void;
   socketFactory?: GatewaySocketFactory;
@@ -345,6 +353,15 @@ export class DiscordGateway {
           typeof ready.session_id === "string" &&
           typeof ready.resume_gateway_url === "string"
         ) {
+          try {
+            this.options.onReady?.();
+          } catch (error) {
+            this.statusValue.lastError = "ready_failed";
+            this.options.logger.log("error", "gateway.ready_failed", {
+              reason: error instanceof Error ? error.name : "unknown",
+            });
+            return false;
+          }
           this.options.store.saveGatewayState({
             sessionId: ready.session_id,
             sequence: typeof payload.s === "number" ? payload.s : null,
@@ -360,6 +377,13 @@ export class DiscordGateway {
         this.statusValue.state = "connected";
         this.reconnectAttempt = 0;
         this.statusValue.lastError = null;
+        try {
+          this.options.onResumed?.();
+        } catch (error) {
+          this.options.logger.log("error", "gateway.resumed_failed", {
+            reason: error instanceof Error ? error.name : "unknown",
+          });
+        }
         return true;
       case "GUILD_CREATE":
         this.recordThreads((payload.d as { threads?: unknown }).threads);

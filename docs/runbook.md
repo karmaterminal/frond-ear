@@ -65,13 +65,13 @@ filename is git-ignored) and fill in the fields below.
 
 **Timing, loops and limits**
 
-| Field         | Meaning                                                                                                                                                                                                                              |
-| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `defaults`    | `quietWindowMs` sets how long the room must be quiet before a flush. `maxDelayMs` caps how long continuous chatter can delay one. `priorityQuietMs` is the short wait after a mention. `historyLimit` caps how much context is kept. |
-| `botLoop`     | If more than `maxEvents` bot messages arrive within `windowMs` in one chat, bot messages stop waking the session for `cooldownMs`.                                                                                                   |
-| `ambientWake` | If more than `maxEvents` mention- or reply-driven wakes from ambient (non-principal, non-peer) users arrive within `windowMs` in one chat, further ones stop waking the session for `cooldownMs`. They are kept as context.          |
-| `limits`      | Per-message and per-notification size caps, the per-ear pending cap, and retention time.                                                                                                                                             |
-| `paused`      | Kill switch. Messages are still ingested, but nothing is pushed.                                                                                                                                                                     |
+| Field         | Meaning                                                                                                                                                                                                                                                                           |
+| ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `defaults`    | `quietWindowMs` sets how long the room must be quiet before a flush. `maxDelayMs` caps how long continuous chatter can delay one. `priorityQuietMs` is the short wait after a mention. `historyLimit` caps how much context is kept.                                              |
+| `botLoop`     | If more than `maxEvents` bot messages arrive within `windowMs` in one chat, bot messages stop waking the session for `cooldownMs`.                                                                                                                                                |
+| `ambientWake` | If more than `maxEvents` mention- or reply-driven wakes from ambient (non-principal, non-peer) users arrive within `windowMs` in one chat, further ones stop waking the session for `cooldownMs`. They are kept as context.                                                       |
+| `limits`      | Per-message and per-notification size caps, the per-ear pending cap, retention time, and how much is read back after an outage too long for Discord to resume the session: `catchUpMessages` per chat (50; 0 turns it off) in the `catchUpChats` most recently active chats (25). |
+| `paused`      | Kill switch. Messages are still ingested, but nothing is pushed.                                                                                                                                                                                                                  |
 
 Changes to the config take effect without a restart.
 
@@ -213,7 +213,10 @@ report `connected` before claiming success. Lingering must be on (`loginctl enab
 or user units will not start until someone logs in — the script warns if it is off.
 
 The SQLite state lives outside the checkout, so a restart keeps everything the ear is holding for
-a detached session. `docs/recovery.md` covers the rest: what is durable, what you have to back up
+a detached session. Messages sent while the daemon is down are replayed by Discord when the
+daemon is back within a few minutes; after a longer outage the daemon reads them back from each
+chat's history instead, up to `limits.catchUpMessages` per chat, and tells the session in a
+`catch_up` event. `docs/recovery.md` covers the rest: what is durable, what you have to back up
 yourself, and how to get back from a lost checkout, a lost home directory, or a lost session.
 
 ## 8. Hear binary-canticle (optional)

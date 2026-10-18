@@ -284,6 +284,72 @@ test("a failed ingest fences the stream and the event is replayed on resume", ()
   store.close();
 });
 
+test("READY calls onReady before the session is stored or dispatches anything; RESUMED calls onResumed", () => {
+  const store = new EventStore(":memory:", new FakeClock());
+  const calls: string[] = [];
+  const { gateway, sockets } = gatewayWith(store, {
+    onReady: () =>
+      calls.push(`ready, stored ${store.gatewayState().sessionId ?? "none"}`),
+    onResumed: () => calls.push("resumed"),
+    onMessage: (event) => calls.push(`message ${event.content}`),
+  });
+  gateway.start();
+  sockets[0]?.emitMessage({
+    op: 0,
+    t: "READY",
+    s: 1,
+    d: { session_id: "fresh", resume_gateway_url: "wss://resume.example" },
+  });
+  sockets[0]?.emitMessage({
+    op: 0,
+    t: "MESSAGE_CREATE",
+    s: 2,
+    d: message({ content: "first" }),
+  });
+  sockets[0]?.emitMessage({ op: 0, t: "RESUMED", s: 3, d: {} });
+  assert.deepEqual(calls, ["ready, stored none", "message first", "resumed"]);
+  assert.equal(store.gatewayState().sessionId, "fresh");
+  gateway.stop();
+  store.close();
+});
+
+test("a READY whose onReady fails is never stored: the stream is fenced and the next connection identifies afresh", () => {
+  const store = new EventStore(":memory:", new FakeClock());
+  let readies = 0;
+  const { gateway, sockets, timers } = gatewayWith(store, {
+    onReady: () => {
+      readies += 1;
+      if (readies === 1) {
+        throw new Error("simulated persistence failure");
+      }
+    },
+  });
+  gateway.start();
+  sockets[0]?.emitMessage({
+    op: 0,
+    t: "READY",
+    s: 1,
+    d: { session_id: "dropped", resume_gateway_url: "wss://resume.example" },
+  });
+  assert.equal(store.gatewayState().sessionId, null);
+  assert.equal(gateway.status().lastError, "ready_failed");
+  assert.equal(sockets[0]?.closeCode, 4_000, "the connection is dropped");
+  assert.equal(timers.length, 1);
+  timers.shift()?.callback();
+  sockets[1]?.emitMessage({ op: 10, d: { heartbeat_interval: 60_000 } });
+  assert.ok(sockets[1]?.sent.some((payload) => payload.op === 2));
+  sockets[1]?.emitMessage({
+    op: 0,
+    t: "READY",
+    s: 1,
+    d: { session_id: "kept", resume_gateway_url: "wss://resume.example" },
+  });
+  assert.equal(readies, 2);
+  assert.equal(store.gatewayState().sessionId, "kept");
+  gateway.stop();
+  store.close();
+});
+
 test("thread parents are learned from GUILD_CREATE, THREAD_CREATE and THREAD_LIST_SYNC", () => {
   const store = new EventStore(":memory:", new FakeClock());
   const seen: Array<[string, string]> = [];

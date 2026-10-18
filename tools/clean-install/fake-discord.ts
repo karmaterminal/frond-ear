@@ -20,6 +20,11 @@
 //   POST /control/inbound          {"channel", "author", "username", "content", "mention"}: one
 //                                  MESSAGE_CREATE to every connected Gateway client
 //   POST /control/expire-sessions  forgets every session issued so far, so none can be resumed
+//
+// REST: POST /channels/:id/messages (a send), PUT .../reactions/:emoji/@me, and GET
+// /channels/:id/messages, which reads a channel's history as Discord's does: newest first, at most
+// `limit` (1 to 100, default 50), older than `before` when given, and without the guild_id and
+// member that only the Gateway's MESSAGE_CREATE carries.
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import {
   createServer,
@@ -93,7 +98,12 @@ const state = {
   dispatches: [] as Dispatch[],
   posts: [] as Post[],
   reactions: [] as Array<{ channel: string; message: string; emoji: string }>,
-  restCalls: [] as Array<{ method: string; path: string; authOk: boolean }>,
+  restCalls: [] as Array<{
+    method: string;
+    path: string;
+    query: string;
+    authOk: boolean;
+  }>,
 };
 const sockets = new Set<WebSocket>();
 /** The session each connection holds, by READY or by an accepted RESUME. */
@@ -233,12 +243,14 @@ function rest(
   request: IncomingMessage,
   response: ServerResponse,
   path: string,
+  query: URLSearchParams,
   body: Record<string, unknown>,
 ): void {
   const method = request.method ?? "GET";
   const authOk = request.headers.authorization === `Bot ${TOKEN}`;
-  state.restCalls.push({ method, path, authOk });
-  log("rest.call", { method, path, authOk });
+  const search = query.size > 0 ? `?${query}` : "";
+  state.restCalls.push({ method, path, query: search, authOk });
+  log("rest.call", { method, path, query: search, authOk });
   if (!authOk) {
     send(response, 401, { code: 0, message: "401: Unauthorized" });
     return;
@@ -275,11 +287,35 @@ function rest(
   }
   if (messages?.[1] && method === "GET") {
     const channel = messages[1];
+    const limit = Number(query.get("limit") ?? 50);
+    const before = query.get("before");
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      send(response, 400, { code: 50035, message: "Invalid Form Body" });
+      return;
+    }
+    if (
+      query.has("after") ||
+      query.has("around") ||
+      (before !== null && !/^\d{17,20}$/u.test(before))
+    ) {
+      send(response, 400, {
+        code: 0,
+        message: "fake discord: only limit and before are modelled",
+      });
+      return;
+    }
     const inbound = state.dispatches
       .filter(
         (item) => item.t === "MESSAGE_CREATE" && item.d.channel_id === channel,
       )
-      .map((item) => item.d);
+      .map((item) => ({
+        id: String(item.d.id),
+        channel_id: channel,
+        author: item.d.author,
+        content: item.d.content,
+        timestamp: item.d.timestamp,
+        mentions: item.d.mentions,
+      }));
     const outbound = state.posts
       .filter((post) => post.channel_id === channel)
       .map((post) => ({
@@ -288,8 +324,13 @@ function rest(
         author: { id: BOT, username: "receipt-bot", bot: true },
         content: post.content,
         timestamp: post.timestamp,
+        mentions: [],
       }));
-    send(response, 200, [...inbound, ...outbound].reverse());
+    const page = [...inbound, ...outbound]
+      .filter((item) => before === null || BigInt(item.id) < BigInt(before))
+      .sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? 1 : -1))
+      .slice(0, limit);
+    send(response, 200, page);
     return;
   }
   const reaction =
@@ -373,7 +414,13 @@ const server = createServer((request, response) => {
   const url = new URL(request.url ?? "/", "http://127.0.0.1");
   void readBody(request).then((body) => {
     if (url.pathname.startsWith("/api/v10/")) {
-      rest(request, response, url.pathname.slice("/api/v10".length), body);
+      rest(
+        request,
+        response,
+        url.pathname.slice("/api/v10".length),
+        url.searchParams,
+        body,
+      );
     } else if (url.pathname.startsWith("/control/")) {
       control(request, response, url.pathname, body);
     } else {
