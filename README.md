@@ -25,7 +25,7 @@ Discord ──ws──▶ frond-ear daemon ──unix socket──▶ frond-ear 
 ```
 
 - **Trust comes from the verified author ID, never from message text.** Each message is classed as `principal`, `peer_agent` or `ambient`. The class travels in channel attributes that message content cannot forge, and operator-authored channel instructions tell Claude how to weigh each one.
-- **Nothing is lost while a session is away.** A durable ledger tracks every event through `queued → offered → seen`, and anything still waiting is delivered when the session reattaches.
+- **Admitted events survive a session's absence.** A durable ledger tracks each event through `queued → offered → seen` and re-offers waiting events on reattach. After a Gateway outage too long to resume, the daemon reads back a bounded slice of channel history; if that slice may omit messages, it tells the session about the gap rather than claiming complete recovery.
 - **No Anthropic credentials needed.** The shim rides on the Claude Code session's own login.
 - **No runtime dependencies.** Node ≥ 22.18 runs the TypeScript directly.
 
