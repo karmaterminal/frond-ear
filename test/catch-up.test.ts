@@ -465,6 +465,68 @@ test("with no session attached, the read-back is told at the next attach, failur
   }
 });
 
+test("a saved read-back report the daemon cannot read is dropped: the attach still finishes, and the next report is kept", async () => {
+  const anchor = mention("last heard");
+  const missed = mention("sent while down");
+  const config = testConfig({
+    ears: {
+      scribe: { attachCanary: true, channels: { [CHANNEL]: "mentions" } },
+    },
+  });
+  const h = harness(config, {
+    history: historyOf({ [CHANNEL]: [anchor, missed] }),
+  });
+  const pending = "catch_up.pending.scribe";
+  // Rows the daemon never writes. Some threw in the attach, before the canary; the others told
+  // the session of chats that are not there.
+  const unreadable = [
+    "{not json",
+    "null",
+    '{"skipped":[]}',
+    '{"chats":[]}',
+    '{"chats":[null],"skipped":[]}',
+    '{"chats":[{"read":1}],"skipped":[]}',
+    '{"chats":[{"chatId":"1"}],"skipped":[]}',
+    '{"chats":[{"chatId":"1","read":0,"failed":403}],"skipped":[]}',
+    '{"chats":[{"chatId":"1","read":0,"missing":{"after":"1"}}],"skipped":[]}',
+    '{"chats":[{"chatId":"1","read":0,"missing":{"before":"2"}}],"skipped":[]}',
+    '{"chats":[],"skipped":[7]}',
+  ];
+  try {
+    for (const saved of unreadable) {
+      h.store.setRuntimeState(pending, saved);
+      const shim = h.attach("scribe");
+      assert.deepEqual(kinds(shim.connection.events()), ["attach"], saved);
+      assert.equal(h.store.runtimeState(pending), undefined, saved);
+      shim.close();
+    }
+    // With no session attached, a read-back threw adding its report to an unreadable one, so
+    // its own was lost too.
+    h.daemon.ingest(anchor);
+    h.store.setRuntimeState(pending, "{not json");
+    h.daemon.gatewayReady();
+    await settled();
+    const shim = h.attach("scribe");
+    const [notice, canary] = shim.connection.events();
+    assert.equal(notice?.meta.kind, "catch_up");
+    assert.match(
+      notice?.content ?? "",
+      new RegExp(`chat ${CHANNEL}: 1 message read back\\.`, "u"),
+    );
+    assert.equal(canary?.meta.kind, "attach");
+    assert.equal(h.store.counters().catch_up_unreadable, unreadable.length + 1);
+    const warned = h.logs.filter(
+      (line) =>
+        (JSON.parse(line) as { event?: unknown }).event ===
+        "ear.catch_up_unreadable",
+    );
+    assert.equal(warned.length, unreadable.length + 1);
+    assert.deepEqual(told(h.logs), [{ ear: "scribe", chats: 1, skipped: 0 }]);
+  } finally {
+    h.dispose();
+  }
+});
+
 test("read-back mentions spend no wake budget, so live mentions still wake afterwards", async () => {
   const anchor = mention("last heard", AMBIENT);
   const channel = [anchor];

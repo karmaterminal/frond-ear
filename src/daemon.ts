@@ -124,6 +124,43 @@ const UNROUTED = new Set(["channel_not_bound", "dm_not_routed"]);
 /** Read-back entries kept for an ear whose session has not attached since. */
 const CATCH_UP_KEPT = 100;
 
+/** A saved read-back report, or undefined when the row is not one the daemon wrote. */
+function parsePendingCatchUp(
+  saved: string,
+): { chats: CatchUpChat[]; skipped: string[] } | undefined {
+  let value: unknown;
+  try {
+    value = JSON.parse(saved);
+  } catch {
+    return undefined;
+  }
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  const { chats, skipped } = value as { chats?: unknown; skipped?: unknown };
+  return Array.isArray(chats) &&
+    chats.every(isCatchUpChat) &&
+    Array.isArray(skipped) &&
+    skipped.every((chatId) => typeof chatId === "string")
+    ? { chats, skipped }
+    : undefined;
+}
+
+function isCatchUpChat(value: unknown): value is CatchUpChat {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const chat = value as Partial<CatchUpChat>;
+  return (
+    typeof chat.chatId === "string" &&
+    typeof chat.read === "number" &&
+    (chat.failed === undefined || typeof chat.failed === "string") &&
+    (chat.missing === undefined ||
+      (typeof chat.missing?.after === "string" &&
+        typeof chat.missing.before === "string"))
+  );
+}
+
 /** Whether snowflake `a` is newer than `b`. They are digit strings, so a longer one is newer. */
 function newerId(a: string, b: string): boolean {
   return a.length === b.length ? a > b : a.length > b.length;
@@ -939,16 +976,27 @@ export class Daemon {
     );
   }
 
-  /** Read-backs no session of this ear has been told of yet. */
+  /**
+   * Read-backs no session of this ear has been told of yet. A saved report the daemon cannot
+   * read is dropped, so it can neither break an attach nor lose the next report.
+   */
   private pendingCatchUp(ear: string): {
     chats: CatchUpChat[];
     skipped: string[];
   } {
-    const saved = this.store.runtimeState(`catch_up.pending.${ear}`);
+    const name = `catch_up.pending.${ear}`;
+    const saved = this.store.runtimeState(name);
     if (!saved) {
       return { chats: [], skipped: [] };
     }
-    return JSON.parse(saved) as { chats: CatchUpChat[]; skipped: string[] };
+    const pending = parsePendingCatchUp(saved);
+    if (!pending) {
+      this.store.clearRuntimeState(name);
+      this.store.increment("catch_up_unreadable");
+      this.logger.log("warn", "ear.catch_up_unreadable", { ear });
+      return { chats: [], skipped: [] };
+    }
+    return pending;
   }
 
   // ---- scheduling ----------------------------------------------------------------
