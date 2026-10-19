@@ -642,7 +642,7 @@ test("with catch-up off, a fresh session owes nothing and reads nothing", async 
   }
 });
 
-test("the catch_up notice lists gaps and failures first and names at most 20 chats", () => {
+test("the catch_up notice lists gaps and failures first, then chats read back in full up to 20 named", () => {
   const chats = [
     ...Array.from({ length: 25 }, (_, index) => ({
       chatId: String(700_000_000_000_000_100n + BigInt(index)),
@@ -663,4 +663,50 @@ test("the catch_up notice lists gaps and failures first and names at most 20 cha
   );
   assert.match(notice.content, / 7 more chats were read back in full\./u);
   assert.equal(notice.content.match(/chat 7\d+:/gu)?.length, 20);
+});
+
+test("the catch_up notice names every gap and failure past 20, and counts only chats read back in full (#75)", () => {
+  const chatId = (index: number) =>
+    String(700_000_000_000_001_000n + BigInt(index));
+  // Discord's REST API failing right after a fresh session fails every page.
+  const failed = renderCatchUp(
+    Array.from({ length: 25 }, (_, index) => ({
+      chatId: chatId(index),
+      read: 0,
+      failed: "Discord answered 503",
+    })),
+    [],
+  );
+  assert.equal(failed.meta.count, "0");
+  assert.equal(
+    failed.content.match(/: not read back \(Discord answered 503\)/gu)?.length,
+    25,
+  );
+  assert.doesNotMatch(failed.content, /read back in full/u);
+  const gaps = renderCatchUp(
+    Array.from({ length: 25 }, (_, index) =>
+      index < 22
+        ? {
+            chatId: chatId(index),
+            read: 50,
+            missing: {
+              after: "1000000000000000001",
+              before: "1000000000000000060",
+            },
+          }
+        : { chatId: chatId(index), read: 1 },
+    ),
+    [],
+  );
+  for (let index = 0; index < 22; index += 1) {
+    assert.match(
+      gaps.content,
+      new RegExp(
+        `chat ${chatId(index)}: 50 messages read back, but older ones may be missing`,
+        "u",
+      ),
+    );
+  }
+  assert.equal(gaps.content.match(/chat 7\d+:/gu)?.length, 22);
+  assert.match(gaps.content, / 3 more chats were read back in full\./u);
 });
