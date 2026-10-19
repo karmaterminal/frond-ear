@@ -44,6 +44,13 @@ class Reader {
   private readonly lines: string[] = [];
   private budget = MAX_COMPONENTS;
 
+  /** `prose`: the author's text blocks only, no control labels or media markers. */
+  private readonly prose: boolean;
+
+  public constructor(prose = false) {
+    this.prose = prose;
+  }
+
   public text(): string {
     return this.lines.join("\n");
   }
@@ -78,6 +85,9 @@ class Reader {
         this.push(this.control(asComponent(component.accessory)));
         return;
       case ACTION_ROW: {
+        if (this.prose) {
+          return;
+        }
         // One line per row: its buttons and selects, each marked as a control.
         const controls: string[] = [];
         if (
@@ -102,6 +112,9 @@ class Reader {
         return;
       }
       case MEDIA_GALLERY: {
+        if (this.prose) {
+          return;
+        }
         const items = Array.isArray(component.items) ? component.items : [];
         for (const _item of items.slice(0, this.budget)) {
           this.budget -= 1;
@@ -116,7 +129,7 @@ class Reader {
 
   /** A control or media leaf, marked so it never reads as the author's prose. */
   private control(component: Component | null): string | null {
-    if (!component) {
+    if (!component || this.prose) {
       return null;
     }
     if (component.type === BUTTON) {
@@ -147,6 +160,17 @@ class Reader {
 /** The readable text of a message's `components`, one line per text block; "" when none. */
 export function componentText(components: unknown): string {
   const reader = new Reader();
+  reader.list(components, 1);
+  return reader.text();
+}
+
+/**
+ * The author's prose in a message's components: TextDisplay blocks only, without button or
+ * select labels or media markers. Attention matching reads this, so a V2 message that names
+ * the ear wakes it like `content` would, while a control label never counts as addressing.
+ */
+export function componentProse(components: unknown): string {
+  const reader = new Reader(true);
   reader.list(components, 1);
   return reader.text();
 }

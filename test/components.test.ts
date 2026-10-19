@@ -9,6 +9,7 @@ import {
   IS_COMPONENTS_V2,
   MAX_COMPONENT_DEPTH,
   MAX_COMPONENTS,
+  componentProse,
   componentText,
   messageText,
 } from "../src/components.ts";
@@ -294,6 +295,62 @@ test("fetch_messages renders a V2 message's component text", async () => {
     const result = await h.call(shim, "fetch_messages", { chat_id: CHANNEL });
     assert.match(result.text, /> read from history/u);
     assert.doesNotMatch(result.text, /\(empty\)/u);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("componentProse reads text blocks only, never control labels or media", () => {
+  const components = [
+    CONTAINER([
+      TEXT("is scribe around?"),
+      {
+        type: 9,
+        components: [TEXT("in a section")],
+        accessory: { type: 2, label: "scribe" },
+      },
+      { type: 12, items: [{}] },
+    ]),
+    {
+      type: 1,
+      components: [
+        { type: 2, label: "scribe" },
+        { type: 3, placeholder: "scribe" },
+      ],
+    },
+  ];
+  assert.equal(componentProse(components), "is scribe around?\nin a section");
+});
+
+test("a V2 message whose text matches mentionPatterns wakes the ear without a Discord mention", () => {
+  const result = pushed(
+    v2Mention([CONTAINER([TEXT("is scribe around?")])], { mentions: [] }),
+  );
+  assert.match(result.content, /> is scribe around\?/u);
+});
+
+test("a V2 button or select label that matches mentionPatterns is not addressing", () => {
+  const h = harness(testConfig());
+  try {
+    const shim = h.attach("scribe");
+    const item = v2Mention(
+      [
+        CONTAINER([TEXT("a notice")]),
+        {
+          type: 1,
+          components: [
+            { type: 2, label: "ask scribe" },
+            { type: 3, placeholder: "scribe" },
+          ],
+        },
+      ],
+      { mentions: [] },
+    );
+    assert.equal(h.daemon.ingest(item), "inserted");
+    h.timers.advance(2_000);
+    assert.equal(shim.connection.events().length, 0);
+    const stored = h.store.unseen("scribe", undefined, 10)[0];
+    assert.match(stored?.content ?? "", /\[button: ask scribe\]/u);
   } finally {
     h.dispose();
   }

@@ -1,3 +1,4 @@
+import { componentProse } from "./components.ts";
 import type { ChannelConfig, Config, WakeBudget } from "./config.ts";
 import type { BatchKind, DiscordMessage, Mode, Trust } from "./types.ts";
 
@@ -113,18 +114,16 @@ export function isMentioned(config: Config, message: DiscordMessage): boolean {
   if (message.mentions?.some((mention) => mention.id === bot)) {
     return true;
   }
-  if (
-    message.content.includes(`<@${bot}>`) ||
-    message.content.includes(`<@!${bot}>`)
-  ) {
+  // Components V2 messages carry their prose in TextDisplay blocks, not `content` (#78).
+  const prose = componentProse(message.components);
+  const text = prose ? `${message.content}\n${prose}` : message.content;
+  if (text.includes(`<@${bot}>`) || text.includes(`<@!${bot}>`)) {
     return true;
   }
   if (message.referenced_message?.author.id === bot) {
     return true;
   }
-  return config.mentionMatchers.some((matcher) =>
-    matcher.test(message.content),
-  );
+  return config.mentionMatchers.some((matcher) => matcher.test(text));
 }
 
 export function classify(
