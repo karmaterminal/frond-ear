@@ -15,6 +15,7 @@ import { join } from "node:path";
 
 import { DELIVERY_PROOF, targetAdvice } from "./advice.ts";
 import { CanticleDelivery } from "./canticle/delivery.ts";
+import { messageText } from "./components.ts";
 import { CANTICLE_KEY_ID, CANTICLE_STATION, type Config } from "./config.ts";
 import type { StructuredLogger } from "./logger.ts";
 import {
@@ -687,7 +688,7 @@ export class Daemon {
       trust: classification.trust,
       wake: classification.wake,
       priority: classification.priority,
-      content: message.content.slice(0, this.config.limits.maxMessageChars),
+      content: messageText(message, this.config.limits.maxMessageChars),
       timestamp: message.timestamp,
       replyTo:
         message.message_reference?.message_id ??
@@ -2071,7 +2072,7 @@ export class Daemon {
       trust: trustOf(this.config, message.author.id),
       wake: false,
       priority: false,
-      content: message.content,
+      content: messageText(message, this.config.limits.maxMessageChars),
       timestamp: message.timestamp,
       replyTo: message.message_reference?.message_id ?? null,
       attachments: (message.attachments ?? []).map((file) => ({
