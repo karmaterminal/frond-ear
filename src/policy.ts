@@ -114,8 +114,9 @@ export function isMentioned(config: Config, message: DiscordMessage): boolean {
   if (message.mentions?.some((mention) => mention.id === bot)) {
     return true;
   }
-  // The text the session reads: a Components V2 message has its text in components.
-  const text = messageText(message);
+  // What the author wrote, which a Components V2 message keeps in its components. Its buttons
+  // and links are left out: a label or URL that names this ear does not address it.
+  const text = messageText(message, false);
   if (text.includes(`<@${bot}>`) || text.includes(`<@!${bot}>`)) {
     return true;
   }

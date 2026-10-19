@@ -177,7 +177,7 @@ test("fetch_messages shows a Components V2 message's text", async () => {
   }
 });
 
-test("a mention in a Components V2 message's text wakes the ear, as it would in content", () => {
+test("a mention in a Components V2 message's text wakes the ear, as it would in content; its buttons and links do not", () => {
   const h = harness();
   try {
     // CHANNEL is in mentions mode, and testConfig's mentionPatterns has \bscribe\b.
@@ -196,9 +196,29 @@ test("a mention in a Components V2 message's text wakes the ear, as it would in 
         channel_id: CHANNEL,
       }),
     );
+    h.daemon.ingest(
+      v2Message(
+        [
+          { type: 10, content: "the canary is green" },
+          {
+            type: 1,
+            components: [
+              { type: 2, style: 2, label: "Ping scribe", custom_id: "p" },
+              {
+                type: 2,
+                style: 5,
+                label: "View",
+                url: "https://example.com/frond-scribe/pull/12",
+              },
+            ],
+          },
+        ],
+        { channel_id: CHANNEL },
+      ),
+    );
     const counts = h.store.stateCounts("scribe");
     assert.equal(counts.queued, 2, "the two addressed messages wake");
-    assert.equal(counts.context, 1, "the unaddressed one is context");
+    assert.equal(counts.context, 2, "the unaddressed ones are context");
   } finally {
     h.dispose();
   }
@@ -285,14 +305,18 @@ test("messageText reads text displays, sections and containers, and marks button
   );
 });
 
-test("messageText keeps content when there is any, components or not", () => {
+test("messageText keeps content when there is any, and leaves controls out when asked", () => {
+  const buttons = [{ type: 1, components: [{ type: 2, label: "Approve" }] }];
   assert.equal(
-    messageText({
-      content: "Approve the deploy?",
-      components: [{ type: 1, components: [{ type: 2, label: "Approve" }] }],
-    }),
+    messageText({ content: "Approve the deploy?", components: buttons }),
     "Approve the deploy?",
   );
+  // A message without the V2 flag but with no content shows its buttons too.
+  assert.equal(
+    messageText({ content: "", components: buttons }),
+    "[button: Approve]",
+  );
+  assert.equal(messageText({ content: "", components: buttons }, false), "");
   assert.equal(messageText({ content: "" }), "");
 });
 

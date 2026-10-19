@@ -76,12 +76,16 @@ function controlText(component: DiscordComponent): string | undefined {
 }
 
 /**
- * The text of a message's components, a line each, in order: every TextDisplay's text, and
- * each row of buttons and select menus on one line. Containers and Sections are read
- * through, a Section's button accessory included. Media, files, thumbnails and separators
- * carry no text.
+ * The text of a message's components, a line each, in order: every TextDisplay's text, and,
+ * with `controls`, each row of buttons and select menus on one line. Containers and Sections
+ * are read through, a Section's button accessory included. Media, files, thumbnails and
+ * separators carry no text.
  */
-function componentLines(components: unknown, depth = 0): string[] {
+function componentLines(
+  components: unknown,
+  controls: boolean,
+  depth = 0,
+): string[] {
   if (!Array.isArray(components) || depth > COMPONENT_DEPTH) {
     return [];
   }
@@ -96,25 +100,32 @@ function componentLines(components: unknown, depth = 0): string[] {
     }
     const control = controlText(component);
     if (control) {
-      return [control];
+      return controls ? [control] : [];
     }
-    const inner = componentLines(component.components, depth + 1);
+    const inner = componentLines(component.components, controls, depth + 1);
     if (component.type === ACTION_ROW) {
       return inner.length > 0 ? [inner.join(" ")] : [];
     }
-    return [...inner, ...componentLines([component.accessory], depth + 1)];
+    return [
+      ...inner,
+      ...componentLines([component.accessory], controls, depth + 1),
+    ];
   });
 }
 
 /**
  * What a message says: its `content`, or, when that is empty, the text of its components,
  * where a Components V2 message keeps all of its text (#78). Either is the author's, so it is
- * quoted and cleaned the same way and never sets trust.
+ * quoted and cleaned the same way and never sets trust. Without `controls`, buttons and select
+ * menus are left out: they are what a reader can press, not what the author said.
  */
 export function messageText(
   message: Pick<DiscordMessage, "content" | "components">,
+  controls = true,
 ): string {
-  return message.content || componentLines(message.components).join("\n");
+  return (
+    message.content || componentLines(message.components, controls).join("\n")
+  );
 }
 
 function clockTime(timestamp: string): string {
