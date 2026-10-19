@@ -102,8 +102,8 @@ It covers everything that goes public with the repository:
   heads GitHub keeps under `refs/pull/*`. Merge commits are diffed against their first parent,
   and binary files are read as text.
 - **Conversations.** Issue and pull-request titles and bodies, issue comments, review bodies and
-  review line comments, read through `gh api`. It uses `GH_CONFIG_DIR`, or
-  `~/.config/gh-gloss` when that exists. If `gh` is missing or not signed in, the report says
+  review line comments, read through `gh api` with your own gh login
+  (set `GH_CONFIG_DIR` first if you keep more than one). If `gh` is missing or not signed in, the report says
   "not covered: PR/issue/review text" instead.
 
 It reports:

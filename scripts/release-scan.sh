@@ -6,9 +6,9 @@
 # Scans every ref the public will see: origin's branches and tags, and the pull request
 # heads GitHub serves under refs/pull/*, which outlive deleted branches. Merge commits are
 # diffed against their first parent and binary blobs are read as text. Then, through gh, it
-# scans the issue, pull request, comment and review text that goes public with the repo
-# (GH_CONFIG_DIR defaults to ~/.config/gh-gloss when that exists). Prints counts and
-# locations, never a matched secret value or a full email address.
+# scans the issue, pull request, comment and review text that goes public with the repo,
+# using the caller's own gh login. Prints counts and locations, never a matched secret value
+# or a full email address.
 #
 #   --expect <sha>  fail unless both HEAD and origin/main are exactly this commit
 #   --no-check      skip `pnpm check` and run only `pnpm scan:credentials` at HEAD
@@ -172,9 +172,6 @@ echo
 echo "## Conversations (issues, pull requests, comments, reviews)"
 echo
 SLUG="$(git remote get-url origin | sed -E 's#\.git$##; s#^.*github\.com[:/]##')"
-if [ -z "${GH_CONFIG_DIR:-}" ] && [ -d "$HOME/.config/gh-gloss" ]; then
-  export GH_CONFIG_DIR="$HOME/.config/gh-gloss"
-fi
 # lines LABEL-EXPR: jq that turns each item into "<place>\t<line>" for every line of its text.
 lines() { printf '.[] | (%s) as $p | ((.title // "") + "\\n" + (.body // "")) | split("\\n")[] | "\\($p)\\t\\(.)"' "$1"; }
 fetch_talk() {
