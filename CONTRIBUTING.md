@@ -93,20 +93,33 @@ RELEASE_SCAN_KNOWN_IDS=~/private/real-discord-ids.txt \
   scripts/release-scan.sh --expect <sha> > release-scan.md
 ```
 
-It covers every ref the public will see: origin's branches and tags, plus the pull-request heads
-GitHub keeps under `refs/pull/*`. It reports:
+`--expect` fails the scan unless both HEAD (the tree `pnpm check` tests) and `origin/main` are
+that commit.
+
+It covers everything that goes public with the repository:
+
+- **Git.** Every ref the public will see: origin's branches and tags, plus the pull-request
+  heads GitHub keeps under `refs/pull/*`. Merge commits are diffed against their first parent,
+  and binary files are read as text.
+- **Conversations.** Issue and pull-request titles and bodies, issue comments, review bodies and
+  review line comments, read through `gh api`. It uses `GH_CONFIG_DIR`, or
+  `~/.config/gh-gloss` when that exists. If `gh` is missing or not signed in, the report says
+  "not covered: PR/issue/review text" instead.
+
+It reports:
 
 - `pnpm check` at HEAD (or only `scan:credentials`, with `--no-check`);
-- `git log -p` over those refs, checked for:
+- for git history and for conversations alike, checks for:
   - Discord tokens and webhooks;
   - GitHub, Anthropic, OpenAI, Slack and AWS keys;
   - private-key headers;
   - `/home/` paths and private IPv4 addresses;
-- every 17–20-digit run that isn't shaped like a synthetic ID, and any real ID from
-  `RELEASE_SCAN_KNOWN_IDS` (a file kept outside the repository);
+  - every 17–20-digit run that isn't shaped like a synthetic ID, and any real ID from
+    `RELEASE_SCAN_KNOWN_IDS` (a file kept outside the repository);
+- the binary paths in each ref's tree;
 - a census of author and committer emails, masked as `abc…@domain`;
 - every branch, and whether `main` contains it.
 
 It never prints a matched secret. It exits 1 on any secret shape, real ID or unexplained
-snowflake. Paths, addresses and emails are for a person to judge. Attach its output to the
-release issue.
+snowflake, and when a `gh api` call fails partway. Paths, addresses, binaries and emails are
+for a person to judge. Attach its output to the release issue.
