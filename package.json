@@ -1,9 +1,8 @@
 {
   "name": "frond-ear",
   "version": "0.1.0",
-  "private": true,
   "description": "Discord Gateway ear that pushes debounced, trust-classified events into a long-running Claude Code session via a channel shim.",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "type": "module",
   "engines": {
     "node": ">=22.18.0"
