@@ -163,7 +163,7 @@ sh -c 'umask 077; set -C; : > "$1"' sh ~/.config/frond-ear/token && $EDITOR ~/.c
 # the agent does this, with the IDs the human gave it:
 node src/cli.ts init --non-interactive \
   --bot-user-id 100000000000000001 \
-  --principal 200000000000000002:figs \
+  --principal 200000000000000002:your-principal \
   --peer 300000000000000003:other-bot \
   --ear my-ear \
   --channel 700000000000000007 --channel 700000000000000008:room \
@@ -200,7 +200,7 @@ Nothing heard reaches a session unasked unless its ear has a `canticle.delivery`
 only records from station keys on `canticle.wakeKeys` are pushed
 ([runbook § Delivery modes](runbook.md#delivery-modes)). Where frond-ear is the host's one canticle listener it binds its own
 (`canticle.source: "embedded"`, the default). On a **shared host** (one where another harness,
-such as an OpenClaw prince, also hears canticle) it binds nothing and reads record v1 from
+such as an OpenClaw agent, also hears canticle) it binds nothing and reads record v1 from
 binary-canticle's host daemon (`"host-daemon"`); the embedded listener refuses to bind while a
 daemon answers. The fields, their defaults and how to check them are in
 [runbook §8](runbook.md#8-hear-binary-canticle-optional).

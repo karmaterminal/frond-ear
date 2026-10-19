@@ -38,7 +38,7 @@ const CREDENTIAL_HEADER =
 export interface ConnectorServerOptions {
   tools: ToolSet;
   auth: Authenticator;
-  /** The public origin a tunnel serves this at, e.g. https://silas.example.ts.net. */
+  /** The public origin a tunnel serves this at, e.g. https://host.example.ts.net. */
   publicUrl?: string | undefined;
   /** Extra Origin values to accept, besides the public URL and claude.ai's. */
   allowedOrigins?: readonly string[];

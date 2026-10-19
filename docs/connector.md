@@ -1,7 +1,7 @@
 # claude.ai custom connector: the echo step (#53)
 
 `frond-ear connector-echo` is the first, disposable step of #53: a **read-only** MCP server that a
-claude.ai custom connector can call, run on a seat behind Tailscale Funnel. It proves what the
+claude.ai custom connector can call, run on a host behind Tailscale Funnel. It proves what the
 connector's transport and auth actually need before the Discord facade is built.
 
 - **It has no Discord access.** No bot token, no daemon socket, no ledger. Its two tools are
@@ -71,8 +71,8 @@ umask 077 && openssl rand -base64 33 | tr -d '\n' > ~/.config/frond-ear/connecto
 
 Generate the owner passphrase this way too, rather than choosing one. The consent page is on the
 open internet, and its limits on wrong passphrases (under [oauth](#oauth)) only slow guessing
-down; 33 random bytes put the passphrase out of reach. figs pastes it on the consent page, so
-keep it as a POCKET key and say which one; never put it in a channel or an issue.
+down; 33 random bytes put the passphrase out of reach. The owner pastes it on the consent page, so
+keep it in a password manager; never put it in a channel or an issue.
 
 Funnel forwards a bare port to `127.0.0.1` only, so a server listening on `[::1]`, or on a
 `localhost` that resolves to it, can't be reached through it.
@@ -133,10 +133,10 @@ A single-owner authorization server on the same origin, which Claude discovers f
 
 ## The proof, step by step
 
-The seat and the princes do steps 1 to 4, 9 and 10; figs does 5 to 8 in claude.ai. Nothing here
+The host's operator does steps 1 to 4, 9 and 10; the connector's owner does 5 to 8 in claude.ai. Nothing here
 is automated.
 
-1. **Choose the host.** Which seat runs it, as which user, and whether it gets its own unit. Funnel
+1. **Choose the host.** Which machine runs it, as which user, and whether it gets its own unit. Funnel
    needs Tailscale 1.38.3 or later, MagicDNS, HTTPS certificates, and the `funnel` node attribute
    in the tailnet policy file ([Tailscale Funnel](https://tailscale.com/kb/1223/funnel)).
 2. **Start the server** in tmux or a user unit, with the auth mode under test, for example:
@@ -161,9 +161,9 @@ is automated.
      Funnel should replace both headers rather than pass them on, so `forwardedFor` should be
      that address alone. The per-caller limits rely on this: if `source` is `192.0.2.1`, stop
      and record it on #53.
-5. **Add the connector** (figs): [Customize > Connectors](https://claude.ai/customize/connectors) >
-   **Add custom connector**, URL `https://<host>/mcp`, settings from the table above. For Project 95
-   threads, also turn it on under the project's settings, Connectors. Connectors load when a session
+5. **Add the connector** (owner): [Customize > Connectors](https://claude.ai/customize/connectors) >
+   **Add custom connector**, URL `https://<host>/mcp`, settings from the table above. For claude.ai
+   project threads, also turn it on under the project's settings, Connectors. Connectors load when a session
    starts, so the test needs a new thread.
 6. **Sign in** (oauth): the consent page should say the browser goes back to `claude.ai`. Approve
    with the owner passphrase.
@@ -173,7 +173,7 @@ is automated.
    refreshes up to five minutes before expiry, or on a `401`.
 9. **Restart the server** and call a tool once more, to see what Claude does when its session or
    token is gone. In oauth mode, expect a refresh that gets `invalid_grant`, then a new sign-in
-   for figs to approve: note whether Claude registers again or reuses its client id.
+   for the owner to approve: note whether Claude registers again or reuses its client id.
 10. **Take it down**: repeat the Funnel command with `off` at the end (`tailscale funnel --bg 8787 off`),
     stop the server, and remove the connector unless the facade follows soon. Avoid
     `tailscale funnel reset` on a shared host: it clears the node's other Serve and Funnel config too.
@@ -270,8 +270,8 @@ jq -c 'select(.event == "connector.request")
   the gate, and the page names the host the browser goes back to. Tokens and codes are stored
   only as SHA-256 digests, except the newest rotation's pair, held for 60 s.
 - **Consent phishing.** Anyone can add this public URL as a connector in their own claude.ai
-  account and send figs the sign-in link their Connect opened. The consent page can't tell that
-  from figs's own sign-in, and approving it could connect their account. Approve only right
+  account and send the owner the sign-in link their Connect opened. The consent page can't tell that
+  from the owner's own sign-in, and approving it could connect their account. Approve only right
   after pressing Connect yourself, never from a link someone sent.
 - **Not covered.** CIMD, token persistence across restarts, and per-user identity. A single
   owner is all the facade needs; the proof decides whether CIMD is worth adding.

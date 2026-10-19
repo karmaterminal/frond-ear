@@ -8,7 +8,7 @@ check (#35). It works in a disposable root:
 - every command runs under `env -i`, with only the variables the transcript lists: no GitHub
   token, no git or gh config, no proxy, no frond-ear or Claude Code config;
 - the bot token is a synthetic one, written by a stand-in `$EDITOR`;
-- Discord is a loopback stand-in (`fake-discord.ts`), so no real bot, channel or prince takes part.
+- Discord is a loopback stand-in (`fake-discord.ts`), so no real bot, channel or agent takes part.
 
 The one real outside party is Claude Code: a real `claude` session attaches the ear, acks the
 attach canary and answers a message.

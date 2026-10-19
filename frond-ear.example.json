@@ -3,12 +3,12 @@
   "principals": ["200000000000000002"],
   "peerAgents": ["300000000000000003"],
   "labels": {
-    "200000000000000002": "figs",
+    "200000000000000002": "your-principal",
     "300000000000000003": "openclaw-agent"
   },
-  "mentionPatterns": ["\\bscribe\\b"],
+  "mentionPatterns": ["\\bmy-ear\\b"],
   "ears": {
-    "frond-scribe": {
+    "my-ear": {
       "target": "claude-channel",
       "dms": true,
       "dmMode": "mentions",
@@ -24,7 +24,7 @@
         },
         "700000000000000009": "silent"
       },
-      "instructions": "You are frond-scribe. Keep Discord replies short; long work goes in files."
+      "instructions": "Keep Discord replies short; long work goes in files."
     }
   },
   "defaults": {
@@ -59,12 +59,12 @@
     "port": 9999,
     "binding": "lan",
     "tune": {
-      "frond-scribe": ["*:ops.fleet"]
+      "my-ear": ["*:ops.fleet"]
     },
     "wakeKeys": [],
     "muted": false,
     "delivery": {
-      "frond-scribe": {
+      "my-ear": {
         "mode": "digest",
         "windowMs": 60000,
         "debounceMs": 5000,

@@ -225,7 +225,7 @@ function withNote(reply: HttpReply, note: Note): HttpReply {
 }
 
 export interface OAuthOptions {
-  /** The public origin, e.g. https://silas.example.ts.net. It is also the issuer. */
+  /** The public origin, e.g. https://host.example.ts.net. It is also the issuer. */
   publicUrl: string;
   /** The owner passphrase the consent page asks for. */
   ownerSecret: string;
