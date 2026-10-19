@@ -49,6 +49,10 @@ export interface DiscordMessage {
   referenced_message?: { id: string; author: DiscordAuthor } | null;
   webhook_id?: string;
   type?: number;
+  /** Message flags; `IS_COMPONENTS_V2` (1 << 15) means the text is in `components`. */
+  flags?: number;
+  /** Components V2 blocks, or a legacy ActionRow; read by `src/components.ts`. */
+  components?: unknown[];
 }
 
 export interface GatewayPayload {

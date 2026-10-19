@@ -60,6 +60,8 @@ bad value names the field.
 
 `frond-ear.example.json` shows every field filled in. The runbook explains the timing fields.
 
+`maxMessageChars` caps a message's `content` joined with the text of its components (TextDisplay, Section and Container blocks, plus button and select labels marked `[button: …]` / `[select: …]`), which is where a Components V2 message carries its text. That text is quoted and cleaned exactly like `content` and never sets trust.
+
 ## 3. The install boundary
 
 **`init` writes exactly two files and nothing else:**
