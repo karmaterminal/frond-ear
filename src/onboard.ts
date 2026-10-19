@@ -62,7 +62,7 @@ export function defaultTokenPath(env: NodeJS.ProcessEnv): string {
 
 /**
  * The shell line that creates a token file 0600 and opens it in $EDITOR. `set -C` makes it
- * refuse a file that already exists: on a host shared with another seat's ear that file may be
+ * refuse a file that already exists: on a host shared with another agent's ear that file may be
  * the other ear's token, which `install -m 600 /dev/null` would have emptied (#57). The create
  * runs under `sh -c` with the path as an argument, so the line also works pasted into fish.
  */

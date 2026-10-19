@@ -196,7 +196,7 @@ export function parseConnectorEchoArgs(argv: string[]): ConnectorEchoConfig {
     }
     if (url.protocol !== "https:" || url.pathname !== "/" || url.search) {
       throw new Error(
-        "--public-url must be an https origin with no path, e.g. https://silas.example.ts.net",
+        "--public-url must be an https origin with no path, e.g. https://host.example.ts.net",
       );
     }
   }

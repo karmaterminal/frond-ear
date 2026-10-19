@@ -1,0 +1,298 @@
+#!/usr/bin/env bash
+# Pre-public release scan (#35). Rerun it at the exact SHA that goes public, in a fresh clone.
+#
+#   scripts/release-scan.sh [--expect <sha>] [--no-check] [--no-conversations]
+#
+# Scans every ref the public will see: origin's branches and tags, and the pull request
+# heads GitHub serves under refs/pull/*, which outlive deleted branches. Merge commits are
+# diffed against their first parent and binary blobs are read as text. Then, through gh, it
+# scans the issue, pull request, comment and review text that goes public with the repo,
+# using the caller's own gh login, and the wiki's history when the wiki is enabled. Commit
+# messages are scanned in full. Prints counts and locations, never a matched secret value or
+# a full email address.
+#
+#   --expect <sha>  fail unless both HEAD and origin/main are exactly this commit
+#   --no-check      skip `pnpm check` and run only `pnpm scan:credentials` at HEAD
+#   --no-conversations
+#                   skip the gh pass on purpose; the run can then never certify a release
+#
+# RELEASE_SCAN_KNOWN_IDS may name a file of real Discord IDs (one per line, kept outside the
+# repository) that must appear nowhere in history.
+#
+# Exit status is 1 if any secret-shaped pattern, known ID or unexplained snowflake is found,
+# if --expect doesn't match HEAD and origin/main, or if pull request heads or conversations
+# couldn't be read (gh missing or signed out included), or if an enabled wiki can't be
+# cloned. With --no-conversations, a run that
+# found nothing else exits 3, "incomplete": never 0, so it can't pass for a release receipt.
+# `/home/` paths, private IPv4 addresses and author emails are reported, not failed: they are
+# for a person to judge.
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+EXPECT=""
+CHECK=1
+CONVERSATIONS=1
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --expect) EXPECT="${2:?--expect needs a sha}"; shift 2 ;;
+    --no-check) CHECK=0; shift ;;
+    --no-conversations) CONVERSATIONS=0; shift ;;
+    *) echo "usage: scripts/release-scan.sh [--expect <sha>] [--no-check] [--no-conversations]" >&2; exit 2 ;;
+  esac
+done
+
+FAIL=0
+SCRATCH="$(mktemp -d)"
+PATCH="$SCRATCH/patch"
+MSG="$SCRATCH/messages"
+TALK="$SCRATCH/talk"
+WIKI="$SCRATCH/wiki"
+trap 'rm -rf "$SCRATCH"; git for-each-ref --format="delete %(refname)" refs/release-scan | git update-ref --stdin' EXIT
+if ! git fetch --quiet --prune --tags origin; then
+  echo "release-scan: fetching branches and tags from origin failed" >&2
+  exit 1
+fi
+# Pull request heads are public and outlive deleted branches. A failed fetch would silently
+# scan none of them, so it stops the scan, and the count is checked against the server's.
+if ! git fetch --quiet origin '+refs/pull/*/head:refs/release-scan/pull/*'; then
+  echo "release-scan: fetching refs/pull/*/head from origin failed; the pull request heads would go unscanned" >&2
+  exit 1
+fi
+PULLS_SERVER="$(git ls-remote origin 'refs/pull/*/head' | wc -l)"
+PULLS="$(git for-each-ref refs/release-scan/pull | wc -l)"
+REFS=(--remotes=origin --tags '--glob=refs/release-scan/pull/*')
+
+MAIN="$(git rev-parse origin/main)"
+HEAD_SHA="$(git rev-parse HEAD)"
+echo "# frond-ear release scan"
+echo
+echo "- origin/main: \`$MAIN\`"
+echo "- HEAD: \`$HEAD_SHA\`"
+if [ -n "$EXPECT" ]; then
+  # The tree `pnpm check` tests is HEAD's, and what goes public is origin/main: both must be it.
+  WANT="$(git rev-parse --verify --quiet "$EXPECT^{commit}" || true)"
+  if [ -z "$WANT" ]; then
+    echo "- **--expect $EXPECT is not a commit here**"
+    FAIL=1
+  else
+    [ "$MAIN" = "$WANT" ] || { echo "- **origin/main is not the expected \`$WANT\`**"; FAIL=1; }
+    [ "$HEAD_SHA" = "$WANT" ] || { echo "- **HEAD is not the expected \`$WANT\`**"; FAIL=1; }
+  fi
+fi
+echo "- branches: $(git branch -r --list 'origin/*' | grep -vc -- '->'), tags: $(git tag | wc -l), pull request heads: $PULLS fetched of $PULLS_SERVER on origin"
+if [ "$PULLS" != "$PULLS_SERVER" ]; then
+  echo "- **pull request heads fetched ($PULLS) differ from origin's ($PULLS_SERVER)**"
+  FAIL=1
+fi
+echo "- reachable commits: $(git rev-list "${REFS[@]}" | wc -l)"
+echo
+
+echo "## pnpm at HEAD"
+echo
+if [ "$CHECK" = 1 ]; then
+  pnpm --silent check >/dev/null 2>&1 && echo "- pnpm check: pass" || { echo "- pnpm check: **FAIL**"; FAIL=1; }
+else
+  pnpm --silent scan:credentials >/dev/null 2>&1 && echo "- scan:credentials: pass" || { echo "- scan:credentials: **FAIL**"; FAIL=1; }
+fi
+echo
+
+# One line per patch line, prefixed with its commit, so a hit can be located without printing it.
+# Merges are diffed against their first parent, so a merge resolution is scanned too, and
+# binary blobs are scanned as text.
+git log "${REFS[@]}" -p --diff-merges=first-parent --text --no-ext-diff --no-color --format='commit %H' |
+  awk '/^commit [0-9a-f]{40}$/ { c = substr($2, 1, 10); next } { print c "\t" $0 }' >"$PATCH"
+# Commit messages, in full: on these repos they carry session links and trailers.
+git log "${REFS[@]}" --format='commit %H%n%B' |
+  awk '/^commit [0-9a-f]{40}$/ { c = substr($2, 1, 10); next } { print c "\t" $0 }' >"$MSG"
+
+# count FILE NAME REGEX FATAL: distinct values, then the places (first column) that hold them.
+count() {
+  local hits values places
+  hits="$(grep -aE -- "$3" "$1" || true)"
+  # Trim the boundary characters some patterns match, so a quoted and an unquoted path count as one value.
+  values="$(printf '%s' "$hits" | cut -f2- | grep -aoE -- "$3" | sed -E 's/^[^A-Za-z0-9/]//; s/[^A-Za-z0-9]$//' | sort -u | grep -c . || true)"
+  places="$(printf '%s' "$hits" | cut -f1 | sort -u | grep -c . || true)"
+  echo "| $2 | $values | $places |"
+  if [ "$4" = 1 ] && [ "$values" != 0 ]; then FAIL=1; fi
+}
+
+# patterns FILE PLACES: the pattern table, then the Discord ID checks, over one dump.
+patterns() {
+  echo "| Pattern | Distinct values | $2 |"
+  echo "| --- | --- | --- |"
+  count "$1" "Discord bot token" '[A-Za-z0-9_-]{24,}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{25,}|mfa\.[A-Za-z0-9_-]{20,}' 1
+  count "$1" "Discord webhook URL" 'discord(app)?\.com/api/webhooks/[0-9]+/[A-Za-z0-9_-]+' 1
+  count "$1" "GitHub token" 'gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{22,}' 1
+  count "$1" "Anthropic/OpenAI key" 'sk-(ant-)?[A-Za-z0-9_-]{20,}' 1
+  count "$1" "Slack token" 'xox[abprs]-[A-Za-z0-9-]{10,}' 1
+  count "$1" "AWS access key" 'AKIA[0-9A-Z]{16}' 1
+  count "$1" "Private key header" '-----BEGIN [A-Z ]*PRIVATE KEY-----' 1
+  count "$1" "/home/ path" '(^|[^A-Za-z0-9_})$])/home/[a-z_][a-z0-9_-]*' 0
+  count "$1" "Private IPv4" '(^|[^0-9.])(10(\.[0-9]{1,3}){3}|192\.168(\.[0-9]{1,3}){2}|172\.(1[6-9]|2[0-9]|3[01])(\.[0-9]{1,3}){2}|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])(\.[0-9]{1,3}){2})($|[^0-9.])' 0
+  echo
+
+  # Snowflakes: 17-20 digit runs standing alone (not inside hex or base64). Fixtures use
+  # synthetic IDs, which have a run of six repeated digits (100000000000000001) or count up
+  # (123456789012345678); anything else needs a person to look at it.
+  # Split into word tokens first: matching the boundaries instead would consume the `/`
+  # between two IDs in a guild/channel/message link and skip the second.
+  local all other id known
+  all="$(cut -f2- "$1" | grep -aoE '[0-9A-Za-z_]+' | grep -xE '[0-9]{17,20}' | sort -u || true)"
+  other="$(printf '%s\n' "$all" | grep -E . | grep -vE '([0-9])\1{5}|123456789' || true)"
+  echo "- distinct 17–20 digit runs: $(printf '%s\n' "$all" | grep -c . || true)"
+  echo "- not synthetic-shaped: $(printf '%s\n' "$other" | grep -c . || true)"
+  for id in $other; do
+    echo "  - \`${id:0:4}…${id: -4}\` in $(grep -aF -- "$id" "$1" | cut -f1 | sort -u | head -3 | tr '\n' ' ')"
+    FAIL=1
+  done
+  if [ -n "${RELEASE_SCAN_KNOWN_IDS:-}" ]; then
+    known=0
+    while read -r id; do
+      [ -z "$id" ] && continue
+      if grep -qaF -- "$id" "$1"; then known=$((known + 1)); fi
+    done <"$RELEASE_SCAN_KNOWN_IDS"
+    echo "- known real IDs (from \$RELEASE_SCAN_KNOWN_IDS) found: $known"
+    [ "$known" = 0 ] || FAIL=1
+  else
+    echo "- known real IDs: not checked (set RELEASE_SCAN_KNOWN_IDS)"
+  fi
+  echo
+}
+
+echo "## History (all refs above)"
+echo
+patterns "$PATCH" "Commits"
+
+echo "## Commit messages (all refs above)"
+echo
+patterns "$MSG" "Commits"
+
+# Binary files are scanned as text above, but a pattern can miss inside one; list them.
+echo "## Binary paths"
+echo
+EMPTY_TREE="$(git hash-object -t tree /dev/null)"
+with_binary=0
+total_refs=0
+while read -r ref; do
+  total_refs=$((total_refs + 1))
+  n="$(git diff --numstat "$EMPTY_TREE" "$ref" | awk -F'\t' '$1 == "-"' | wc -l)"
+  if [ "$n" != 0 ]; then
+    with_binary=$((with_binary + 1))
+    echo "- \`${ref#refs/}\`: $n"
+  fi
+done < <(git for-each-ref --format='%(refname)' refs/remotes/origin refs/tags refs/release-scan/pull | grep -vx 'refs/remotes/origin/HEAD')
+echo "- refs with binary paths in their tree: $with_binary of $total_refs"
+echo "- distinct binary paths in history: $(git log "${REFS[@]}" --diff-merges=first-parent --numstat --format= | awk -F'\t' '$1 == "-" { print $3 }' | sort -u | grep -c . || true)"
+echo
+
+# Issues, pull requests and their comments and reviews go public with the repository too.
+echo "## Conversations (issues, pull requests, comments, reviews)"
+echo
+SLUG="$(git remote get-url origin | sed -E 's#\.git$##; s#^.*github\.com[:/]##')"
+# lines LABEL-EXPR: jq that turns each item into "<place>\t<line>" for every line of its text.
+lines() { printf '.[] | (%s) as $p | ((.title // "") + "\\n" + (.body // "")) | split("\\n")[] | "\\($p)\\t\\(.)"' "$1"; }
+# Every call must succeed: a failed one returns 1, never an empty list that looks scanned.
+PRS_LISTED=0
+PRS_REVIEWED=0
+fetch_talk() {
+  local pr prs
+  gh api --paginate "repos/$SLUG/issues?state=all&per_page=100" \
+    --jq "$(lines 'if .pull_request then "pr#" else "issue#" end + (.number | tostring)')" || return 1
+  gh api --paginate "repos/$SLUG/issues/comments?per_page=100" \
+    --jq "$(lines '"comment:" + (.issue_url | split("/") | last)')" || return 1
+  gh api --paginate "repos/$SLUG/pulls/comments?per_page=100" \
+    --jq "$(lines '"review-line:" + (.pull_request_url | split("/") | last)')" || return 1
+  prs="$(gh api --paginate "repos/$SLUG/pulls?state=all&per_page=100" --jq '.[].number')" || return 1
+  PRS_LISTED="$(printf '%s\n' "$prs" | grep -c . || true)"
+  for pr in $prs; do
+    gh api --paginate "repos/$SLUG/pulls/$pr/reviews?per_page=100" --jq "$(lines "\"review:$pr\"")" || return 1
+    PRS_REVIEWED=$((PRS_REVIEWED + 1))
+  done
+}
+if [ "$CONVERSATIONS" = 0 ]; then
+  echo "- **not covered: PR/issue/review text** (skipped by --no-conversations)"
+  echo
+elif ! command -v gh >/dev/null 2>&1 || ! gh auth status >/dev/null 2>&1; then
+  echo "- **not covered: PR/issue/review text** (gh is missing or not signed in)"
+  echo
+  FAIL=1
+elif ! fetch_talk >"$TALK"; then
+  echo "- **not covered: PR/issue/review text** (a gh api call failed; $PRS_REVIEWED of $PRS_LISTED pull requests' reviews fetched)"
+  echo
+  FAIL=1
+else
+  echo "- pull requests listed: $PRS_LISTED, reviews fetched for: $PRS_REVIEWED"
+  if [ "$PRS_LISTED" != "$PRS_REVIEWED" ]; then
+    echo "- **pull requests listed and reviewed differ**"
+    FAIL=1
+  fi
+  echo "- \`$SLUG\`: $(cut -f1 "$TALK" | sort -u | sed -E 's/[0-9]+$//' | uniq -c | awk '{ printf "%s%s %s", sep, $1, $2; sep = ", " }') places, $(wc -l <"$TALK") lines"
+  echo
+  patterns "$TALK" "Places"
+fi
+
+# The wiki is a separate git repository, public with the main one when it is enabled. GitHub
+# answers "not found" for an enabled wiki that has no pages yet.
+echo "## Wiki"
+echo
+if [ "$CONVERSATIONS" = 0 ]; then
+  echo "- wiki: not checked (--no-conversations)"
+elif ! command -v gh >/dev/null 2>&1 || ! gh auth status >/dev/null 2>&1; then
+  echo "- **wiki: not checked** (gh is missing or not signed in)"
+  FAIL=1
+elif ! HAS_WIKI="$(gh api "repos/$SLUG" --jq .has_wiki)"; then
+  echo "- **wiki: could not read whether it is enabled**"
+  FAIL=1
+elif [ "$HAS_WIKI" != true ]; then
+  echo "- wiki: disabled"
+else
+  # Clone with the caller's gh login. It must reach the main repository first, so a "not
+  # found" from the wiki means no wiki, not missing credentials.
+  GIT_GH=(git -c credential.helper= -c 'credential.helper=!gh auth git-credential')
+  if ! GIT_TERMINAL_PROMPT=0 "${GIT_GH[@]}" ls-remote "https://github.com/$SLUG.git" HEAD >/dev/null 2>&1; then
+    echo "- **wiki: enabled, but gh's credentials can't reach https://github.com/$SLUG.git**"
+    FAIL=1
+  elif ERR="$(GIT_TERMINAL_PROMPT=0 "${GIT_GH[@]}" clone --quiet --mirror "https://github.com/$SLUG.wiki.git" "$WIKI" 2>&1)"; then
+    git -C "$WIKI" log --all -p --diff-merges=first-parent --text --no-ext-diff --no-color --format='commit %H%n%B' |
+      awk '/^commit [0-9a-f]{40}$/ { c = substr($2, 1, 10); next } { print c "\t" $0 }' >"$SCRATCH/wiki-patch"
+    echo "- wiki: enabled, $(git -C "$WIKI" rev-list --all | wc -l) commits, scanned with their messages"
+    echo
+    patterns "$SCRATCH/wiki-patch" "Commits"
+  elif printf '%s' "$ERR" | grep -qi 'not found'; then
+    echo "- wiki: enabled, no content"
+  else
+    echo "- **wiki: enabled, but cloning it failed**"
+    FAIL=1
+  fi
+fi
+echo
+
+echo "## Author and committer emails"
+echo
+echo "| Email (masked) | Commits |"
+echo "| --- | --- |"
+git log "${REFS[@]}" --format='%H %ae%n%H %ce' | sort -u | cut -d' ' -f2 | sort | uniq -c | sort -rn |
+  awk '{ split($2, a, "@"); printf "| `%s…@%s` | %d |\n", substr(a[1], 1, 3), a[2], $1 }'
+echo
+
+echo "## Branches"
+echo
+echo "| Branch | Merged into main |"
+echo "| --- | --- |"
+MERGED="$(git branch -r --merged origin/main --format='%(refname:short)')"
+git branch -r --list 'origin/*' --format='%(refname:short)' | grep -v '^origin$' | grep -vx 'origin/HEAD' |
+  while read -r branch; do
+    if printf '%s\n' "$MERGED" | grep -qxF -- "$branch"; then m=yes; else m=no; fi
+    echo "| \`${branch#origin/}\` | $m |"
+  done
+echo
+
+if [ "$FAIL" != 0 ]; then
+  echo "**Result: needs a look (see above).**"
+  exit 1
+fi
+if [ "$CONVERSATIONS" = 0 ]; then
+  echo "**Result: incomplete. Conversations were skipped (--no-conversations), so this is not a release receipt.**"
+  exit 3
+fi
+echo "**Result: clean.**"

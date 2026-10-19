@@ -1,6 +1,6 @@
 # frond-ear runbook
 
-This runbook takes a Claude Code session from polling Discord to having Discord events pushed to it. Work through the stages in order, and don't point frond-ear at a long-running session (such as frond-scribe) until stage 2 passes on a throwaway session.
+This runbook takes a Claude Code session from polling Discord to having Discord events pushed to it. Work through the stages in order, and don't point frond-ear at a long-running session (such as your main agent) until stage 2 passes on a throwaway session.
 
 ## 0. Prerequisites
 
@@ -38,13 +38,13 @@ filename is git-ignored) and fill in the fields below.
 
 **Identity and trust**
 
-| Field             | Meaning                                                                                                                                            |
-| ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `botUserId`       | The bot's own user ID. Its own messages are always ignored.                                                                                        |
-| `principals`      | Your operators, e.g. figs. Their messages have `trust="principal"` and they may DM the bot. Being a principal does not by itself wake the session. |
-| `peerAgents`      | OpenClaw or other agent bots allowed through, with `trust="peer_agent"`. Any other bot is dropped.                                                 |
-| `labels`          | Optional friendly names for IDs, shown in headers and in the channel instructions.                                                                 |
-| `mentionPatterns` | Regexes that count as addressing the bot, e.g. `\bscribe\b`.                                                                                       |
+| Field             | Meaning                                                                                                                                                                 |
+| ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `botUserId`       | The bot's own user ID. Its own messages are always ignored.                                                                                                             |
+| `principals`      | Your operators, the people this ear answers to. Their messages have `trust="principal"` and they may DM the bot. Being a principal does not by itself wake the session. |
+| `peerAgents`      | OpenClaw or other agent bots allowed through, with `trust="peer_agent"`. Any other bot is dropped.                                                                      |
+| `labels`          | Optional friendly names for IDs, shown in headers and in the channel instructions.                                                                                      |
+| `mentionPatterns` | Regexes that count as addressing the bot, e.g. `\bmy-ear\b`.                                                                                                            |
 
 **Ears**
 
@@ -118,7 +118,7 @@ Claude Code asks you to confirm the development-channel flag. Then:
 2. **Idle wake.** From another terminal, inject a mention from a principal:
    ```sh
    FROND_EAR_BOT_USER_ID=<botUserId> node src/cli.ts inject \
-     --chat <a mentions channel id> --guild <guild id> --author <principal id> --name figs \
+     --chat <a mentions channel id> --guild <guild id> --author <principal id> --name your-principal \
      --mention "are you there?"
    ```
    The idle session should wake, and its `reply` should appear on the daemon's stderr as `dry-run send → …`.
@@ -137,7 +137,7 @@ A long-running session stalls on permission prompts. Allow frond-ear's tools in 
 
 Stop the dry-run daemon and start it for real. Skip the first line if `init` already wrote the
 token (§1). It creates the token file and refuses one that already exists: on a host shared with
-another seat's ear, that file may be the other ear's token.
+another agent's ear, that file may be the other ear's token.
 
 ```sh
 sh -c 'umask 077; set -C; : > "$1"' sh ~/.config/frond-ear/token && $EDITOR ~/.config/frond-ear/token
@@ -236,7 +236,7 @@ by default.
      "manifestPath": "/path/to/canticle-fleet.json",
      "port": 9999,
      "binding": "lan",
-     "tune": { "frond-gloss": ["*:ops.fleet", "silas:chatter"] }
+     "tune": { "my-ear": ["*:ops.fleet", "station-a:chatter"] }
    }
    ```
 
@@ -246,7 +246,7 @@ by default.
    allowed only while frond-ear is the host's one listener (RFC-0001 §14), and it refuses to bind if a canticle
    host daemon answers on `canticle.hostSocket`. `host-daemon` binds nothing and reads record v1
    (§14.18.3) from the host daemon's socket (default `$XDG_RUNTIME_DIR/canticle/daemon.sock`). Use it on any
-   host where another harness (an OpenClaw prince) also hears canticle (binary-canticle#65). Each connection
+   host where another agent harness (such as OpenClaw) also hears canticle (binary-canticle#65). Each connection
    asks the daemon for a join snapshot (§14.18.3, D36) of what is live and on air. Until a complete one
    arrives, `ear_status` reports receive health `degraded`, reason `joined_late` (`joinSnapshot` says why:
    `pending`, `unsupported` for a daemon that doesn't serve snapshots, or `truncated`), and `hear` says so:
@@ -269,8 +269,8 @@ by default.
    everyone at once is more likely our own socket or network.
 
 **`ops.fleet`** is the first real stream. Fleet scripts (flush, deploy, restart) announce themselves with the
-spike's `canticle sing --control <station.sock> --stream ops.fleet --class advisory --ctype 1 --state-key <seat>
---text "…"`, so a prince going dark is explained without anyone asking. One `state_key` per seat means a newer
+spike's `canticle sing --control <station.sock> --stream ops.fleet --class advisory --ctype 1 --state-key <host>
+--text "…"`, so an agent going dark is explained without anyone asking. One `state_key` per host means a newer
 status supersedes the older one.
 
 ### Delivery modes
@@ -285,14 +285,14 @@ and `source` still need a restart.
 "canticle": {
   "wakeKeys": ["0123456789abcdef"],
   "delivery": {
-    "frond-gloss": { "mode": "digest", "stations": { "silas": "immediate" } }
+    "my-ear": { "mode": "digest", "stations": { "station-a": "immediate" } }
   }
 }
 ```
 
 | Field                | Default        | Meaning                                                                                                                                                                                                                                                                                              |
 | -------------------- | -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `wakeKeys`           | `[]`           | Station key ids (16 hex digits, the `key=` of a `hear` banner) whose records may be pushed. Empty: nothing is pushed, and `ear_status` warns. Leave out the seat's own station key, or it hears itself.                                                                                              |
+| `wakeKeys`           | `[]`           | Station key ids (16 hex digits, the `key=` of a `hear` banner) whose records may be pushed. Empty: nothing is pushed, and `ear_status` warns. Leave out the host's own station key, or it hears itself.                                                                                              |
 | `muted`              | `false`        | `true` mutes every push to every ear.                                                                                                                                                                                                                                                                |
 | `delivery.<ear>`     | absent (`off`) | The ear's ceiling. A bare string (`"digest"`) sets `mode` alone.                                                                                                                                                                                                                                     |
 | `….mode`             | `off`          | `immediate`, `digest` or `off`, for every station.                                                                                                                                                                                                                                                   |
@@ -375,8 +375,8 @@ the RFC hasn't been amended to match yet (binary-canticle#100 tracks the amendme
 | §14.6.4, §14.6.6, §14.6.7 | Salience regulation: a stream's threshold doubles after 5 surfacings in 10 min; no station fills more than 25% of a session's digest over 10 min (AGC); each session's threshold tracks 12 surfaced items an hour. | Not applied: nothing is ranked or thresholded. Every allowlisted record is pushed, in `station:stream` order, and a report a cap cut short continues after the last stream it covered, so a busy stream can't starve the rest. This suits a small allowlist under the hourly cap.                                                                                                                                                                                                                                                                                                                   |
 | §14.6.5, §14.14           | At most two slots per session, rebuilt in place; a digest of at most 5 one-line items and 1.5 KB per turn, full text on demand; a drained item that is later plucked or expires gets a one-line note.              | Each push is a new channel event, which can't be rebuilt or recalled. The dose is per ear instead: `maxItems` records (5 by default, at most 10) and `limits.maxNotificationChars` (6,000 by default) per push, and `maxPushesPerHour` (at most 360). A `records` report carries each record whole, as #65's radio report asks; `counts` is the compact form. A pushed record gets no note when it is plucked or expires (#67).                                                                                                                                                                     |
 | §14.10                    | Only `alarm` may wake, when all 11 conditions hold; until S3 passes, deployments behave as if nothing wakes.                                                                                                       | Any class from an allowlisted key is pushed. Kept: verified and not under the host daemon's MUTE, an allowlist (in place of the alarm capability), the ear's opt-in, hop 0 and not wake-derived, coalescing of at least 5 s, the breaker, and item 9's freshness bound for `immediate` (`maxAgeMs`, 30 s by default and at most 120 s, on the age at first hearing and on the time since). A report may still carry an older record, marked late. Not applied: the class rule, the session, host and token budgets (a per-ear cap on pushes per hour instead), host prerequisites and proofreading. |
-| §14.12, BC-1              | No ambient delivery to a session with an off-host channel route, such as Discord, until §23.2 question 22 is settled.                                                                                              | A frond-ear session has a Discord route by design. It already takes the same princes' Discord messages as `peer_agent` events, outside any untrusted-content wrapper, so canticle adds no new trust level; this holds for frond-ear seats only. Pushes come behind the banner and wrapper; frond-ear can't taint what the session does next.                                                                                                                                                                                                                                                        |
-| §14.16 item 3 (A11)       | Chatter, ambient and advisory items land after a random per-session delay.                                                                                                                                         | No delay beyond the debounce or window. This is agreed for the two scribe seats; revisit it before any prince seat opts in.                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| §14.12, BC-1              | No ambient delivery to a session with an off-host channel route, such as Discord, until §23.2 question 22 is settled.                                                                                              | A frond-ear session has a Discord route by design. It already takes the same agents' Discord messages as `peer_agent` events, outside any untrusted-content wrapper, so canticle adds no new trust level; this holds for frond-ear hosts only. Pushes come behind the banner and wrapper; frond-ear can't taint what the session does next.                                                                                                                                                                                                                                                         |
+| §14.16 item 3 (A11)       | Chatter, ambient and advisory items land after a random per-session delay.                                                                                                                                         | No delay beyond the debounce or window. This is agreed for frond-ear hosts; revisit it before an agent on another harness opts in.                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | §14.18.3 (D36)            | Join-snapshot entries and `resurfaced` records never wake a session.                                                                                                                                               | One already pushed is never pushed again; one never pushed goes out once, so each record is heard once across a dropped link (#65). It is marked `late: … (snapshot)` or `(resurfaced)`, and goes `immediate` only within `maxAgeMs`; an older one goes into the next report.                                                                                                                                                                                                                                                                                                                       |
 | §14.18.4                  | A half-open breaker allows a wake within its allowance.                                                                                                                                                            | Half-open holds, as open does.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 
