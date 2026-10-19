@@ -100,7 +100,10 @@ It covers everything that goes public with the repository:
 
 - **Git.** Every ref the public will see: origin's branches and tags, plus the pull-request
   heads GitHub keeps under `refs/pull/*`. Merge commits are diffed against their first parent,
-  and binary files are read as text.
+  binary files are read as text, and commit messages are scanned in full.
+- **Wiki.** If the repository has its wiki enabled, the scan clones it with your gh login and
+  scans its history the same way. An enabled wiki with no pages is reported as "enabled, no
+  content". If cloning fails for any other reason, the scan fails.
 - **Conversations.** Issue and pull-request titles and bodies, issue comments, review bodies and
   review line comments, read through `gh api` with your own gh login
   (set `GH_CONFIG_DIR` first if you keep more than one). If `gh` is missing or not signed in,

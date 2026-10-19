@@ -7,8 +7,9 @@
 # heads GitHub serves under refs/pull/*, which outlive deleted branches. Merge commits are
 # diffed against their first parent and binary blobs are read as text. Then, through gh, it
 # scans the issue, pull request, comment and review text that goes public with the repo,
-# using the caller's own gh login. Prints counts and locations, never a matched secret value
-# or a full email address.
+# using the caller's own gh login, and the wiki's history when the wiki is enabled. Commit
+# messages are scanned in full. Prints counts and locations, never a matched secret value or
+# a full email address.
 #
 #   --expect <sha>  fail unless both HEAD and origin/main are exactly this commit
 #   --no-check      skip `pnpm check` and run only `pnpm scan:credentials` at HEAD
@@ -20,7 +21,8 @@
 #
 # Exit status is 1 if any secret-shaped pattern, known ID or unexplained snowflake is found,
 # if --expect doesn't match HEAD and origin/main, or if pull request heads or conversations
-# couldn't be read (gh missing or signed out included). With --no-conversations, a run that
+# couldn't be read (gh missing or signed out included), or if an enabled wiki can't be
+# cloned. With --no-conversations, a run that
 # found nothing else exits 3, "incomplete": never 0, so it can't pass for a release receipt.
 # `/home/` paths, private IPv4 addresses and author emails are reported, not failed: they are
 # for a person to judge.
@@ -40,9 +42,12 @@ while [ $# -gt 0 ]; do
 done
 
 FAIL=0
-PATCH="$(mktemp)"
-TALK="$(mktemp)"
-trap 'rm -f "$PATCH" "$TALK"; git for-each-ref --format="delete %(refname)" refs/release-scan | git update-ref --stdin' EXIT
+SCRATCH="$(mktemp -d)"
+PATCH="$SCRATCH/patch"
+MSG="$SCRATCH/messages"
+TALK="$SCRATCH/talk"
+WIKI="$SCRATCH/wiki"
+trap 'rm -rf "$SCRATCH"; git for-each-ref --format="delete %(refname)" refs/release-scan | git update-ref --stdin' EXIT
 if ! git fetch --quiet --prune --tags origin; then
   echo "release-scan: fetching branches and tags from origin failed" >&2
   exit 1
@@ -96,6 +101,9 @@ echo
 # binary blobs are scanned as text.
 git log "${REFS[@]}" -p --diff-merges=first-parent --text --no-ext-diff --no-color --format='commit %H' |
   awk '/^commit [0-9a-f]{40}$/ { c = substr($2, 1, 10); next } { print c "\t" $0 }' >"$PATCH"
+# Commit messages, in full: on these repos they carry session links and trailers.
+git log "${REFS[@]}" --format='commit %H%n%B' |
+  awk '/^commit [0-9a-f]{40}$/ { c = substr($2, 1, 10); next } { print c "\t" $0 }' >"$MSG"
 
 # count FILE NAME REGEX FATAL: distinct values, then the places (first column) that hold them.
 count() {
@@ -154,6 +162,10 @@ patterns() {
 echo "## History (all refs above)"
 echo
 patterns "$PATCH" "Commits"
+
+echo "## Commit messages (all refs above)"
+echo
+patterns "$MSG" "Commits"
 
 # Binary files are scanned as text above, but a pattern can miss inside one; list them.
 echo "## Binary paths"
@@ -218,6 +230,42 @@ else
   echo
   patterns "$TALK" "Places"
 fi
+
+# The wiki is a separate git repository, public with the main one when it is enabled. GitHub
+# answers "not found" for an enabled wiki that has no pages yet.
+echo "## Wiki"
+echo
+if [ "$CONVERSATIONS" = 0 ]; then
+  echo "- wiki: not checked (--no-conversations)"
+elif ! command -v gh >/dev/null 2>&1 || ! gh auth status >/dev/null 2>&1; then
+  echo "- **wiki: not checked** (gh is missing or not signed in)"
+  FAIL=1
+elif ! HAS_WIKI="$(gh api "repos/$SLUG" --jq .has_wiki)"; then
+  echo "- **wiki: could not read whether it is enabled**"
+  FAIL=1
+elif [ "$HAS_WIKI" != true ]; then
+  echo "- wiki: disabled"
+else
+  # Clone with the caller's gh login. It must reach the main repository first, so a "not
+  # found" from the wiki means no wiki, not missing credentials.
+  GIT_GH=(git -c credential.helper= -c 'credential.helper=!gh auth git-credential')
+  if ! GIT_TERMINAL_PROMPT=0 "${GIT_GH[@]}" ls-remote "https://github.com/$SLUG.git" HEAD >/dev/null 2>&1; then
+    echo "- **wiki: enabled, but gh's credentials can't reach https://github.com/$SLUG.git**"
+    FAIL=1
+  elif ERR="$(GIT_TERMINAL_PROMPT=0 "${GIT_GH[@]}" clone --quiet --mirror "https://github.com/$SLUG.wiki.git" "$WIKI" 2>&1)"; then
+    git -C "$WIKI" log --all -p --diff-merges=first-parent --text --no-ext-diff --no-color --format='commit %H%n%B' |
+      awk '/^commit [0-9a-f]{40}$/ { c = substr($2, 1, 10); next } { print c "\t" $0 }' >"$SCRATCH/wiki-patch"
+    echo "- wiki: enabled, $(git -C "$WIKI" rev-list --all | wc -l) commits, scanned with their messages"
+    echo
+    patterns "$SCRATCH/wiki-patch" "Commits"
+  elif printf '%s' "$ERR" | grep -qi 'not found'; then
+    echo "- wiki: enabled, no content"
+  else
+    echo "- **wiki: enabled, but cloning it failed**"
+    FAIL=1
+  fi
+fi
+echo
 
 echo "## Author and committer emails"
 echo
