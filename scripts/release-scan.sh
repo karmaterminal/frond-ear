@@ -119,7 +119,7 @@ echo "## Author and committer emails"
 echo
 echo "| Email (masked) | Commits |"
 echo "| --- | --- |"
-git log "${REFS[@]}" --format='%ae%n%ce' | sort | uniq -c | sort -rn |
+git log "${REFS[@]}" --format='%H %ae%n%H %ce' | sort -u | cut -d' ' -f2 | sort | uniq -c | sort -rn |
   awk '{ split($2, a, "@"); printf "| `%s…@%s` | %d |\n", substr(a[1], 1, 3), a[2], $1 }'
 echo
 
