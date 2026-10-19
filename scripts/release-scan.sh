@@ -96,7 +96,7 @@ git log "${REFS[@]}" -p --diff-merges=first-parent --text --no-ext-diff --no-col
 count() {
   local hits values places
   hits="$(grep -aE -- "$3" "$1" || true)"
-  # Trim the boundary characters some patterns match, so `"/home/x` and ` /home/x` are one value.
+  # Trim the boundary characters some patterns match, so a quoted and an unquoted path count as one value.
   values="$(printf '%s' "$hits" | cut -f2- | grep -aoE -- "$3" | sed -E 's/^[^A-Za-z0-9/]//; s/[^A-Za-z0-9]$//' | sort -u | grep -c . || true)"
   places="$(printf '%s' "$hits" | cut -f1 | sort -u | grep -c . || true)"
   echo "| $2 | $values | $places |"
