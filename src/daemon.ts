@@ -29,6 +29,7 @@ import { EAR_PROTOCOL_VERSION } from "./protocol.ts";
 import {
   channelInstructions,
   cleanName,
+  messageText,
   renderBatch,
   renderAmbiguousSends,
   renderCanary,
@@ -687,7 +688,10 @@ export class Daemon {
       trust: classification.trust,
       wake: classification.wake,
       priority: classification.priority,
-      content: message.content.slice(0, this.config.limits.maxMessageChars),
+      content: messageText(message).slice(
+        0,
+        this.config.limits.maxMessageChars,
+      ),
       timestamp: message.timestamp,
       replyTo:
         message.message_reference?.message_id ??
@@ -2071,7 +2075,7 @@ export class Daemon {
       trust: trustOf(this.config, message.author.id),
       wake: false,
       priority: false,
-      content: message.content,
+      content: messageText(message),
       timestamp: message.timestamp,
       replyTo: message.message_reference?.message_id ?? null,
       attachments: (message.attachments ?? []).map((file) => ({

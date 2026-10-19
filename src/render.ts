@@ -1,5 +1,10 @@
 import { canticleDelivers, type Config } from "./config.ts";
-import type { BatchKind, StoredEvent } from "./types.ts";
+import type {
+  BatchKind,
+  DiscordComponent,
+  DiscordMessage,
+  StoredEvent,
+} from "./types.ts";
 
 // Invisible format controls that can make quoted text render as something
 // else: zero-width and directional marks (U+200B-U+200F), bidi embeddings and
@@ -40,6 +45,76 @@ export function cleanName(name: string): string {
     .replace(/\s+/gu, " ")
     .trim();
   return (cleaned || "unknown").slice(0, 64);
+}
+
+// Discord's component types.
+const ACTION_ROW = 1;
+const BUTTON = 2;
+const TEXT_DISPLAY = 10;
+/** String, user, role, mentionable and channel select menus. */
+const SELECT_MENUS = new Set([3, 5, 6, 7, 8]);
+/** Discord nests components three deep at most; this keeps a malformed payload's walk short. */
+const COMPONENT_DEPTH = 8;
+
+function nonEmpty(value: unknown): string | undefined {
+  return typeof value === "string" && value !== "" ? value : undefined;
+}
+
+/** A button or select menu, named as a control: "[button: Undo]", "[select: Pick one]". */
+function controlText(component: DiscordComponent): string | undefined {
+  if (component.type === BUTTON) {
+    const label = nonEmpty(component.label);
+    const url = nonEmpty(component.url);
+    const shown = label && url ? `${label} (${url})` : (label ?? url);
+    return shown ? `[button: ${shown}]` : "[button]";
+  }
+  if (SELECT_MENUS.has(component.type)) {
+    const placeholder = nonEmpty(component.placeholder);
+    return placeholder ? `[select: ${placeholder}]` : "[select]";
+  }
+  return undefined;
+}
+
+/**
+ * The text of a message's components, a line each, in order: every TextDisplay's text, and
+ * each row of buttons and select menus on one line. Containers and Sections are read
+ * through, a Section's button accessory included. Media, files, thumbnails and separators
+ * carry no text.
+ */
+function componentLines(components: unknown, depth = 0): string[] {
+  if (!Array.isArray(components) || depth > COMPONENT_DEPTH) {
+    return [];
+  }
+  return components.flatMap((item: unknown): string[] => {
+    if (!item || typeof item !== "object") {
+      return [];
+    }
+    const component = item as DiscordComponent;
+    if (component.type === TEXT_DISPLAY) {
+      const text = nonEmpty(component.content);
+      return text ? [text] : [];
+    }
+    const control = controlText(component);
+    if (control) {
+      return [control];
+    }
+    const inner = componentLines(component.components, depth + 1);
+    if (component.type === ACTION_ROW) {
+      return inner.length > 0 ? [inner.join(" ")] : [];
+    }
+    return [...inner, ...componentLines([component.accessory], depth + 1)];
+  });
+}
+
+/**
+ * What a message says: its `content`, or, when that is empty, the text of its components,
+ * where a Components V2 message keeps all of its text (#78). Either is the author's, so it is
+ * quoted and cleaned the same way and never sets trust.
+ */
+export function messageText(
+  message: Pick<DiscordMessage, "content" | "components">,
+): string {
+  return message.content || componentLines(message.components).join("\n");
 }
 
 function clockTime(timestamp: string): string {

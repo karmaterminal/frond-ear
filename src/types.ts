@@ -35,6 +35,23 @@ export interface DiscordAttachment {
   url: string;
 }
 
+/**
+ * A message component, with only the fields frond-ear reads text from. Components V2 nest:
+ * a Container or Section holds `components`, and a Section may have a button `accessory`.
+ */
+export interface DiscordComponent {
+  type: number;
+  /** A TextDisplay's text. */
+  content?: string;
+  /** A button's label, and a link button's URL. */
+  label?: string;
+  url?: string;
+  /** A select menu's placeholder. */
+  placeholder?: string;
+  components?: DiscordComponent[];
+  accessory?: DiscordComponent;
+}
+
 export interface DiscordMessage {
   id: string;
   channel_id: string;
@@ -45,6 +62,8 @@ export interface DiscordMessage {
   timestamp: string;
   mentions?: Array<{ id: string }>;
   attachments?: DiscordAttachment[];
+  /** Where a Components V2 message (flag IS_COMPONENTS_V2, 1 << 15) keeps its text. */
+  components?: DiscordComponent[];
   message_reference?: { message_id?: string; channel_id?: string };
   referenced_message?: { id: string; author: DiscordAuthor } | null;
   webhook_id?: string;

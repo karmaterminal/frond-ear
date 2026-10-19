@@ -1,4 +1,5 @@
 import type { ChannelConfig, Config, WakeBudget } from "./config.ts";
+import { messageText } from "./render.ts";
 import type { BatchKind, DiscordMessage, Mode, Trust } from "./types.ts";
 
 export interface Route {
@@ -113,18 +114,15 @@ export function isMentioned(config: Config, message: DiscordMessage): boolean {
   if (message.mentions?.some((mention) => mention.id === bot)) {
     return true;
   }
-  if (
-    message.content.includes(`<@${bot}>`) ||
-    message.content.includes(`<@!${bot}>`)
-  ) {
+  // The text the session reads: a Components V2 message has its text in components.
+  const text = messageText(message);
+  if (text.includes(`<@${bot}>`) || text.includes(`<@!${bot}>`)) {
     return true;
   }
   if (message.referenced_message?.author.id === bot) {
     return true;
   }
-  return config.mentionMatchers.some((matcher) =>
-    matcher.test(message.content),
-  );
+  return config.mentionMatchers.some((matcher) => matcher.test(text));
 }
 
 export function classify(
