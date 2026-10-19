@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Pre-public release scan (#35). Rerun it at the exact SHA that goes public, in a fresh clone.
 #
-#   scripts/release-scan.sh [--expect <sha>] [--no-check]
+#   scripts/release-scan.sh [--expect <sha>] [--no-check] [--no-conversations]
 #
 # Scans every ref the public will see: origin's branches and tags, and the pull request
 # heads GitHub serves under refs/pull/*, which outlive deleted branches. Merge commits are
@@ -12,13 +12,16 @@
 #
 #   --expect <sha>  fail unless both HEAD and origin/main are exactly this commit
 #   --no-check      skip `pnpm check` and run only `pnpm scan:credentials` at HEAD
+#   --no-conversations
+#                   skip the gh pass on purpose; the run can then never certify a release
 #
 # RELEASE_SCAN_KNOWN_IDS may name a file of real Discord IDs (one per line, kept outside the
 # repository) that must appear nowhere in history.
 #
 # Exit status is 1 if any secret-shaped pattern, known ID or unexplained snowflake is found,
 # if --expect doesn't match HEAD and origin/main, or if pull request heads or conversations
-# couldn't be read.
+# couldn't be read (gh missing or signed out included). With --no-conversations, a run that
+# found nothing else exits 3, "incomplete": never 0, so it can't pass for a release receipt.
 # `/home/` paths, private IPv4 addresses and author emails are reported, not failed: they are
 # for a person to judge.
 set -euo pipefail
@@ -26,11 +29,13 @@ cd "$(git rev-parse --show-toplevel)"
 
 EXPECT=""
 CHECK=1
+CONVERSATIONS=1
 while [ $# -gt 0 ]; do
   case "$1" in
     --expect) EXPECT="${2:?--expect needs a sha}"; shift 2 ;;
     --no-check) CHECK=0; shift ;;
-    *) echo "usage: scripts/release-scan.sh [--expect <sha>] [--no-check]" >&2; exit 2 ;;
+    --no-conversations) CONVERSATIONS=0; shift ;;
+    *) echo "usage: scripts/release-scan.sh [--expect <sha>] [--no-check] [--no-conversations]" >&2; exit 2 ;;
   esac
 done
 
@@ -174,26 +179,41 @@ echo
 SLUG="$(git remote get-url origin | sed -E 's#\.git$##; s#^.*github\.com[:/]##')"
 # lines LABEL-EXPR: jq that turns each item into "<place>\t<line>" for every line of its text.
 lines() { printf '.[] | (%s) as $p | ((.title // "") + "\\n" + (.body // "")) | split("\\n")[] | "\\($p)\\t\\(.)"' "$1"; }
+# Every call must succeed: a failed one returns 1, never an empty list that looks scanned.
+PRS_LISTED=0
+PRS_REVIEWED=0
 fetch_talk() {
-  local pr
+  local pr prs
   gh api --paginate "repos/$SLUG/issues?state=all&per_page=100" \
     --jq "$(lines 'if .pull_request then "pr#" else "issue#" end + (.number | tostring)')" || return 1
   gh api --paginate "repos/$SLUG/issues/comments?per_page=100" \
     --jq "$(lines '"comment:" + (.issue_url | split("/") | last)')" || return 1
   gh api --paginate "repos/$SLUG/pulls/comments?per_page=100" \
     --jq "$(lines '"review-line:" + (.pull_request_url | split("/") | last)')" || return 1
-  for pr in $(gh api --paginate "repos/$SLUG/pulls?state=all&per_page=100" --jq '.[].number'); do
+  prs="$(gh api --paginate "repos/$SLUG/pulls?state=all&per_page=100" --jq '.[].number')" || return 1
+  PRS_LISTED="$(printf '%s\n' "$prs" | grep -c . || true)"
+  for pr in $prs; do
     gh api --paginate "repos/$SLUG/pulls/$pr/reviews?per_page=100" --jq "$(lines "\"review:$pr\"")" || return 1
+    PRS_REVIEWED=$((PRS_REVIEWED + 1))
   done
 }
-if ! command -v gh >/dev/null 2>&1 || ! gh auth status >/dev/null 2>&1; then
+if [ "$CONVERSATIONS" = 0 ]; then
+  echo "- **not covered: PR/issue/review text** (skipped by --no-conversations)"
+  echo
+elif ! command -v gh >/dev/null 2>&1 || ! gh auth status >/dev/null 2>&1; then
   echo "- **not covered: PR/issue/review text** (gh is missing or not signed in)"
   echo
+  FAIL=1
 elif ! fetch_talk >"$TALK"; then
-  echo "- **not covered: PR/issue/review text** (a gh api call failed)"
+  echo "- **not covered: PR/issue/review text** (a gh api call failed; $PRS_REVIEWED of $PRS_LISTED pull requests' reviews fetched)"
   echo
   FAIL=1
 else
+  echo "- pull requests listed: $PRS_LISTED, reviews fetched for: $PRS_REVIEWED"
+  if [ "$PRS_LISTED" != "$PRS_REVIEWED" ]; then
+    echo "- **pull requests listed and reviewed differ**"
+    FAIL=1
+  fi
   echo "- \`$SLUG\`: $(cut -f1 "$TALK" | sort -u | sed -E 's/[0-9]+$//' | uniq -c | awk '{ printf "%s%s %s", sep, $1, $2; sep = ", " }') places, $(wc -l <"$TALK") lines"
   echo
   patterns "$TALK" "Places"
@@ -219,5 +239,12 @@ git branch -r --list 'origin/*' --format='%(refname:short)' | grep -v '^origin$'
   done
 echo
 
-[ "$FAIL" = 0 ] && echo "**Result: clean.**" || echo "**Result: needs a look (see above).**"
-exit "$FAIL"
+if [ "$FAIL" != 0 ]; then
+  echo "**Result: needs a look (see above).**"
+  exit 1
+fi
+if [ "$CONVERSATIONS" = 0 ]; then
+  echo "**Result: incomplete. Conversations were skipped (--no-conversations), so this is not a release receipt.**"
+  exit 3
+fi
+echo "**Result: clean.**"

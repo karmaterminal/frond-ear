@@ -103,8 +103,11 @@ It covers everything that goes public with the repository:
   and binary files are read as text.
 - **Conversations.** Issue and pull-request titles and bodies, issue comments, review bodies and
   review line comments, read through `gh api` with your own gh login
-  (set `GH_CONFIG_DIR` first if you keep more than one). If `gh` is missing or not signed in, the report says
-  "not covered: PR/issue/review text" instead.
+  (set `GH_CONFIG_DIR` first if you keep more than one). If `gh` is missing or not signed in,
+  the report says "not covered: PR/issue/review text" and the scan fails. To run without
+  `gh` on purpose, pass `--no-conversations`. The report then says the text was skipped, and
+  the scan exits 3 ("incomplete") at best, never 0, so that run can't serve as a release
+  receipt.
 
 It reports:
 
@@ -121,5 +124,6 @@ It reports:
 - every branch, and whether `main` contains it.
 
 It never prints a matched secret. It exits 1 on any secret shape, real ID or unexplained
-snowflake, and when a `gh api` call fails partway. Paths, addresses, binaries and emails are
+snowflake. It also exits 1 when `gh` is unavailable or any `gh api` call fails, or when the
+number of pull requests listed differs from the number whose reviews were fetched. Paths, addresses, binaries and emails are
 for a person to judge. Attach its output to the release issue.
