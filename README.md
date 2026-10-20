@@ -40,7 +40,8 @@ This is the whole path from a fresh clone to the session's first reply in Discor
   _Bot → Privileged Gateway Intents_. Invite the bot to your server with _View Channels_,
   _Send Messages_, _Send Messages in Threads_, _Read Message History_ and _Add Reactions_, and keep
   its token to hand. With Discord's Developer Mode on (right-click → Copy ID), copy the bot's user
-  ID, your own user ID and the IDs of the channels it should hear.
+  ID, your own user ID (you give it to `init` as a principal, someone the session answers to)
+  and the IDs of the channels it should hear.
 - **Node.js ≥ 22.18 and Claude Code ≥ 2.1.128**, logged in with claude.ai or a Console API key.
   Channels don't work on Bedrock, Vertex or Foundry, and in a Team or Enterprise org an Owner must
   enable them first ([runbook §0](docs/runbook.md#0-prerequisites)).
@@ -56,12 +57,13 @@ node src/cli.ts doctor    # read-only: ✓/✗ per check, a fix line for each �
 ```
 
 `init` validates the config, writes `~/.config/frond-ear/frond-ear.json` and the 0600 token file,
-and prints the rest of these steps with your paths and ear name filled in. An agent can run
-`init --non-interactive` with flags instead, and needs only the token and the IDs from you. The
-daemon, `doctor` and `ops/install-systemd.sh` read the config and token only from
-`FROND_EAR_CONFIG` and `DISCORD_BOT_TOKEN_FILE` (the daemon's own default is `./frond-ear.json`),
-so every terminal that runs them needs the two `export` lines. `doctor` passes config and token
-now, and its socket and daemon checks stay ✗ until step 2.
+and prints the commands for steps 2 to 4, numbered its own way, with your paths and ear name
+filled in. An agent can run `init --non-interactive` with flags instead: it needs only the IDs
+from you, and you write the token file yourself, as in
+[onboarding §6](docs/onboarding.md#6-agent-onboarding). The daemon and `doctor` find the config
+and token only through `FROND_EAR_CONFIG` and `DISCORD_BOT_TOKEN_FILE` (the daemon's own default
+is `./frond-ear.json`), so every terminal that runs them needs the two `export` lines. `doctor`
+passes config and token now, and its socket and daemon checks stay ✗ until step 2.
 
 **2. Start the daemon** in a second terminal, in the checkout. It runs in the foreground, so leave
 it there:
@@ -72,10 +74,12 @@ export DISCORD_BOT_TOKEN_FILE="$HOME/.config/frond-ear/token"
 node src/cli.ts daemon
 ```
 
-To keep it running across reboots instead, run `ops/install-systemd.sh` with the same two
-variables. Back in the first terminal, run `doctor` again. Once the daemon has connected, it exits
-0, and the one ✗ left is the ear's advisory `attached` check, which passes once step 4 attaches a
-session.
+To keep it running across reboots, stop this daemon and run `ops/install-systemd.sh` instead. It
+installs a systemd user unit for the files `init` wrote, and warns if lingering, which a reboot
+needs, is off.
+
+Back in the first terminal, run `doctor` again. Once the daemon has connected, it exits 0, and the
+one ✗ left is the ear's advisory `attached` check, which passes once step 4 attaches a session.
 
 **3. Register the shim** in a directory of its own, so that no other Claude Code session claims
 the ear. `<ear>` is the name you gave `init`, which prints this line with your paths filled in:
@@ -88,7 +92,8 @@ claude mcp add -s local frond-ear -e FROND_EAR_EAR=<ear> -- node /abs/path/to/fr
 To let the ear's tools run without a prompt each time, put
 `{ "permissions": { "allow": ["mcp__frond-ear"] } }` in `.claude/settings.local.json` there.
 
-**4. Launch Claude Code there** with the channel flag, and confirm the flag when it asks:
+**4. Launch Claude Code there** with the channel flag. It asks you to trust the folder and to
+confirm the development-channel flag:
 
 ```sh
 claude --dangerously-load-development-channels server:frond-ear
@@ -98,15 +103,16 @@ claude --dangerously-load-development-channels server:frond-ear
 `ear_status`, or run `node src/cli.ts status` in the checkout: the gateway should be `connected`
 and the ear's delivery `confirmed`.
 
-**6. Get a first reply.** @mention the bot with a question in one of the ear's `mentions`
-channels (the mode `init` offers by default). The session wakes, and its answer appears in the
-channel.
+**6. Get a first reply.** From the account you gave `init` as a principal, @mention the bot with
+a question in one of the ear's `mentions` channels (the mode `init` offers by default). The
+session wakes, and its answer appears in the channel.
 
 For a Copilot CLI session, steps 3 and 4 are the three steps under
-[GitHub Copilot CLI](#github-copilot-cli) instead.
+[GitHub Copilot CLI](#github-copilot-cli) instead. That path is covered by tests against a fake
+session, but no live Copilot CLI attach has been proved yet.
 
-**If a step fails,** start with `doctor`, which prints a `fix:` line under each ✗. The failures a
-new install usually meets:
+**If a step fails,** start with `doctor` and the `fix:` lines it prints. The failures a new
+install usually meets:
 
 - `doctor` marks config and token ✗: that terminal lacks the two `export` lines.
 - The daemon exits with close code 4014: Message Content Intent is off. Close code 4004 means the
