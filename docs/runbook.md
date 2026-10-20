@@ -50,7 +50,8 @@ filename is git-ignored) and fill in the fields below.
 
 | Field                      | Meaning                                                                                                                                                                                         |
 | -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ears.<name>`              | One ear per Claude session. `target` must be `claude-channel`.                                                                                                                                  |
+| `ears.<name>`              | One ear per session.                                                                                                                                                                            |
+| `ears.<name>.target`       | `claude-channel` (the default, which `init` writes) or `copilot-extension`. This runbook attaches Claude Code; the [README](../README.md#github-copilot-cli) has the Copilot CLI steps.         |
 | `ears.<name>.channels`     | Channel IDs to modes: `silent`, `mentions` (the default) or `room`. Per-channel `quietWindowMs`, `maxDelayMs` and `historyLimit` are optional. Threads inherit their parent channel's settings. |
 | `ears.<name>.dms`          | Whether this ear receives DMs from principals and peers.                                                                                                                                        |
 | `ears.<name>.dmMode`       | `mentions` (the default: every DM wakes the session) or `silent` (DMs are stored for `inbox` only).                                                                                             |
