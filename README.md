@@ -56,8 +56,8 @@ export DISCORD_BOT_TOKEN_FILE="$HOME/.config/frond-ear/token"
 node src/cli.ts doctor    # read-only: ✓/✗ per check, a fix line for each ✗
 ```
 
-`init` validates the config, writes `~/.config/frond-ear/frond-ear.json` and the 0600 token file,
-and prints the commands for steps 2 to 4, numbered its own way, with your paths and ear name
+`init` validates the config, writes `~/.config/frond-ear/frond-ear.json` and, if you paste the
+token, the 0600 token file (choose "already in a file" or "skip" and you write it yourself), and prints the commands for steps 2 to 4, numbered its own way, with your paths and ear name
 filled in. An agent can run `init --non-interactive` with flags instead: it needs only the IDs
 from you, and you write the token file yourself, as in
 [onboarding §6](docs/onboarding.md#6-agent-onboarding). The daemon and `doctor` find the config
