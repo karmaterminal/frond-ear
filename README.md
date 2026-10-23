@@ -31,24 +31,106 @@ Discord ──ws──▶ frond-ear daemon ──unix socket──▶ frond-ear 
 
 ## Quick start
 
+This is the whole path from a fresh clone to the session's first reply in Discord.
+
+**Before you start**, you need two things that frond-ear cannot set up for you:
+
+- **A Discord bot.** In the [Discord Developer Portal](https://discord.com/developers/applications),
+  create an application with a bot, and turn on **Message Content Intent** under
+  _Bot → Privileged Gateway Intents_. Invite the bot to your server with _View Channels_,
+  _Send Messages_, _Send Messages in Threads_, _Read Message History_ and _Add Reactions_, and keep
+  its token to hand. With Discord's Developer Mode on (right-click → Copy ID), copy the bot's user
+  ID, your own user ID (you give it to `init` as a principal, someone the session answers to)
+  and the IDs of the channels it should hear.
+- **Node.js ≥ 22.18 and Claude Code ≥ 2.1.128**, logged in with claude.ai or a Console API key.
+  Channels don't work on Bedrock, Vertex or Foundry, and in a Team or Enterprise org an Owner must
+  enable them first ([runbook §0](docs/runbook.md#0-prerequisites)).
+
+**1. Clone, configure and check.**
+
 ```sh
 git clone https://github.com/karmaterminal/frond-ear && cd frond-ear
-node src/cli.ts init      # asks for the bot's ID, your IDs, the channels and the token
+node src/cli.ts init      # asks for the IDs, a name for the ear, its channels and the token
 export FROND_EAR_CONFIG="$HOME/.config/frond-ear/frond-ear.json"
 export DISCORD_BOT_TOKEN_FILE="$HOME/.config/frond-ear/token"
 node src/cli.ts doctor    # read-only: ✓/✗ per check, a fix line for each ✗
 ```
 
-`init` writes two files, `~/.config/frond-ear/frond-ear.json` and the 0600 token file, validates
-the config before writing, and prints the steps it cannot do for you: start the daemon (or
-`ops/install-systemd.sh`), `claude mcp add` in the project that owns the ear, and the launch flag
-`--dangerously-load-development-channels server:frond-ear`. The daemon, `doctor` and
-`ops/install-systemd.sh` read the config and token only from `FROND_EAR_CONFIG` and
-`DISCORD_BOT_TOKEN_FILE` (the daemon's own default is `./frond-ear.json`), which is why the two
-`export` lines come before `doctor`; `init` also prints them in front of every command. `doctor`
-then checks config, token, socket, daemon, gateway and each ear: config and token pass at once,
-and the socket and daemon checks stay ✗ until you start the daemon. An agent can run
-`init --non-interactive` with flags and needs only the token and the IDs from you.
+`init` validates the config, writes `~/.config/frond-ear/frond-ear.json` and the 0600 token file,
+and prints the commands for steps 2 to 4, numbered its own way, with your paths and ear name
+filled in. An agent can run `init --non-interactive` with flags instead: it needs only the IDs
+from you, and you write the token file yourself, as in
+[onboarding §6](docs/onboarding.md#6-agent-onboarding). The daemon and `doctor` find the config
+and token only through `FROND_EAR_CONFIG` and `DISCORD_BOT_TOKEN_FILE` (the daemon's own default
+is `./frond-ear.json`), so every terminal that runs them needs the two `export` lines. `doctor`
+passes config and token now, and its socket and daemon checks stay ✗ until step 2.
+
+**2. Start the daemon** in a second terminal, in the checkout. It runs in the foreground, so leave
+it there:
+
+```sh
+export FROND_EAR_CONFIG="$HOME/.config/frond-ear/frond-ear.json"
+export DISCORD_BOT_TOKEN_FILE="$HOME/.config/frond-ear/token"
+node src/cli.ts daemon
+```
+
+To keep it running across reboots, stop this daemon and run `ops/install-systemd.sh` instead. It
+installs a systemd user unit for the files `init` wrote, and warns if lingering, which a reboot
+needs, is off.
+
+Back in the first terminal, run `doctor` again. Once the daemon has connected, it exits 0, and the
+one ✗ left is the ear's advisory `attached` check, which passes once step 4 attaches a session.
+
+**3. Register the shim** in a directory of its own, so that no other Claude Code session claims
+the ear. `<ear>` is the name you gave `init`, which prints this line with your paths filled in:
+
+```sh
+mkdir -p ~/ear-trial && cd ~/ear-trial
+claude mcp add -s local frond-ear -e FROND_EAR_EAR=<ear> -- node /abs/path/to/frond-ear/src/cli.ts shim
+```
+
+To let the ear's tools run without a prompt each time, put
+`{ "permissions": { "allow": ["mcp__frond-ear"] } }` in `.claude/settings.local.json` there.
+
+**4. Launch Claude Code there** with the channel flag. It asks you to trust the folder and to
+confirm the development-channel flag:
+
+```sh
+claude --dangerously-load-development-channels server:frond-ear
+```
+
+**5. Check the attach.** The session gets an attach event and `ack`s its nonce. Ask it to call
+`ear_status`, or run `node src/cli.ts status` in the checkout: the gateway should be `connected`
+and the ear's delivery `confirmed`.
+
+**6. Get a first reply.** From the account you gave `init` as a principal, @mention the bot with
+a question in one of the ear's `mentions` channels (the mode `init` offers by default). The
+session wakes, and its answer appears in the channel.
+
+For a Copilot CLI session, steps 3 and 4 are the three steps under
+[GitHub Copilot CLI](#github-copilot-cli) instead. That path is covered by tests against a fake
+session, but no live Copilot CLI attach has been proved yet.
+
+**If a step fails,** start with `doctor` and the `fix:` lines it prints. The failures a new
+install usually meets:
+
+- `doctor` marks config and token ✗: that terminal lacks the two `export` lines.
+- The daemon exits with close code 4014: Message Content Intent is off. Close code 4004 means the
+  token is wrong.
+- `attached` stays `false` while the session runs: `FROND_EAR_EAR` names an ear the config does
+  not have.
+- `registered` stays `false`: Claude Code was started without the channel flag, or an org policy
+  blocks channels.
+
+The runbook's [Troubleshooting](docs/runbook.md#troubleshooting) table has more, and
+[`docs/recovery.md`](docs/recovery.md) covers a reboot, a stopped daemon and a session that is
+gone. `tools/clean-install/receipt.sh` runs this same path against a stand-in for Discord and a
+real Claude Code session, and [`docs/proofs/clean-install/`](docs/proofs/clean-install/README.md)
+holds its records.
+
+Once the trial works, remove its registration (`claude mcp remove -s local frond-ear` in
+`~/ear-trial`) and attach the session you mean to keep, as in
+[runbook §5](docs/runbook.md#5-attach-the-long-running-session).
 
 - [`docs/onboarding.md`](docs/onboarding.md): the contract. Every config field and where it comes
   from, what `init` writes and what stays manual, what `doctor` checks and what it refuses to probe.
