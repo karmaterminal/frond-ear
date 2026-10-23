@@ -193,7 +193,11 @@ export interface CatchUpChat {
   failed?: string;
 }
 
-/** Chats a catch_up notice names one by one; gaps and failures come first. */
+/**
+ * Chats a catch_up notice names one by one. Every gap and failure is named first, however
+ * many, since each needs its own fetch_messages call (#75); chats read back in full fill what
+ * is left, and the rest of them are only counted.
+ */
 const CATCH_UP_LISTED = 20;
 
 export function renderCatchUp(
@@ -201,11 +205,17 @@ export function renderCatchUp(
   skipped: string[],
 ): Notification {
   const read = chats.reduce((sum, chat) => sum + chat.read, 0);
-  const ordered = [
-    ...chats.filter((chat) => chat.missing || chat.failed !== undefined),
-    ...chats.filter((chat) => !chat.missing && chat.failed === undefined),
+  const toFetch = chats.filter(
+    (chat) => chat.missing || chat.failed !== undefined,
+  );
+  const full = chats.filter(
+    (chat) => !chat.missing && chat.failed === undefined,
+  );
+  const listed = [
+    ...toFetch,
+    ...full.slice(0, Math.max(0, CATCH_UP_LISTED - toFetch.length)),
   ];
-  const lines = ordered.slice(0, CATCH_UP_LISTED).map((chat) => {
+  const lines = listed.map((chat) => {
     if (chat.failed !== undefined) {
       return `chat ${chat.chatId}: not read back (${cleanName(chat.failed)}); fetch_messages with this chat_id reads it.`;
     }
@@ -214,7 +224,7 @@ export function renderCatchUp(
       ? `chat ${chat.chatId}: ${count}, but older ones may be missing, back to message ${chat.missing.after} (the last one heard before): fetch_messages with this chat_id and before=${chat.missing.before} reads them.`
       : `chat ${chat.chatId}: ${count}.`;
   });
-  const unlisted = ordered.length - lines.length;
+  const unlisted = chats.length - listed.length;
   if (unlisted > 0) {
     lines.push(
       `${unlisted} more chat${unlisted === 1 ? " was" : "s were"} read back in full.`,
