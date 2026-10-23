@@ -56,14 +56,17 @@ export DISCORD_BOT_TOKEN_FILE="$HOME/.config/frond-ear/token"
 node src/cli.ts doctor    # read-only: ✓/✗ per check, a fix line for each ✗
 ```
 
-`init` validates the config, writes `~/.config/frond-ear/frond-ear.json` and the 0600 token file,
-and prints the commands for steps 2 to 4, numbered its own way, with your paths and ear name
-filled in. An agent can run `init --non-interactive` with flags instead: it needs only the IDs
-from you, and you write the token file yourself, as in
+`init` validates the config, writes `~/.config/frond-ear/frond-ear.json`, and prints the commands
+for steps 2 to 4, numbered its own way, with your paths and ear name filled in. It writes the 0600
+token file `~/.config/frond-ear/token` only if you paste the token. If the token is already in a
+file, `init` uses that file, so export its path instead; if you skip, `init` prints the command
+that creates the file. An agent can run `init --non-interactive` with flags instead: it needs
+only the IDs from you, and you write the token file yourself, as in
 [onboarding §6](docs/onboarding.md#6-agent-onboarding). The daemon and `doctor` find the config
 and token only through `FROND_EAR_CONFIG` and `DISCORD_BOT_TOKEN_FILE` (the daemon's own default
-is `./frond-ear.json`), so every terminal that runs them needs the two `export` lines. `doctor`
-passes config and token now, and its socket and daemon checks stay ✗ until step 2.
+is `./frond-ear.json`), so every terminal that runs them needs the two `export` lines. Once the
+token file holds the token, `doctor` passes config and token, and its socket and daemon checks
+stay ✗ until step 2.
 
 **2. Start the daemon** in a second terminal, in the checkout. It runs in the foreground, so leave
 it there:
