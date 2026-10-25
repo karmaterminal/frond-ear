@@ -18,6 +18,7 @@ import {
 } from "../src/canticle/records.ts";
 import { GuardedEmbedded } from "../src/canticle/source.ts";
 import { StructuredLogger } from "../src/logger.ts";
+import { FINDING_FIXTURE } from "./helpers.ts";
 
 const NOW = 1_790_000_100_000;
 const RUN = "a1b2";
@@ -94,6 +95,51 @@ test("records: a verified, surfaced frame is live; retract removes it", () => {
     NOW,
   );
   assert.equal(items(c).length, 0);
+});
+
+test("records: a finding's bytes come from body.base64, by content type id or name; bytes that are malformed, not canonical or not its size stay opaque (frond-ear#85)", () => {
+  const b64 = FINDING_FIXTURE.toString("base64");
+  const heard = (body: Record<string, unknown>, extra = {}) => {
+    const c = started();
+    c.feed(frame(1, { state_key: "seat-a:distress", body, ...extra }), NOW);
+    return items(c)[0]!;
+  };
+  const size = FINDING_FIXTURE.length;
+  const read = heard({ ctype: 11, size, sha256: "00", base64: b64 });
+  assert.equal(read.finding?.voice, "observer");
+  assert.equal(read.finding?.subject, "seat-a");
+  assert.equal(read.text, undefined);
+  assert.equal(read.bodyBytes, size);
+  assert.equal(
+    heard({
+      ctype: "application/vnd.canticle.finding+cbor",
+      size,
+      base64: b64,
+    }).finding?.status,
+    "open",
+  );
+  // The last character before the padding carries two unused bits: set one, and the
+  // bytes decode the same but the text isn't the canonical encoding of them.
+  const alphabet =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  const at = b64.indexOf("=") - 1;
+  const loose = `${b64.slice(0, at)}${alphabet[alphabet.indexOf(b64[at]!) ^ 1]}${b64.slice(at + 1)}`;
+  assert.deepEqual(Buffer.from(loose, "base64"), FINDING_FIXTURE);
+  for (const body of [
+    { ctype: 11, size: size - 1, base64: b64 },
+    { ctype: 11, size, base64: loose },
+    { ctype: 11, size, base64: b64.replace(/=+$/u, "") },
+    { ctype: 11, size, base64: ` ${b64.slice(1)}` },
+    { ctype: 11, size },
+    { ctype: 1, size, base64: b64 },
+  ]) {
+    assert.equal(heard(body).finding, undefined, JSON.stringify(body));
+  }
+  assert.equal(
+    heard({ ctype: 11, size, base64: b64 }, { class: "live-state" }).finding,
+    undefined,
+    "only an advisory",
+  );
 });
 
 test("records: nothing from a run is delivered before its first landing_state", () => {

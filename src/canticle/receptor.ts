@@ -14,6 +14,7 @@ import type { CanticleConfig } from "../config.ts";
 import type { StructuredLogger } from "../logger.ts";
 import type { Clock, Timers } from "../types.ts";
 import { systemClock, systemTimers } from "../types.ts";
+import { parseFinding, type Finding } from "./finding.ts";
 import { CLASSES, SCOPE_NAMES } from "./ids.ts";
 import { Listener, type ListenerEvent, type SafetyState } from "./listener.ts";
 import type { Manifest } from "./manifest.ts";
@@ -73,6 +74,11 @@ export interface LiveItem {
   root?: string | undefined;
   text: string | undefined;
   ctype: number | string | undefined;
+  /**
+   * The body as a finding (content type 11, frond-ear#85, binary-canticle#112): set only
+   * for an advisory whose body is one, never from anything but the body itself.
+   */
+  finding?: Finding | undefined;
   bodyRef: { url: string; sha256: string; size: string } | undefined;
   ageMs: number;
   expiresInMs: number;
@@ -123,6 +129,11 @@ export interface HearView {
    * Not set by the embedded receptor, which has none.
    */
   breaker?: "closed" | "open" | "half_open";
+  /**
+   * The host receptor's mute, from record v1's `landing_state`: while it holds, every
+   * item is withdrawn from the binding. Not set by the embedded receptor.
+   */
+  hostMute?: true;
   lastDatagramAt: number | undefined;
   stations: Array<{ name: string; presence: string }>;
   items: LiveItem[];
@@ -451,13 +462,14 @@ export class CanticleReceptor {
         ?.streamNames.get(h.item.stream);
       if (stream === undefined || !tuned(patterns, station, stream)) continue;
       const it = h.item;
+      const cls = CLASSES.get(it.cls)?.name ?? String(it.cls);
       out.push({
         station,
         key: h.kid,
         stream,
         seq: it.seq.toString(),
         epoch: it.epoch,
-        class: CLASSES.get(it.cls)?.name ?? String(it.cls),
+        class: cls,
         scope: SCOPE_NAMES.get(it.scope) ?? String(it.scope),
         hop: it.hop,
         purpose: it.purpose,
@@ -473,6 +485,10 @@ export class CanticleReceptor {
             ? Buffer.from(it.body).toString("utf8")
             : undefined,
         ctype: it.ctype,
+        finding: parseFinding(
+          { class: cls, ctype: it.ctype, stateKey: it.stateKey },
+          it.body,
+        ),
         bodyRef: it.bodyRef && {
           url: it.bodyRef.url,
           sha256: Buffer.from(it.bodyRef.sha256).toString("hex"),

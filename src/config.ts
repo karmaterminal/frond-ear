@@ -112,6 +112,12 @@ export interface CanticleEarDelivery {
    * entry, the narrower holds.
    */
   stations: Record<string, CanticleMode>;
+  /**
+   * Per-stream ceilings, instead of `mode`, by stream name (frond-ear#85: `distress`
+   * immediate, `alerts` digest). Where a record's station and its stream both have an
+   * entry, the narrower holds.
+   */
+  streams: Record<string, CanticleMode>;
   /** How often a digest report goes out, at most. */
   windowMs: number;
   /** How long immediate waits to coalesce a burst into one push. */
@@ -153,7 +159,8 @@ export function canticleDelivers(
   return (
     delivery !== undefined &&
     (delivery.mode !== "off" ||
-      Object.values(delivery.stations).some((mode) => mode !== "off"))
+      Object.values(delivery.stations).some((mode) => mode !== "off") ||
+      Object.values(delivery.streams).some((mode) => mode !== "off"))
   );
 }
 
@@ -333,6 +340,9 @@ export const CANTICLE_KEY_ID = /^[0-9a-f]{16}$/iu;
 const KEY_ID = CANTICLE_KEY_ID;
 /** A station name a tune can name on its own (the station half of `TUNE`). */
 export const CANTICLE_STATION = /^[a-z][a-z0-9-]{0,30}$/u;
+/** A stream name (the stream half of `TUNE`). */
+export const CANTICLE_STREAM =
+  /^[a-z][a-z0-9-]{0,30}(\.[a-z][a-z0-9-]{0,30}){0,3}$/u;
 
 function canticleMode(value: unknown, name: string): CanticleMode {
   if (value !== "off" && value !== "digest" && value !== "immediate") {
@@ -362,6 +372,19 @@ function parseDelivery(value: unknown, name: string): CanticleEarDelivery {
       );
     }
     stations[scope] = canticleMode(mode, `${name}.stations.${station}`);
+  }
+  const streamsInput = input.streams ?? {};
+  if (!isObject(streamsInput)) {
+    throw new Error(`${name}.streams must be an object of stream -> mode`);
+  }
+  const streams: Record<string, CanticleMode> = {};
+  for (const [stream, mode] of Object.entries(streamsInput)) {
+    if (!CANTICLE_STREAM.test(stream)) {
+      throw new Error(
+        `${name}.streams: ${JSON.stringify(stream)} must be a stream name (lowercase letters, digits and -, with up to three dots), without its station`,
+      );
+    }
+    streams[stream] = canticleMode(mode, `${name}.streams.${stream}`);
   }
   const style = input.style ?? "records";
   if (style !== "records" && style !== "counts") {
@@ -396,6 +419,7 @@ function parseDelivery(value: unknown, name: string): CanticleEarDelivery {
   return {
     mode: canticleMode(input.mode ?? "off", `${name}.mode`),
     stations,
+    streams,
     windowMs,
     debounceMs,
     maxAgeMs,

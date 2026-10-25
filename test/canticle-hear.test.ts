@@ -3,7 +3,7 @@ import test from "node:test";
 
 import { renderHear, renderItem } from "../src/canticle/hear.ts";
 import type { HearView, LiveItem } from "../src/canticle/receptor.ts";
-import { harness, testConfig } from "./helpers.ts";
+import { assertWellFormed, harness, testConfig } from "./helpers.ts";
 
 const NOW = 1_790_000_100_000;
 
@@ -347,48 +347,6 @@ test("hear tool: prototype-named ears hear nothing and don't throw", async () =>
 });
 
 // ---- the character cap (🩸 #28: the first item, the frame and the omission line all count)
-
-/** Every wrapper opened is closed with its own id, and nothing sits half-open. */
-function assertWellFormed(out: string): void {
-  const opens = [
-    ...out.matchAll(/<<<EXTERNAL_UNTRUSTED_CONTENT id="([0-9a-f]{12})">>>/gu),
-  ];
-  const closes = [
-    ...out.matchAll(
-      /<<<END_EXTERNAL_UNTRUSTED_CONTENT id="([0-9a-f]{12})">>>/gu,
-    ),
-  ];
-  assert.deepEqual(
-    closes.map((m) => m[1]),
-    opens.map((m) => m[1]),
-    "each wrapper closes with its own id",
-  );
-  for (const [index, open] of opens.entries()) {
-    const close = closes[index]!;
-    assert.ok(open.index < close.index);
-    // The banner precedes its wrapper, outside it.
-    const before = out.slice(0, open.index);
-    assert.ok(
-      before.lastIndexOf("[canticle:heard]") > (closes[index - 1]?.index ?? -1),
-    );
-    // Inside: only the fixed header, quoted payload, or our truncation line.
-    const inside = out
-      .slice(open.index + open[0].length, close.index)
-      .split("\n")
-      .slice(1, -1);
-    assert.deepEqual(
-      inside.slice(0, 3).map((l) => l.split(" ")[0]),
-      ["Source:", "From:", "---"],
-    );
-    for (const line of inside.slice(3)) {
-      assert.match(line, /^> |^\(payload truncated by frond-ear /u, line);
-    }
-  }
-  assert.doesNotMatch(
-    out,
-    /<<<(END_)?EXTERNAL_UNTRUSTED_CONTENT(?! id="[0-9a-f]{12}">>>)/u,
-  );
-}
 
 test("hear: cap 500, one 700-char item stays within 500 and well-formed", () => {
   const out = renderHear(view({ items: [item({ text: "a".repeat(700) })] }), {

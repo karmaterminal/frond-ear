@@ -108,7 +108,11 @@ export interface CanticleSettled {
   expiresAt: number;
 }
 
-/** A session's own canticle delivery choice for a station, or "*" for all of them. */
+/**
+ * A session's own canticle delivery choice: for a station (its name, or its key id in
+ * lowercase), a stream on every station (`*:stream`), one station's stream
+ * (`station:stream`), or "*" for all of them.
+ */
 export interface CanticleChoice {
   scope: string;
   mode: "mute" | "digest" | "immediate";
@@ -723,7 +727,7 @@ export class EventStore {
       .run(expiresAt, ear, identity);
   }
 
-  /** `scope` is a station name or key id (lowercase), or "*" for every station the ear hears. */
+  /** `scope` is one of CanticleChoice's: `*`, a station, `*:stream` or `station:stream`. */
   public setCanticleAttention(
     ear: string,
     scope: string,

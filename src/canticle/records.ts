@@ -36,6 +36,7 @@
 // `lastFailure` keeps the latest connection's first failure. `snapshotFrames` counts
 // this connection's join snapshot; `counts.snapshot_frames` adds them up.
 
+import { isFindingCtype, parseFinding } from "./finding.ts";
 import type { HearView, LiveItem } from "./receptor.ts";
 import { MAX_CLAMP_TTL_S } from "./wire.ts";
 
@@ -149,6 +150,25 @@ const strOrNull = (v: unknown) => v === null || str(v);
 /** A sender-chosen reason, bounded to a short token before it is kept. */
 const reasonToken = (v: unknown) =>
   str(v) && /^[a-z0-9_]{1,40}$/u.test(v) ? v : "other";
+
+/**
+ * A record v1 body's bytes (`base64`, for a body that isn't text), or undefined when they
+ * aren't well-formed or don't match the body's `size`: then nothing is read from them.
+ */
+function bytesOf(body: Obj): Uint8Array | undefined {
+  const b64 = body.base64;
+  if (
+    !str(b64) ||
+    b64.length % 4 !== 0 ||
+    !/^[A-Za-z0-9+/]*={0,2}$/u.test(b64)
+  ) {
+    return undefined;
+  }
+  const bytes = Buffer.from(b64, "base64");
+  if (bytes.toString("base64") !== b64) return undefined; // not canonical
+  if (body.size !== undefined && body.size !== bytes.length) return undefined;
+  return new Uint8Array(bytes);
+}
 
 /** §14.11 lineage root from a record, as `key:epoch:stream:seq`; undefined if absent. */
 function rootOf(lineage: Json | undefined): string | undefined {
@@ -739,6 +759,12 @@ export class RecordConsumer {
     }
     const body = isObj(rec.body) ? rec.body : undefined;
     const text = body && str(body.text) ? body.text : undefined;
+    const ctype =
+      body && (str(body.ctype) || int(body.ctype))
+        ? body.ctype
+        : text !== undefined
+          ? 1
+          : undefined;
     const ref = isObj(rec.body_ref) ? rec.body_ref : undefined;
     // §14.18.3 `flags`. An absent or mistyped `wake_derived` stays unknown, and
     // delivery never wakes on an unknown (fail closed); the others only label.
@@ -765,12 +791,18 @@ export class RecordConsumer {
       principal: str(station.principal) ? station.principal : undefined,
       root: rootOf(rec.lineage),
       text,
-      ctype:
-        body && (str(body.ctype) || int(body.ctype))
-          ? body.ctype
-          : text !== undefined
-            ? 1
-            : undefined,
+      ctype,
+      finding:
+        body && isFindingCtype(ctype)
+          ? parseFinding(
+              {
+                class: rec.class,
+                ctype,
+                stateKey: str(rec.state_key) ? rec.state_key : undefined,
+              },
+              bytesOf(body),
+            )
+          : undefined,
       bodyRef:
         ref && str(ref.url) && str(ref.sha256)
           ? { url: ref.url, sha256: ref.sha256, size: String(ref.size ?? "?") }
@@ -940,6 +972,7 @@ export class RecordConsumer {
       ...(this.health === "stopped" ? { ended: true } : {}),
       blind,
       ...(this.breaker !== undefined ? { breaker: this.breaker } : {}),
+      ...(this.mute !== null && live ? { hostMute: true as const } : {}),
       lastDatagramAt: this.lastDatagramAt,
       ...(this.joinedLate
         ? {
