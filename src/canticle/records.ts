@@ -792,8 +792,11 @@ export class RecordConsumer {
       root: rootOf(rec.lineage),
       text,
       ctype,
+      // A body with text is shown as text, so it is never also a finding: a finding's
+      // banner line must sit over its own fields (the daemon sends `text` only for
+      // content type 1 and `base64` otherwise).
       finding:
-        body && isFindingCtype(ctype)
+        text === undefined && body && isFindingCtype(ctype)
           ? parseFinding(
               {
                 class: rec.class,

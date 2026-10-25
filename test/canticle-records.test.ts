@@ -140,6 +140,10 @@ test("records: a finding's bytes come from body.base64, by content type id or na
     undefined,
     "only an advisory",
   );
+  // A body that also carries text is shown as that text, never as a finding.
+  const both = heard({ ctype: 11, size, base64: b64, text: "free text" });
+  assert.equal(both.text, "free text");
+  assert.equal(both.finding, undefined);
 });
 
 test("records: nothing from a run is delivered before its first landing_state", () => {

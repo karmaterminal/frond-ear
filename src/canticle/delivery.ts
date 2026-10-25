@@ -14,8 +14,9 @@
 //   TTL. The config is the ceiling (per station and per stream, frond-ear#85), and the
 //   choice that names more of a record beats one that names less, as a station's own
 //   choice beats the one for every station with `set_attention`.
-// Mute always wins: a mute at any scope (a station, the ear, an ear-wide `set_attention`
-// silence, `canticle.muted`) passes over every record first heard while it holds, and drops
+// Mute always wins: a mute at any scope (a station, a stream, a station's stream, the ear,
+// an ear-wide `set_attention` silence, `canticle.muted`) passes over every record first
+// heard while it holds, whatever a stream's or a station's ceiling allows, and drops
 // what was waiting; a record a mute passed over is never pushed after it lifts. Dedupe is
 // by record identity (key · epoch · stream · seq), never by text: a pushed or muted record
 // keeps a durable tombstone until its local expiry plus 5 s (§14.18.5), so a

@@ -690,6 +690,48 @@ test("mute always wins: an ear-wide set_attention silence and canticle.muted bot
   }
 });
 
+test("mute always wins over a stream's ceiling: with the ear off and distress immediate, a set_attention silence and canticle.muted each stop its pushes, and nothing they passed over goes later", async () => {
+  const delivery = {
+    mode: "off",
+    windowMs: 10_000,
+    streams: { distress: "immediate", alerts: "digest" },
+  };
+  const tune = { tune: { scribe: ALARMS } };
+  const { h, host } = setup(delivery, tune);
+  host.tune = ALARMS;
+  try {
+    const shim = h.attach("scribe");
+    await h.call(shim, "set_attention", { mode: "silent" });
+    host.sing(1, { stream: "distress", text: "seat down" });
+    host.sing(1, { stream: "alerts", text: "disk 91%" });
+    h.timers.advance(12_000);
+    assert.equal(pushes(shim).length, 0);
+    assert.equal(status(h).muted, "set_attention silenced every chat");
+    await h.call(shim, "set_attention", { mode: "configured" });
+    h.timers.advance(12_000);
+    assert.equal(
+      pushes(shim).length,
+      0,
+      "what the silence passed over isn't pushed once it lifts",
+    );
+
+    h.daemon.reloadConfig(canticleConfig(delivery, { ...tune, muted: true }));
+    host.sing(2, { stream: "distress", text: "still down" });
+    h.timers.advance(12_000);
+    assert.equal(pushes(shim).length, 0);
+    assert.equal(status(h).muted, "canticle.muted is set");
+
+    h.daemon.reloadConfig(canticleConfig(delivery, tune));
+    host.sing(3, { stream: "distress", text: "down 3 min" });
+    h.timers.advance(12_000);
+    assert.equal(pushes(shim).length, 1);
+    assert.equal(pushes(shim)[0]!.meta.delivery, "immediate");
+    assert.deepEqual(order(pushes(shim)[0]!.content), ["ops:distress/3"]);
+  } finally {
+    h.dispose();
+  }
+});
+
 test("dedupe: digest and immediate never deliver one record twice, whichever pushed it and whenever the mode changes", async () => {
   const { h, host } = setup({ mode: "immediate" });
   try {
