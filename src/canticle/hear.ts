@@ -7,13 +7,14 @@
 // frame, never from the payload; missing provenance reads "unavailable".
 // `body_ref` is shown, never fetched (§9.6). Nothing here wakes a session; the
 // delivery modes (delivery.ts) and `sitrep` (sitrep.ts) render with the same `renderItem`.
-// A finding (finding.ts, frond-ear#85) gets one more banner line, naming the signing
-// station as the speaker; its words stay in the payload.
+// A finding (finding.ts, frond-ear#85) gets one more banner line, with only its status
+// and severity words and its voice as attributed to the signing station (RFC-0001 §6.7);
+// the station's own text, its subject included, stays in the payload.
 
 import { randomBytes } from "node:crypto";
 
 import { cleanName, cleanText } from "../render.ts";
-import { voiceOf, type Finding } from "./finding.ts";
+import { isFindingCtype, voiceOf, type Finding } from "./finding.ts";
 import type { HearView, LiveItem } from "./receptor.ts";
 
 /** Receiver-measured age (now − issued_at − δ̂) above which an item is marked `aged` (§6.3). */
@@ -94,26 +95,25 @@ function wrapped(item: LiveItem, payload: string): string[] {
 }
 
 /**
- * A finding's banner line: the signing station speaks, about itself only when the
- * finding's subject is its own station. Every value is a closed word or a token, so the
- * body can't add a field or a sentence here.
+ * A finding's banner line (RFC-0001 §6.7): its status and severity words and its voice as
+ * attributed to the signing station, which the [canticle:heard] line above names; the
+ * station speaks, about itself only when the finding's subject is its own station. Only
+ * closed words and frond-ear's own sentences appear here. The station's text, its subject
+ * included, stays inside the wrapper, so the body can't add a field or a sentence.
  */
 function findingLine(finding: Finding, station: string): string {
   const voice = voiceOf(finding, station);
-  const speaker = token(station);
-  const subject = token(finding.subject);
   const said =
     finding.subject === station
-      ? `"${speaker}" reports about itself`
-      : `"${speaker}" reports about "${subject}", which is not speaking${finding.voice === "self" ? " (the body says self, but its subject isn't the signing station)" : ""}`;
+      ? "the station named above reports about itself"
+      : voice === "self-unmatched"
+        ? "the body says self, but the subject named below isn't the station named above: read it as that station's report about the subject, which is not speaking"
+        : "the station named above reports about the subject named below, which is not speaking";
   return [
     "[canticle:finding]",
-    `speaker="${speaker}"`,
-    `voice=${voice}`,
-    `subject="${subject}"`,
     `status=${finding.status}`,
     ...(finding.severity !== undefined ? [`severity=${finding.severity}`] : []),
-    `incident=${token(finding.incident)}`,
+    `voice=${voice}`,
     `— ${said}${finding.status === "ended" ? "; ended means it stopped watching without seeing a resolution" : ""}`,
   ].join(" ");
 }
@@ -201,6 +201,8 @@ export function renderItem(
       ...wrapped(
         item,
         [
+          "(subject)",
+          quoted(item.finding.subject),
           "(summary)",
           quoted(item.finding.summary),
           "(not proved)",
@@ -210,7 +212,7 @@ export function renderItem(
     );
   } else if (item.bodyBytes !== undefined) {
     lines.push(
-      `(non-text payload, ctype ${token(item.ctype)}, ${digits(item.bodyBytes)} bytes; not shown)`,
+      `(non-text payload, ctype ${token(item.ctype)}, ${digits(item.bodyBytes)} bytes; not shown${isFindingCtype(item.ctype) ? ", and not a finding by RFC-0001 §6.7, so no status or severity" : ""})`,
     );
   }
   if (item.bodyRef) {

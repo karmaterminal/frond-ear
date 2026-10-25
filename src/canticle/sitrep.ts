@@ -4,7 +4,10 @@
 // fold: one entry per (station, state_key) across the chosen streams, the newest standing
 // in RFC-0001 §7.8's order (issued_at, epoch, seq). It never folds across stations
 // (§6.5), and tells them apart by key id, which a manifest rename keeps. An unkeyed item
-// is its own entry. The fold is display only: `hear` still reads every item.
+// is its own entry. The fold is display only: `hear` still reads every item, and an item
+// folded from another stream is still current there, since only a newer item on its own
+// stream supersedes it (§7.8) or, for a finding, resolves it (§6.7). Its `folded:` line
+// says so, with a folded finding's status and severity words.
 //
 // Where the live set comes from (§7.10): a relay's fill-only join would be a one-off view
 // of it, but no frond-ear source talks to a relay. With `host-daemon` the ear holds the
@@ -123,7 +126,7 @@ const BASIS: Readonly<Record<string, string>> = {
 };
 
 const ABSENT =
-  "absent is not resolved: an incident that expired, was plucked or went unheard isn't here, and only a finding's own status=resolved says it resolved (the station's claim).";
+  "absent is not resolved: an incident that expired, was plucked or went unheard isn't here, and only a newer status=resolved finding from the same station, on the same stream and state_key, resolves one (the station's claim, RFC-0001 §6.7).";
 
 /**
  * The whole result stays within `maxChars`, as `hear`'s does: entries are whole or
@@ -208,10 +211,13 @@ export function renderSitrep(view: HearView, options: SitrepOptions): string {
       const older = entry.folded
         .map(
           (item) =>
-            `stream=${token(item.stream)} item=${digits(item.epoch)}/${digits(item.seq)}`,
+            `stream=${token(item.stream)} item=${digits(item.epoch)}/${digits(item.seq)}${item.finding ? ` finding status=${item.finding.status}${item.finding.severity !== undefined ? ` severity=${item.finding.severity}` : ""}` : ""}`,
         )
         .join(", ");
-      return `${out}\nfolded: ${entry.folded.length} older live item${entry.folded.length === 1 ? "" : "s"} for this station and state_key (${older}); hear shows ${entry.folded.length === 1 ? "it" : "them"}`;
+      const elsewhere = entry.folded.some(
+        (item) => item.stream !== entry.standing.stream,
+      );
+      return `${out}\nfolded: ${entry.folded.length} older live item${entry.folded.length === 1 ? "" : "s"} for this station and state_key (${older}); hear shows ${entry.folded.length === 1 ? "it" : "them"}${elsewhere ? "; each stays current on its own stream, where only that stream's newer item supersedes or resolves it (RFC-0001 §7.8, §6.7)" : ""}`;
     };
     const full = render();
     if (fits([...kept, full])) {

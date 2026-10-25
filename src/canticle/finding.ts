@@ -1,12 +1,12 @@
 // A finding: what a probe or watcher sings about a seat on `alerts` or `distress`
-// (binary-canticle#112's profile, RFC-0001 amendment FP-1, proposed; frond-ear#85).
+// (RFC-0001 §6.7, amendment FP-1, proposed in binary-canticle#115; frond-ear#85).
 //
 // Content type 11, `application/vnd.canticle.finding+cbor`: a CBOR map with small integer
 // keys. 1 incident (equal to the item's state_key), 2 subject, 3 voice (`self` or
 // `observer`), 4 status (`open`, `resolved` or `ended`), 5 severity (CAP's words, present
-// exactly when status is `open`), 6 summary, 7 not_proved. Keys 8 and up are ignored.
-// Only an `advisory` is a finding; anything malformed is not one, and its body stays
-// opaque, never shown with a status or a severity.
+// exactly when status is `open`), 6 summary, 7 not_proved. Unsigned integer keys other
+// than 1-7 are ignored. Only an `advisory` is a finding; anything malformed is not one,
+// and its body stays opaque, never shown with a status or a severity.
 //
 // The signer is always the speaker: the key that signed the frame, under the name the
 // manifest pins to it. `voice` and `subject` are the signer's own claims, so a finding
@@ -81,7 +81,7 @@ export function parseFinding(
     return undefined;
   }
   for (const key of map.keys()) {
-    if (typeof key !== "bigint" || key < 1n) return undefined;
+    if (typeof key !== "bigint" || key < 0n) return undefined;
   }
   const text = (key: bigint, max: number): string | undefined => {
     const value = map.get(key);
@@ -129,15 +129,15 @@ export function parseFinding(
 }
 
 /**
- * Who speaks: the signer, always. It speaks for itself only when the subject is its own
- * station, as the manifest names it; any other `self` is a claim the signer made about
- * someone else, so it reads as the signer's observation.
+ * The voice as attributed to the signer, which always speaks (RFC-0001 §6.7). `self` only
+ * when the body says self and its subject is the signer's own station, as the manifest
+ * names it; `self-unmatched` when the body says self about another subject, which is the
+ * signer's observation of that subject. The words are binary-canticle's (`finding.attribute`).
  */
 export function voiceOf(
   finding: Finding,
   station: string,
-): "self" | "observer" {
-  return finding.voice === "self" && finding.subject === station
-    ? "self"
-    : "observer";
+): "self" | "observer" | "self-unmatched" {
+  if (finding.voice === "observer") return "observer";
+  return finding.subject === station ? "self" : "self-unmatched";
 }

@@ -343,12 +343,19 @@ export class FakeSocket implements GatewaySocket {
 }
 
 /**
- * A finding body (frond-ear#85), from binary-canticle#112's profile lane (RFC-0001
- * amendment FP-1, not yet merged there): 131 bytes, incident `seat-a:distress`, subject
- * `seat-a`, voice `observer`, status `open`, severity `moderate`.
+ * A finding body (frond-ear#85), the first worked example of binary-canticle's probe
+ * profile (`rfc/0001-notes/probe-profile.md`, RFC-0001 §6.7, amendment FP-1, proposed in
+ * binary-canticle#115): 131 bytes, incident `seat-a:distress`, subject `seat-a`, voice
+ * `observer`, status `open`, severity `moderate`.
  */
 export const FINDING_FIXTURE = Buffer.from(
   "a7016f736561742d613a64697374726573730266736561742d6103686f6273657276657204646f70656e05686d6f64657261746506783467617465776179206e6f7420726561647920666f722036206d696e3b203320636c61696d6564207475726e732077616974696e6707767468617420616e79207475726e20776173206c6f7374",
+  "hex",
+);
+
+/** The profile's second example, 134 bytes: the same incident `resolved`, with no severity. */
+export const FINDING_RESOLVED_FIXTURE = Buffer.from(
+  "a6016f736561742d613a64697374726573730266736561742d6103686f6273657276657204687265736f6c76656406782b6761746577617920726561647920616761696e3b20636c61696d6564207475726e7320647261696e696e67077827746861742074686520332077616974696e67207475726e7320776572652064656c697665726564",
   "hex",
 );
 
@@ -391,7 +398,7 @@ export function assertWellFormed(out: string): void {
     for (const line of inside.slice(3)) {
       assert.match(
         line,
-        /^> |^\(payload truncated by frond-ear |^\((summary|not proved)\)$/u,
+        /^> |^\(payload truncated by frond-ear |^\((subject|summary|not proved)\)$/u,
         line,
       );
     }
