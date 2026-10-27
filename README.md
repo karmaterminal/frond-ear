@@ -16,7 +16,7 @@ Existing Discord MCP plugins are pull-based: a session only learns about new mes
 - keeps unmentioned room chatter as context
 - breaks bot-to-bot loops
 
-It then **pushes** the result into a live Claude Code session as [channel](https://code.claude.com/docs/en/channels) events. Events that arrive while Claude is busy wait for its next turn, and they are never typed in as if they were user input. Claude answers through the shim's eleven tools: `reply`, `react` and `edit_message` post; `fetch_messages`, `inbox`, `fetch_attachment` and `hear` read; `ack` marks events seen; `set_attention` and `set_canticle_delivery` narrow what it hears; and `ear_status` checks that the ear works.
+It then **pushes** the result into a live Claude Code session as [channel](https://code.claude.com/docs/en/channels) events. Events that arrive while Claude is busy wait for its next turn, and they are never typed in as if they were user input. Claude answers through the shim's twelve tools: `reply`, `react` and `edit_message` post; `fetch_messages`, `inbox`, `fetch_attachment`, `hear` and `sitrep` read; `ack` marks events seen; `set_attention` and `set_canticle_delivery` narrow what it hears; and `ear_status` checks that the ear works.
 
 ```
 Discord ──ws──▶ frond-ear daemon ──unix socket──▶ frond-ear shim ──stdio (MCP channel)──▶ Claude Code
@@ -139,6 +139,21 @@ Once the trial works, remove its registration (`claude mcp remove -s local frond
   from, what `init` writes and what stays manual, what `doctor` checks and what it refuses to probe.
 - [`docs/runbook.md`](docs/runbook.md): the manual path, stage by stage, with the dry-run proof of
   delivery on a throwaway session before you hand the ear to a long-running one.
+
+## binary-canticle: alerts and distress
+
+An ear can also hear [binary-canticle](https://github.com/karmaterminal/binary-canticle) stations (off by
+default; [runbook §8](docs/runbook.md#8-hear-binary-canticle-optional)). For a seat's `distress` and `alerts`
+streams (frond-ear#85):
+
+- **Per stream.** `canticle.delivery.<ear>.streams` sets each stream's ceiling (`"distress": "immediate"`,
+  `"alerts": "digest"`), and the session narrows within it with `set_canticle_delivery`'s `stream`.
+- **What did I miss.** `sitrep(streams: ["distress", "alerts"])` shows what stands on them now: one entry per
+  station and state_key, the newest standing. An incident missing from it is not resolved.
+- **Who speaks.** A watcher's finding about another seat is bannered as the watcher's report, never as that seat
+  speaking (RFC-0001 §6.7, merged in binary-canticle#115): the banner line carries only its status, severity
+  and voice, and the subject stays inside the wrapper. Heard text stays data either way: it can't authorize an
+  action.
 
 ## GitHub Copilot CLI
 

@@ -9,11 +9,14 @@
 // - `digest` sends one "what's on the radio" report per `windowMs`: sorted by
 //   station:stream, the records in seq order (or, with style `counts`, counts, gaps and
 //   repeats per stream), and a cursor, so the next report goes on where this one stopped;
-// - the attached session narrows either with `set_canticle_delivery`, for one station or
-//   the whole ear, down to mute, with an optional TTL. The config is the ceiling, and a
-//   station's own choice beats the one for every station, as with `set_attention`.
-// Mute always wins: a mute at any scope (a station, the ear, an ear-wide `set_attention`
-// silence, `canticle.muted`) passes over every record first heard while it holds, and drops
+// - the attached session narrows either with `set_canticle_delivery`, for one station,
+//   one stream, one station's stream or the whole ear, down to mute, with an optional
+//   TTL. The config is the ceiling (per station and per stream, frond-ear#85), and the
+//   choice that names more of a record beats one that names less, as a station's own
+//   choice beats the one for every station with `set_attention`.
+// Mute always wins: a mute at any scope (a station, a stream, a station's stream, the ear,
+// an ear-wide `set_attention` silence, `canticle.muted`) passes over every record first
+// heard while it holds, whatever a stream's or a station's ceiling allows, and drops
 // what was waiting; a record a mute passed over is never pushed after it lifts. Dedupe is
 // by record identity (key · epoch · stream · seq), never by text: a pushed or muted record
 // keeps a durable tombstone until its local expiry plus 5 s (§14.18.5), so a
@@ -202,19 +205,46 @@ interface EarState {
 }
 
 /**
- * Whose mode is asked: a record's station, which a ceiling or a choice can name by key id
- * (lowercase hex, which outlasts a manifest rename) or by name; one scope as config or
- * the tool spells it; or, undefined, the ear as a whole.
+ * Whose mode is asked: a record, whose station a ceiling or a choice can name by key id
+ * (lowercase hex, which outlasts a manifest rename) or by name, and whose stream it can
+ * name too; one scope as config or the tool spells it (`station`, `*:stream` or
+ * `station:stream`); or, undefined, the ear as a whole.
  */
-type Target = { key: string; station: string } | string | undefined;
+type Target =
+  | { key: string; station: string; stream: string }
+  | string
+  | undefined;
 
-/** The scopes a target answers to. */
-const scopesOf = (target: Target): string[] =>
-  target === undefined
-    ? []
-    : typeof target === "string"
-      ? [target]
-      : [target.key.toLowerCase(), target.station];
+/** The station scopes and the stream a target, or a choice's scope, answers to. */
+function partsOf(target: Target): {
+  stations: string[];
+  stream: string | undefined;
+} {
+  if (target === undefined) return { stations: [], stream: undefined };
+  if (typeof target !== "string") {
+    return {
+      stations: [target.key.toLowerCase(), target.station],
+      stream: target.stream,
+    };
+  }
+  const at = target.indexOf(":");
+  const station = at < 0 ? target : target.slice(0, at);
+  return {
+    stations: station === "*" ? [] : [station],
+    stream: at < 0 ? undefined : target.slice(at + 1),
+  };
+}
+
+const narrowest = <M extends DeliveryMode>(
+  modes: ReadonlyArray<M | undefined>,
+): M | undefined =>
+  modes.reduce<M | undefined>(
+    (held, mode) =>
+      mode !== undefined && (held === undefined || RANK[mode] < RANK[held])
+        ? mode
+        : held,
+    undefined,
+  );
 
 /** One ear's effective modes, from its config ceiling and the session's choices. */
 class Modes {
@@ -233,43 +263,53 @@ class Modes {
   }
 
   /**
-   * A station's ceiling: its entry in `stations`, by key id or by name (the narrower,
-   * when both have one), else the ear's `mode`.
+   * A record's ceiling: its station's entry in `stations`, by key id or by name, and its
+   * stream's entry in `streams` (the narrowest, when more than one has one), else the
+   * ear's `mode`.
    */
   ceiling(target: Target): CanticleMode {
-    let ceiling: CanticleMode | undefined;
-    for (const scope of scopesOf(target)) {
-      if (!Object.hasOwn(this.#delivery.stations, scope)) continue;
-      const mode = this.#delivery.stations[scope] ?? "off";
-      if (ceiling === undefined || RANK[mode] < RANK[ceiling]) ceiling = mode;
-    }
-    return ceiling ?? this.#delivery.mode;
+    const { stations, stream } = partsOf(target);
+    return (
+      narrowest([
+        ...stations.map((scope) =>
+          Object.hasOwn(this.#delivery.stations, scope)
+            ? (this.#delivery.stations[scope] ?? "off")
+            : undefined,
+        ),
+        stream !== undefined && Object.hasOwn(this.#delivery.streams, stream)
+          ? (this.#delivery.streams[stream] ?? "off")
+          : undefined,
+      ]) ?? this.#delivery.mode
+    );
   }
 
   /**
-   * A station's mode; `undefined` for the ear as a whole. The session's choice for the
-   * station (by key id or name: the narrower, when both have one) beats its choice for
-   * every station, as with `set_attention`, and the ceiling caps it. Mute always wins.
+   * A record's mode; `undefined` for the ear as a whole. Of the session's choices that
+   * cover it, the one that names more of it wins, as a station's own choice beats the one
+   * for every station with `set_attention`: its station's stream, then its station or its
+   * stream (the narrowest, when more than one has a choice: a station by key id and by
+   * name, or a station and a stream), then the whole ear. The ceiling caps it, and a mute
+   * at any scope that covers the record wins.
    */
   of(target: Target): DeliveryMode {
     const ceiling = this.ceiling(target);
     if (ceiling === "off") return "off";
     if (this.muted !== undefined) return "mute";
-    const scopes = scopesOf(target);
-    let station: DeliveryMode | undefined;
-    let ear: DeliveryMode | undefined;
+    const { stations, stream } = partsOf(target);
+    /** By how much of the record a choice names: nothing, a station or a stream, both. */
+    const named: Array<Array<CanticleChoice["mode"]>> = [[], [], []];
     for (const choice of this.#choices) {
-      if (choice.scope === "*") {
-        ear = choice.mode;
-      } else if (
-        scopes.includes(choice.scope) &&
-        (station === undefined || RANK[choice.mode] < RANK[station])
-      ) {
-        station = choice.mode;
-      }
+      const scope = partsOf(choice.scope);
+      const station = scope.stations[0];
+      if (station !== undefined && !stations.includes(station)) continue;
+      if (scope.stream !== undefined && scope.stream !== stream) continue;
+      if (choice.mode === "mute") return "mute";
+      named[
+        (station !== undefined ? 1 : 0) + (scope.stream !== undefined ? 1 : 0)
+      ]!.push(choice.mode);
     }
-    if (ear === "mute") return "mute";
-    const chosen = station ?? ear;
+    const chosen =
+      narrowest(named[2]!) ?? narrowest(named[1]!) ?? narrowest(named[0]!);
     return chosen !== undefined && RANK[chosen] < RANK[ceiling]
       ? chosen
       : ceiling;
@@ -927,23 +967,33 @@ export class CanticleDelivery {
     const now = this.#deps.clock.now();
     const modes = this.#modes(ear, config, now);
     const choices = this.#deps.store.canticleAttention(ear, now);
-    const names = new Set([
-      ...Object.keys(delivery.stations),
-      ...choices.map((choice) => choice.scope).filter((scope) => scope !== "*"),
-    ]);
-    return {
-      ceiling: delivery.mode,
-      mode: modes.of(undefined),
-      style: modes.style,
-      ...(modes.muted !== undefined ? { muted: modes.muted } : {}),
-      stations: Object.fromEntries(
-        [...names]
+    const scopes = choices
+      .map((choice) => choice.scope)
+      .filter((scope) => scope !== "*");
+    /** Each scope as config or the session names it, with its ceiling and mode. */
+    const rows = (names: Iterable<string>) =>
+      Object.fromEntries(
+        [...new Set(names)]
           .sort()
           .map((name) => [
             name,
             { ceiling: modes.ceiling(name), mode: modes.of(name) },
           ]),
-      ),
+      );
+    return {
+      ceiling: delivery.mode,
+      mode: modes.of(undefined),
+      style: modes.style,
+      ...(modes.muted !== undefined ? { muted: modes.muted } : {}),
+      stations: rows([
+        ...Object.keys(delivery.stations),
+        ...scopes.filter((scope) => !scope.includes(":")),
+      ]),
+      // A stream as `*:stream` (any station's), and one station's stream as `station:stream`.
+      streams: rows([
+        ...Object.keys(delivery.streams).map((stream) => `*:${stream}`),
+        ...scopes.filter((scope) => scope.includes(":")),
+      ]),
       choices: choices.map(({ scope, mode, style, expiresAt }) => ({
         scope,
         mode,

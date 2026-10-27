@@ -1,4 +1,5 @@
 import type { HearView } from "../src/canticle/receptor.ts";
+import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -339,4 +340,72 @@ export class FakeSocket implements GatewaySocket {
       listener(event);
     }
   }
+}
+
+/**
+ * A finding body (frond-ear#85), the first worked example of binary-canticle's probe
+ * profile (`rfc/0001-notes/probe-profile.md` at binary-canticle 9047b4e, the merge of
+ * binary-canticle#115; RFC-0001 §6.7, amendment FP-1): 131 bytes, incident
+ * `seat-a:distress`, subject `seat-a`, voice `observer`, status `open`, severity
+ * `moderate`.
+ */
+export const FINDING_FIXTURE = Buffer.from(
+  "a7016f736561742d613a64697374726573730266736561742d6103686f6273657276657204646f70656e05686d6f64657261746506783467617465776179206e6f7420726561647920666f722036206d696e3b203320636c61696d6564207475726e732077616974696e6707767468617420616e79207475726e20776173206c6f7374",
+  "hex",
+);
+
+/** The profile's second example, 134 bytes: the same incident `resolved`, with no severity. */
+export const FINDING_RESOLVED_FIXTURE = Buffer.from(
+  "a6016f736561742d613a64697374726573730266736561742d6103686f6273657276657204687265736f6c76656406782b6761746577617920726561647920616761696e3b20636c61696d6564207475726e7320647261696e696e67077827746861742074686520332077616974696e67207475726e7320776572652064656c697665726564",
+  "hex",
+);
+
+/**
+ * Rendered canticle items are well-formed: each wrapper closes with its own id after its
+ * banner, and inside it is only the fixed header, "> "-quoted payload, frond-ear's
+ * truncation line, or a finding's labels (frond-ear#85).
+ */
+export function assertWellFormed(out: string): void {
+  const opens = [
+    ...out.matchAll(/<<<EXTERNAL_UNTRUSTED_CONTENT id="([0-9a-f]{12})">>>/gu),
+  ];
+  const closes = [
+    ...out.matchAll(
+      /<<<END_EXTERNAL_UNTRUSTED_CONTENT id="([0-9a-f]{12})">>>/gu,
+    ),
+  ];
+  assert.deepEqual(
+    closes.map((m) => m[1]),
+    opens.map((m) => m[1]),
+    "each wrapper closes with its own id",
+  );
+  for (const [index, open] of opens.entries()) {
+    const close = closes[index]!;
+    assert.ok(open.index < close.index);
+    // The banner precedes its wrapper, outside it.
+    const before = out.slice(0, open.index);
+    assert.ok(
+      before.lastIndexOf("[canticle:heard]") > (closes[index - 1]?.index ?? -1),
+    );
+    // Inside: only the fixed header, quoted payload, or our own unquoted lines.
+    const inside = out
+      .slice(open.index + open[0].length, close.index)
+      .split("\n")
+      .slice(1, -1);
+    assert.deepEqual(
+      inside.slice(0, 3).map((l) => l.split(" ")[0]),
+      ["Source:", "From:", "---"],
+    );
+    for (const line of inside.slice(3)) {
+      assert.match(
+        line,
+        /^> |^\(payload truncated by frond-ear |^\((subject|summary|not proved)\)$/u,
+        line,
+      );
+    }
+  }
+  assert.doesNotMatch(
+    out,
+    /<<<(END_)?EXTERNAL_UNTRUSTED_CONTENT(?! id="[0-9a-f]{12}">>>)/u,
+  );
 }

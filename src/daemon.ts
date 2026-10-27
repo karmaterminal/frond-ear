@@ -16,7 +16,12 @@ import { join } from "node:path";
 import { DELIVERY_PROOF, targetAdvice } from "./advice.ts";
 import { CanticleDelivery } from "./canticle/delivery.ts";
 import { messageText } from "./components.ts";
-import { CANTICLE_KEY_ID, CANTICLE_STATION, type Config } from "./config.ts";
+import {
+  CANTICLE_KEY_ID,
+  CANTICLE_STATION,
+  CANTICLE_STREAM,
+  type Config,
+} from "./config.ts";
 import type { StructuredLogger } from "./logger.ts";
 import {
   WakeLimiter,
@@ -41,6 +46,7 @@ import {
 import type { DiscordRest } from "./rest.ts";
 import { chunkMessage, RestError } from "./rest.ts";
 import { renderHear } from "./canticle/hear.ts";
+import { renderSitrep } from "./canticle/sitrep.ts";
 import type { HearView } from "./canticle/receptor.ts";
 import type { EventStore, ReplyPart } from "./store.ts";
 import type {
@@ -198,6 +204,39 @@ function stringArg(
 const SNOWFLAKE = /^\d{1,25}$/u;
 const CANTICLE_TUNE =
   /^(\*|[a-z][a-z0-9-]{0,30}):[a-z][a-z0-9-]{0,30}(\.[a-z][a-z0-9-]{0,30}){0,3}$/u;
+
+/**
+ * `sitrep`'s streams, in the session's order: a stream name (any station's) or
+ * `station:stream`, one to eight. A string is split on commas and spaces, for a client
+ * that sends a list as one.
+ */
+function sitrepStreams(value: unknown): string[] {
+  const list =
+    typeof value === "string"
+      ? value.split(/[\s,]+/u).filter((entry) => entry !== "")
+      : value;
+  if (
+    !Array.isArray(list) ||
+    list.length === 0 ||
+    list.length > 8 ||
+    !list.every(
+      (entry) =>
+        typeof entry === "string" &&
+        (CANTICLE_STREAM.test(entry) || CANTICLE_TUNE.test(entry)),
+    )
+  ) {
+    throw new Error(
+      'streams must list one to eight streams, each a stream name (such as "distress", any station\'s) or station:stream (station may be *)',
+    );
+  }
+  return [
+    ...new Set(
+      (list as string[]).map((entry) =>
+        entry.includes(":") ? entry : `*:${entry}`,
+      ),
+    ),
+  ];
+}
 
 const ATTACHMENT_RETENTION_MS = 24 * 60 * 60 * 1_000;
 /** How often the daemon sweeps every ear's saved attachments, fetching or not. */
@@ -1662,6 +1701,27 @@ export class Daemon {
           maxChars: this.config.limits.maxNotificationChars,
         });
       }
+      case "sitrep": {
+        const ear = this.readableEar(client, args);
+        if (!this.options.canticleHear) {
+          return "canticle is not enabled on this daemon (config canticle.enabled).";
+        }
+        const streams = sitrepStreams(args.streams);
+        const canticle = this.config.canticle;
+        // A read, as hear is: it marks nothing seen, touches no ledger and pushes nothing.
+        return renderSitrep(this.options.canticleHear(ear), {
+          streams,
+          tune:
+            canticle && Object.hasOwn(canticle.tune, ear)
+              ? (canticle.tune[ear] ?? [])
+              : canticle
+                ? []
+                : undefined,
+          source: canticle?.source,
+          limit: numberArg(args, "limit", 20, 50),
+          maxChars: this.config.limits.maxNotificationChars,
+        });
+      }
       case "fetch_attachment":
         return this.fetchAttachment(args);
       case "ear_status":
@@ -1815,7 +1875,8 @@ export class Daemon {
   /**
    * The attached session chooses how canticle reaches it (frond-ear#65), as with
    * set_attention: the config's delivery is the ceiling, so it can only narrow, down to
-   * mute, for one station or the whole ear, with an optional TTL.
+   * mute, for one station, one stream (frond-ear#85), one station's stream or the whole
+   * ear, with an optional TTL.
    */
   private setCanticleDelivery(
     client: Client,
@@ -1854,12 +1915,23 @@ export class Daemon {
       named !== undefined && CANTICLE_KEY_ID.test(named)
         ? named.toLowerCase()
         : named;
+    const stream = stringArg(args, "stream");
+    if (stream !== undefined && !CANTICLE_STREAM.test(stream)) {
+      throw new Error(
+        "stream must be one stream's name as hear shows it (the stream= of a hear banner, without its station); omit it for every stream",
+      );
+    }
+    // The scopes `choices` and config name: `*`, `station`, `*:stream`, `station:stream`.
+    const scope =
+      stream === undefined ? (station ?? "*") : `${station ?? "*"}:${stream}`;
     const style = stringArg(args, "style");
     if (style !== undefined && style !== "records" && style !== "counts") {
       throw new Error("style must be records or counts");
     }
-    if (style !== undefined && station !== undefined) {
-      throw new Error("style applies to the whole ear; omit station");
+    if (style !== undefined && scope !== "*") {
+      throw new Error(
+        "style applies to the whole ear; omit station and stream",
+      );
     }
     if (style !== undefined && mode === "configured") {
       throw new Error(
@@ -1875,17 +1947,11 @@ export class Daemon {
       }
       expiresAt = this.clock.now() + seconds * 1_000;
     }
-    const view = this.canticle.choose(
-      ear,
-      station ?? "*",
-      mode,
-      expiresAt,
-      style,
-    );
+    const view = this.canticle.choose(ear, scope, mode, expiresAt, style);
     this.store.increment("canticle_delivery_changes");
     this.logger.log("info", "canticle.delivery_chosen", {
       ear,
-      scope: station ?? "*",
+      scope,
       mode,
     });
     return JSON.stringify(view, null, 2);
