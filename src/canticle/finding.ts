@@ -1,5 +1,5 @@
 // A finding: what a probe or watcher sings about a seat on `alerts` or `distress`
-// (RFC-0001 §6.7, amendment FP-1, proposed in binary-canticle#115; frond-ear#85).
+// (RFC-0001 §6.7, amendment FP-1, merged in binary-canticle#115; frond-ear#85).
 //
 // Content type 11, `application/vnd.canticle.finding+cbor`: a CBOR map with small integer
 // keys. 1 incident (equal to the item's state_key), 2 subject, 3 voice (`self` or

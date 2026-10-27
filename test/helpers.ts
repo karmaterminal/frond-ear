@@ -344,9 +344,10 @@ export class FakeSocket implements GatewaySocket {
 
 /**
  * A finding body (frond-ear#85), the first worked example of binary-canticle's probe
- * profile (`rfc/0001-notes/probe-profile.md`, RFC-0001 §6.7, amendment FP-1, proposed in
- * binary-canticle#115): 131 bytes, incident `seat-a:distress`, subject `seat-a`, voice
- * `observer`, status `open`, severity `moderate`.
+ * profile (`rfc/0001-notes/probe-profile.md` at binary-canticle 9047b4e, the merge of
+ * binary-canticle#115; RFC-0001 §6.7, amendment FP-1): 131 bytes, incident
+ * `seat-a:distress`, subject `seat-a`, voice `observer`, status `open`, severity
+ * `moderate`.
  */
 export const FINDING_FIXTURE = Buffer.from(
   "a7016f736561742d613a64697374726573730266736561742d6103686f6273657276657204646f70656e05686d6f64657261746506783467617465776179206e6f7420726561647920666f722036206d696e3b203320636c61696d6564207475726e732077616974696e6707767468617420616e79207475726e20776173206c6f7374",

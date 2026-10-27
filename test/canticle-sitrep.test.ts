@@ -1,4 +1,4 @@
-// frond-ear#85: findings (RFC-0001 §6.7, amendment FP-1, proposed in binary-canticle#115)
+// frond-ear#85: findings (RFC-0001 §6.7, amendment FP-1, merged in binary-canticle#115)
 // and `sitrep`, "what did I miss" on chosen streams. A finding's banner line carries only
 // its status and severity words and its voice as attributed to the signing station, which
 // the banner names; a sitrep has one entry per station and state_key, the newest standing,
