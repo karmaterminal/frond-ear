@@ -1,6 +1,7 @@
 // A listener: verify, dedup, pluck, supersede and track presence (RFC-0001 §7.4–§7.8, §8).
 // A port of the spike's `canticle/listener.py` at binary-canticle `6b6553761d` (#62, #63),
-// which bounds every per-key structure (#60).
+// which bounds every per-key structure (#60), with the mark limit's factor cap of
+// binary-canticle#117 (`9bfc089a2a`, #67).
 //
 // It surfaces events (a new item, a withdrawal, a supersession, an expiry, a
 // presence change, evidence) and never actuates anything. Landing into a
@@ -15,8 +16,9 @@
 // more, through the same checks, when next heard.
 //
 // Bounds (§7.4, #60): dedup entries have a per-key share; supersession marks
-// have their own per-key limit (they outlive dedup entries); stream hearing
-// times are capped at the share; beacon maps hold one advertised catalog.
+// have their own per-key limit (they outlive dedup entries; its factor is capped
+// at the keyed classes' largest, 8: #67); stream hearing times are capped at the
+// share; beacon maps hold one advertised catalog.
 // Refusals never change state, and the epoch is adopted only on admission.
 
 import { createHash } from "node:crypto";
@@ -28,6 +30,7 @@ import {
   CTYPE_TEXT,
   SCOPES,
   SCOPE_NAMES,
+  type ClassSpec,
 } from "./ids.ts";
 import { hex, type Manifest } from "./manifest.ts";
 import {
@@ -46,6 +49,23 @@ import {
 export const SKEW_MS = 5_000;
 const OFFSET_SAMPLES = 16;
 const LIVE_STATE = CLASS_BY_NAME.get("live-state")!.code;
+
+/** How many dedup entries' lifetimes a mark of class c lasts: ⌈(default TTL + max TTL + skew) / default TTL⌉ (§7.4). */
+function markFactor(c: ClassSpec): number {
+  return Math.ceil(
+    ((c.defaultTtlS + c.maxTtlS) * 1000 + SKEW_MS) / (c.defaultTtlS * 1000),
+  );
+}
+
+/**
+ * The mark limit's factor never exceeds the largest among the classes that must carry a
+ * state_key (§6.2): 8, for regulatory and control. ambient (14) and finding-ref (98) may
+ * carry one but need not, and uncapped they let one key hold 98 times its dedup share in
+ * marks, every one of them in each saved snapshot (binary-canticle#67, #117).
+ */
+const MARK_FACTOR_CAP = Math.max(
+  ...[...CLASSES.values()].filter((c) => c.keyed).map(markFactor),
+);
 
 export type EventKind =
   | "item"
@@ -1045,7 +1065,11 @@ export class Listener {
    * Per-key limit on supersession marks, counted apart from dedup entries. A dedup
    * entry lasts about one TTL; a mark lasts that TTL + skew + the class max TTL
    * (§7.8). So the limit is the dedup share scaled by the largest
-   * ⌈(default TTL + max TTL + skew) / default TTL⌉ among the key's granted classes.
+   * ⌈(default TTL + max TTL + skew) / default TTL⌉ among the key's granted classes,
+   * capped at MARK_FACTOR_CAP (binary-canticle#67): a key churning state_keys at its
+   * class default TTLs within its share fits, for every class whose factor is at most
+   * the cap. The factor is still taken over every granted class, keyed or not, and
+   * every mark counts whatever its class.
    */
   #markQuota(kid: string): number {
     if (this.perKeyMarkQuota !== undefined) {
@@ -1056,15 +1080,10 @@ export class Listener {
       .map((c) => CLASSES.get(c))
       .filter((c) => c !== undefined);
     const specs = granted.length > 0 ? granted : [...CLASSES.values()];
-    const factor = Math.max(
-      ...specs.map((c) =>
-        Math.ceil(
-          ((c.defaultTtlS + c.maxTtlS) * 1000 + SKEW_MS) /
-            (c.defaultTtlS * 1000),
-        ),
-      ),
+    return (
+      this.#quota() *
+      Math.min(MARK_FACTOR_CAP, Math.max(...specs.map(markFactor)))
     );
-    return this.#quota() * factor;
   }
 
   /** Checked at admission and never met by evicting a live mark (§7.4). */

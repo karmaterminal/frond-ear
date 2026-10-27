@@ -1,13 +1,17 @@
 // Listener behaviour beyond the spike's vectors: bounded state (binary-canticle#60),
 // refusals that leave state untouched, scope / hop / warm-up / beacon paths.
 import assert from "node:assert/strict";
-import { createPrivateKey, sign } from "node:crypto";
+import { createPrivateKey, sign, type KeyObject } from "node:crypto";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import * as cbor from "../src/canticle/cbor.ts";
-import { streamId } from "../src/canticle/ids.ts";
-import { Listener, SKEW_MS } from "../src/canticle/listener.ts";
+import { CLASSES, CLASS_BY_NAME, streamId } from "../src/canticle/ids.ts";
+import {
+  Listener,
+  SKEW_MS,
+  type SafetyState,
+} from "../src/canticle/listener.ts";
 import { Manifest } from "../src/canticle/manifest.ts";
 import {
   KIND_BEACON,
@@ -23,26 +27,39 @@ const vectors = JSON.parse(
   ),
 ) as {
   keys: Record<string, { secret: string; key_id: string }>;
-  manifest: unknown;
+  manifest: { stations: Array<Record<string, unknown> & { name: string }> };
 };
 const manifest = Manifest.fromJson(vectors.manifest);
 const T0 = 1_790_000_000_000;
 const CHATTER = streamId("chatter");
 const THREAT = streamId("lens.threat");
 
-const sk = createPrivateKey({
-  key: Buffer.from(
-    "302e020100300506032b657004220420" + vectors.keys.test1!.secret,
-    "hex",
-  ),
-  format: "der",
-  type: "pkcs8",
-});
-const kid = Buffer.from(vectors.keys.test1!.key_id, "hex");
+interface Signer {
+  sk: KeyObject;
+  kid: Buffer;
+}
+
+function signer(name: string): Signer {
+  return {
+    sk: createPrivateKey({
+      key: Buffer.from(
+        "302e020100300506032b657004220420" + vectors.keys[name]!.secret,
+        "hex",
+      ),
+      format: "der",
+      type: "pkcs8",
+    }),
+    kid: Buffer.from(vectors.keys[name]!.key_id, "hex"),
+  };
+}
+
+const TEST1 = signer("test1");
+const { kid } = TEST1;
 
 function frame(
   kind: number,
   fields: Record<number, cbor.CborValue | number>,
+  { sk, kid }: Signer = TEST1,
 ): Uint8Array {
   const m: cbor.CborMap = new Map();
   for (const [k, v] of Object.entries(fields))
@@ -67,6 +84,7 @@ interface ItemOpts {
   hop?: number;
   scope?: number;
   text?: string;
+  as?: Signer;
 }
 
 function item(o: ItemOpts): Uint8Array {
@@ -84,7 +102,7 @@ function item(o: ItemOpts): Uint8Array {
     13: o.scope ?? 1,
   };
   if (o.stateKey !== undefined) f[10] = o.stateKey;
-  return frame(KIND_ITEM, f);
+  return frame(KIND_ITEM, f, o.as);
 }
 
 function beacon(
@@ -190,6 +208,284 @@ test("the default mark limit lets an honest key churn state_keys within its shar
     at += 70_000; // past the previous dedup slot
     l.tick(at);
   }
+});
+
+// ---- binary-canticle#67 / #117: the derived mark limit's factor is capped at the keyed classes' largest
+
+/** The vector manifest's stations, granted `classes` instead (none revoked). */
+const granted = (classes: string[], names = ["test1"]) =>
+  Manifest.fromJson({
+    stations: vectors.manifest.stations
+      .filter((s) => names.includes(s.name))
+      .map((s) => ({ ...s, classes, revoked: false })),
+  });
+const FINDING_REF = CLASS_BY_NAME.get("finding-ref")!.code;
+const ADVISORY = CLASS_BY_NAME.get("advisory")!.code;
+// A 1 s item's dedup slot is gone after its expiry + skew (6 s); its mark lasts that + the class max TTL.
+const STEP_MS = 7_000;
+const shortLived = (
+  seq: number,
+  at: number,
+  stateKey: string,
+  cls = FINDING_REF,
+  as: Signer = TEST1,
+  text?: string,
+) =>
+  item({
+    seq,
+    cls,
+    stateKey,
+    issued: at,
+    ttlMs: 1_000,
+    as,
+    ...(text === undefined ? {} : { text }),
+  });
+// The three vector stations' keys; `granted(…, THREE_STATIONS)` lists test3 unrevoked.
+const THREE_STATIONS = ["test1", "test2", "test3"];
+const signers = ["test1", "test2", "test3-revoked"].map(signer);
+// How many dedup lifetimes a mark of each class lasts, ⌈(default TTL + max TTL + skew) / default TTL⌉,
+// from the class table; the cap is the largest among keyed classes (state_key required, §6.2).
+const factorOf = new Map(
+  [...CLASSES.values()].map((c) => [
+    c.name,
+    Math.ceil(
+      ((c.defaultTtlS + c.maxTtlS) * 1000 + SKEW_MS) / (c.defaultTtlS * 1000),
+    ),
+  ]),
+);
+const CAP = Math.max(
+  ...[...CLASSES.values()]
+    .filter((c) => c.keyed)
+    .map((c) => factorOf.get(c.name)!),
+);
+const overQuota = (evs: { event: string; data: Record<string, unknown> }[]) =>
+  evs.filter((e) => e.event === "evidence" && e.data.reason === "over-quota")
+    .length;
+
+test("the mark limit's factor is capped at the keyed classes' largest, derived from the class table (#67)", () => {
+  assert.deepEqual(Object.fromEntries(factorOf), {
+    chatter: 7,
+    ambient: 14,
+    "live-state": 7,
+    advisory: 6,
+    "finding-ref": 98,
+    regulatory: 8,
+    alarm: 6,
+    control: 8,
+    root: 3,
+  });
+  assert.equal(CAP, 8); // regulatory, control
+  // At a dedup quota of 1 the limit is the factor itself. Classes at or under the cap keep theirs;
+  // finding-ref (98) and ambient (14) stop at 8. The factor is still the largest over every granted
+  // class, keyed or not, so advisory (unkeyed, 6) beside finding-ref gets 8, not 6.
+  for (const [classes, factor] of [
+    [["finding-ref"], 8], // main: 98
+    [["ambient"], 8], // main: 14
+    [["chatter", "finding-ref"], 8], // main: 98
+    [["advisory", "finding-ref"], 8], // main: 98 (the binary-canticle#115 profile)
+    [["regulatory"], 8],
+    [["control"], 8],
+    [["chatter", "live-state", "root"], 7],
+    [["advisory"], 6],
+    [["alarm"], 6],
+    [["root"], 3],
+  ] as const) {
+    const l = new Listener(granted([...classes]), {
+      ephemeral: true,
+      warmup: false,
+      perKeyQuota: 1,
+    });
+    const cls = CLASS_BY_NAME.get(classes[0])!.code;
+    let admitted = 0;
+    let refused = 0;
+    for (let i = 0; i <= CAP; i++) {
+      const at = T0 + i * STEP_MS;
+      l.tick(at);
+      const evs = l.hear(shortLived(i + 1, at, `k${i}`, cls), at);
+      admitted += kinds(evs).filter((k) => k === "item").length;
+      refused += overQuota(evs);
+    }
+    assert.deepEqual(
+      [admitted, refused, l.hwm.size],
+      [factor, CAP + 1 - factor, factor],
+      classes.join("+"),
+    );
+  }
+});
+
+test("a key granted finding-ref churning state_keys holds at most quota × 8 marks (#67)", () => {
+  const l = new Listener(granted(["finding-ref"]), {
+    ephemeral: true,
+    warmup: false,
+    perKeyQuota: 2,
+  });
+  let admitted = 0;
+  let refused = 0;
+  for (let i = 0; i < 60; i++) {
+    const at = T0 + i * STEP_MS;
+    l.tick(at);
+    for (let j = 0; j < 2; j++) {
+      const evs = l.hear(shortLived(2 * i + j + 1, at, `f${i}.${j}`), at);
+      admitted += kinds(evs).filter((k) => k === "item").length;
+      refused += overQuota(evs);
+    }
+    assert.ok(l.hwm.size <= 16, `round ${i}: ${l.hwm.size} marks`);
+  }
+  assert.deepEqual(
+    [admitted, refused, l.hwm.size, l.hwmPerKey.get(kid.toString("hex"))],
+    [16, 104, 16, 16], // main: 120 admitted, 0 refused
+  );
+  const at = T0 + 60 * STEP_MS;
+  assert.deepEqual(
+    kinds(l.hear(shortLived(200, at, "f0.0"), at)),
+    ["item"],
+    "a marked state_key needs no new mark",
+  );
+});
+
+test("the mark cap holds per key when several keys saturate together (#67)", () => {
+  // Equal shares (no per-key quota, capacity ≥ keys): each key holds its own quota × 8 and none
+  // locks another out. 30 / 3 leaves no remainder, so the sum is exactly 8 × the dedup capacity.
+  const l = new Listener(granted(["finding-ref"], THREE_STATIONS), {
+    ephemeral: true,
+    warmup: false,
+    dedupCapacity: 30,
+  });
+  for (let i = 0; i < 12; i++) {
+    const at = T0 + i * STEP_MS;
+    l.tick(at);
+    for (const as of signers) {
+      for (let j = 0; j < 10; j++) {
+        l.hear(
+          shortLived(10 * i + j + 1, at, `f${i}.${j}`, FINDING_REF, as),
+          at,
+        );
+      }
+    }
+  }
+  assert.deepEqual(
+    signers.map((s) => l.hwmPerKey.get(s.kid.toString("hex"))),
+    [80, 80, 80], // main: 120 each
+  );
+  assert.equal(l.hwm.size, 8 * 30);
+});
+
+test("the 8 × capacity sum over keys holds only for equal shares (#67)", () => {
+  // The cap is per key: the sum is 8 × the per-key dedup quotas. An explicit per-key quota, or the
+  // floor of 1 with more keys than capacity, takes it past 8 × the dedup capacity.
+  const saturate = (l: Listener, quota: number) => {
+    for (let i = 0; i <= CAP; i++) {
+      const at = T0 + i * STEP_MS;
+      l.tick(at);
+      for (const as of signers) {
+        for (let j = 0; j < quota; j++) {
+          l.hear(
+            shortLived(quota * i + j + 1, at, `f${i}.${j}`, FINDING_REF, as),
+            at,
+          );
+        }
+      }
+    }
+    return l.hwm.size;
+  };
+  const three = granted(["finding-ref"], THREE_STATIONS);
+  const opts = { ephemeral: true, warmup: false } as const;
+  assert.equal(
+    saturate(
+      new Listener(three, { ...opts, dedupCapacity: 30, perKeyQuota: 20 }),
+      20,
+    ),
+    3 * 20 * 8, // not 8 × 30 = 240
+  );
+  assert.equal(
+    saturate(new Listener(three, { ...opts, dedupCapacity: 2 }), 1),
+    3 * 8, // quota floored at 1 each; not 8 × 2 = 16
+  );
+});
+
+test("a full mark limit refuses a new incident's open, never a marked incident's close (#67, binary-canticle#115)", () => {
+  // advisory (unkeyed, state_key optional) + finding-ref: the keyed advisories make the marks and
+  // count against the key's limit. A resolve for an incident already marked needs no new mark.
+  const l = new Listener(granted(["advisory", "finding-ref"]), {
+    ephemeral: true,
+    warmup: false,
+    perKeyQuota: 1,
+  });
+  const adv = (seq: number, at: number, inc: string, text: string) =>
+    l.hear(shortLived(seq, at, inc, ADVISORY, TEST1, text), at);
+  for (let i = 0; i < 8; i++) {
+    const at = T0 + i * STEP_MS;
+    l.tick(at);
+    assert.deepEqual(kinds(adv(i + 1, at, `inc-${i}`, "open")), ["item"]);
+  }
+  assert.equal(l.hwmPerKey.get(kid.toString("hex")), 8);
+  assert.deepEqual(
+    new Set([...l.hwm.values()].map((v) => v.cls)),
+    new Set([ADVISORY]),
+  );
+  let at = T0 + 8 * STEP_MS;
+  l.tick(at);
+  assert.deepEqual(kinds(adv(9, at, "inc-8", "open")), ["evidence:over-quota"]); // main: admitted (limit 98)
+  at += STEP_MS;
+  l.tick(at);
+  assert.deepEqual(kinds(adv(10, at, "inc-3", "resolved")), ["item"]);
+  assert.equal(
+    l.hwm.get(`${kid.toString("hex")}:${CHATTER}:inc-3`)!.order[2],
+    10n,
+    "the mark moved",
+  );
+  assert.equal(l.hwm.size, 8, "and none was added");
+});
+
+test("marks round-trip a restart at the cap, and state saved over it loads whole (#67)", () => {
+  const m = granted(["finding-ref"]);
+  const k = kid.toString("hex");
+  const restore = (state: SafetyState) =>
+    new Listener(m, {
+      warmup: false,
+      perKeyQuota: 1,
+      restore: JSON.parse(JSON.stringify(state)),
+    });
+  const l = new Listener(m, { warmup: false, perKeyQuota: 1, restore: null });
+  for (let i = 0; i < 10; i++) {
+    const at = T0 + i * STEP_MS;
+    l.tick(at);
+    l.hear(shortLived(i + 1, at, `f${i}`), at);
+  }
+  assert.equal(l.hwmPerKey.get(k), 8); // main: 10
+  const at = T0 + 10 * STEP_MS;
+  const fresh = restore(l.snapshot());
+  assert.deepEqual(fresh.hwm, l.hwm);
+  assert.deepEqual(fresh.hwmPerKey, new Map([[k, 8]]));
+  assert.deepEqual(kinds(fresh.hear(shortLived(20, at, "new"), at)), [
+    "evidence:over-quota",
+  ]);
+  // State saved under the old, looser limit may hold more marks than the cap. Marks are never
+  // evicted early (§7.4): all of them load, and new ones wait until the key is under its limit.
+  const state = l.snapshot();
+  const row = state.hwm[0]!;
+  const prefix = row[0].slice(0, row[0].lastIndexOf(":") + 1);
+  for (let i = 0; i < 20; i++) {
+    state.hwm.push([
+      `${prefix}old${i}`,
+      row[1],
+      row[2],
+      row[3],
+      row[4],
+      row[5] ?? null,
+    ]);
+  }
+  const old = restore(state);
+  assert.deepEqual(old.hwmPerKey, new Map([[k, 28]]));
+  assert.deepEqual(kinds(old.hear(shortLived(21, at, "new"), at)), [
+    "evidence:over-quota",
+  ]);
+  assert.equal(old.hwm.size, 28);
+  assert.deepEqual(
+    kinds(old.hear(shortLived(22, at, "f3"), at)),
+    ["item"],
+    "a marked state_key still updates",
+  );
 });
 
 test("a mark's horizon never shrinks when a shorter-lived newer value arrives", () => {
