@@ -4,7 +4,6 @@ import {
   copyFileSync,
   mkdirSync,
   readFileSync,
-  watch,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -18,6 +17,7 @@ import {
   readBotToken,
   runtimeOptions,
 } from "./config.ts";
+import { watchConfigFile } from "./config-watch.ts";
 import {
   createCanticleSource,
   type CanticleSource,
@@ -177,7 +177,7 @@ async function runDaemon(argv: string[]): Promise<void> {
   canticle?.start();
 
   let reloadTimer: NodeJS.Timeout | undefined;
-  const watcher = watch(runtime.configPath, () => {
+  const watcher = watchConfigFile(runtime.configPath, () => {
     clearTimeout(reloadTimer);
     reloadTimer = setTimeout(() => {
       try {
