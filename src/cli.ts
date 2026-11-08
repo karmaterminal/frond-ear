@@ -25,6 +25,7 @@ import {
 import { Manifest } from "./canticle/manifest.ts";
 import { runConnectorEcho } from "./connector/echo.ts";
 import { Daemon } from "./daemon.ts";
+import { hookInput } from "./letters.ts";
 import { DiscordGateway } from "./gateway.ts";
 import { StructuredLogger } from "./logger.ts";
 import { runDoctor, runInit } from "./onboard.ts";
@@ -256,18 +257,12 @@ async function runRelease(argv: string[]): Promise<void> {
   let sessionId = values.session;
   if (hook && !process.stdin.isTTY) {
     try {
-      const input = JSON.parse(await readStdin(64 * 1024)) as {
-        session_id?: unknown;
-        source?: unknown;
-      };
-      if (typeof input.session_id === "string") {
-        sessionId ??= input.session_id;
-      }
-      if (typeof input.source === "string") {
-        source ??= input.source;
-      }
+      // Claude Code sends session_id, Copilot CLI sessionId (#92); either names it.
+      const input = hookInput(await readStdin(64 * 1024));
+      sessionId ??= input.sessionId;
+      source ??= input.source;
     } catch {
-      // A hook without JSON on stdin still releases; the session check is skipped.
+      // Unreadable stdin names no session, and the daemon releases nothing without one.
     }
   }
   const ear = values.ear ?? process.env.FROND_EAR_EAR;
