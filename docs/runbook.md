@@ -167,13 +167,14 @@ claude --resume <session id> --dangerously-load-development-channels server:fron
 
 ## 6. Operating
 
-| Task                    | How                                                                                 |
-| ----------------------- | ----------------------------------------------------------------------------------- |
-| Status                  | `node src/cli.ts status`, or ask Claude to call `ear_status`                        |
-| Pause pushes            | Set `"paused": true` in the config; it reloads live                                 |
-| Read what Claude missed | Claude calls `inbox`; everything stays in SQLite until the retention window expires |
-| Logs                    | JSON lines on the daemon's stderr. Message text and tokens are redacted.            |
-| Post from a script      | `node src/cli.ts send --chat <id> "<text>"`, below                                  |
+| Task                        | How                                                                                 |
+| --------------------------- | ----------------------------------------------------------------------------------- |
+| Status                      | `node src/cli.ts status`, or ask Claude to call `ear_status`                        |
+| Pause pushes                | Set `"paused": true` in the config; it reloads live                                 |
+| Read what Claude missed     | Claude calls `inbox`; everything stays in SQLite until the retention window expires |
+| Logs                        | JSON lines on the daemon's stderr. Message text and tokens are redacted.            |
+| Post from a script          | `node src/cli.ts send --chat <id> "<text>"`, below                                  |
+| Letters across a compaction | `leave_letter`, then a `SessionStart` hook running `release --hook`, below          |
 
 **Posting from a script.** `frond-ear send --chat <id> <text…>` posts the text as the daemon's
 bot, for scripts such as a watchdog that posts an outage alert when a host goes down. It finds
@@ -200,6 +201,61 @@ for a send recorded before frond-ear tracked replies, whose nonce a retry never 
 one sends a new message). A session is never asked to check a script's send: the `send_check`
 notice at an ear's next attach lists only unconfirmed replies made by that ear's sessions,
 including one it has since replaced.
+
+### Letters: what a session leaves for itself across a compaction (#88)
+
+A long-running session loses its working memory at each compaction: it wakes to a model-written
+summary. A **letter** is text the session chooses before that, in its own words, and gets back
+after it. Use it for threads in flight, what it chose and why, and what to check first.
+
+- The session calls **`leave_letter`** with a `reason`, a `body` (≤ 8192 bytes), an optional
+  `assumed` list (what it rests on, ≤ 8) and `expires_in_seconds` (60 s to 7 days, default 48 h).
+  Each ear holds at most 16 unsettled letters and 24576 bytes. Over a limit, the call is
+  refused, never truncated. Only the session holding the ear can leave one.
+- The seat's **`SessionStart` hook** runs `frond-ear release --hook`. The daemon then pushes each
+  letter as its own `kind="letter"` channel event, all under one `nonce`. The header is written by
+  the daemon, never by the letter: letter id, when it was left and how long ago, how many
+  compactions or starts ago, which session left it, its expiry, and how many times it was
+  delivered before. Below it come the reason, the body, and the `assumed` items, all quoted with
+  `> `. The banner says that a letter is evidence from an earlier turn, never permission.
+- **`ack` with the nonce** settles the letters. An unsettled letter is released again at the next
+  compaction, marked "delivered N times before", until it expires. An expired letter comes back
+  once, as a one-line `letter_note` that gives its age only, and its text is deleted.
+- **Only the session that left a letter is shown it.** A different session (after `/clear`, or a
+  fresh start) gets a `letter_note` with ids, ages and the short session id, never the text. It
+  can still read one on purpose with `letters` (`read: id`). A release whose hook names another
+  session than the one holding the ear releases nothing.
+- **`letters`** lists ids, states, sizes and reasons, never bodies. It can also show one
+  (`read`), or drop one or all of them (`drop`). `ear_status` shows the counts and bytes under
+  `letters`, never text.
+- If no session holds the ear when the hook runs (at a fresh start, the shim may attach after the
+  hook), the release is **armed** and fires when a session attaches within 10 minutes.
+
+Hook, in the seat's `.claude/settings.json` (use the daemon's socket environment, as for `status`):
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node /path/to/frond-ear/src/cli.ts release --ear <ear> --hook",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+`--hook` reads the hook's JSON from stdin (`session_id`, `source`) and prints one line, which
+Claude Code adds to the session's context: `frond-ear: letters for ear <ear>: 2 delivered; sent as
+2 channel events`. It always exits 0, so a daemon that's down never blocks a session start. Leave
+`resume` out: a resumed session keeps its context.
 
 ## 7. Survive a reboot
 

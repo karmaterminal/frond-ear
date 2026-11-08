@@ -19,7 +19,15 @@ export type ClientMessage =
   | { type: "call"; id: number; tool: string; args: Record<string, unknown> }
   | { type: "status"; id: number }
   | { type: "inject"; id: number; message: unknown }
-  | { type: "session"; sessionId: string; source?: string };
+  | { type: "session"; sessionId: string; source?: string }
+  /** A seat's SessionStart hook: release the ear's letters (#88). */
+  | {
+      type: "release";
+      id: number;
+      ear: string;
+      source?: string;
+      sessionId?: string;
+    };
 
 /** Messages from the daemon to a client. */
 export type DaemonMessage =
