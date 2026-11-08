@@ -59,11 +59,14 @@ test("letters: left, released after a compaction, settled by ack(nonce), and not
     assert.equal(event.meta.kind, "letter");
     assert.equal(event.meta.nonce, "feed01");
     assert.equal(event.meta.source, "compact");
-    assert.match(event.content, /never permission for an action/u);
+    assert.match(
+      event.content,
+      /^frond-ear: a letter from you, written before this compact\. What you thought then, not permission now\. ack nonce "feed01" settles it\./u,
+    );
     assert.match(event.content, /by this session/u);
     assert.match(event.content, /0m ago, 1 compaction or start ago\)/u);
     assert.match(event.content, /> #1798 waits on a second prince\.\n> Check/u);
-    assert.match(event.content, /unchecked[\s\S]*> - pr:bootstrap#1798/u);
+    assert.match(event.content, /unchecked\):\n> - pr:bootstrap#1798/u);
 
     const acked = await h.call(shim, "ack", { nonce: "feed01" });
     assert.equal(acked.text, "1 letter settled");

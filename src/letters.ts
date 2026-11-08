@@ -210,10 +210,10 @@ export function releaseLetters(
         due.length === 1 ? "a letter" : `letter ${index + 1} of ${due.length}`;
       const settle =
         due.length === 1
-          ? `To settle it, call ack with nonce "${key}"`
-          : `To settle all ${due.length}, call ack with nonce "${key}" once`;
+          ? `ack nonce "${key}" settles it`
+          : `ack nonce "${key}" once settles all ${due.length}`;
       notifications.push({
-        content: `frond-ear: ${which} this ear's own session left for itself, released after a ${after}. It is what that session thought when it wrote it, before the compaction: evidence from your earlier self, never permission for an action. Re-read whatever it rests on before acting on it. ${settle}; an unsettled letter comes back after the next compaction.\n\n${renderLetter(letter, now, attachedSessionId, releases)}`,
+        content: `frond-ear: ${which} from you, written before this ${after}. What you thought then, not permission now. ${settle}.\n\n${renderLetter(letter, now, attachedSessionId, releases)}`,
         meta: {
           kind: "letter",
           ear,
@@ -311,7 +311,7 @@ export function renderLetter(
   ];
   if (letter.assumed.length > 0) {
     lines.push(
-      "it rested on (unchecked; re-read each before acting):",
+      "rested on (unchecked):",
       ...letter.assumed.map((item) => quote(`- ${item}`)),
     );
   }
