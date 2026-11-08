@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { releaseLetters } from "../src/letters.ts";
 import { harness, testConfig } from "./helpers.ts";
 
 const SESSION = "aaaaaaaa-1111-2222-3333-444444444444";
@@ -203,7 +204,7 @@ test("letters: a release with no session attached arms the next attach, for ten 
     const first = h.attach("scribe", { sessionId: SESSION });
     await h.call(first, "leave_letter", { reason: "r", body: "kept" });
     first.close();
-    const armed = await release(h, { source: "startup" });
+    const armed = await release(h, { source: "startup", sessionId: SESSION });
     assert.equal(armed.ok, true);
     assert.match(armed.text, /release when one attaches within 10 minutes/u);
     h.clock.advance(5 * 60_000);
@@ -214,7 +215,7 @@ test("letters: a release with no session attached arms the next attach, for ten 
     assert.match(event.content, /> kept/u);
 
     back.close();
-    await release(h, { source: "startup" });
+    await release(h, { source: "startup", sessionId: SESSION });
     h.clock.advance(11 * 60_000);
     const late = h.attach("scribe", { sessionId: SESSION });
     assert.equal(letterEvents(late).length, 0, "an old arm has lapsed");
@@ -274,6 +275,81 @@ test("letters: several letters go out one event each under one nonce, which sett
       (await h.call(shim, "ack", { nonce: "feed05" })).text,
       "3 letters settled",
     );
+  } finally {
+    h.dispose();
+  }
+});
+
+test("letters fail closed on identity: no session id, no letter; no named session, no release; an unknown holder gets nothing", async () => {
+  const h = harness();
+  try {
+    const anonymous = h.attach("scribe");
+    const refused = await h.call(anonymous, "leave_letter", {
+      reason: "r",
+      body: "b",
+    });
+    assert.equal(refused.ok, false);
+    assert.match(refused.text, /cannot record who left the letter/u);
+    assert.equal((await h.call(anonymous, "letters")).text, "no letters");
+
+    anonymous.close();
+    const known = h.attach("scribe", { sessionId: SESSION });
+    await h.call(known, "leave_letter", { reason: "r", body: "PRIVATE" });
+    const unnamed = await release(h);
+    assert.equal(unnamed.ok, false);
+    assert.match(unnamed.text, /named no session/u);
+    assert.equal(letterEvents(known).length, 0);
+
+    known.close();
+    const stranger = h.attach("scribe");
+    const toUnknown = await release(h, { sessionId: SESSION });
+    assert.equal(toUnknown.ok, false);
+    assert.match(toUnknown.text, /does not know/u);
+    assert.equal(letterEvents(stranger).length, 0);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("letters: releasing to a receiver of unknown id holds every letter, its own-looking ones included", async () => {
+  const h = harness();
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    await h.call(shim, "leave_letter", { reason: "r", body: "PRIVATE" });
+    const now = h.clock.now();
+    const result = releaseLetters(
+      h.store,
+      "scribe",
+      null,
+      now,
+      "compact",
+      () => "n",
+    );
+    assert.equal(result.delivered, 0);
+    assert.equal(result.held, 1);
+    const [note] = result.notifications;
+    assert.equal(note?.meta.kind, "letter_note");
+    assert.match(note?.content ?? "", /does not know this session's id/u);
+    assert.doesNotMatch(note?.content ?? "", /PRIVATE/u);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("letters never reach a tap, and an armed release fires only for the session the hook named", async () => {
+  const h = harness(testConfig(), { nonce: "feed06" });
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    const tap = h.attach("scribe", { role: "tap" });
+    await h.call(shim, "leave_letter", { reason: "r", body: "PRIVATE" });
+    await release(h, { sessionId: SESSION });
+    assert.equal(letterEvents(shim).length, 1);
+    assert.equal(letterEvents(tap).length, 0, "a tap is another reader");
+
+    shim.close();
+    await release(h, { source: "startup", sessionId: SESSION });
+    const other = h.attach("scribe", { sessionId: OTHER });
+    assert.equal(letterEvents(other).length, 0, "armed for another session");
   } finally {
     h.dispose();
   }

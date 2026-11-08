@@ -193,9 +193,11 @@ export function releaseLetters(
   const open = store.letters(ear).filter(unsettled);
   const expired = open.filter((letter) => letter.expiresAt <= now);
   const live = open.filter((letter) => letter.expiresAt > now);
+  // Fail closed: a letter is shown only when both the session that left it and
+  // the session receiving it are known and the same.
   const sameSession = (letter: Letter): boolean =>
-    letter.sessionId === null ||
-    attachedSessionId === null ||
+    letter.sessionId !== null &&
+    attachedSessionId !== null &&
     letter.sessionId === attachedSessionId;
   const due = live.filter(sameSession);
   const held = live.filter((letter) => !sameSession(letter));
@@ -230,8 +232,12 @@ export function releaseLetters(
   }
   const notes: string[] = [];
   if (held.length > 0) {
+    const whose =
+      attachedSessionId === null
+        ? "held because frond-ear does not know this session's id (its shim had no CLAUDE_CODE_SESSION_ID), so it cannot tell whose they are"
+        : "left by another session than this one";
     notes.push(
-      `[frond-ear: ${held.length === 1 ? "1 letter" : `${held.length} letters`} left by another session than this one (${held
+      `[frond-ear: ${held.length === 1 ? "1 letter" : `${held.length} letters`} ${whose} (${held
         .map(
           (letter) =>
             `letter ${letter.id} from session ${shortSession(letter.sessionId)}, ${age(now - letter.leftAt)} old`,

@@ -1439,26 +1439,31 @@ export class Daemon {
       typeof message.source === "string" && message.source
         ? message.source.slice(0, 32)
         : "compaction";
+    const sessionId =
+      typeof message.sessionId === "string" && message.sessionId
+        ? message.sessionId
+        : undefined;
+    if (!sessionId) {
+      return {
+        ok: false,
+        text: "the release named no session (a SessionStart hook passes session_id on stdin); nothing released",
+      };
+    }
     const client = this.attached.get(ear);
     if (!client) {
       this.store.setRuntimeState(
         `letters.armed.${ear}`,
-        JSON.stringify({ at: this.clock.now(), source }),
+        JSON.stringify({ at: this.clock.now(), source, sessionId }),
       );
       return {
         ok: true,
         text: `no session holds ear ${ear} yet; its letters release when one attaches within ${LETTER_LIMITS.armMs / 60_000} minutes`,
       };
     }
-    if (
-      typeof message.sessionId === "string" &&
-      message.sessionId &&
-      client.sessionId &&
-      message.sessionId !== client.sessionId
-    ) {
+    if (sessionId !== client.sessionId) {
       return {
         ok: false,
-        text: `ear ${ear} is held by session ${client.sessionId.slice(0, 8)}, not ${message.sessionId.slice(0, 8)}; nothing released`,
+        text: `ear ${ear} is held by ${client.sessionId ? `session ${client.sessionId.slice(0, 8)}` : "a session whose id frond-ear does not know"}, not ${sessionId.slice(0, 8)}; nothing released`,
       };
     }
     this.store.clearRuntimeState(`letters.armed.${ear}`);
@@ -1471,7 +1476,7 @@ export class Daemon {
       return;
     }
     this.store.clearRuntimeState(`letters.armed.${ear}`);
-    let parsed: { at?: unknown; source?: unknown } = {};
+    let parsed: { at?: unknown; source?: unknown; sessionId?: unknown } = {};
     try {
       parsed = JSON.parse(armed) as typeof parsed;
     } catch {
@@ -1480,6 +1485,8 @@ export class Daemon {
     const client = this.attached.get(ear);
     if (
       client &&
+      client.sessionId !== undefined &&
+      parsed.sessionId === client.sessionId &&
       typeof parsed.at === "number" &&
       parsed.at > this.clock.now() - LETTER_LIMITS.armMs
     ) {
@@ -1500,8 +1507,10 @@ export class Daemon {
       source,
       this.options.nonce ?? (() => randomBytes(6).toString("hex")),
     );
+    // To the session only, never to taps: a tap is another reader, and a letter
+    // is for the session that left it.
     for (const notification of release.notifications) {
-      this.pushNotice(ear, notification);
+      client.connection.send({ type: "event", batchId: null, ...notification });
     }
     this.logger.log("info", "letters.released", {
       ear,
@@ -1811,10 +1820,15 @@ export class Daemon {
         return this.fetchAttachment(args);
       case "leave_letter": {
         const ear = this.requireHolder(client, "leave a letter");
+        if (!client.sessionId) {
+          throw new Error(
+            "frond-ear does not know this session's id (its shim had no CLAUDE_CODE_SESSION_ID), so it cannot record who left the letter; nothing was stored",
+          );
+        }
         return leaveLetter(
           this.store,
           ear,
-          client.sessionId ?? null,
+          client.sessionId,
           this.clock.now(),
           parseLeave(args),
         );
