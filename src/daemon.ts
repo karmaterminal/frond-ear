@@ -1201,10 +1201,17 @@ export class Daemon {
         }
         return;
       case "release":
+        // The SessionStart hook's knock comes as a CLI client. A tap is read-only and
+        // a shim has its own tools, so neither may move another reader's letters.
         client.connection.send({
           type: "result",
           id: message.id,
-          ...this.releaseRequest(message),
+          ...(client.role === "cli"
+            ? this.releaseRequest(message)
+            : {
+                ok: false,
+                text: `only a CLI client (frond-ear release, from a SessionStart hook) can release letters, not a ${client.role ?? "client"}`,
+              }),
         });
         return;
       case "session":

@@ -354,3 +354,32 @@ test("letters never reach a tap, and an armed release fires only for the session
     h.dispose();
   }
 });
+
+test("letters: only a CLI client can release; a tap's or a shim's release moves nothing", async () => {
+  const h = harness(testConfig(), { nonce: "feed07" });
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    await h.call(shim, "leave_letter", { reason: "r", body: "b" });
+    const tap = h.attach("scribe", { role: "tap" });
+    for (const [client, role] of [
+      [tap, "tap"],
+      [shim, "shim"],
+    ] as const) {
+      await client.send({
+        type: "release",
+        id: 77,
+        ear: "scribe",
+        sessionId: SESSION,
+      });
+      const result = client.connection.results().find((item) => item.id === 77);
+      assert.equal(result?.ok, false);
+      assert.match(result?.text ?? "", new RegExp(`not a ${role}`, "u"));
+    }
+    assert.equal(letterEvents(shim).length, 0);
+    assert.match((await h.call(shim, "letters")).text, /· waiting ·/u);
+    const ok = await release(h, { sessionId: SESSION });
+    assert.equal(ok.ok, true, "the CLI control still releases");
+  } finally {
+    h.dispose();
+  }
+});
