@@ -56,6 +56,10 @@ usage:
                                       install the Copilot CLI extension for an ear
                                       (default dir $COPILOT_HOME/extensions/frond-ear; run copilot --experimental)
   frond-ear tap --ear <name>          stream the batches pushed to an ear's attached session (read-only;\n                                      wakes a session without channel push; a shim must be attached)
+  frond-ear release --ear <name> [--source <s>] [--session <id>] [--hook]
+                                      release an ear's letters (#88) to its attached session; for a
+                                      SessionStart hook (matcher startup|compact): --hook reads the hook's
+                                      JSON on stdin (session_id, source) and always exits 0
   frond-ear inject --chat <id> --author <id> [--guild <id>] [--name <n>] [--bot] [--mention] <text…>
                                       push a synthetic MESSAGE_CREATE (dry-run or FROND_EAR_ALLOW_INJECT=1)
   frond-ear connector-echo [--public-url https://<host>] [--auth none|bearer|oauth] …
@@ -229,6 +233,85 @@ function runShim(): void {
   });
   shim.start();
   process.stdin.on("end", () => process.exit(0));
+}
+
+/**
+ * A SessionStart hook's knock (#88): ask the daemon to release an ear's letters.
+ * Under --hook the hook's own JSON (stdin) names the session and the source,
+ * every outcome is one line on stdout (which Claude Code adds to the session's
+ * context), and the exit code is 0, so a down daemon never blocks a session start.
+ */
+async function runRelease(argv: string[]): Promise<void> {
+  const { values } = parseArgs({
+    args: argv,
+    options: {
+      ear: { type: "string" },
+      source: { type: "string" },
+      session: { type: "string" },
+      hook: { type: "boolean" },
+    },
+  });
+  const hook = values.hook === true;
+  let source = values.source;
+  let sessionId = values.session;
+  if (hook && !process.stdin.isTTY) {
+    try {
+      const input = JSON.parse(await readStdin(64 * 1024)) as {
+        session_id?: unknown;
+        source?: unknown;
+      };
+      if (typeof input.session_id === "string") {
+        sessionId ??= input.session_id;
+      }
+      if (typeof input.source === "string") {
+        source ??= input.source;
+      }
+    } catch {
+      // A hook without JSON on stdin still releases; the session check is skipped.
+    }
+  }
+  const ear = values.ear ?? process.env.FROND_EAR_EAR;
+  try {
+    if (!ear) {
+      throw new Error("release needs --ear <name> (or FROND_EAR_EAR)");
+    }
+    const result = await request(
+      {
+        type: "release",
+        ear,
+        ...(source ? { source } : {}),
+        ...(sessionId ? { sessionId } : {}),
+      },
+      process.env,
+      5_000,
+    );
+    process.stdout.write(`frond-ear: ${result.text}\n`);
+    process.exitCode = result.ok || hook ? 0 : 1;
+  } catch (error) {
+    if (!hook) {
+      throw error;
+    }
+    process.stdout.write(
+      `frond-ear: letters not released (${error instanceof Error ? error.message : String(error)})\n`,
+    );
+    process.exitCode = 0;
+  }
+}
+
+function readStdin(maxBytes: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (chunk: string) => {
+      data += chunk;
+      if (Buffer.byteLength(data) > maxBytes) {
+        reject(new Error("stdin too large"));
+        process.stdin.destroy();
+      }
+    });
+    process.stdin.on("end", () => resolve(data));
+    process.stdin.on("error", reject);
+  });
 }
 
 async function runInject(argv: string[]): Promise<void> {
@@ -461,6 +544,9 @@ async function main(): Promise<void> {
       return;
     case "inject":
       await runInject(rest);
+      return;
+    case "release":
+      await runRelease(rest);
       return;
     case "tap":
       runTap(rest);

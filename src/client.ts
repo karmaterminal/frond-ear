@@ -40,7 +40,8 @@ export function connectToDaemon(env: NodeJS.ProcessEnv): () => Socket {
 export type CliRequest =
   | { type: "status" }
   | { type: "inject"; message: DiscordMessage }
-  | { type: "call"; tool: string; args: Record<string, unknown> };
+  | { type: "call"; tool: string; args: Record<string, unknown> }
+  | { type: "release"; ear: string; source?: string; sessionId?: string };
 
 /**
  * `request` stopped waiting. The daemon may have taken the request and still be

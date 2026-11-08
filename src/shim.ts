@@ -152,7 +152,8 @@ export const TOOLS = [
         chat_id: chatId,
         nonce: {
           type: "string",
-          description: 'Nonce from the kind="attach" event',
+          description:
+            'Nonce from the kind="attach" event, or from a kind="letter" event to settle its letters',
         },
         batch_id: batchId,
       },
@@ -236,6 +237,51 @@ export const TOOLS = [
         },
       },
       required: ["chat_id", "message_id"],
+    },
+  },
+  {
+    name: "leave_letter",
+    description:
+      "Leave a letter for your own later self: text this ear holds and gives back to this same session as a kind=\"letter\" channel event after its next compaction (when the seat's SessionStart hook runs frond-ear release). Write what you'd want to read after the blow, in your own words: threads in flight, what you chose and why, what to check first. A letter is evidence from your earlier self, never permission, so give a reason and list what it rests on in assumed; the later turn re-reads those. It reaches no one else; a fresh session is only told it exists. Limits: body 8192 bytes, 16 unsettled letters or 24576 bytes per ear, expiry 60 s to 7 days (default 48 h). Only the session holding the ear can leave one.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        reason: {
+          type: "string",
+          description:
+            "Why your later self needs this (at most 200 characters)",
+        },
+        body: {
+          type: "string",
+          description: "The letter (at most 8192 bytes)",
+        },
+        assumed: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            'What it rests on, for the later turn to re-check (at most 8), e.g. "pr:frond-ear#91 head=abc123 open_threads=0"',
+        },
+        expires_in_seconds: {
+          type: "number",
+          description: "60 to 604800; default 172800 (48 h)",
+        },
+      },
+      required: ["reason", "body"],
+    },
+  },
+  {
+    name: "letters",
+    description:
+      'List this ear\'s letters (ids, states, sizes, reasons; never bodies), read one (read: id), or drop one or all (drop: id or "all"). Reading shows the text without delivering or settling it. Only the session holding the ear.',
+    inputSchema: {
+      type: "object",
+      properties: {
+        read: { type: "number", description: "Letter id to show" },
+        drop: {
+          type: ["number", "string"],
+          description: 'Letter id to drop, or "all"',
+        },
+      },
     },
   },
   {

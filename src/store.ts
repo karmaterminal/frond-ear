@@ -116,6 +116,30 @@ export interface CanticleChoice {
   expiresAt: number | null;
 }
 
+/**
+ * Something an ear's own session left for a later turn of itself (#88),
+ * released to it as a channel event when its seat's SessionStart hook says
+ * it compacted.
+ */
+export interface Letter {
+  id: number;
+  /** The session that held the ear when it left the letter. */
+  sessionId: string | null;
+  reason: string;
+  body: string;
+  bytes: number;
+  /** What the letter rested on; the receiving turn re-reads each. */
+  assumed: string[];
+  leftAt: number;
+  expiresAt: number;
+  deliveredAt: number | null;
+  deliveries: number;
+  nonce: string | null;
+  ackedAt: number | null;
+  /** The ear's release count when it was left: releases since = compactions or starts since. */
+  releasesAtLeave: number;
+}
+
 /** Where one Discord message sits in the reply it is part of (#55). */
 export interface ReplyPart {
   /** A hash of the chat, reply_to and whole text, so identical replies share it. */
@@ -307,6 +331,23 @@ export class EventStore {
         expires_at INTEGER,
         PRIMARY KEY (ear, scope)
       );
+      CREATE TABLE IF NOT EXISTS letters (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ear TEXT NOT NULL,
+        session_id TEXT,
+        reason TEXT NOT NULL,
+        body TEXT NOT NULL,
+        bytes INTEGER NOT NULL,
+        assumed TEXT NOT NULL DEFAULT '[]',
+        left_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        delivered_at INTEGER,
+        deliveries INTEGER NOT NULL DEFAULT 0,
+        nonce TEXT,
+        acked_at INTEGER,
+        releases_at_leave INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE INDEX IF NOT EXISTS letters_ear ON letters (ear, id);
     `);
     // outbound_intents shipped without these columns; a database created before
     // one of them gains it here. Its older rows read as no session's (#49) and
@@ -769,6 +810,92 @@ export class EventStore {
            WHERE ear = ? ORDER BY scope`,
       )
       .all(ear) as unknown as CanticleChoice[];
+  }
+
+  // ---- letters (#88) ---------------------------------------------------------------
+
+  public leaveLetter(letter: {
+    ear: string;
+    sessionId: string | null;
+    reason: string;
+    body: string;
+    bytes: number;
+    assumed: string[];
+    leftAt: number;
+    expiresAt: number;
+    releasesAtLeave: number;
+  }): number {
+    const result = this.database
+      .prepare(
+        `INSERT INTO letters (ear, session_id, reason, body, bytes, assumed, left_at, expires_at,
+           releases_at_leave)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        letter.ear,
+        letter.sessionId,
+        letter.reason,
+        letter.body,
+        letter.bytes,
+        JSON.stringify(letter.assumed),
+        letter.leftAt,
+        letter.expiresAt,
+        letter.releasesAtLeave,
+      );
+    return Number(result.lastInsertRowid);
+  }
+
+  /** Every letter the ear holds, expired ones included, oldest first. */
+  public letters(ear: string): Letter[] {
+    return (
+      this.database
+        .prepare(
+          `SELECT id, session_id AS sessionId, reason, body, bytes, assumed, left_at AS leftAt,
+                  expires_at AS expiresAt, delivered_at AS deliveredAt, deliveries, nonce,
+                  acked_at AS ackedAt, releases_at_leave AS releasesAtLeave
+             FROM letters WHERE ear = ? ORDER BY id`,
+        )
+        .all(ear) as Array<Record<string, unknown>>
+    ).map((row) => ({
+      ...(row as unknown as Letter),
+      assumed: JSON.parse(String(row.assumed)) as string[],
+    }));
+  }
+
+  /** Records one delivery of the letters under `nonce`; an ack of the nonce settles them. */
+  public deliverLetters(ids: number[], nonce: string, now: number): void {
+    const statement = this.database.prepare(
+      "UPDATE letters SET delivered_at = ?, deliveries = deliveries + 1, nonce = ? WHERE id = ? AND acked_at IS NULL",
+    );
+    this.atomically(() => {
+      for (const id of ids) {
+        statement.run(now, nonce, id);
+      }
+    });
+  }
+
+  /** Settles the ear's letters delivered under `nonce`. Returns how many. */
+  public ackLetters(ear: string, nonce: string, now: number): number {
+    const result = this.database
+      .prepare(
+        "UPDATE letters SET acked_at = ? WHERE ear = ? AND nonce = ? AND acked_at IS NULL",
+      )
+      .run(now, ear, nonce);
+    return Number(result.changes);
+  }
+
+  /** Deletes letters by id. */
+  public deleteLetters(ear: string, ids: number[]): number {
+    const statement = this.database.prepare(
+      "DELETE FROM letters WHERE ear = ? AND id = ?",
+    );
+    let changes = 0;
+    this.atomically(() => {
+      for (const id of ids) {
+        changes += Number(statement.run(ear, id).changes);
+      }
+    });
+    return changes;
   }
 
   // ---- outbound intents (write-ahead for sends) ------------------------------------

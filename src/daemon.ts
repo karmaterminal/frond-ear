@@ -41,6 +41,15 @@ import {
 import type { DiscordRest } from "./rest.ts";
 import { chunkMessage, RestError } from "./rest.ts";
 import { renderHear } from "./canticle/hear.ts";
+import {
+  LETTER_LIMITS,
+  leaveLetter,
+  listLetters,
+  parseLeave,
+  releaseCount,
+  releaseLetters,
+  renderLetter,
+} from "./letters.ts";
 import type { HearView } from "./canticle/receptor.ts";
 import type { EventStore, ReplyPart } from "./store.ts";
 import type {
@@ -1191,6 +1200,13 @@ export class Daemon {
           );
         }
         return;
+      case "release":
+        client.connection.send({
+          type: "result",
+          id: message.id,
+          ...this.releaseRequest(message),
+        });
+        return;
       case "session":
         if (client.ear && typeof message.sessionId === "string") {
           client.sessionId = message.sessionId;
@@ -1398,7 +1414,122 @@ export class Daemon {
       const canary = renderCanary(ear, record.generation, nonce);
       client.connection.send({ type: "event", batchId: null, ...canary });
     }
+    this.releaseArmed(ear);
     this.tick();
+  }
+
+  // ---- letters (#88) -----------------------------------------------------------------
+
+  /**
+   * A seat's SessionStart hook says its session compacted (or started): release the
+   * ear's letters to the attached session now, or, with none attached, arm a release
+   * for the next attach within LETTER_LIMITS.armMs. A hook from another session than
+   * the one holding the ear releases nothing.
+   */
+  private releaseRequest(message: {
+    ear: string;
+    source?: string;
+    sessionId?: string;
+  }): { ok: boolean; text: string } {
+    const ear = typeof message.ear === "string" ? message.ear : "";
+    if (!this.config.ears[ear]) {
+      return { ok: false, text: `unknown ear ${ear || "(none)"}` };
+    }
+    const source =
+      typeof message.source === "string" && message.source
+        ? message.source.slice(0, 32)
+        : "compaction";
+    const client = this.attached.get(ear);
+    if (!client) {
+      this.store.setRuntimeState(
+        `letters.armed.${ear}`,
+        JSON.stringify({ at: this.clock.now(), source }),
+      );
+      return {
+        ok: true,
+        text: `no session holds ear ${ear} yet; its letters release when one attaches within ${LETTER_LIMITS.armMs / 60_000} minutes`,
+      };
+    }
+    if (
+      typeof message.sessionId === "string" &&
+      message.sessionId &&
+      client.sessionId &&
+      message.sessionId !== client.sessionId
+    ) {
+      return {
+        ok: false,
+        text: `ear ${ear} is held by session ${client.sessionId.slice(0, 8)}, not ${message.sessionId.slice(0, 8)}; nothing released`,
+      };
+    }
+    this.store.clearRuntimeState(`letters.armed.${ear}`);
+    return { ok: true, text: this.deliverLetters(ear, client, source) };
+  }
+
+  private releaseArmed(ear: string): void {
+    const armed = this.store.runtimeState(`letters.armed.${ear}`);
+    if (armed === undefined) {
+      return;
+    }
+    this.store.clearRuntimeState(`letters.armed.${ear}`);
+    let parsed: { at?: unknown; source?: unknown } = {};
+    try {
+      parsed = JSON.parse(armed) as typeof parsed;
+    } catch {
+      return;
+    }
+    const client = this.attached.get(ear);
+    if (
+      client &&
+      typeof parsed.at === "number" &&
+      parsed.at > this.clock.now() - LETTER_LIMITS.armMs
+    ) {
+      this.deliverLetters(
+        ear,
+        client,
+        typeof parsed.source === "string" ? parsed.source : "start",
+      );
+    }
+  }
+
+  private deliverLetters(ear: string, client: Client, source: string): string {
+    const release = releaseLetters(
+      this.store,
+      ear,
+      client.sessionId ?? null,
+      this.clock.now(),
+      source,
+      this.options.nonce ?? (() => randomBytes(6).toString("hex")),
+    );
+    for (const notification of release.notifications) {
+      this.pushNotice(ear, notification);
+    }
+    this.logger.log("info", "letters.released", {
+      ear,
+      source,
+      delivered: release.delivered,
+      held: release.held,
+      expired: release.expired,
+    });
+    if (release.notifications.length === 0) {
+      return `no letters for ear ${ear}`;
+    }
+    const parts = [`${release.delivered} delivered`];
+    if (release.held > 0) {
+      parts.push(`${release.held} held (left by another session)`);
+    }
+    if (release.expired > 0) {
+      parts.push(`${release.expired} expired`);
+    }
+    const events = release.notifications.length;
+    return `letters for ear ${ear}: ${parts.join(", ")}; sent as ${events} channel event${events === 1 ? "" : "s"}`;
+  }
+
+  private requireHolder(client: Client, what: string): string {
+    const ear = client.ear;
+    if (!ear || !this.isAttachedSession(client, ear)) {
+      throw new Error(`only the session attached to an ear can ${what}`);
+    }
+    return ear;
   }
 
   // ---- tools -------------------------------------------------------------------------
@@ -1623,6 +1754,20 @@ export class Daemon {
       }
       case "ack": {
         const nonce = stringArg(args, "nonce");
+        if (nonce && client.ear && this.isAttachedSession(client, client.ear)) {
+          const settled = this.store.ackLetters(
+            client.ear,
+            nonce,
+            this.clock.now(),
+          );
+          if (settled > 0) {
+            this.logger.log("info", "letters.settled", {
+              ear: client.ear,
+              letters: settled,
+            });
+            return `${settled} letter${settled === 1 ? "" : "s"} settled`;
+          }
+        }
         if (nonce) {
           if (!client.ear || !this.store.registerEar(client.ear, nonce)) {
             throw new Error("unknown or already-used nonce");
@@ -1664,6 +1809,48 @@ export class Daemon {
       }
       case "fetch_attachment":
         return this.fetchAttachment(args);
+      case "leave_letter": {
+        const ear = this.requireHolder(client, "leave a letter");
+        return leaveLetter(
+          this.store,
+          ear,
+          client.sessionId ?? null,
+          this.clock.now(),
+          parseLeave(args),
+        );
+      }
+      case "letters": {
+        const ear = this.requireHolder(client, "read its letters");
+        const now = this.clock.now();
+        const read = args.read;
+        const drop = args.drop;
+        if (read !== undefined && read !== null) {
+          const letter = this.store
+            .letters(ear)
+            .find((item) => item.id === Number(read));
+          if (!letter) {
+            throw new Error(`no letter ${String(read)} on ear ${ear}`);
+          }
+          return renderLetter(
+            letter,
+            now,
+            client.sessionId ?? null,
+            releaseCount(this.store, ear),
+          );
+        }
+        if (drop !== undefined && drop !== null) {
+          const ids =
+            drop === "all"
+              ? this.store.letters(ear).map((item) => item.id)
+              : [Number(drop)];
+          if (ids.some((id) => !Number.isInteger(id))) {
+            throw new Error('drop takes a letter id or "all"');
+          }
+          const dropped = this.store.deleteLetters(ear, ids);
+          return `${dropped} letter${dropped === 1 ? "" : "s"} dropped`;
+        }
+        return listLetters(this.store, ear, now, client.sessionId ?? null);
+      }
       case "ear_status":
         return JSON.stringify(
           this.status(client.ear ?? stringArg(args, "ear")),
@@ -2182,6 +2369,25 @@ export class Daemon {
 
   // ---- status --------------------------------------------------------------------------
 
+  /** Counts and sizes only: a status read never shows a letter's text. */
+  private lettersView(ear: string): object {
+    const now = this.clock.now();
+    const letters = this.store.letters(ear);
+    const open = letters.filter((item) => item.ackedAt === null);
+    return {
+      waiting: open.filter(
+        (item) => item.expiresAt > now && item.deliveries === 0,
+      ).length,
+      deliveredUnsettled: open.filter(
+        (item) => item.expiresAt > now && item.deliveries > 0,
+      ).length,
+      expiredUnsettled: open.filter((item) => item.expiresAt <= now).length,
+      settled: letters.length - open.length,
+      bytes: open.reduce((sum, item) => sum + item.bytes, 0),
+      armed: this.store.runtimeState(`letters.armed.${ear}`) !== undefined,
+    };
+  }
+
   public status(onlyEar?: string): object {
     const ears = Object.entries(this.config.ears)
       .filter(([name]) => onlyEar === undefined || name === onlyEar)
@@ -2210,6 +2416,7 @@ export class Daemon {
           lastEventAt: this.store.lastEventAt(name),
           nextFlushAt: this.store.nextDue(name) ?? null,
           attention: this.attentionView(name),
+          letters: this.lettersView(name),
           ...(canticleDelivery ? { canticleDelivery } : {}),
         };
       });
