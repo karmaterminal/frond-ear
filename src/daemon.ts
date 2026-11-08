@@ -1477,32 +1477,42 @@ export class Daemon {
     return { ok: true, text: this.deliverLetters(ear, client, source) };
   }
 
+  /**
+   * An armed release fires for the session its hook named, when that session attaches
+   * within LETTER_LIMITS.armMs. Another session attaching first leaves the arm in
+   * place (it is not the one the hook spoke for); a lapsed or unreadable arm is cleared.
+   */
   private releaseArmed(ear: string): void {
-    const armed = this.store.runtimeState(`letters.armed.${ear}`);
+    const key = `letters.armed.${ear}`;
+    const armed = this.store.runtimeState(key);
     if (armed === undefined) {
       return;
     }
-    this.store.clearRuntimeState(`letters.armed.${ear}`);
     let parsed: { at?: unknown; source?: unknown; sessionId?: unknown } = {};
     try {
       parsed = JSON.parse(armed) as typeof parsed;
     } catch {
+      this.store.clearRuntimeState(key);
+      return;
+    }
+    if (
+      typeof parsed.at !== "number" ||
+      parsed.at <= this.clock.now() - LETTER_LIMITS.armMs ||
+      typeof parsed.sessionId !== "string"
+    ) {
+      this.store.clearRuntimeState(key);
       return;
     }
     const client = this.attached.get(ear);
-    if (
-      client &&
-      client.sessionId !== undefined &&
-      parsed.sessionId === client.sessionId &&
-      typeof parsed.at === "number" &&
-      parsed.at > this.clock.now() - LETTER_LIMITS.armMs
-    ) {
-      this.deliverLetters(
-        ear,
-        client,
-        typeof parsed.source === "string" ? parsed.source : "start",
-      );
+    if (!client || client.sessionId !== parsed.sessionId) {
+      return;
     }
+    this.store.clearRuntimeState(key);
+    this.deliverLetters(
+      ear,
+      client,
+      typeof parsed.source === "string" ? parsed.source : "start",
+    );
   }
 
   private deliverLetters(ear: string, client: Client, source: string): string {

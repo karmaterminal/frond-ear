@@ -353,6 +353,14 @@ test("letters never reach a tap, and an armed release fires only for the session
     await release(h, { source: "startup", sessionId: SESSION });
     const other = h.attach("scribe", { sessionId: OTHER });
     assert.equal(letterEvents(other).length, 0, "armed for another session");
+    other.close();
+    h.clock.advance(60_000);
+    const named = h.attach("scribe", { sessionId: SESSION });
+    assert.equal(
+      letterEvents(named).length,
+      1,
+      "the arm outlives another session's attach and fires for the named one",
+    );
   } finally {
     h.dispose();
   }
