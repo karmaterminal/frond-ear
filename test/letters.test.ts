@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { releaseLetters } from "../src/letters.ts";
+import { hookInput, releaseLetters } from "../src/letters.ts";
 import { harness, testConfig } from "./helpers.ts";
 
 const SESSION = "aaaaaaaa-1111-2222-3333-444444444444";
@@ -392,5 +392,44 @@ test("letters: only a CLI client can release; a tap's or a shim's release moves 
     assert.equal(ok.ok, true, "the CLI control still releases");
   } finally {
     h.dispose();
+  }
+});
+
+test("letters: a hook's stdin names the session in either spelling (#92)", () => {
+  // Claude Code's SessionStart payload.
+  assert.deepEqual(
+    hookInput(JSON.stringify({ session_id: SESSION, source: "compact" })),
+    { sessionId: SESSION, source: "compact" },
+  );
+  // Copilot CLI's preCompact payload, as captured live on #92: sessionId, and trigger instead of source.
+  assert.deepEqual(
+    hookInput(
+      JSON.stringify({
+        sessionId: SESSION,
+        timestamp: 1794180599854,
+        cwd: "/tmp/x",
+        transcriptPath: "/tmp/x/events.jsonl",
+        trigger: "manual",
+        customInstructions: "",
+      }),
+    ),
+    { sessionId: SESSION },
+  );
+  // Both present: Claude's spelling wins, as before.
+  assert.deepEqual(
+    hookInput(JSON.stringify({ session_id: SESSION, sessionId: OTHER })),
+    { sessionId: SESSION },
+  );
+  // Nothing usable names nothing, so the daemon releases nothing.
+  for (const raw of [
+    "",
+    "not json",
+    "null",
+    "[]",
+    '"s"',
+    '{"session_id":""}',
+    '{"sessionId":7}',
+  ]) {
+    assert.deepEqual(hookInput(raw), {}, raw);
   }
 });

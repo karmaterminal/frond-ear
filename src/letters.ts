@@ -97,6 +97,36 @@ export function parseLeave(args: Record<string, unknown>): LeaveRequest {
   return { reason, body, bytes, assumed, ttlMs: ttlSeconds * 1000 };
 }
 
+/**
+ * The session and source a hook names on stdin. Claude Code's hooks send `session_id`
+ * and `source`; Copilot CLI's (preCompact, sessionStart) send `sessionId` and, for
+ * preCompact, `trigger` instead of a source. Either spelling names the session; a
+ * payload that isn't a JSON object names nothing.
+ */
+export function hookInput(raw: string): {
+  sessionId?: string;
+  source?: string;
+} {
+  let input: unknown;
+  try {
+    input = JSON.parse(raw);
+  } catch {
+    return {};
+  }
+  if (typeof input !== "object" || input === null || Array.isArray(input)) {
+    return {};
+  }
+  const fields = input as Record<string, unknown>;
+  const sessionId = [fields.session_id, fields.sessionId].find(
+    (value): value is string => typeof value === "string" && value !== "",
+  );
+  const source = typeof fields.source === "string" ? fields.source : undefined;
+  return {
+    ...(sessionId ? { sessionId } : {}),
+    ...(source ? { source } : {}),
+  };
+}
+
 /** How many releases (compactions or starts) the ear has had. */
 export function releaseCount(store: EventStore, ear: string): number {
   const value = Number(store.runtimeState(`letters.releases.${ear}`) ?? 0);
