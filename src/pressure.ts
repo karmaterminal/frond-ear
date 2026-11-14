@@ -246,6 +246,11 @@ export function runPressure(argv: string[], io: PressureIo): number {
       },
     }).values;
   } catch (error) {
+    // A hook line with a bad flag must still never block: exit 2 from a
+    // UserPromptSubmit hook would refuse the prompt.
+    if (argv.some((arg) => arg === "--hook" || arg.startsWith("--hook="))) {
+      return 0;
+    }
     io.stderr.write(
       `${error instanceof Error ? error.message : String(error)}\n`,
     );

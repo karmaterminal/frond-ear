@@ -102,19 +102,24 @@ function run(
   argv: string[],
   stdin: string,
   env: NodeJS.ProcessEnv,
-): Promise<{ code: number | null; stdout: string }> {
+): Promise<{ code: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [CLI, "pressure", ...argv], {
       env: { ...process.env, ...env },
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "";
+    let stderr = "";
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
       stdout += chunk;
     });
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
     child.stdin.end(stdin);
-    child.on("close", (code) => resolve({ code, stdout }));
+    child.on("close", (code) => resolve({ code, stdout, stderr }));
   });
 }
 
@@ -174,13 +179,33 @@ test("--hook never blocks: bad stdin, a missing transcript, bad bands all print 
         JSON.stringify({ session_id: "s", transcript_path: join(dir, "nope") }),
       ],
       [["--hook", "--bands", "nonsense"], "{}"],
+      // argument-parse failures (🌫's review on #95): a missing value, an
+      // unknown flag, a value given to the boolean
+      [["--hook", "--bands"], "{}"],
+      [["--bands", "--hook"], "{}"],
+      [["--hook", "--nope"], "{}"],
+      [["--hook=yes"], "{}"],
     ] as const) {
       const result = await run([...argv], stdin, env);
       assert.equal(result.code, 0, `${argv.join(" ")} / ${stdin}`);
       assert.equal(result.stdout, "");
+      assert.equal(result.stderr, "", `${argv.join(" ")}: quiet`);
     }
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("without --hook, a bad flag is still a usage error", async () => {
+  for (const argv of [
+    ["--bands"],
+    ["--nope"],
+    ["--transcript", "x", "--bands", "1k,1k"],
+    [],
+  ]) {
+    const result = await run(argv, "", {});
+    assert.equal(result.code, 2, argv.join(" "));
+    assert.notEqual(result.stderr, "", `${argv.join(" ")}: says why`);
   }
 });
 
