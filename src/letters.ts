@@ -98,6 +98,16 @@ export function parseLeave(args: Record<string, unknown>): LeaveRequest {
 }
 
 /**
+ * The line the release hook adds after its result whenever the daemon answered. A
+ * session gets no warning before a compaction, and stock Claude Code has nothing like a
+ * letter, so a seat that is never told forgets the tool exists (the gloss went 44
+ * compactions without one, 11-14). Printed at every startup and compaction, so the
+ * reminder arrives even when no letter does.
+ */
+export const LETTER_HINT =
+  "compaction gives no warning. Leave a letter to your later self (leave_letter: reason, body, assumed) whenever your threads change; this hook hands it back after the next compaction. `letters` lists, reads or drops them.";
+
+/**
  * The session and source a hook names on stdin. Claude Code's hooks send `session_id`
  * and `source`; Copilot CLI's (preCompact, sessionStart) send `sessionId` and, for
  * preCompact, `trigger` instead of a source. Either spelling names the session; a

@@ -252,10 +252,13 @@ Hook, in the seat's `.claude/settings.json` (use the daemon's socket environment
 }
 ```
 
-`--hook` reads the hook's JSON from stdin (`session_id`, `source`) and prints one line, which
+`--hook` reads the hook's JSON from stdin (`session_id`, `source`) and prints the result line, which
 Claude Code adds to the session's context: `frond-ear: letters for ear <ear>: 2 delivered; sent as
-2 channel events`. It always exits 0, so a daemon that's down never blocks a session start. Leave
-`resume` out: a resumed session keeps its context.
+2 channel events`. When the daemon answered, a second line follows, even with no letters: a
+reminder that compaction gives no warning, and how to leave a letter. A session that's never told
+forgets the tool exists. It always exits 0, so a daemon that's down never blocks a session start
+(and then prints no reminder, since it couldn't take a letter). Leave `resume` out: a resumed
+session keeps its context.
 
 ### Context pressure (Claude Code)
 

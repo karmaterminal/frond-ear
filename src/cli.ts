@@ -25,7 +25,7 @@ import {
 import { Manifest } from "./canticle/manifest.ts";
 import { runConnectorEcho } from "./connector/echo.ts";
 import { Daemon } from "./daemon.ts";
-import { hookInput } from "./letters.ts";
+import { LETTER_HINT, hookInput } from "./letters.ts";
 import { DiscordGateway } from "./gateway.ts";
 import { StructuredLogger } from "./logger.ts";
 import { runDoctor, runInit } from "./onboard.ts";
@@ -288,6 +288,10 @@ async function runRelease(argv: string[]): Promise<void> {
       5_000,
     );
     process.stdout.write(`frond-ear: ${result.text}\n`);
+    if (hook) {
+      // Only when the daemon answered: a down daemon can't take a letter either.
+      process.stdout.write(`frond-ear: ${LETTER_HINT}\n`);
+    }
     process.exitCode = result.ok || hook ? 0 : 1;
   } catch (error) {
     if (!hook) {
