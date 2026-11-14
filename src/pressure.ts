@@ -14,6 +14,7 @@
  * Only usage written after the latest marker counts, so the turn that compacted is
  * never read as the size after it.
  */
+import { createHash } from "node:crypto";
 import { closeSync, openSync, readSync, fstatSync } from "node:fs";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -89,7 +90,7 @@ export function latestReading(transcript: string): PressureReading {
           ? record.uuid
           : typeof record.timestamp === "string" && record.timestamp
             ? record.timestamp
-            : `line:${line.length}:${i}`;
+            : `sha256:${createHash("sha256").update(line).digest("hex").slice(0, 16)}`;
       return { ...(tokens !== undefined ? { tokens } : {}), boundary: id };
     }
     if (tokens !== undefined || record.type !== "assistant") {

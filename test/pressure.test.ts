@@ -106,6 +106,15 @@ test("reading: only usage after the latest compaction marker counts", () => {
     ),
     { tokens: 31_000, boundary: "m-1" },
   );
+  // A marker with no uuid or timestamp gets an id from its own bytes, so it stays
+  // the same as the tail slides (🌿's review on #96).
+  const bare = JSON.stringify({ type: "system", subtype: "compact_boundary" });
+  const a = latestReading(`${bare}\n${turn(20_000)}\n`).boundary;
+  const b = latestReading(
+    `${turn(1)}\n${turn(2)}\n${bare}\n${turn(20_000)}\n${turn(21_000)}\n`,
+  ).boundary;
+  assert.match(a ?? "", /^sha256:[0-9a-f]{16}$/u);
+  assert.equal(a, b);
 });
 
 test("bands: a new compaction marker starts them again, even when over half is kept", () => {
