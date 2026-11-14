@@ -29,6 +29,7 @@ import { hookInput } from "./letters.ts";
 import { DiscordGateway } from "./gateway.ts";
 import { StructuredLogger } from "./logger.ts";
 import { runDoctor, runInit } from "./onboard.ts";
+import { runPressure } from "./pressure.ts";
 import type { DaemonMessage } from "./protocol.ts";
 import { EAR_PROTOCOL_VERSION, LineConnection } from "./protocol.ts";
 import { HttpDiscordRest, RecordingRest } from "./rest.ts";
@@ -61,6 +62,12 @@ usage:
                                       release an ear's letters (#88) to its attached session; for a
                                       SessionStart hook (matcher startup|compact): --hook reads the hook's
                                       JSON on stdin (session_id, source) and always exits 0
+  frond-ear pressure --hook [--bands 150k,200k,300k,450k,650k]
+                                      context pressure for a PostToolUse / UserPromptSubmit hook: reads the
+                                      transcript's latest token usage and adds one line to the session's
+                                      context on crossing into a new band; always exits 0
+  frond-ear pressure --transcript <path>
+                                      print a transcript's latest context size
   frond-ear inject --chat <id> --author <id> [--guild <id>] [--name <n>] [--bot] [--mention] <text…>
                                       push a synthetic MESSAGE_CREATE (dry-run or FROND_EAR_ALLOW_INJECT=1)
   frond-ear connector-echo [--public-url https://<host>] [--auth none|bearer|oauth] …
@@ -542,6 +549,18 @@ async function main(): Promise<void> {
       return;
     case "release":
       await runRelease(rest);
+      return;
+    case "pressure":
+      process.exitCode = runPressure(rest, {
+        // PostToolUse's JSON carries the whole tool response, so the cap is wide;
+        // past it the gauge just stays quiet.
+        stdin: process.stdin.isTTY
+          ? ""
+          : await readStdin(32 * 1024 * 1024).catch(() => ""),
+        stdout: process.stdout,
+        stderr: process.stderr,
+        env: process.env,
+      });
       return;
     case "tap":
       runTap(rest);

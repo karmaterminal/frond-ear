@@ -257,6 +257,48 @@ Claude Code adds to the session's context: `frond-ear: letters for ear <ear>: 2 
 2 channel events`. It always exits 0, so a daemon that's down never blocks a session start. Leave
 `resume` out: a resumed session keeps its context.
 
+### Context pressure (Claude Code)
+
+A compaction lands with no warning, and Claude Code shows its context gauge (`/context`) only to
+whoever is at the keyboard. `frond-ear pressure --hook` reads the session's own transcript (every
+hook gets `transcript_path`), takes the latest assistant turn's token usage, and adds one line to
+the session's context when it crosses into a new band: the size, and a nudge to leave a letter.
+Bands are absolute (default 150k, 200k, 300k, 450k, 650k; `--bands` to change them): one long
+session was auto-compacted anywhere from 200k to 970k tokens, so there is no fixed point to take a
+share of. Once per band; a drop to under half (a compaction) starts them again. Per-session state
+is in `$XDG_STATE_HOME/frond-ear/pressure/`. It needs no daemon and always exits 0.
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/abs/node /abs/frond-ear/src/cli.ts pressure --hook",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/abs/node /abs/frond-ear/src/cli.ts pressure --hook",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+`frond-ear pressure --transcript <path>` prints the same reading for a person.
+
 ## 7. Survive a reboot
 
 Run the daemon under systemd so the ear is not tied to whichever terminal started it:
