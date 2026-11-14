@@ -268,7 +268,7 @@ hook gets `transcript_path`), takes the latest assistant turn's token usage, and
 the session's context when it crosses into a new band: the size, and a nudge to leave a letter.
 Bands are absolute (default 150k, 200k, 300k, 450k, 650k; `--bands` to change them): one long
 session was auto-compacted anywhere from 200k to 970k tokens, so there is no fixed point to take a
-share of. Once per band; a drop to under half (a compaction) starts them again. Per-session state
+share of. Once per band; a compaction starts them again (a new `compact_boundary` row in the transcript, or a drop to under half). Per-session state
 is in `$XDG_STATE_HOME/frond-ear/pressure/`. It needs no daemon and always exits 0.
 
 ```json

@@ -15,7 +15,11 @@ import { LETTER_HINT } from "../src/letters.ts";
 
 const CLI = join(import.meta.dirname, "..", "src", "cli.ts");
 
-function fakeDaemon(socketPath: string, text: string): Promise<Server> {
+function fakeDaemon(
+  socketPath: string,
+  text: string,
+  ok = true,
+): Promise<Server> {
   const server = createServer((socket) => {
     socket.setEncoding("utf8");
     let buffer = "";
@@ -34,7 +38,7 @@ function fakeDaemon(socketPath: string, text: string): Promise<Server> {
           );
         } else if (message.type === "release") {
           socket.write(
-            `${JSON.stringify({ type: "result", id: message.id, ok: true, text })}\n`,
+            `${JSON.stringify({ type: "result", id: message.id, ok, text })}\n`,
           );
         }
       }
@@ -114,6 +118,23 @@ test("release --hook with the daemon down reports it and offers no letter it can
     assert.match(stdout, /^frond-ear: letters not released \(/u);
     assert.doesNotMatch(stdout, /leave_letter/u);
   } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("release --hook when the daemon refuses (ok:false) prints its answer and no reminder", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "fe-release-hook-"));
+  const socketPath = join(dir, "d.sock");
+  const server = await fakeDaemon(socketPath, "unknown ear t", false);
+  try {
+    const { code, stdout } = await run(["release", "--ear", "t", "--hook"], {
+      FROND_EAR_SOCKET: socketPath,
+      FROND_EAR_TCP: "",
+    });
+    assert.equal(code, 0);
+    assert.equal(stdout, "frond-ear: unknown ear t\n");
+  } finally {
+    server.close();
     rmSync(dir, { recursive: true, force: true });
   }
 });

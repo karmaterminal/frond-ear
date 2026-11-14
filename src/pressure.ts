@@ -8,8 +8,11 @@
  * Bands are absolute token counts, not a share of a compaction point: one long
  * session (the gloss, 87 compactions by 11-14) was auto-compacted anywhere from
  * 200k to 970k tokens, so no fixed point exists to take a percentage of. A line is
- * printed only on crossing up into a new band; a drop to under half the last
- * reading (a compaction, or a /clear) starts the bands again.
+ * printed only on crossing up into a new band. A compaction starts the bands again:
+ * seen as a new compaction marker in the transcript (a `system` row with subtype
+ * `compact_boundary`), or as a drop to under half the last reading (also a /clear).
+ * Only usage written after the latest marker counts, so the turn that compacted is
+ * never read as the size after it.
  */
 import { closeSync, openSync, readSync, fstatSync } from "node:fs";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
@@ -27,14 +30,40 @@ export interface PressureState {
   band: number;
   /** The last reading, to see a compaction as a drop. */
   tokens: number;
+  /**
+   * The latest compaction marker seen (its uuid), null when the transcript's tail
+   * held none. Absent in state written before markers were read: the first marker
+   * then is only recorded, not taken as a compaction.
+   */
+  boundary?: string | null;
+}
+
+export interface PressureReading {
+  /** Tokens at the latest assistant turn after the latest marker, if any. */
+  tokens?: number;
+  /** The latest compaction marker's id in the tail, or null for none. */
+  boundary: string | null;
 }
 
 /** Tokens in context at the latest assistant turn: its input (cached or not) plus its output. */
 export function latestContextTokens(transcript: string): number | undefined {
+  return latestReading(transcript).tokens;
+}
+
+/**
+ * The latest compaction marker in the transcript's tail, and the latest assistant
+ * usage written after it (none yet right after a compaction).
+ */
+export function latestReading(transcript: string): PressureReading {
   const lines = transcript.split("\n");
+  let tokens: number | undefined;
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i]?.trim();
-    if (!line || !line.includes('"usage"')) {
+    if (!line) {
+      continue;
+    }
+    const marker = line.includes('"compact_boundary"');
+    if (!marker && (tokens !== undefined || !line.includes('"usage"'))) {
       continue;
     }
     let row: unknown;
@@ -47,8 +76,23 @@ export function latestContextTokens(transcript: string): number | undefined {
     if (typeof row !== "object" || row === null) {
       continue;
     }
-    const record = row as { type?: unknown; message?: unknown };
-    if (record.type !== "assistant") {
+    const record = row as {
+      type?: unknown;
+      subtype?: unknown;
+      uuid?: unknown;
+      timestamp?: unknown;
+      message?: unknown;
+    };
+    if (record.type === "system" && record.subtype === "compact_boundary") {
+      const id =
+        typeof record.uuid === "string" && record.uuid
+          ? record.uuid
+          : typeof record.timestamp === "string" && record.timestamp
+            ? record.timestamp
+            : `line:${line.length}:${i}`;
+      return { ...(tokens !== undefined ? { tokens } : {}), boundary: id };
+    }
+    if (tokens !== undefined || record.type !== "assistant") {
       continue;
     }
     const usage = (record.message as { usage?: unknown } | undefined)?.usage;
@@ -64,10 +108,10 @@ export function latestContextTokens(transcript: string): number | undefined {
       n("cache_creation_input_tokens") +
       n("output_tokens");
     if (total > 0) {
-      return total;
+      tokens = total;
     }
   }
-  return undefined;
+  return { ...(tokens !== undefined ? { tokens } : {}), boundary: null };
 }
 
 export function readTail(path: string, maxBytes = TAIL_BYTES): string {
@@ -91,11 +135,25 @@ export function step(
   previous: PressureState | undefined,
   tokens: number,
   bands: readonly number[],
+  boundary?: string | null,
 ): { state: PressureState; announce?: number } {
   let band = previous?.band ?? -1;
-  if (previous && tokens < previous.tokens / 2) {
+  const newMarker =
+    typeof boundary === "string" &&
+    previous?.boundary !== undefined &&
+    previous.boundary !== boundary;
+  if (previous && (newMarker || tokens < previous.tokens / 2)) {
     band = -1;
   }
+  // A marker that slid out of the tail is still the latest one seen; null records
+  // that the tail was read and held none (so the first marker is a compaction).
+  const seen =
+    typeof boundary === "string"
+      ? boundary
+      : previous?.boundary !== undefined
+        ? previous.boundary
+        : boundary;
+  const keep = seen !== undefined ? { boundary: seen } : {};
   let reached = -1;
   for (let i = 0; i < bands.length; i++) {
     if (tokens >= (bands[i] ?? Infinity)) {
@@ -103,9 +161,9 @@ export function step(
     }
   }
   if (reached > band) {
-    return { state: { band: reached, tokens }, announce: reached };
+    return { state: { band: reached, tokens, ...keep }, announce: reached };
   }
-  return { state: { band, tokens } };
+  return { state: { band, tokens, ...keep } };
 }
 
 export function formatTokens(tokens: number): string {
@@ -170,7 +228,11 @@ export function loadState(
       readFileSync(join(dir, safeSessionFile(sessionId)), "utf8"),
     ) as Partial<PressureState>;
     if (typeof parsed.band === "number" && typeof parsed.tokens === "number") {
-      return { band: parsed.band, tokens: parsed.tokens };
+      const boundary =
+        typeof parsed.boundary === "string" || parsed.boundary === null
+          ? { boundary: parsed.boundary }
+          : {};
+      return { band: parsed.band, tokens: parsed.tokens, ...boundary };
     }
   } catch {
     // No state yet, or unreadable: start the bands again.
@@ -277,7 +339,9 @@ export function runPressure(argv: string[], io: PressureIo): number {
     }
     const tokens = latestContextTokens(readTail(values.transcript));
     if (tokens === undefined) {
-      io.stdout.write("no assistant turn with usage in that transcript\n");
+      io.stdout.write(
+        "no assistant turn with usage in that transcript (since its last compaction)\n",
+      );
       return 1;
     }
     const { announce } = step(undefined, tokens, bands);
@@ -291,8 +355,10 @@ export function runPressure(argv: string[], io: PressureIo): number {
     if (!input.sessionId || !input.transcriptPath) {
       return 0;
     }
-    const tokens = latestContextTokens(readTail(input.transcriptPath));
+    const reading = latestReading(readTail(input.transcriptPath));
+    const tokens = reading.tokens;
     if (tokens === undefined) {
+      // Nothing read yet, or compacted with no turn since: the next call reads it.
       return 0;
     }
     const dir = stateDir(io.env);
@@ -300,6 +366,7 @@ export function runPressure(argv: string[], io: PressureIo): number {
       loadState(dir, input.sessionId),
       tokens,
       bands,
+      reading.boundary,
     );
     saveState(dir, input.sessionId, state);
     if (announce !== undefined) {
