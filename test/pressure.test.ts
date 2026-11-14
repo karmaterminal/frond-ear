@@ -104,10 +104,16 @@ function run(
   env: NodeJS.ProcessEnv,
 ): Promise<{ code: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
-    const child = spawn(process.execPath, [CLI, "pressure", ...argv], {
-      env: { ...process.env, ...env },
-      stdio: ["pipe", "pipe", "pipe"],
-    });
+    // Node 22 prints an ExperimentalWarning for node:sqlite on import; the
+    // stderr assertions are about the CLI's own output, so drop that one kind.
+    const child = spawn(
+      process.execPath,
+      ["--disable-warning=ExperimentalWarning", CLI, "pressure", ...argv],
+      {
+        env: { ...process.env, ...env },
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+    );
     let stdout = "";
     let stderr = "";
     child.stdout.setEncoding("utf8");
