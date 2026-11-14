@@ -162,9 +162,11 @@ test("the line names the size, the no-warning fact and leave_letter", () => {
   assert.match(line, /leave_letter\(reason, body, assumed\)/u);
 });
 
+// stdin null leaves the pipe open, the way an agent's tool shell does; the
+// kill timer turns a CLI that waits on it into a failure, not a hung suite.
 function run(
   argv: string[],
-  stdin: string,
+  stdin: string | null,
   env: NodeJS.ProcessEnv,
 ): Promise<{ code: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
@@ -188,8 +190,13 @@ function run(
     child.stderr.on("data", (chunk: string) => {
       stderr += chunk;
     });
-    child.stdin.end(stdin);
-    child.on("close", (code) => resolve({ code, stdout, stderr }));
+    if (stdin !== null) child.stdin.end(stdin);
+    const timer = setTimeout(() => child.kill("SIGKILL"), 10_000);
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      child.stdin.destroy();
+      resolve({ code, stdout, stderr });
+    });
   });
 }
 
@@ -308,6 +315,22 @@ test("--hook across a compaction that keeps over half: announces again, quiet be
       (await run(["--hook"], input, env)).stdout,
       /~310k tokens \(past the 300k band/u,
       "kept over half, but a new marker: the bands start again",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("--transcript returns with stdin left open: only --hook reads stdin", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "fe-pressure-"));
+  try {
+    const transcript = join(dir, "s.jsonl");
+    writeFileSync(transcript, `${turn(236_000)}\n`);
+    const result = await run(["--transcript", transcript], null, {});
+    assert.equal(result.code, 0, "exited by itself, not killed");
+    assert.equal(
+      result.stdout,
+      "~236k tokens in context, past the 200k band\n",
     );
   } finally {
     rmSync(dir, { recursive: true, force: true });

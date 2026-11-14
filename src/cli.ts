@@ -29,7 +29,7 @@ import { LETTER_HINT, hookInput } from "./letters.ts";
 import { DiscordGateway } from "./gateway.ts";
 import { StructuredLogger } from "./logger.ts";
 import { runDoctor, runInit } from "./onboard.ts";
-import { runPressure } from "./pressure.ts";
+import { pressureHookRequested, runPressure } from "./pressure.ts";
 import type { DaemonMessage } from "./protocol.ts";
 import { EAR_PROTOCOL_VERSION, LineConnection } from "./protocol.ts";
 import { HttpDiscordRest, RecordingRest } from "./rest.ts";
@@ -557,11 +557,14 @@ async function main(): Promise<void> {
       return;
     case "pressure":
       process.exitCode = runPressure(rest, {
-        // PostToolUse's JSON carries the whole tool response, so the cap is wide;
-        // past it the gauge just stays quiet.
-        stdin: process.stdin.isTTY
-          ? ""
-          : await readStdin(32 * 1024 * 1024).catch(() => ""),
+        // Only the hook reads stdin. A hand run from a shell whose stdin is a
+        // pipe or socket that never ends (an agent's tool shell) would wait on it
+        // forever. PostToolUse's JSON carries the whole tool response, so the cap
+        // is wide; past it the gauge just stays quiet.
+        stdin:
+          pressureHookRequested(rest) && !process.stdin.isTTY
+            ? await readStdin(32 * 1024 * 1024).catch(() => "")
+            : "",
         stdout: process.stdout,
         stderr: process.stderr,
         env: process.env,
