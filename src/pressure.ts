@@ -291,6 +291,14 @@ export interface PressureIo {
 }
 
 /**
+ * Whether argv asks for hook mode, read off the raw words so it holds even when
+ * the rest of the line doesn't parse. Only hook mode reads stdin.
+ */
+export function pressureHookRequested(argv: readonly string[]): boolean {
+  return argv.some((arg) => arg === "--hook" || arg.startsWith("--hook="));
+}
+
+/**
  * `frond-ear pressure`. Under --hook (PostToolUse or UserPromptSubmit), reads the
  * hook's JSON on stdin and prints Claude Code's added-context JSON only on crossing
  * into a new band; anything it can't read prints nothing, and it always exits 0, so
@@ -311,7 +319,7 @@ export function runPressure(argv: string[], io: PressureIo): number {
   } catch (error) {
     // A hook line with a bad flag must still never block: exit 2 from a
     // UserPromptSubmit hook would refuse the prompt.
-    if (argv.some((arg) => arg === "--hook" || arg.startsWith("--hook="))) {
+    if (pressureHookRequested(argv)) {
       return 0;
     }
     io.stderr.write(
