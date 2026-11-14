@@ -12,6 +12,7 @@ import test from "node:test";
 import {
   DEFAULT_BANDS,
   latestContextTokens,
+  latestReading,
   parseBands,
   pressureLine,
   step,
@@ -78,6 +79,69 @@ test("bands: a drop that isn't a compaction keeps the announced band", () => {
   assert.equal(r.announce, undefined);
   r = step(r.state, 210, bands);
   assert.equal(r.announce, undefined);
+});
+
+function marker(uuid: string): string {
+  return JSON.stringify({
+    type: "system",
+    subtype: "compact_boundary",
+    uuid,
+    compactMetadata: { trigger: "auto" },
+  });
+}
+
+test("reading: only usage after the latest compaction marker counts", () => {
+  assert.deepEqual(latestReading(`${turn(90_000)}\n${turn(160_000)}\n`), {
+    tokens: 160_000,
+    boundary: null,
+  });
+  assert.deepEqual(
+    latestReading(`${turn(400_000)}\n${marker("m-1")}\n`),
+    { boundary: "m-1" },
+    "compacted, no turn since: nothing to read",
+  );
+  assert.deepEqual(
+    latestReading(
+      `${marker("m-0")}\n${turn(400_000)}\n${marker("m-1")}\n${turn(30_000)}\n${turn(31_000)}\n`,
+    ),
+    { tokens: 31_000, boundary: "m-1" },
+  );
+  // A marker with no uuid or timestamp gets an id from its own bytes, so it stays
+  // the same as the tail slides (🌿's review on #96).
+  const bare = JSON.stringify({ type: "system", subtype: "compact_boundary" });
+  const a = latestReading(`${bare}\n${turn(20_000)}\n`).boundary;
+  const b = latestReading(
+    `${turn(1)}\n${turn(2)}\n${bare}\n${turn(20_000)}\n${turn(21_000)}\n`,
+  ).boundary;
+  assert.match(a ?? "", /^sha256:[0-9a-f]{16}$/u);
+  assert.equal(a, b);
+});
+
+test("bands: a new compaction marker starts them again, even when over half is kept", () => {
+  const bands = [100, 200, 300];
+  let r = step(undefined, 250, bands, null);
+  assert.equal(r.announce, 1);
+  assert.equal(r.state.boundary, null);
+  r = step(r.state, 210, bands, "m-1");
+  assert.equal(r.announce, 1, "a marker the state hadn't seen: announce again");
+  r = step(r.state, 220, bands, "m-1");
+  assert.equal(r.announce, undefined, "same marker: quiet");
+  r = step(r.state, 230, bands, null);
+  assert.equal(
+    r.announce,
+    undefined,
+    "marker slid out of the tail: still quiet",
+  );
+  assert.equal(r.state.boundary, "m-1", "and still the latest seen");
+  r = step(r.state, 240, bands, "m-2");
+  assert.equal(r.announce, 1);
+});
+
+test("bands: state from before markers were read takes the first marker as known", () => {
+  const legacy = { band: 1, tokens: 250 };
+  const r = step(legacy, 260, [100, 200, 300], "m-old");
+  assert.equal(r.announce, undefined);
+  assert.equal(r.state.boundary, "m-old");
 });
 
 test("--bands parses k and M, and refuses bands that don't rise", () => {
@@ -212,6 +276,41 @@ test("without --hook, a bad flag is still a usage error", async () => {
     const result = await run(argv, "", {});
     assert.equal(result.code, 2, argv.join(" "));
     assert.notEqual(result.stderr, "", `${argv.join(" ")}: says why`);
+  }
+});
+
+test("--hook across a compaction that keeps over half: announces again, quiet before the first turn", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "fe-pressure-"));
+  try {
+    const transcript = join(dir, "s.jsonl");
+    const env = { XDG_STATE_HOME: join(dir, "state") };
+    const input = JSON.stringify({
+      session_id: "s-m",
+      transcript_path: transcript,
+      hook_event_name: "PostToolUse",
+    });
+    writeFileSync(transcript, `${marker("m-0")}\n${turn(320_000)}\n`);
+    assert.match((await run(["--hook"], input, env)).stdout, /~320k tokens/u);
+    writeFileSync(
+      transcript,
+      `${marker("m-0")}\n${turn(320_000)}\n${marker("m-1")}\n`,
+    );
+    assert.equal(
+      (await run(["--hook"], input, env)).stdout,
+      "",
+      "compacted, no turn yet: the old size is not read as the new one",
+    );
+    writeFileSync(
+      transcript,
+      `${marker("m-0")}\n${turn(320_000)}\n${marker("m-1")}\n${turn(310_000)}\n`,
+    );
+    assert.match(
+      (await run(["--hook"], input, env)).stdout,
+      /~310k tokens \(past the 300k band/u,
+      "kept over half, but a new marker: the bands start again",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

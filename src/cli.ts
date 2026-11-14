@@ -288,8 +288,9 @@ async function runRelease(argv: string[]): Promise<void> {
       5_000,
     );
     process.stdout.write(`frond-ear: ${result.text}\n`);
-    if (hook) {
-      // Only when the daemon answered: a down daemon can't take a letter either.
+    if (hook && result.ok) {
+      // Only when the daemon answered ok: a down daemon, or one that refused this
+      // ear, can't take a letter either.
       process.stdout.write(`frond-ear: ${LETTER_HINT}\n`);
     }
     process.exitCode = result.ok || hook ? 0 : 1;
