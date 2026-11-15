@@ -54,6 +54,7 @@ import {
   releaseCount,
   releaseLetters,
   renderLetter,
+  summaryLetters,
 } from "./letters.ts";
 import type { HearView } from "./canticle/receptor.ts";
 import type { EventStore, ReplyPart } from "./store.ts";
@@ -1229,6 +1230,20 @@ export class Daemon {
               }),
         });
         return;
+      case "precompact":
+        // Read-only, but letter text is the session's own: only a CLI client (the
+        // PreCompact hook) asks, and only for the session that holds the ear.
+        client.connection.send({
+          type: "result",
+          id: message.id,
+          ...(client.role === "cli"
+            ? this.precompactRequest(message)
+            : {
+                ok: false,
+                text: `only a CLI client (frond-ear precompact, from a PreCompact hook) can ask for letters, not a ${client.role ?? "client"}`,
+              }),
+        });
+        return;
       case "session":
         if (client.ear && typeof message.sessionId === "string") {
           client.sessionId = message.sessionId;
@@ -1490,6 +1505,42 @@ export class Daemon {
     }
     this.store.clearRuntimeState(`letters.armed.${ear}`);
     return { ok: true, text: this.deliverLetters(ear, client, source) };
+  }
+
+  /**
+   * The PreCompact hook's ask (#102): the letters the compacting session left, as
+   * summary instructions. Fails closed like a release: the hook must name a session,
+   * and that session must hold the ear now.
+   */
+  private precompactRequest(message: { ear: string; sessionId?: string }): {
+    ok: boolean;
+    text: string;
+  } {
+    const ear = typeof message.ear === "string" ? message.ear : "";
+    if (!this.config.ears[ear]) {
+      return { ok: false, text: `unknown ear ${ear || "(none)"}` };
+    }
+    const sessionId =
+      typeof message.sessionId === "string" && message.sessionId
+        ? message.sessionId
+        : undefined;
+    if (!sessionId) {
+      return {
+        ok: false,
+        text: "the PreCompact hook named no session (Claude Code passes session_id on stdin); nothing to carry",
+      };
+    }
+    const client = this.attached.get(ear);
+    if (!client || client.sessionId !== sessionId) {
+      return {
+        ok: false,
+        text: `ear ${ear} is not held by session ${sessionId.slice(0, 8)}; its letters are not printed`,
+      };
+    }
+    return {
+      ok: true,
+      text: summaryLetters(this.store, ear, sessionId, this.clock.now()),
+    };
   }
 
   /**

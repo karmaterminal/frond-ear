@@ -183,14 +183,14 @@ claude --resume <session id> --dangerously-load-development-channels server:fron
 
 ## 6. Operating
 
-| Task                        | How                                                                                 |
-| --------------------------- | ----------------------------------------------------------------------------------- |
-| Status                      | `node src/cli.ts status`, or ask Claude to call `ear_status`                        |
-| Pause pushes                | Set `"paused": true` in the config; it reloads live                                 |
-| Read what Claude missed     | Claude calls `inbox`; everything stays in SQLite until the retention window expires |
-| Logs                        | JSON lines on the daemon's stderr. Message text and tokens are redacted.            |
-| Post from a script          | `node src/cli.ts send --chat <id> "<text>"`, below                                  |
-| Letters across a compaction | `leave_letter`, then a `SessionStart` hook running `release --hook`, below          |
+| Task                        | How                                                                                                                              |
+| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| Status                      | `node src/cli.ts status`, or ask Claude to call `ear_status`                                                                     |
+| Pause pushes                | Set `"paused": true` in the config; it reloads live                                                                              |
+| Read what Claude missed     | Claude calls `inbox`; everything stays in SQLite until the retention window expires                                              |
+| Logs                        | JSON lines on the daemon's stderr. Message text and tokens are redacted.                                                         |
+| Post from a script          | `node src/cli.ts send --chat <id> "<text>"`, below                                                                               |
+| Letters across a compaction | `leave_letter`, then a `SessionStart` hook running `release --hook` (and a `PreCompact` hook running `precompact --hook`), below |
 
 **Posting from a script.** `frond-ear send --chat <id> <text…>` posts the text as the daemon's
 bot, for scripts such as a watchdog that posts an outage alert when a host goes down. It finds
@@ -275,6 +275,44 @@ reminder that compaction gives no warning, and how to leave a letter. A session 
 forgets the tool exists. It always exits 0, so a daemon that's down never blocks a session start
 (and then prints no reminder, since it couldn't take a letter). Leave `resume` out: a resumed
 session keeps its context.
+
+**Letters into the compaction summary** (#102). The release only hands letters back after the
+compaction, as events. The summary that the next turn reasons from never saw them. Most
+compactions on a quiet seat are idle compactions, about 55 minutes after the last request, with
+nobody there to leave a letter just before. A `PreCompact` hook closes that gap.
+`frond-ear precompact --ear <ear> --hook` prints the compacting session's own unsettled, unexpired
+letters, newest first, as instructions for the summary. Claude Code uses a `PreCompact` hook's
+exit-0 stdout that way, up to 10,000 characters; this stays under 9,500 and names any letter that
+doesn't fit. The framing asks the summary to keep each letter's id, reason, text and `assumed`
+under "Letters from before this compaction", as the session's own evidence, never permission.
+
+- **It is read-only.** Nothing is marked delivered or settled, and the `SessionStart` release still
+  hands the letters back afterwards.
+- **It fails closed on the session, like a release.** The hook must name the session that holds
+  the ear now, and only a CLI client may ask.
+- **It never blocks a compaction.** Under `--hook` stdout carries the letters or nothing (an error
+  there would land in the summary), every reason goes to stderr, and the exit code is always 0.
+  Exit 2 would block the compaction. The output never starts with `{`, so it can't be read as a
+  JSON decision.
+
+```json
+{
+  "hooks": {
+    "PreCompact": [
+      {
+        "matcher": "auto|manual",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node /path/to/frond-ear/src/cli.ts precompact --ear <ear> --hook",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
+```
 
 ### Context pressure (Claude Code)
 
