@@ -49,7 +49,7 @@ export const TOOLS = [
   {
     name: "reply",
     description:
-      'Answer on Discord. Your transcript never reaches Discord, so this is the only way to speak there. Pass the event\'s chat_id and batch_id. Only chats an ear serves are reachable: its configured channels, their threads, and DMs it has received from principals and peer agents. Text over 2000 characters goes out as several messages. Returns the sent message ids, which edit_message takes. If a send could not be confirmed (the error says so, or a kind="send_check" event lists it), check fetch_messages before sending again: re-sending the same text and reply_to within 5 minutes of the first try posts only what did not go out (the error says how long is left); after that, every part posts again.',
+      'Answer on Discord. Your transcript never reaches Discord, so this is the only way to speak there. Pass the event\'s chat_id and batch_id. Only chats an ear serves are reachable: its configured channels, their threads, and DMs it has received from principals and peer agents. Text over 2000 characters goes out as several messages. attachments may list local regular files for Discord upload (at most 10, 8 MiB each and 8 MiB total by default); text may be omitted for an attachment-only post. Attachment filenames must not contain path separators. Returns the sent message ids, which edit_message takes. If a send could not be confirmed (the error says so, or a kind="send_check" event lists it), check fetch_messages before sending again: re-sending the same text, attachments and reply_to within 5 minutes of the first try posts only what did not go out (the error says how long is left); after that, every part posts again.',
     inputSchema: {
       type: "object",
       properties: {
@@ -57,15 +57,23 @@ export const TOOLS = [
         batch_id: batchId,
         text: {
           type: "string",
-          description: "Message text (Discord markdown)",
+          description:
+            "Message text (Discord markdown); omit for an attachment-only post",
         },
         reply_to: {
           type: "string",
           description:
             "msg id of an earlier message to quote-reply (digits only); omit for a normal reply",
         },
+        attachments: {
+          type: "array",
+          items: { type: "string" },
+          maxItems: 10,
+          description:
+            "Local file paths accessible to the frond-ear daemon; regular files only, no symlinks",
+        },
       },
-      required: ["chat_id", "text"],
+      required: ["chat_id"],
     },
   },
   {

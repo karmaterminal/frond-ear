@@ -78,6 +78,66 @@ test("fetch_attachment saves the file privately and reports the author's trust",
   h.dispose();
 });
 
+test("reply uploads regular local files, including attachment-only", async () => {
+  const h = harness();
+  const shim = h.attach("scribe");
+  const image = join(h.directory, "outbound.png");
+  writeFileSync(image, PNG);
+
+  const withText = await h.call(shim, "reply", {
+    chat_id: CHANNEL,
+    text: "see the file",
+    attachments: [image],
+  });
+  assert.equal(withText.ok, true, withText.text);
+  assert.deepEqual(h.rest.calls.at(-1)?.attachments, [
+    { name: "outbound.png", size: PNG.length },
+  ]);
+
+  const attachmentOnly = await h.call(shim, "reply", {
+    chat_id: CHANNEL,
+    attachments: [image],
+  });
+  assert.equal(attachmentOnly.ok, true, attachmentOnly.text);
+  assert.deepEqual(h.rest.calls.at(-1)?.attachments, [
+    { name: "outbound.png", size: PNG.length },
+  ]);
+
+  h.dispose();
+});
+
+test("reply refuses unsafe, oversized or missing outbound attachments", async () => {
+  const h = harness();
+  const shim = h.attach("scribe");
+
+  const missing = await h.call(shim, "reply", {
+    chat_id: CHANNEL,
+    attachments: [join(h.directory, "missing.bin")],
+  });
+  assert.equal(missing.ok, false);
+  assert.match(missing.text, /attachment not readable/u);
+
+  const directory = join(h.directory, "folder");
+  mkdirSync(directory);
+  const notRegular = await h.call(shim, "reply", {
+    chat_id: CHANNEL,
+    attachments: [directory],
+  });
+  assert.equal(notRegular.ok, false);
+  assert.match(notRegular.text, /not a regular file/u);
+
+  const oversized = join(h.directory, "oversized.bin");
+  writeFileSync(oversized, new Uint8Array(8 * 1024 * 1024 + 1));
+  const tooLarge = await h.call(shim, "reply", {
+    chat_id: CHANNEL,
+    attachments: [oversized],
+  });
+  assert.equal(tooLarge.ok, false);
+  assert.match(tooLarge.text, /the limit is 8388608/u);
+
+  h.dispose();
+});
+
 test("fetch_attachment: an ambient author's file is labelled data, never instructions", async () => {
   const h = harness();
   withAttachment(h, { author: { id: AMBIENT, username: "someone" } });

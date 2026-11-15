@@ -2,6 +2,11 @@ import type { DiscordMessage } from "./types.ts";
 
 export const DISCORD_MESSAGE_LIMIT = 2_000;
 
+export interface OutboundAttachment {
+  name: string;
+  bytes: Uint8Array;
+}
+
 export interface DiscordRest {
   /**
    * `nonce` is sent with `enforce_nonce`, so Discord returns the original
@@ -13,6 +18,7 @@ export interface DiscordRest {
     content: string,
     replyTo?: string,
     nonce?: string,
+    attachments?: OutboundAttachment[],
   ): Promise<{ id: string }>;
   addReaction(
     channelId: string,
@@ -117,18 +123,23 @@ export class HttpDiscordRest implements DiscordRest {
       ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
     const maxRetries = this.options.maxRetries ?? 3;
     for (let attempt = 0; ; attempt += 1) {
+      const headers: Record<string, string> = {
+        Authorization: `Bot ${this.options.token}`,
+        "User-Agent":
+          "DiscordBot (https://github.com/karmaterminal/frond-ear, 0.1.0)",
+      };
+      let requestBody: RequestInit["body"];
+      if (body instanceof FormData) {
+        requestBody = body;
+      } else if (body !== undefined) {
+        headers["Content-Type"] = "application/json";
+        requestBody = JSON.stringify(body);
+      }
       const init: RequestInit = {
         method,
-        headers: {
-          Authorization: `Bot ${this.options.token}`,
-          "User-Agent":
-            "DiscordBot (https://github.com/karmaterminal/frond-ear, 0.1.0)",
-          ...(body === undefined ? {} : { "Content-Type": "application/json" }),
-        },
+        headers,
+        ...(requestBody === undefined ? {} : { body: requestBody }),
       };
-      if (body !== undefined) {
-        init.body = JSON.stringify(body);
-      }
       const response = await fetchImpl(`${this.options.apiBase}${path}`, init);
       if (response.status === 429 && attempt < maxRetries) {
         const payload = (await response.json().catch(() => ({}))) as {
@@ -167,6 +178,7 @@ export class HttpDiscordRest implements DiscordRest {
     content: string,
     replyTo?: string,
     nonce?: string,
+    attachments?: OutboundAttachment[],
   ): Promise<{ id: string }> {
     const body: Record<string, unknown> = {
       content,
@@ -181,6 +193,30 @@ export class HttpDiscordRest implements DiscordRest {
         message_id: replyTo,
         fail_if_not_exists: false,
       };
+    }
+    if (attachments && attachments.length > 0) {
+      body.attachments = attachments.map((file, index) => ({
+        id: index,
+        filename: file.name,
+      }));
+      const form = new FormData();
+      form.append(
+        "payload_json",
+        new Blob([JSON.stringify(body)], { type: "application/json" }),
+      );
+      attachments.forEach((file, index) => {
+        form.append(
+          `files[${index}]`,
+          new Blob([file.bytes], { type: "application/octet-stream" }),
+          file.name,
+        );
+      });
+      const result = (await this.request(
+        "POST",
+        `/channels/${seg(channelId)}/messages`,
+        form,
+      )) as { id: string };
+      return { id: result.id };
     }
     const result = (await this.request(
       "POST",
@@ -295,6 +331,7 @@ export interface RecordedCall {
   content?: string;
   replyTo?: string;
   emoji?: string;
+  attachments?: Array<{ name: string; size: number }>;
 }
 
 /** Dry-run and test double: records outbound calls, sends nothing. */
@@ -327,6 +364,7 @@ export class RecordingRest implements DiscordRest {
     content: string,
     replyTo?: string,
     nonce?: string,
+    attachments?: OutboundAttachment[],
   ): Promise<{ id: string }> {
     // Mirror Discord's enforce_nonce: a repeated nonce returns the original.
     const existing = nonce
@@ -346,6 +384,14 @@ export class RecordingRest implements DiscordRest {
       messageId: id,
       content,
       ...(replyTo ? { replyTo } : {}),
+      ...(attachments && attachments.length > 0
+        ? {
+            attachments: attachments.map((file) => ({
+              name: file.name,
+              size: file.bytes.length,
+            })),
+          }
+        : {}),
     });
     return { id };
   }

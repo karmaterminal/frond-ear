@@ -5,13 +5,15 @@ import {
   timingSafeEqual,
 } from "node:crypto";
 import {
+  lstatSync,
   mkdirSync,
+  readFileSync,
   readdirSync,
   statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { basename, join, resolve } from "node:path";
 
 import { DELIVERY_PROOF, targetAdvice } from "./advice.ts";
 import { CanticleDelivery } from "./canticle/delivery.ts";
@@ -38,7 +40,7 @@ import {
   renderEvent,
   type CatchUpChat,
 } from "./render.ts";
-import type { DiscordRest } from "./rest.ts";
+import type { DiscordRest, OutboundAttachment } from "./rest.ts";
 import { chunkMessage, RestError } from "./rest.ts";
 import { renderHear } from "./canticle/hear.ts";
 import {
@@ -202,6 +204,67 @@ function stringArg(
     throw new Error(`${name} must be a string`);
   }
   return String(value);
+}
+
+const MAX_OUTBOUND_ATTACHMENTS = 10;
+
+function attachmentsArg(
+  args: Record<string, unknown>,
+  maxBytes: number,
+): OutboundAttachment[] {
+  const value = args.attachments;
+  if (value === undefined || value === null) {
+    return [];
+  }
+  if (!Array.isArray(value) || value.length > MAX_OUTBOUND_ATTACHMENTS) {
+    throw new Error(
+      `attachments must be an array of at most ${MAX_OUTBOUND_ATTACHMENTS} local file paths`,
+    );
+  }
+  const files: OutboundAttachment[] = [];
+  let total = 0;
+  for (const item of value) {
+    if (typeof item !== "string" || item.length === 0) {
+      throw new Error("each attachments item must be a local file path string");
+    }
+    const path = resolve(item);
+    let stat;
+    try {
+      stat = lstatSync(path);
+    } catch (error) {
+      throw new Error(
+        `attachment not readable: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    if (!stat.isFile()) {
+      throw new Error(`attachment is not a regular file: ${path}`);
+    }
+    if (stat.size > maxBytes) {
+      throw new Error(
+        `attachment is ${stat.size} bytes; the limit is ${maxBytes} (limits.maxAttachmentBytes)`,
+      );
+    }
+    total += stat.size;
+    if (total > maxBytes) {
+      throw new Error(
+        `attachments total ${total} bytes; the limit is ${maxBytes} (limits.maxAttachmentBytes)`,
+      );
+    }
+    let bytes: Buffer;
+    try {
+      bytes = readFileSync(path);
+    } catch (error) {
+      throw new Error(
+        `attachment not readable: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    const name = basename(path);
+    if (!name || name.length > 255 || /[/\\\0]/u.test(name)) {
+      throw new Error(`attachment filename is invalid: ${name}`);
+    }
+    files.push({ name, bytes: new Uint8Array(bytes) });
+  }
+  return files;
 }
 
 const SNOWFLAKE = /^\d{1,25}$/u;
@@ -1672,7 +1735,14 @@ export class Daemon {
     switch (tool) {
       case "reply": {
         const { chatId, ear } = this.requireChat(args);
-        const text = stringArg(args, "text", true);
+        const text = stringArg(args, "text") ?? "";
+        const attachments = attachmentsArg(
+          args,
+          this.config.limits.maxAttachmentBytes,
+        );
+        if (text === "" && attachments.length === 0) {
+          throw new Error("text or attachments is required");
+        }
         const replyTo = snowflakeArg(args, "reply_to");
         const horizon = this.seenHorizon(client, ear, chatId, args);
         // Superseded sessions included; null for a script or a tools-only shim.
@@ -1682,6 +1752,7 @@ export class Daemon {
           text,
           replyTo,
           sessionEar,
+          attachments,
         );
         this.markSeenThrough(client, ear, chatId, horizon);
         this.store.increment("replies_sent");
@@ -2165,10 +2236,20 @@ export class Daemon {
     text: string,
     replyTo: string | undefined,
     sessionEar: string | null,
+    attachments: OutboundAttachment[] = [],
   ): Promise<{ ids: string[]; earlier: number[] }> {
     const chunks = chunkMessage(text);
+    const attachmentKey = createHash("sha256");
+    for (const file of attachments) {
+      attachmentKey.update(file.name);
+      attachmentKey.update("\0");
+      attachmentKey.update(file.bytes);
+      attachmentKey.update("\0");
+    }
     const key = createHash("sha256")
-      .update(`${chatId}\n${replyTo ?? ""}\n${text}`)
+      .update(
+        `${chatId}\n${replyTo ?? ""}\n${text}\n${attachmentKey.digest("hex")}`,
+      )
       .digest("hex");
     const id = this.store.resumeReply(
       key,
@@ -2194,6 +2275,7 @@ export class Daemon {
             index === 0 ? replyTo : undefined,
             sessionEar,
             reply,
+            index === 0 ? attachments : [],
           ),
         );
       } catch (error) {
@@ -2226,14 +2308,29 @@ export class Daemon {
     replyTo: string | undefined,
     sessionEar: string | null,
     reply: ReplyPart,
+    attachments: OutboundAttachment[] = [],
   ): Promise<string> {
+    const attachmentKey = createHash("sha256");
+    for (const file of attachments) {
+      attachmentKey.update(file.name);
+      attachmentKey.update("\0");
+      attachmentKey.update(file.bytes);
+      attachmentKey.update("\0");
+    }
     const key = createHash("sha256")
-      .update(`${chatId}\n${replyTo ?? ""}\n${reply.part}\n${content}`)
+      .update(
+        `${chatId}\n${replyTo ?? ""}\n${reply.part}\n${content}\n${attachmentKey.digest("hex")}`,
+      )
       .digest("hex");
+    const preview =
+      content ||
+      (attachments.length > 0
+        ? `[attachment-only: ${attachments.map((file) => file.name).join(", ")}]`
+        : "");
     const intent = this.store.beginSend(
       key,
       chatId,
-      content,
+      preview,
       randomBytes(10).toString("hex"),
       SEND_DEDUPE_WINDOW_MS,
       sessionEar,
@@ -2246,6 +2343,7 @@ export class Daemon {
         content,
         replyTo,
         intent.nonce,
+        attachments,
       );
       if (!this.stopped) {
         this.store.completeSend(intent.nonce, sent.id, chatId);

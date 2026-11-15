@@ -173,11 +173,11 @@ claude --resume <session id> --dangerously-load-development-channels server:fron
 | Pause pushes                | Set `"paused": true` in the config; it reloads live                                 |
 | Read what Claude missed     | Claude calls `inbox`; everything stays in SQLite until the retention window expires |
 | Logs                        | JSON lines on the daemon's stderr. Message text and tokens are redacted.            |
-| Post from a script          | `node src/cli.ts send --chat <id> "<text>"`, below                                  |
+| Post from a script          | `node src/cli.ts send --chat <id> [--attachment <path> …] "<text>"`, below          |
 | Letters across a compaction | `leave_letter`, then a `SessionStart` hook running `release --hook`, below          |
 
-**Posting from a script.** `frond-ear send --chat <id> <text…>` posts the text as the daemon's
-bot, for scripts such as a watchdog that posts an outage alert when a host goes down. It finds
+**Posting from a script.** `frond-ear send --chat <id> [--attachment <path> …] [--] [<text…>]` posts text and/or local regular files as the daemon's
+bot, for scripts such as a watchdog that posts an outage alert or report. It finds
 the daemon the way `status` does: `FROND_EAR_SOCKET` (default
 `$XDG_RUNTIME_DIR/frond-ear/daemon.sock`), or `FROND_EAR_TCP` with `FROND_EAR_TOKEN_FILE`, never
 `FROND_EAR_CONFIG`. It goes through the daemon's `reply` tool, so the daemon keeps the token, sends

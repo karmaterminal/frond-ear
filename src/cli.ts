@@ -52,8 +52,8 @@ usage:
   frond-ear daemon [--dry-run]        run the gateway daemon (config: FROND_EAR_CONFIG, default ./frond-ear.json)
   frond-ear shim                      run the Claude Code channel shim (stdio MCP; launched by Claude Code)
   frond-ear status                    print daemon status as JSON
-  frond-ear send --chat <id> <text…>  post text as the daemon's bot, from a script (e.g. an alert); only to
-                                      chats an ear serves; marks nothing seen; exit 0 once Discord confirmed it
+  frond-ear send --chat <id> [--attachment <path> …] [--] [<text…>]  post text and/or local files as the
+                                      daemon's bot, from a script; only to chats an ear serves; marks nothing seen
   frond-ear copilot-extension --ear <name> [--dir <path>]
                                       install the Copilot CLI extension for an ear
                                       (default dir $COPILOT_HOME/extensions/frond-ear; run copilot --experimental)
@@ -130,7 +130,7 @@ async function runDaemon(argv: string[]): Promise<void> {
         // (the structured logger redacts message text by design).
         (call) =>
           process.stderr.write(
-            `dry-run ${call.method} → ${call.channelId}${call.replyTo ? ` (reply to ${call.replyTo})` : ""}${call.emoji ? ` ${call.emoji}` : ""}${call.content ? `:\n${call.content}` : ""}\n`,
+            `dry-run ${call.method} → ${call.channelId}${call.replyTo ? ` (reply to ${call.replyTo})` : ""}${call.emoji ? ` ${call.emoji}` : ""}${call.attachments && call.attachments.length > 0 ? ` [attachments ${call.attachments.map((file) => `${file.name} (${file.size} bytes)`).join(", ")}]` : ""}${call.content ? `:\n${call.content}` : ""}\n`,
           ),
       )
     : new HttpDiscordRest({ token, apiBase: runtime.apiBase });

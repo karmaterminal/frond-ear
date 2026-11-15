@@ -26,7 +26,8 @@ import {
 
 const CLI = join(import.meta.dirname, "..", "src", "cli.ts");
 const UNBOUND = "123456789012345678";
-const USAGE_LINE = /usage: frond-ear send --chat <id> \[--\] <text…>/u;
+const USAGE_LINE =
+  /usage: frond-ear send --chat <id> \[--attachment <path> …\] \[--\] \[<text…>\]/u;
 
 interface Sent {
   code: number;
@@ -109,6 +110,31 @@ test("send posts the text to a chat an ear serves, as one reply, and prints the 
     assert.equal(dashed.code, 0, dashed.stderr);
     assert.equal(h.rest.calls[1]?.channelId, ROOM);
     assert.equal(h.rest.calls[1]?.content, "-5 min idle");
+  });
+});
+
+test("send accepts repeated --attachment flags, text or attachment-only", async () => {
+  await withDaemon(async (h, env) => {
+    const file = join(h.directory, "report.txt");
+    writeFileSync(file, "hello from a report");
+
+    const withText = await send(
+      ["--chat", CHANNEL, "--attachment", file, "report follows"],
+      env,
+    );
+    assert.equal(withText.code, 0, withText.stderr);
+    assert.deepEqual(h.rest.calls.at(-1)?.attachments, [
+      { name: "report.txt", size: Buffer.byteLength("hello from a report") },
+    ]);
+
+    const attachmentOnly = await send(
+      ["--chat", CHANNEL, "--attachment", file],
+      env,
+    );
+    assert.equal(attachmentOnly.code, 0, attachmentOnly.stderr);
+    assert.deepEqual(h.rest.calls.at(-1)?.attachments, [
+      { name: "report.txt", size: Buffer.byteLength("hello from a report") },
+    ]);
   });
 });
 

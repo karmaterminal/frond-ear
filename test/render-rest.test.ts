@@ -228,7 +228,7 @@ test("the reply description says what an identical re-send of an unconfirmed rep
   const reply = TOOLS.find((tool) => tool.name === "reply");
   assert.match(
     reply?.description ?? "",
-    /re-sending the same text and reply_to within 5 minutes of the first try posts only what did not go out \(the error says how long is left\); after that, every part posts again\./u,
+    /re-sending the same text, attachments and reply_to within 5 minutes of the first try posts only what did not go out \(the error says how long is left\); after that, every part posts again\./u,
   );
 });
 
@@ -285,6 +285,39 @@ test("REST retries 429 with retry_after and sends a bot-authorised request", asy
     parse: ["users"],
     replied_user: false,
   });
+});
+
+test("REST sends multipart payload_json and named file parts", async () => {
+  const { fetch, requests } = fakeFetch([
+    { status: 200, body: { id: "1000" } },
+  ]);
+  const rest = new HttpDiscordRest({
+    token: "fixture-token",
+    apiBase: "https://discord.example/api/v10",
+    fetch,
+  });
+  const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47]);
+  assert.deepEqual(
+    await rest.sendMessage(CHANNEL, "see file", undefined, "nonce", [
+      { name: "image.png", bytes },
+    ]),
+    { id: "1000" },
+  );
+  const form = requests[0]?.init.body;
+  assert.ok(form instanceof FormData);
+  const payloadBlob = form.get("payload_json");
+  assert.ok(payloadBlob instanceof Blob);
+  const payload = JSON.parse(await payloadBlob.text()) as Record<
+    string,
+    unknown
+  >;
+  assert.equal(payload.content, "see file");
+  assert.deepEqual(payload.attachments, [{ id: 0, filename: "image.png" }]);
+  assert.equal((payload as { nonce?: string }).nonce, "nonce");
+  const file = form.get("files[0]");
+  assert.ok(file instanceof Blob);
+  assert.equal((file as File).name, "image.png");
+  assert.deepEqual(new Uint8Array(await file.arrayBuffer()), bytes);
 });
 
 test("REST errors carry status and code but never the token", async () => {
