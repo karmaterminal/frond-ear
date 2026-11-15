@@ -8,7 +8,8 @@ import { parseArgs } from "node:util";
 import { DaemonTimeoutError, request } from "./client.ts";
 import type { Io } from "./onboard.ts";
 
-const USAGE = "usage: frond-ear send --chat <id> [--] <text…>";
+const USAGE =
+  "usage: frond-ear send --chat <id> [--file <absolute path>]… [--] [text…]";
 /**
  * Long enough for Discord's rate-limit retries (the daemon's REST client retries a 429 up
  * to three times, each after Discord's retry_after); short enough that a wedged daemon fails
@@ -28,14 +29,19 @@ export async function runSend(
   timeoutMs = SEND_TIMEOUT_MS,
 ): Promise<number> {
   let chats: string[];
+  let files: string[];
   let text: string;
   try {
     const { values, positionals } = parseArgs({
       args: argv,
       allowPositionals: true,
-      options: { chat: { type: "string", multiple: true } },
+      options: {
+        chat: { type: "string", multiple: true },
+        file: { type: "string", multiple: true },
+      },
     });
     chats = values.chat ?? [];
+    files = values.file ?? [];
     text = positionals.join(" ");
   } catch (error) {
     io.stderr.write(
@@ -50,16 +56,20 @@ export async function runSend(
     );
     return 2;
   }
-  if (!chat || text.trim() === "") {
+  if (!chat || (text.trim() === "" && files.length === 0)) {
     io.stderr.write(
-      `frond-ear send: --chat and message text are required\n${USAGE}\n`,
+      `frond-ear send: --chat and message text or --file are required\n${USAGE}\n`,
     );
     return 2;
   }
   let result: { ok: boolean; text: string };
   try {
     result = await request(
-      { type: "call", tool: "reply", args: { chat_id: chat, text } },
+      {
+        type: "call",
+        tool: "reply",
+        args: { chat_id: chat, text, ...(files.length > 0 ? { files } : {}) },
+      },
       io.env,
       timeoutMs,
     );

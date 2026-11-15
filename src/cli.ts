@@ -130,7 +130,7 @@ async function runDaemon(argv: string[]): Promise<void> {
         // (the structured logger redacts message text by design).
         (call) =>
           process.stderr.write(
-            `dry-run ${call.method} → ${call.channelId}${call.replyTo ? ` (reply to ${call.replyTo})` : ""}${call.emoji ? ` ${call.emoji}` : ""}${call.content ? `:\n${call.content}` : ""}\n`,
+            `dry-run ${call.method} → ${call.channelId}${call.replyTo ? ` (reply to ${call.replyTo})` : ""}${call.emoji ? ` ${call.emoji}` : ""}${call.files ? ` [files: ${call.files.map((file) => `${file.name} ${file.size} B`).join(", ")}]` : ""}${call.content ? `:\n${call.content}` : ""}\n`,
           ),
       )
     : new HttpDiscordRest({ token, apiBase: runtime.apiBase });
@@ -145,6 +145,14 @@ async function runDaemon(argv: string[]): Promise<void> {
     rest,
     logger,
     attachmentsDir: runtime.attachmentsPath,
+    protectedPaths: [
+      runtime.configPath,
+      runtime.databasePath,
+      `${runtime.databasePath}-wal`,
+      `${runtime.databasePath}-shm`,
+      ...(env.DISCORD_BOT_TOKEN_FILE ? [env.DISCORD_BOT_TOKEN_FILE] : []),
+      ...(env.FROND_EAR_TOKEN_FILE ? [env.FROND_EAR_TOKEN_FILE] : []),
+    ],
     allowInject: runtime.allowInject,
     ...(sharedToken ? { token: sharedToken } : {}),
     gatewayStatus: () =>

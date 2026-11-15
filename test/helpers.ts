@@ -201,6 +201,8 @@ export function harness(
     token?: string;
     /** Channel history, newest first, for fetch_messages and the read-back. */
     history?: (channelId: string, limit: number) => DiscordMessage[];
+    /** Paths a reply's files never include (the real daemon passes its own state). */
+    protectedPaths?: string[];
   } = {},
 ): Harness {
   const clock = new FakeClock();
@@ -226,6 +228,9 @@ export function harness(
     attachmentsDir: join(directory, "attachments"),
     ...(options.env ? { env: options.env } : {}),
     ...(options.token ? { token: options.token } : {}),
+    ...(options.protectedPaths
+      ? { protectedPaths: options.protectedPaths }
+      : {}),
   });
   let callId = 0;
   const flush = () => new Promise<void>((resolve) => setImmediate(resolve));

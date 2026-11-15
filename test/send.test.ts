@@ -26,7 +26,8 @@ import {
 
 const CLI = join(import.meta.dirname, "..", "src", "cli.ts");
 const UNBOUND = "123456789012345678";
-const USAGE_LINE = /usage: frond-ear send --chat <id> \[--\] <text…>/u;
+const USAGE_LINE =
+  /usage: frond-ear send --chat <id> \[--file <absolute path>\]… \[--\] \[text…\]/u;
 
 interface Sent {
   code: number;
@@ -441,4 +442,44 @@ test("the CLI lists send where seat-pulse looks for it, and posts through a dry-
   const usage = await run(["send", "--chat", CHANNEL], env);
   assert.equal(usage.code, 2);
   assert.match(usage.stderr, USAGE_LINE);
+});
+
+test("send --file attaches files (frond-ear#99); a file alone needs no text", async () => {
+  const box = temp();
+  const file = join(box, "alert.txt");
+  writeFileSync(file, "tmux gone\n");
+  const config = testConfig({
+    ears: {
+      scribe: {
+        target: "claude-channel",
+        dms: true,
+        attachCanary: false,
+        channels: { [CHANNEL]: { mode: "mentions" } },
+        sendFileRoots: [box],
+      },
+    },
+  });
+  try {
+    await withDaemon(async (h, env) => {
+      const sent = await send(
+        ["--chat", CHANNEL, "--file", file, "see file"],
+        env,
+      );
+      assert.equal(sent.code, 0, sent.stderr);
+      assert.equal(h.rest.calls[0]?.content, "see file");
+      assert.equal(h.rest.calls[0]?.files?.[0]?.name, "alert.txt");
+      const bare = await send(["--chat", CHANNEL, "--file", file], env);
+      assert.equal(bare.code, 0, bare.stderr);
+      assert.equal(h.rest.calls[1]?.content, "");
+      const refused = await send(["--chat", CHANNEL, "--file", CLI], env);
+      assert.equal(refused.code, 1);
+      assert.match(
+        refused.stderr,
+        /is not under any of ears\.scribe\.sendFileRoots/u,
+      );
+      assert.equal(h.rest.calls.length, 2);
+    }, config);
+  } finally {
+    rmSync(box, { recursive: true, force: true });
+  }
 });

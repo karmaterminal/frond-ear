@@ -27,6 +27,11 @@ export interface EarConfig {
   attachCanary: boolean;
   /** Operator-authored text appended to the channel instructions. */
   instructions: string;
+  /**
+   * Absolute directories a reply's `files` must resolve under (frond-ear#99). Empty, the
+   * default: this ear sends no files.
+   */
+  sendFileRoots: string[];
 }
 
 export interface Config {
@@ -55,6 +60,8 @@ export interface Config {
     maxNotificationChars: number;
     /** Largest attachment `fetch_attachment` will download. */
     maxAttachmentBytes: number;
+    /** Total bytes of the files one reply may carry (Discord's own cap is 10 MiB). */
+    maxSendFileBytes: number;
     maxPendingPerEar: number;
     retentionMs: number;
     /**
@@ -558,6 +565,18 @@ export function parseConfig(candidate: unknown): Config {
     if (dmMode !== "mentions" && dmMode !== "silent") {
       throw new Error(`ears.${name}.dmMode must be mentions or silent`);
     }
+    const sendFileRoots = value.sendFileRoots ?? [];
+    if (
+      !Array.isArray(sendFileRoots) ||
+      sendFileRoots.some(
+        (root) =>
+          typeof root !== "string" || !root.startsWith("/") || root === "/",
+      )
+    ) {
+      throw new Error(
+        `ears.${name}.sendFileRoots must be an array of absolute directories (not /)`,
+      );
+    }
     ears[name] = {
       target: target as EarTarget,
       channels,
@@ -565,6 +584,7 @@ export function parseConfig(candidate: unknown): Config {
       dmMode,
       attachCanary: value.attachCanary !== false,
       instructions: (value.instructions as string | undefined) ?? "",
+      sendFileRoots: [...(sendFileRoots as string[])],
     };
   }
 
@@ -651,6 +671,12 @@ export function parseConfig(candidate: unknown): Config {
         limitsInput.maxAttachmentBytes,
         8 * 1024 * 1024,
         "limits.maxAttachmentBytes",
+        1,
+      ),
+      maxSendFileBytes: integer(
+        limitsInput.maxSendFileBytes,
+        10 * 1024 * 1024,
+        "limits.maxSendFileBytes",
         1,
       ),
       maxPendingPerEar: integer(
