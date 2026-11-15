@@ -366,7 +366,11 @@ test("precompact --hook ignores --session (stdin names the compacting session) a
     assert.equal(bad.stdout, "");
     assert.notEqual(bad.stderr, "");
     const badManual = await run(["precompact", "--bogus"], env, "");
-    assert.equal(badManual.code, 2);
+    assert.equal(
+      badManual.code,
+      1,
+      "never exit 2: that code blocks a compaction",
+    );
   } finally {
     server.close();
     h.dispose();

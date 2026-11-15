@@ -336,11 +336,12 @@ async function runPrecompact(argv: string[]): Promise<void> {
       },
     }));
   } catch (error) {
-    // A hook's bad arguments must not block the compaction (exit 2) or fail it.
+    // Bad arguments must never block a compaction: exit 2 is the code that does,
+    // so a PreCompact entry misconfigured without --hook exits 1, never 2.
     process.stderr.write(
       `frond-ear precompact: ${error instanceof Error ? error.message : String(error)}\n`,
     );
-    process.exitCode = hookRequested ? 0 : 2;
+    process.exitCode = hookRequested ? 0 : 1;
     return;
   }
   const hook = values.hook === true;
