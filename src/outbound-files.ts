@@ -87,6 +87,13 @@ export async function loadOutboundFiles(
   const roots = (
     await Promise.all(policy.roots.map((root) => resolved(root)))
   ).filter((root): root is string => root !== undefined);
+  // Checked after resolution: a root that is, or links to, `/` would allow every
+  // file on the host. Fail closed for the whole reply rather than skip the root.
+  if (roots.some((root) => root === sep)) {
+    throw new Error(
+      `ears.${policy.ear}.sendFileRoots has a root that resolves to /; refusing to send files`,
+    );
+  }
   const guarded = (
     await Promise.all(policy.protectedPaths.map((path) => resolved(path)))
   ).filter((path): path is string => path !== undefined);

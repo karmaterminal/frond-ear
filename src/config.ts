@@ -570,11 +570,15 @@ export function parseConfig(candidate: unknown): Config {
       !Array.isArray(sendFileRoots) ||
       sendFileRoots.some(
         (root) =>
-          typeof root !== "string" || !root.startsWith("/") || root === "/",
+          typeof root !== "string" ||
+          !root.startsWith("/") ||
+          // `..` could climb to `/` (frond-ear#100 review: "/tmp/.." passed).
+          root.split("/").includes("..") ||
+          root.replace(/\/+$/u, "") === "",
       )
     ) {
       throw new Error(
-        `ears.${name}.sendFileRoots must be an array of absolute directories (not /)`,
+        `ears.${name}.sendFileRoots must be an array of absolute directories (not /, no ..)`,
       );
     }
     ears[name] = {

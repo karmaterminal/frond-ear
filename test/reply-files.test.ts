@@ -290,7 +290,16 @@ test("config: sendFileRoots defaults to off and must be absolute directories; ma
   const parsed = parseConfig(base);
   assert.deepEqual(parsed.ears.scribe?.sendFileRoots, []);
   assert.equal(parsed.limits.maxSendFileBytes, 10 * 1024 * 1024);
-  for (const bad of [["relative"], ["/"], "/home", [1]]) {
+  for (const bad of [
+    ["relative"],
+    ["/"],
+    ["//"],
+    ["/tmp/.."],
+    ["/tmp/../"],
+    ["/a/../../etc"],
+    "/home",
+    [1],
+  ]) {
     assert.throws(
       () =>
         parseConfig({
@@ -365,4 +374,27 @@ test("REST: files go as multipart, payload_json names each attachment, a 429 ret
     (last?.headers as Record<string, string>)["Content-Type"],
     "application/json",
   );
+});
+
+test("a root that resolves to / (a symlink to /) refuses the reply; nothing posts", async () => {
+  const box = sandbox();
+  const slash = join(box.base, "slash");
+  symlinkSync("/", slash);
+  // Config accepts the path (no "..", not "/"); only resolution shows it is /.
+  const h = harness(configWithRoots([slash]));
+  try {
+    const shim = h.attach("scribe");
+    const target = box.file(box.root, "any.txt", "x");
+    const result = await reply(shim, {
+      chat_id: CHANNEL,
+      text: "t",
+      files: [target],
+    });
+    assert.equal(result.ok, false);
+    assert.match(result.text, /has a root that resolves to \/; refusing/u);
+    assert.equal(h.rest.calls.length, 0);
+  } finally {
+    h.dispose();
+    box.dispose();
+  }
 });
