@@ -273,7 +273,7 @@ test("--hook never blocks: bad stdin, a missing transcript, bad bands all print 
   }
 });
 
-test("without --hook, a bad flag is still a usage error", async () => {
+test("without --hook, a bad flag is still a usage error, exit 1 (never 2, Claude Code's blocking code)", async () => {
   for (const argv of [
     ["--bands"],
     ["--nope"],
@@ -281,7 +281,7 @@ test("without --hook, a bad flag is still a usage error", async () => {
     [],
   ]) {
     const result = await run(argv, "", {});
-    assert.equal(result.code, 2, argv.join(" "));
+    assert.equal(result.code, 1, argv.join(" "));
     assert.notEqual(result.stderr, "", `${argv.join(" ")}: says why`);
   }
 });

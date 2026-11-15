@@ -262,15 +262,30 @@ function runShim(): void {
  * context), and the exit code is 0, so a down daemon never blocks a session start.
  */
 async function runRelease(argv: string[]): Promise<void> {
-  const { values } = parseArgs({
-    args: argv,
-    options: {
-      ear: { type: "string" },
-      source: { type: "string" },
-      session: { type: "string" },
-      hook: { type: "boolean" },
-    },
-  });
+  let values: {
+    ear?: string;
+    source?: string;
+    session?: string;
+    hook?: boolean;
+  };
+  try {
+    ({ values } = parseArgs({
+      args: argv,
+      options: {
+        ear: { type: "string" },
+        source: { type: "string" },
+        session: { type: "string" },
+        hook: { type: "boolean" },
+      },
+    }));
+  } catch (error) {
+    // --hook always exits 0, bad arguments included; without it, 1 (never 2).
+    process.stdout.write(
+      `frond-ear: letters not released (${error instanceof Error ? error.message : String(error)})\n`,
+    );
+    process.exitCode = argv.includes("--hook") ? 0 : 1;
+    return;
+  }
   const hook = values.hook === true;
   let source = values.source;
   let sessionId = values.session;
@@ -675,7 +690,9 @@ async function main(): Promise<void> {
       return;
     default:
       process.stderr.write(`unknown command ${command}\n\n${USAGE}`);
-      process.exitCode = 2;
+      // 1, never 2: frond-ear runs inside Claude Code hooks, where exit 2 blocks
+      // (refuses a prompt, blocks a compaction); a typo'd subcommand must not.
+      process.exitCode = 1;
   }
 }
 

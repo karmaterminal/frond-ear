@@ -325,7 +325,9 @@ export function runPressure(argv: string[], io: PressureIo): number {
     io.stderr.write(
       `${error instanceof Error ? error.message : String(error)}\n`,
     );
-    return 2;
+    // 1, never 2, even without --hook: exit 2 is Claude Code's blocking code in
+    // every hook event, so a misconfigured hook line must not be able to block.
+    return 1;
   }
   let bands: number[];
   try {
@@ -337,14 +339,14 @@ export function runPressure(argv: string[], io: PressureIo): number {
     io.stderr.write(
       `${error instanceof Error ? error.message : String(error)}\n`,
     );
-    return 2;
+    return 1;
   }
   if (!values.hook) {
     if (!values.transcript) {
       io.stderr.write(
         "usage: frond-ear pressure --transcript <path> [--bands 150k,200k,…]\n",
       );
-      return 2;
+      return 1;
     }
     const tokens = latestContextTokens(readTail(values.transcript));
     if (tokens === undefined) {

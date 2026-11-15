@@ -377,3 +377,27 @@ test("precompact --hook ignores --session (stdin names the compacting session) a
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test("no frond-ear command a hook can run exits 2 (Claude Code's blocking code) on bad input", async () => {
+  const env = {
+    ...process.env,
+    FROND_EAR_SOCKET: "/nonexistent/frond-ear.sock",
+  };
+  const cases: Array<[string[], number]> = [
+    [["precompat", "--ear", "x", "--hook"], 1],
+    [["nosuchcommand"], 1],
+    [["precompact", "--bogus"], 1],
+    [["precompact", "--hook", "--bogus"], 0],
+    [["precompact", "--ear", "x", "--hook"], 0],
+    [["pressure", "--nope"], 1],
+    [["pressure", "--hook", "--nope"], 0],
+    [["pressure"], 1],
+    [["release", "--bogus"], 1],
+    [["release", "--hook", "--bogus"], 0],
+    [["release", "--ear", "x", "--hook"], 0],
+  ];
+  for (const [args, want] of cases) {
+    const result = await run(args, env, "{}");
+    assert.equal(result.code, want, `${args.join(" ")}: ${result.stderr}`);
+  }
+});
