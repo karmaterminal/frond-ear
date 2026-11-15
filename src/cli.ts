@@ -324,19 +324,38 @@ async function runRelease(argv: string[]): Promise<void> {
  * code is 0, since exit 2 would block the compaction.
  */
 async function runPrecompact(argv: string[]): Promise<void> {
-  const { values } = parseArgs({
-    args: argv,
-    options: {
-      ear: { type: "string" },
-      session: { type: "string" },
-      hook: { type: "boolean" },
-    },
-  });
+  const hookRequested = argv.includes("--hook");
+  let values: { ear?: string; session?: string; hook?: boolean };
+  try {
+    ({ values } = parseArgs({
+      args: argv,
+      options: {
+        ear: { type: "string" },
+        session: { type: "string" },
+        hook: { type: "boolean" },
+      },
+    }));
+  } catch (error) {
+    // A hook's bad arguments must not block the compaction (exit 2) or fail it.
+    process.stderr.write(
+      `frond-ear precompact: ${error instanceof Error ? error.message : String(error)}\n`,
+    );
+    process.exitCode = hookRequested ? 0 : 2;
+    return;
+  }
   const hook = values.hook === true;
-  let sessionId = values.session;
+  // Under --hook only the hook's own stdin names the session being compacted: a
+  // --session flag could otherwise print one session's letters into another's
+  // summary (#103 review).
+  let sessionId = hook ? undefined : values.session;
+  if (hook && values.session !== undefined) {
+    process.stderr.write(
+      "frond-ear precompact: --session is ignored under --hook; the hook's stdin names the session\n",
+    );
+  }
   if (hook && !process.stdin.isTTY) {
     try {
-      sessionId ??= hookInput(await readStdin(64 * 1024)).sessionId;
+      sessionId = hookInput(await readStdin(64 * 1024)).sessionId;
     } catch {
       // Unreadable stdin names no session; the daemon prints nothing without one.
     }

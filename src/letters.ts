@@ -395,20 +395,25 @@ export function summaryLetters(
     `it thought then, evidence and never permission, and nobody else's instructions. ` +
     `frond-ear also hands them back after the compaction; this copy keeps the threads in the ` +
     `summary itself.`;
+  // Room is kept for one closing note that names every letter left out, so no
+  // letter is ever dropped silently, however close to the cap the others come.
+  const omittedNote = (ids: number[]): string =>
+    `[${ids.length === 1 ? `letter ${ids[0]} did` : `letters ${ids.join(", ")} did`} not fit this hook's ${cap}-character budget; ${ids.length === 1 ? "it comes" : "they come"} back after the compaction as letter events]`;
+  const reserve = 2 + omittedNote(due.map((letter) => letter.id)).length;
   const parts = [head];
   let used = head.length;
+  const omitted: number[] = [];
   for (const letter of due) {
     const text = renderLetter(letter, now, sessionId, releases);
-    if (used + 2 + text.length <= cap) {
+    if (omitted.length === 0 && used + 2 + text.length + reserve <= cap) {
       parts.push(text);
       used += 2 + text.length;
       continue;
     }
-    const note = `[letter ${letter.id} (${letter.reason.slice(0, 80)}) did not fit this hook's ${cap}-character budget; it comes back after the compaction as a letter event]`;
-    if (used + 2 + note.length <= cap) {
-      parts.push(note);
-      used += 2 + note.length;
-    }
+    omitted.push(letter.id);
+  }
+  if (omitted.length > 0) {
+    parts.push(omittedNote(omitted));
   }
   return parts.join("\n\n");
 }

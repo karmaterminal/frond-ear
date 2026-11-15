@@ -171,8 +171,10 @@ test("summaryLetters stays under its cap: the newest whole, older ones named as 
     );
     assert.ok(text.length <= 2_500, `${text.length} > cap`);
     assert.ok(text.includes("3".repeat(1_500)), "the newest letter whole");
-    assert.match(text, /letter \d+ \(thread 2\) did not fit/u);
-    assert.match(text, /letter \d+ \(thread 1\) did not fit/u);
+    assert.match(
+      text,
+      /\[letters \d+, \d+ did not fit this hook's 2500-character budget/u,
+    );
     assert.ok(!text.includes("1".repeat(1_500)));
   } finally {
     h.dispose();
@@ -289,5 +291,85 @@ test("precompact leaves out a letter that has just expired, with no release in b
     assert.equal(result.text, "");
   } finally {
     h.dispose();
+  }
+});
+
+test("summaryLetters names every letter it leaves out, whatever the sizes near the cap (#103 review)", async () => {
+  for (let size = 600; size <= 2_300; size += 85) {
+    const h = harness(testConfig(), { nonce: `pc-sz-${size}` });
+    try {
+      const shim = h.attach("scribe", { sessionId: SESSION });
+      const ids: number[] = [];
+      for (const body of [
+        `a${"x".repeat(300)}`,
+        `b${"y".repeat(300)}`,
+        `c${"z".repeat(size)}`,
+      ]) {
+        const left = await h.call(shim, "leave_letter", {
+          reason: `r-${body[0]}`,
+          body,
+        });
+        ids.push(Number(/letter (\d+) left/u.exec(left.text)?.[1]));
+        h.clock.advance(1_000);
+      }
+      const text = summaryLetters(
+        h.store,
+        "scribe",
+        SESSION,
+        h.clock.now(),
+        2_500,
+      );
+      assert.ok(text.length <= 2_500, `size ${size}: ${text.length} > cap`);
+      const note = /\[letters? ([\d, ]+) did not fit/u.exec(text)?.[1] ?? "";
+      const named = note.split(", ").filter(Boolean).map(Number);
+      for (const id of ids) {
+        const whole = text.includes(`[letter ${id} · left`);
+        assert.ok(
+          whole !== named.includes(id),
+          `size ${size}: letter ${id} whole=${whole} named=${named.includes(id)}`,
+        );
+      }
+    } finally {
+      h.dispose();
+    }
+  }
+});
+
+test("precompact --hook ignores --session (stdin names the compacting session) and exits 0 on bad arguments", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "frond-ear-pc2-"));
+  const socketPath = join(directory, "d.sock");
+  const h = harness();
+  const server = await listenUnix(h.daemon, socketPath);
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    await h.call(shim, "leave_letter", {
+      reason: "mine",
+      body: "holder's letter",
+    });
+    const env = { ...process.env, FROND_EAR_SOCKET: socketPath };
+    // stdin names OTHER (being compacted); --session names the holder. Nothing prints.
+    const spoof = await run(
+      ["precompact", "--ear", "scribe", "--hook", "--session", SESSION],
+      env,
+      JSON.stringify({ session_id: OTHER, hook_event_name: "PreCompact" }),
+    );
+    assert.equal(spoof.code, 0);
+    assert.equal(spoof.stdout, "");
+    assert.match(spoof.stderr, /--session is ignored under --hook/u);
+
+    const bad = await run(["precompact", "--hook", "--bogus"], env, "{}");
+    assert.equal(
+      bad.code,
+      0,
+      "bad hook arguments must not fail the compaction",
+    );
+    assert.equal(bad.stdout, "");
+    assert.notEqual(bad.stderr, "");
+    const badManual = await run(["precompact", "--bogus"], env, "");
+    assert.equal(badManual.code, 2);
+  } finally {
+    server.close();
+    h.dispose();
+    rmSync(directory, { recursive: true, force: true });
   }
 });
