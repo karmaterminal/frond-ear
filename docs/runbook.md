@@ -48,15 +48,16 @@ filename is git-ignored) and fill in the fields below.
 
 **Ears**
 
-| Field                      | Meaning                                                                                                                                                                                         |
-| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ears.<name>`              | One ear per session.                                                                                                                                                                            |
-| `ears.<name>.target`       | `claude-channel` (the default, which `init` writes) or `copilot-extension`. This runbook attaches Claude Code; the [README](../README.md#github-copilot-cli) has the Copilot CLI steps.         |
-| `ears.<name>.channels`     | Channel IDs to modes: `silent`, `mentions` (the default) or `room`. Per-channel `quietWindowMs`, `maxDelayMs` and `historyLimit` are optional. Threads inherit their parent channel's settings. |
-| `ears.<name>.dms`          | Whether this ear receives DMs from principals and peers.                                                                                                                                        |
-| `ears.<name>.dmMode`       | `mentions` (the default: every DM wakes the session) or `silent` (DMs are stored for `inbox` only).                                                                                             |
-| `ears.<name>.attachCanary` | Asks Claude to `ack` a nonce each time a session attaches. This proves the channel is actually registered, because a notification can otherwise be dropped with no error.                       |
-| `ears.<name>.instructions` | Extra text you write, appended to the channel instructions.                                                                                                                                     |
+| Field                       | Meaning                                                                                                                                                                                         |
+| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ears.<name>`               | One ear per session.                                                                                                                                                                            |
+| `ears.<name>.target`        | `claude-channel` (the default, which `init` writes) or `copilot-extension`. This runbook attaches Claude Code; the [README](../README.md#github-copilot-cli) has the Copilot CLI steps.         |
+| `ears.<name>.channels`      | Channel IDs to modes: `silent`, `mentions` (the default) or `room`. Per-channel `quietWindowMs`, `maxDelayMs` and `historyLimit` are optional. Threads inherit their parent channel's settings. |
+| `ears.<name>.dms`           | Whether this ear receives DMs from principals and peers.                                                                                                                                        |
+| `ears.<name>.dmMode`        | `mentions` (the default: every DM wakes the session) or `silent` (DMs are stored for `inbox` only).                                                                                             |
+| `ears.<name>.attachCanary`  | Asks Claude to `ack` a nonce each time a session attaches. This proves the channel is actually registered, because a notification can otherwise be dropped with no error.                       |
+| `ears.<name>.instructions`  | Extra text you write, appended to the channel instructions.                                                                                                                                     |
+| `ears.<name>.sendFileRoots` | Absolute directories a `reply`'s `files` may come from. Empty (the default): this ear sends no files. See **Sending files** below.                                                              |
 
 **Modes**
 
@@ -66,15 +67,30 @@ filename is git-ignored) and fill in the fields below.
 
 **Timing, loops and limits**
 
-| Field         | Meaning                                                                                                                                                                                                                                                                           |
-| ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `defaults`    | `quietWindowMs` sets how long the room must be quiet before a flush. `maxDelayMs` caps how long continuous chatter can delay one. `priorityQuietMs` is the short wait after a mention. `historyLimit` caps how much context is kept.                                              |
-| `botLoop`     | If more than `maxEvents` bot messages arrive within `windowMs` in one chat, bot messages stop waking the session for `cooldownMs`.                                                                                                                                                |
-| `ambientWake` | If more than `maxEvents` mention- or reply-driven wakes from ambient (non-principal, non-peer) users arrive within `windowMs` in one chat, further ones stop waking the session for `cooldownMs`. They are kept as context.                                                       |
-| `limits`      | Per-message and per-notification size caps, the per-ear pending cap, retention time, and how much is read back after an outage too long for Discord to resume the session: `catchUpMessages` per chat (50; 0 turns it off) in the `catchUpChats` most recently active chats (25). |
-| `paused`      | Kill switch. Messages are still ingested, but nothing is pushed.                                                                                                                                                                                                                  |
+| Field         | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| ------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `defaults`    | `quietWindowMs` sets how long the room must be quiet before a flush. `maxDelayMs` caps how long continuous chatter can delay one. `priorityQuietMs` is the short wait after a mention. `historyLimit` caps how much context is kept.                                                                                                                                                                                                                                                   |
+| `botLoop`     | If more than `maxEvents` bot messages arrive within `windowMs` in one chat, bot messages stop waking the session for `cooldownMs`.                                                                                                                                                                                                                                                                                                                                                     |
+| `ambientWake` | If more than `maxEvents` mention- or reply-driven wakes from ambient (non-principal, non-peer) users arrive within `windowMs` in one chat, further ones stop waking the session for `cooldownMs`. They are kept as context.                                                                                                                                                                                                                                                            |
+| `limits`      | Per-message and per-notification size caps, the per-ear pending cap, retention time, and how much is read back after an outage too long for Discord to resume the session: `catchUpMessages` per chat (50; 0 turns it off) in the `catchUpChats` most recently active chats (25). `maxAttachmentBytes` caps one `fetch_attachment` download (8 MiB); `maxSendFileBytes` caps the files one `reply` carries, in total (10 MiB, Discord's own limit for a bot without a boosted server). |
+| `paused`      | Kill switch. Messages are still ingested, but nothing is pushed.                                                                                                                                                                                                                                                                                                                                                                                                                       |
 
 Changes to the config take effect without a restart.
+
+**Sending files** (frond-ear#99). `reply` takes `files`, up to 10 absolute paths, and
+`frond-ear send` takes `--file` (repeatable). The daemon reads the files, so it decides what may
+leave the host, and refuses the whole reply, posting nothing, unless every file:
+
+- resolves, symlinks followed, under one of the ear's `sendFileRoots`;
+- has no dot-named file or directory between that root and itself (`.ssh`, `.env`, `.config`);
+- is not the daemon's own config, database (with its `-wal` and `-shm`) or token file;
+- is a regular file, and together they fit `limits.maxSendFileBytes`.
+
+The files ride on the last message of the reply, after the text, which may be empty. Their
+sha256 digests are part of the reply's identity: retrying the same text with the same files
+resumes a part-sent reply as before, while other files make a new reply with fresh nonces. The
+receipt names each file with its size and digest prefix. Give a seat only the roots it needs, such
+as its scratch and working directories; the dot rule is a backstop, not the boundary.
 
 **The session's own attention.** Configured modes are a _ceiling_. The attached session can narrow what it hears with the `set_attention` tool:
 

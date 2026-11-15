@@ -1,3 +1,4 @@
+import type { OutboundFile } from "./outbound-files.ts";
 import type { DiscordMessage } from "./types.ts";
 
 export const DISCORD_MESSAGE_LIMIT = 2_000;
@@ -6,13 +7,15 @@ export interface DiscordRest {
   /**
    * `nonce` is sent with `enforce_nonce`, so Discord returns the original
    * message instead of creating a second one when the same nonce is retried
-   * within its dedupe window.
+   * within its dedupe window. `files`, when given, go up as multipart attachments on
+   * this message (frond-ear#99).
    */
   sendMessage(
     channelId: string,
     content: string,
     replyTo?: string,
     nonce?: string,
+    files?: readonly OutboundFile[],
   ): Promise<{ id: string }>;
   addReaction(
     channelId: string,
@@ -110,6 +113,7 @@ export class HttpDiscordRest implements DiscordRest {
     method: string,
     path: string,
     body?: unknown,
+    form?: () => FormData,
   ): Promise<unknown> {
     const fetchImpl = this.options.fetch ?? globalThis.fetch;
     const sleep =
@@ -123,10 +127,15 @@ export class HttpDiscordRest implements DiscordRest {
           Authorization: `Bot ${this.options.token}`,
           "User-Agent":
             "DiscordBot (https://github.com/karmaterminal/frond-ear, 0.1.0)",
-          ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+          ...(body === undefined || form
+            ? {}
+            : { "Content-Type": "application/json" }),
         },
       };
-      if (body !== undefined) {
+      if (form) {
+        // A fresh form per attempt: fetch sets the multipart boundary itself.
+        init.body = form();
+      } else if (body !== undefined) {
         init.body = JSON.stringify(body);
       }
       const response = await fetchImpl(`${this.options.apiBase}${path}`, init);
@@ -167,6 +176,7 @@ export class HttpDiscordRest implements DiscordRest {
     content: string,
     replyTo?: string,
     nonce?: string,
+    files?: readonly OutboundFile[],
   ): Promise<{ id: string }> {
     const body: Record<string, unknown> = {
       content,
@@ -182,10 +192,27 @@ export class HttpDiscordRest implements DiscordRest {
         fail_if_not_exists: false,
       };
     }
+    const attached = files ?? [];
+    if (attached.length > 0) {
+      body.attachments = attached.map((file, index) => ({
+        id: index,
+        filename: file.name,
+      }));
+    }
     const result = (await this.request(
       "POST",
       `/channels/${seg(channelId)}/messages`,
       body,
+      attached.length > 0
+        ? () => {
+            const form = new FormData();
+            form.append("payload_json", JSON.stringify(body));
+            for (const [index, file] of attached.entries()) {
+              form.append(`files[${index}]`, new Blob([file.bytes]), file.name);
+            }
+            return form;
+          }
+        : undefined,
     )) as { id: string };
     return { id: result.id };
   }
@@ -295,6 +322,8 @@ export interface RecordedCall {
   content?: string;
   replyTo?: string;
   emoji?: string;
+  /** Names, sizes and digests of the files a send carried. */
+  files?: { name: string; size: number; sha256: string }[];
 }
 
 /** Dry-run and test double: records outbound calls, sends nothing. */
@@ -327,6 +356,7 @@ export class RecordingRest implements DiscordRest {
     content: string,
     replyTo?: string,
     nonce?: string,
+    files?: readonly OutboundFile[],
   ): Promise<{ id: string }> {
     // Mirror Discord's enforce_nonce: a repeated nonce returns the original.
     const existing = nonce
@@ -346,6 +376,15 @@ export class RecordingRest implements DiscordRest {
       messageId: id,
       content,
       ...(replyTo ? { replyTo } : {}),
+      ...(files && files.length > 0
+        ? {
+            files: files.map((file) => ({
+              name: file.name,
+              size: file.bytes.byteLength,
+              sha256: file.sha256,
+            })),
+          }
+        : {}),
     });
     return { id };
   }

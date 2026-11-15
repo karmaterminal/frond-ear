@@ -39,6 +39,11 @@ import {
   type CatchUpChat,
 } from "./render.ts";
 import type { DiscordRest } from "./rest.ts";
+import {
+  filesArg,
+  loadOutboundFiles,
+  type OutboundFile,
+} from "./outbound-files.ts";
 import { chunkMessage, RestError } from "./rest.ts";
 import { renderHear } from "./canticle/hear.ts";
 import {
@@ -83,6 +88,11 @@ export interface DaemonOptions {
   canticleHear?: (ear: string) => HearView;
   /** Directory for `fetch_attachment` (one subdirectory per ear). Absent: the tool is off. */
   attachmentsDir?: string;
+  /**
+   * The daemon's own files (config, database, token): a reply's `files` never include
+   * them, whatever an ear's sendFileRoots say (frond-ear#99).
+   */
+  protectedPaths?: string[];
   /**
    * The daemon's environment, for the commands its delivery warning prints (a Copilot
    * reinstall must reach this daemon's socket). Default: process.env.
@@ -330,6 +340,11 @@ function partNames(numbers: readonly number[]): string {
 function partsWere(numbers: readonly number[], what: string): string {
   const names = partNames(numbers);
   return `${names.charAt(0).toUpperCase()}${names.slice(1)} ${numbers.length === 1 ? "was" : "were"} ${what}`;
+}
+
+/** What a reply's files add to its identity: nothing when it carries none. */
+function fileIdentity(files: readonly OutboundFile[]): string {
+  return files.map((file) => `\nfile ${file.sha256} ${file.name}`).join("");
 }
 
 /** Whole minutes and seconds, rounded down: "4 minutes 59 seconds". */
@@ -1672,9 +1687,20 @@ export class Daemon {
     switch (tool) {
       case "reply": {
         const { chatId, ear } = this.requireChat(args);
-        const text = stringArg(args, "text", true);
+        const paths = filesArg(args.files);
+        const text =
+          paths.length === 0
+            ? stringArg(args, "text", true)
+            : (stringArg(args, "text") ?? "");
         const replyTo = snowflakeArg(args, "reply_to");
         const horizon = this.seenHorizon(client, ear, chatId, args);
+        // Read and checked before anything is posted: a refused file posts nothing.
+        const files = await loadOutboundFiles(paths, {
+          ear,
+          roots: this.config.ears[ear]?.sendFileRoots ?? [],
+          maxBytes: this.config.limits.maxSendFileBytes,
+          protectedPaths: this.options.protectedPaths ?? [],
+        });
         // Superseded sessions included; null for a script or a tools-only shim.
         const sessionEar = client.attachedAs ?? null;
         const { ids, earlier } = await this.sendReply(
@@ -1682,6 +1708,7 @@ export class Daemon {
           text,
           replyTo,
           sessionEar,
+          files,
         );
         this.markSeenThrough(client, ear, chatId, horizon);
         this.store.increment("replies_sent");
@@ -1689,9 +1716,13 @@ export class Daemon {
           earlier.length === 0
             ? ""
             : `; ${partNames(earlier.map((index) => index + 1))} had gone out on an earlier try and ${earlier.length === 1 ? "was" : "were"} not posted again`;
+        const carried =
+          files.length === 0
+            ? ""
+            : ` with ${files.length} file${files.length === 1 ? "" : "s"} (${files.map((file) => `${file.name} ${file.bytes.byteLength} B sha256 ${file.sha256.slice(0, 12)}`).join(", ")}) on the last message`;
         return this.withDeliveryWarning(
           client,
-          `sent ${ids.length} message${ids.length === 1 ? "" : "s"} to ${chatId} (id${ids.length === 1 ? "" : "s"} ${ids.join(", ")})${resumed}`,
+          `sent ${ids.length} message${ids.length === 1 ? "" : "s"} to ${chatId} (id${ids.length === 1 ? "" : "s"} ${ids.join(", ")})${carried}${resumed}`,
         );
       }
       case "react": {
@@ -2158,17 +2189,20 @@ export class Daemon {
    * identical retry of a reply that did not finish resumes it (#55): `earlier`
    * lists the parts Discord had already confirmed, which are not posted again,
    * and an unconfirmed part reuses its nonce. When a part fails, the error says
-   * which parts went out.
+   * which parts went out. `files` ride on the last part, so they follow the text;
+   * their digests are part of the reply's identity, so the same text with other
+   * files is a new reply, not a retry.
    */
   private async sendReply(
     chatId: string,
     text: string,
     replyTo: string | undefined,
     sessionEar: string | null,
+    files: readonly OutboundFile[] = [],
   ): Promise<{ ids: string[]; earlier: number[] }> {
     const chunks = chunkMessage(text);
     const key = createHash("sha256")
-      .update(`${chatId}\n${replyTo ?? ""}\n${text}`)
+      .update(`${chatId}\n${replyTo ?? ""}\n${text}${fileIdentity(files)}`)
       .digest("hex");
     const id = this.store.resumeReply(
       key,
@@ -2194,6 +2228,7 @@ export class Daemon {
             index === 0 ? replyTo : undefined,
             sessionEar,
             reply,
+            index === chunks.length - 1 ? files : [],
           ),
         );
       } catch (error) {
@@ -2226,9 +2261,12 @@ export class Daemon {
     replyTo: string | undefined,
     sessionEar: string | null,
     reply: ReplyPart,
+    files: readonly OutboundFile[] = [],
   ): Promise<string> {
     const key = createHash("sha256")
-      .update(`${chatId}\n${replyTo ?? ""}\n${reply.part}\n${content}`)
+      .update(
+        `${chatId}\n${replyTo ?? ""}\n${reply.part}\n${content}${fileIdentity(files)}`,
+      )
       .digest("hex");
     const intent = this.store.beginSend(
       key,
@@ -2246,6 +2284,7 @@ export class Daemon {
         content,
         replyTo,
         intent.nonce,
+        files,
       );
       if (!this.stopped) {
         this.store.completeSend(intent.nonce, sent.id, chatId);
