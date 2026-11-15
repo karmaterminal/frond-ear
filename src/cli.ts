@@ -62,6 +62,10 @@ usage:
                                       release an ear's letters (#88) to its attached session; for a
                                       SessionStart hook (matcher startup|compact): --hook reads the hook's
                                       JSON on stdin (session_id, source) and always exits 0
+  frond-ear precompact --ear <name> [--session <id>] [--hook]
+                                      print the session's unsettled letters (#102) as compaction-summary
+                                      instructions; for a PreCompact hook: --hook reads session_id on
+                                      stdin, prints nothing on any failure and always exits 0
   frond-ear pressure --hook [--bands 150k,200k,300k,450k,650k]
                                       context pressure for a PostToolUse / UserPromptSubmit hook: reads the
                                       transcript's latest token usage and adds one line to the session's
@@ -310,6 +314,75 @@ async function runRelease(argv: string[]): Promise<void> {
       `frond-ear: letters not released (${error instanceof Error ? error.message : String(error)})\n`,
     );
     process.exitCode = 0;
+  }
+}
+
+/**
+ * A PreCompact hook (#102). Claude Code uses the hook's stdout as instructions for the
+ * compaction summary, so stdout carries the letters or nothing at all: an error there
+ * would land in the summary. Under --hook every failure goes to stderr and the exit
+ * code is 0, since exit 2 would block the compaction.
+ */
+async function runPrecompact(argv: string[]): Promise<void> {
+  const hookRequested = argv.includes("--hook");
+  let values: { ear?: string; session?: string; hook?: boolean };
+  try {
+    ({ values } = parseArgs({
+      args: argv,
+      options: {
+        ear: { type: "string" },
+        session: { type: "string" },
+        hook: { type: "boolean" },
+      },
+    }));
+  } catch (error) {
+    // A hook's bad arguments must not block the compaction (exit 2) or fail it.
+    process.stderr.write(
+      `frond-ear precompact: ${error instanceof Error ? error.message : String(error)}\n`,
+    );
+    process.exitCode = hookRequested ? 0 : 2;
+    return;
+  }
+  const hook = values.hook === true;
+  // Under --hook only the hook's own stdin names the session being compacted: a
+  // --session flag could otherwise print one session's letters into another's
+  // summary (#103 review).
+  let sessionId = hook ? undefined : values.session;
+  if (hook && values.session !== undefined) {
+    process.stderr.write(
+      "frond-ear precompact: --session is ignored under --hook; the hook's stdin names the session\n",
+    );
+  }
+  if (hook && !process.stdin.isTTY) {
+    try {
+      sessionId = hookInput(await readStdin(64 * 1024)).sessionId;
+    } catch {
+      // Unreadable stdin names no session; the daemon prints nothing without one.
+    }
+  }
+  const ear = values.ear ?? process.env.FROND_EAR_EAR;
+  try {
+    if (!ear) {
+      throw new Error("precompact needs --ear <name> (or FROND_EAR_EAR)");
+    }
+    const result = await request(
+      { type: "precompact", ear, ...(sessionId ? { sessionId } : {}) },
+      process.env,
+      5_000,
+    );
+    if (result.ok && result.text !== "") {
+      process.stdout.write(`${result.text}\n`);
+    } else {
+      process.stderr.write(
+        `frond-ear precompact: ${result.ok ? "no unsettled letters to carry" : result.text}\n`,
+      );
+    }
+    process.exitCode = result.ok || hook ? 0 : 1;
+  } catch (error) {
+    process.stderr.write(
+      `frond-ear precompact: ${error instanceof Error ? error.message : String(error)}\n`,
+    );
+    process.exitCode = hook ? 0 : 1;
   }
 }
 
@@ -562,6 +635,9 @@ async function main(): Promise<void> {
       return;
     case "release":
       await runRelease(rest);
+      return;
+    case "precompact":
+      await runPrecompact(rest);
       return;
     case "pressure":
       process.exitCode = runPressure(rest, {

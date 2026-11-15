@@ -27,6 +27,13 @@ export type ClientMessage =
       ear: string;
       source?: string;
       sessionId?: string;
+    }
+  /** A seat's PreCompact hook: the letters to carry into the summary (#102). */
+  | {
+      type: "precompact";
+      id: number;
+      ear: string;
+      sessionId?: string;
     };
 
 /** Messages from the daemon to a client. */

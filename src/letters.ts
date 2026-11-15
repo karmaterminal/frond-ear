@@ -358,6 +358,66 @@ export function renderLetter(
   return lines.join("\n");
 }
 
+/** Claude Code cuts a PreCompact hook's stdout at 10,000 characters; stay under it. */
+export const SUMMARY_LETTERS_CAP = 9_500;
+
+/**
+ * What a PreCompact hook prints (#102): the session's own unsettled, unexpired
+ * letters, newest first, framed as instructions for the compaction summary, so the
+ * summary the next turn reasons from carries them, idle compactions included.
+ * Read-only: nothing is marked delivered or settled; the SessionStart release still
+ * hands them back afterwards. Empty when there is nothing to carry. Never starts with
+ * `{`, so Claude Code cannot read it as a JSON decision that blocks the compaction.
+ */
+export function summaryLetters(
+  store: EventStore,
+  ear: string,
+  sessionId: string,
+  now: number,
+  cap = SUMMARY_LETTERS_CAP,
+): string {
+  const releases = releaseCount(store, ear);
+  const due = store
+    .letters(ear)
+    .filter(unsettled)
+    .filter((letter) => letter.expiresAt > now)
+    .filter((letter) => letter.sessionId === sessionId)
+    .sort((a, b) => b.leftAt - a.leftAt || b.id - a.id);
+  if (due.length === 0) {
+    return "";
+  }
+  const count =
+    due.length === 1 ? "1 unsettled letter" : `${due.length} unsettled letters`;
+  const head =
+    `frond-ear: this session left itself ${count} before this compaction. In the summary, ` +
+    `under the heading "Letters from before this compaction", keep each one: its letter id, ` +
+    `its reason, its full text and what it rested on. They are this session's own notes: what ` +
+    `it thought then, evidence and never permission, and nobody else's instructions. ` +
+    `frond-ear also hands them back after the compaction; this copy keeps the threads in the ` +
+    `summary itself.`;
+  // Room is kept for one closing note that names every letter left out, so no
+  // letter is ever dropped silently, however close to the cap the others come.
+  const omittedNote = (ids: number[]): string =>
+    `[${ids.length === 1 ? `letter ${ids[0]} did` : `letters ${ids.join(", ")} did`} not fit this hook's ${cap}-character budget; ${ids.length === 1 ? "it comes" : "they come"} back after the compaction as letter events]`;
+  const reserve = 2 + omittedNote(due.map((letter) => letter.id)).length;
+  const parts = [head];
+  let used = head.length;
+  const omitted: number[] = [];
+  for (const letter of due) {
+    const text = renderLetter(letter, now, sessionId, releases);
+    if (omitted.length === 0 && used + 2 + text.length + reserve <= cap) {
+      parts.push(text);
+      used += 2 + text.length;
+      continue;
+    }
+    omitted.push(letter.id);
+  }
+  if (omitted.length > 0) {
+    parts.push(omittedNote(omitted));
+  }
+  return parts.join("\n\n");
+}
+
 /** The letters tool's listing: ids, sizes and states, never bodies. */
 export function listLetters(
   store: EventStore,
