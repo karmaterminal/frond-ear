@@ -5,7 +5,7 @@
 // reply. Every check happens before anything is posted, so a refused file posts nothing.
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { open, realpath } from "node:fs/promises";
+import { lstat, open, readlink, realpath, stat } from "node:fs/promises";
 import { basename, isAbsolute, relative, sep } from "node:path";
 
 /** Discord accepts at most 10 attachments on one message. */
@@ -94,9 +94,43 @@ export async function loadOutboundFiles(
       `ears.${policy.ear}.sendFileRoots has a root that resolves to /; refusing to send files`,
     );
   }
+  for (const root of roots) {
+    if (!(await stat(root)).isDirectory()) {
+      throw new Error(
+        `ears.${policy.ear}.sendFileRoots has a root that is not a directory: ${root}`,
+      );
+    }
+  }
+  // Protected files by path and by identity: a hard link has its own path, and
+  // realpath does not resolve it (frond-ear#100 review).
   const guarded = (
     await Promise.all(policy.protectedPaths.map((path) => resolved(path)))
   ).filter((path): path is string => path !== undefined);
+  const guardedIds = new Set<string>();
+  for (const path of guarded) {
+    const info = await stat(path).catch(() => undefined);
+    if (info) {
+      guardedIds.add(`${info.dev}:${info.ino}`);
+    }
+  }
+  /** The path checks, run on the resolved path and again on the opened file's. */
+  const checkPath = (given: string, real: string): void => {
+    const root = roots.find((candidate) => inside(real, candidate));
+    if (!root) {
+      throw new Error(
+        `${given} is not under any of ears.${policy.ear}.sendFileRoots`,
+      );
+    }
+    const below = relative(root, real);
+    if (below.split(sep).some((part) => part.startsWith("."))) {
+      throw new Error(
+        `${given} is in or is a dot-named file or directory below its root; those are never sent`,
+      );
+    }
+    if (guarded.some((protectedPath) => inside(real, protectedPath))) {
+      throw new Error(`${given} is part of frond-ear's own state; never sent`);
+    }
+  };
   const files: OutboundFile[] = [];
   let total = 0;
   for (const path of paths) {
@@ -104,40 +138,54 @@ export async function loadOutboundFiles(
     if (!real) {
       throw new Error(`file not found: ${path}`);
     }
-    const root = roots.find((candidate) => inside(real, candidate));
-    if (!root) {
-      throw new Error(
-        `${path} is not under any of ears.${policy.ear}.sendFileRoots`,
-      );
+    checkPath(path, real);
+    // lstat before open: opening a FIFO or device could block or have effects.
+    const before = await lstat(real);
+    if (!before.isFile()) {
+      throw new Error(`${path} is not a regular file`);
     }
-    const below = relative(root, real);
-    if (below.split(sep).some((part) => part.startsWith("."))) {
-      throw new Error(
-        `${path} is in or is a dot-named file or directory below its root; those are never sent`,
-      );
-    }
-    if (guarded.some((protectedPath) => inside(real, protectedPath))) {
-      throw new Error(`${path} is part of frond-ear's own state; never sent`);
-    }
-    const handle = await open(real, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const handle = await open(
+      real,
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
     try {
-      const stat = await handle.stat();
-      if (!stat.isFile()) {
+      const info = await handle.stat();
+      if (!info.isFile()) {
         throw new Error(`${path} is not a regular file`);
       }
-      total += stat.size;
+      if (info.dev !== before.dev || info.ino !== before.ino) {
+        throw new Error(`${path} changed while it was opened`);
+      }
+      if (guardedIds.has(`${info.dev}:${info.ino}`)) {
+        throw new Error(`${path} is part of frond-ear's own state; never sent`);
+      }
+      if (info.nlink > 1) {
+        throw new Error(
+          `${path} has ${info.nlink} hard links; only singly linked files are sent`,
+        );
+      }
+      // What was actually opened: a directory swapped for a link between realpath
+      // and open shows here. Linux names it in /proc; elsewhere, resolve again.
+      const opened = await readlink(`/proc/self/fd/${handle.fd}`).catch(() =>
+        resolved(real),
+      );
+      if (!opened) {
+        throw new Error(`${path} changed while it was opened`);
+      }
+      checkPath(path, opened);
+      total += info.size;
       if (total > policy.maxBytes) {
         throw new Error(
           `files total more than ${policy.maxBytes} bytes (limits.maxSendFileBytes)`,
         );
       }
-      const buffer = Buffer.alloc(stat.size);
+      const buffer = Buffer.alloc(info.size);
       let read = 0;
-      while (read < stat.size) {
+      while (read < info.size) {
         const { bytesRead } = await handle.read(
           buffer,
           read,
-          stat.size - read,
+          info.size - read,
           read,
         );
         if (bytesRead === 0) {
@@ -145,7 +193,7 @@ export async function loadOutboundFiles(
         }
         read += bytesRead;
       }
-      if (read !== stat.size) {
+      if (read !== info.size) {
         throw new Error(`${path} changed size while it was read`);
       }
       const bytes = new Uint8Array(buffer.buffer, buffer.byteOffset, read);

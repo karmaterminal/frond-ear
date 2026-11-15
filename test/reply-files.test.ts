@@ -1,11 +1,13 @@
 // frond-ear#99: a reply can carry files. The daemon reads them, so every refusal
 // is checked here with nothing posted, and the multipart request is checked on the wire.
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   mkdirSync,
   mkdtempSync,
   rmSync,
+  linkSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -395,6 +397,58 @@ test("a root that resolves to / (a symlink to /) refuses the reply; nothing post
     assert.equal(h.rest.calls.length, 0);
   } finally {
     h.dispose();
+    box.dispose();
+  }
+});
+
+test("hard links, FIFOs and a non-directory root are refused (frond-ear#100 review); nothing posts", async () => {
+  const box = sandbox();
+  const token = box.file(box.outside, "token", "bot-token-fixture");
+  const h = harness(configWithRoots([box.root]), { protectedPaths: [token] });
+  const fileRoot = box.file(box.base, "single.txt", "one file as a root");
+  const bad = harness(configWithRoots([fileRoot]));
+  try {
+    const shim = h.attach("scribe");
+    // A hard link to the protected token, under the root: same inode, other path.
+    const tokenLink = join(box.root, "notes.txt");
+    linkSync(token, tokenLink);
+    // A hard link to any other file outside the root.
+    const other = box.file(box.outside, "other.txt", "elsewhere");
+    const otherLink = join(box.root, "other-link.txt");
+    linkSync(other, otherLink);
+    // A FIFO: opening it for reading would block until a writer comes.
+    const fifo = join(box.root, "pipe");
+    execFileSync("mkfifo", [fifo]);
+    const cases: Array<[string, RegExp]> = [
+      [tokenLink, /frond-ear's own state/u],
+      [otherLink, /2 hard links/u],
+      [fifo, /not a regular file/u],
+    ];
+    for (const [file, pattern] of cases) {
+      const started = Date.now();
+      const result = await reply(shim, {
+        chat_id: CHANNEL,
+        text: "t",
+        files: [file],
+      });
+      assert.equal(result.ok, false, `${file} was accepted`);
+      assert.match(result.text, pattern, file);
+      assert.ok(Date.now() - started < 2_000, `${file} took too long`);
+    }
+    assert.equal(h.rest.calls.length, 0, "a refused reply posted something");
+
+    const badShim = bad.attach("scribe");
+    const refused = await reply(badShim, {
+      chat_id: CHANNEL,
+      text: "t",
+      files: [fileRoot],
+    });
+    assert.equal(refused.ok, false);
+    assert.match(refused.text, /has a root that is not a directory/u);
+    assert.equal(bad.rest.calls.length, 0);
+  } finally {
+    h.dispose();
+    bad.dispose();
     box.dispose();
   }
 });
