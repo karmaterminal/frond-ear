@@ -16,6 +16,8 @@ import {
   parseBands,
   pressureLine,
   step,
+  stopLine,
+  stopStep,
 } from "../src/pressure.ts";
 
 const CLI = join(import.meta.dirname, "..", "src", "cli.ts");
@@ -348,6 +350,110 @@ test("--transcript prints the reading for a person", async () => {
       result.stdout,
       "~236k tokens in context, past the 200k band\n",
     );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("stop: nudges once per band from the second band, never advances band, resets on compaction", () => {
+  const bands = DEFAULT_BANDS;
+  // Under the second band (200k): no nudge, even past the first.
+  const a = stopStep(undefined, 160_000, bands, null);
+  assert.equal(a.nudge, undefined);
+  assert.equal(
+    a.state.band,
+    -1,
+    "Stop never takes the prompt/tool-call announce",
+  );
+  // Past 200k: one nudge, then quiet in the same band.
+  const b = stopStep(a.state, 210_000, bands, null);
+  assert.equal(b.nudge, 1);
+  assert.equal(b.state.stopBand, 1);
+  assert.equal(b.state.band, -1);
+  const c = stopStep(b.state, 260_000, bands, null);
+  assert.equal(c.nudge, undefined, "same band: once");
+  // The next band up nudges again.
+  const d = stopStep(c.state, 310_000, bands, null);
+  assert.equal(d.nudge, 2);
+  // The prompt/tool-call path still announces what it owes, and keeps stopBand.
+  const e = step(d.state, 310_000, bands, null);
+  assert.equal(e.announce, 2);
+  assert.equal(e.state.stopBand, 2);
+  // A compaction (new marker) starts both again.
+  const f = stopStep(e.state, 220_000, bands, "after-compact");
+  const g = stopStep(f.state, 230_000, bands, "after-compact-2");
+  assert.equal(g.nudge, 1, "a new marker resets stopBand");
+  // A drop under half (e.g. /clear) resets too.
+  const h = stopStep(
+    { band: 2, tokens: 600_000, stopBand: 3 },
+    210_000,
+    bands,
+    null,
+  );
+  assert.equal(h.nudge, 1);
+});
+
+test("stop: a single band still nudges at it", () => {
+  const r = stopStep(undefined, 160_000, [150_000], null);
+  assert.equal(r.nudge, 0);
+});
+
+test("the stop line names the size, the idle fact, leave_letter and once per band", () => {
+  const line = stopLine(212_000, 1, DEFAULT_BANDS);
+  assert.match(line, /~212k tokens/u);
+  assert.match(line, /past the 200k band/u);
+  assert.match(line, /idle/u);
+  assert.match(line, /leave_letter/u);
+  assert.match(line, /otherwise just stop/u);
+  assert.match(line, /once per band/u);
+});
+
+test("--hook on Stop: block JSON once per band, silent when stop_hook_active, exit 0 always", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "fe-pressure-stop-"));
+  try {
+    const transcript = join(dir, "s.jsonl");
+    writeFileSync(transcript, `${turn(90_000)}\n${turn(220_000)}\n`);
+    const env = { XDG_STATE_HOME: join(dir, "state") };
+    const stop = (active: boolean) =>
+      JSON.stringify({
+        session_id: "s-stop",
+        transcript_path: transcript,
+        hook_event_name: "Stop",
+        stop_hook_active: active,
+      });
+    // Continuing from a Stop hook already: nothing, and no state written.
+    const looped = await run(["--hook"], stop(true), env);
+    assert.equal(looped.code, 0);
+    assert.equal(looped.stdout, "");
+    const first = await run(["--hook"], stop(false), env);
+    assert.equal(first.code, 0);
+    const out = JSON.parse(first.stdout) as {
+      decision: string;
+      reason: string;
+    };
+    assert.equal(out.decision, "block");
+    assert.match(out.reason, /~220k tokens/u);
+    const again = await run(["--hook"], stop(false), env);
+    assert.equal(again.code, 0);
+    assert.equal(again.stdout, "", "same band: once");
+    // The prompt path still owes its 200k line: Stop did not take it.
+    const prompt = await run(
+      ["--hook"],
+      JSON.stringify({
+        session_id: "s-stop",
+        transcript_path: transcript,
+        hook_event_name: "UserPromptSubmit",
+      }),
+      env,
+    );
+    assert.match(
+      prompt.stdout,
+      /"additionalContext":"frond-ear pressure: context is ~220k/u,
+    );
+    // Bad stdin on Stop: nothing, exit 0.
+    const bad = await run(["--hook"], "{not json", env);
+    assert.equal(bad.code, 0);
+    assert.equal(bad.stdout, "");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

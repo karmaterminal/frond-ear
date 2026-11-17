@@ -37,6 +37,12 @@ export interface PressureState {
    * then is only recorded, not taken as a compaction.
    */
   boundary?: string | null;
+  /**
+   * The highest band a Stop hook has nudged at since the last reset; absent for
+   * none. Kept apart from `band`, so a nudge at the end of a turn never swallows
+   * the added-context line the next prompt or tool call would print.
+   */
+  stopBand?: number;
 }
 
 export interface PressureReading {
@@ -132,20 +138,34 @@ export function readTail(path: string, maxBytes = TAIL_BYTES): string {
  * The band crossed by this reading, if it is a new one. Returns the next state and,
  * when a line is due, the band index it announces.
  */
-export function step(
+/** Whether the bands start again: a new compaction marker, or a drop under half. */
+export function isReset(
   previous: PressureState | undefined,
   tokens: number,
-  bands: readonly number[],
   boundary?: string | null,
-): { state: PressureState; announce?: number } {
-  let band = previous?.band ?? -1;
+): boolean {
   const newMarker =
     typeof boundary === "string" &&
     previous?.boundary !== undefined &&
     previous.boundary !== boundary;
-  if (previous && (newMarker || tokens < previous.tokens / 2)) {
-    band = -1;
+  return previous !== undefined && (newMarker || tokens < previous.tokens / 2);
+}
+
+/** The highest band index `tokens` has reached, -1 for under the first. */
+export function reachedBand(tokens: number, bands: readonly number[]): number {
+  let reached = -1;
+  for (let i = 0; i < bands.length; i++) {
+    if (tokens >= (bands[i] ?? Infinity)) {
+      reached = i;
+    }
   }
+  return reached;
+}
+
+function keepBoundary(
+  previous: PressureState | undefined,
+  boundary?: string | null,
+): { boundary?: string | null } {
   // A marker that slid out of the tail is still the latest one seen; null records
   // that the tail was read and held none (so the first marker is a compaction).
   const seen =
@@ -154,17 +174,55 @@ export function step(
       : previous?.boundary !== undefined
         ? previous.boundary
         : boundary;
-  const keep = seen !== undefined ? { boundary: seen } : {};
-  let reached = -1;
-  for (let i = 0; i < bands.length; i++) {
-    if (tokens >= (bands[i] ?? Infinity)) {
-      reached = i;
-    }
-  }
+  return seen !== undefined ? { boundary: seen } : {};
+}
+
+export function step(
+  previous: PressureState | undefined,
+  tokens: number,
+  bands: readonly number[],
+  boundary?: string | null,
+): { state: PressureState; announce?: number } {
+  const reset = isReset(previous, tokens, boundary);
+  const band = reset ? -1 : (previous?.band ?? -1);
+  const stopBand = reset ? undefined : previous?.stopBand;
+  const keep = {
+    ...keepBoundary(previous, boundary),
+    ...(stopBand !== undefined ? { stopBand } : {}),
+  };
+  const reached = reachedBand(tokens, bands);
   if (reached > band) {
     return { state: { band: reached, tokens, ...keep }, announce: reached };
   }
   return { state: { band, tokens, ...keep } };
+}
+
+/**
+ * The end of a turn (Claude Code's Stop hook, figs + 🌿, 11-17). Most compactions
+ * land idle, about 55 minutes after the last request once the context is large,
+ * so the turn that ends a stretch is the last chance to leave a letter. Nudges at
+ * most once per band from the second band up (200k by default), and resets with
+ * the bands on a compaction. It never advances `band`: the prompt and tool-call
+ * line for a band stays owed.
+ */
+export function stopStep(
+  previous: PressureState | undefined,
+  tokens: number,
+  bands: readonly number[],
+  boundary?: string | null,
+): { state: PressureState; nudge?: number } {
+  const reset = isReset(previous, tokens, boundary);
+  const band = reset ? -1 : (previous?.band ?? -1);
+  const stopBand = reset ? -1 : (previous?.stopBand ?? -1);
+  const from = Math.min(1, bands.length - 1);
+  const reached = reachedBand(tokens, bands);
+  const base = { band, tokens, ...keepBoundary(previous, boundary) };
+  if (reached >= from && reached > stopBand) {
+    return { state: { ...base, stopBand: reached }, nudge: reached };
+  }
+  return {
+    state: { ...base, ...(stopBand >= 0 ? { stopBand } : {}) },
+  };
 }
 
 export function formatTokens(tokens: number): string {
@@ -183,6 +241,20 @@ export function pressureLine(
     `frond-ear pressure: context is ~${formatTokens(tokens)} tokens (past the ${formatTokens(bands[band] ?? 0)} band` +
     `${top ? ", the last one" : ""}). A compaction can land at any size, with no warning. ` +
     "If your threads changed since your last letter, leave one now: leave_letter(reason, body, assumed)."
+  );
+}
+
+/** The Stop hook's reason: why this turn goes on for one more step. */
+export function stopLine(
+  tokens: number,
+  band: number,
+  bands: readonly number[],
+): string {
+  return (
+    `frond-ear pressure: this turn is ending at ~${formatTokens(tokens)} tokens (past the ${formatTokens(bands[band] ?? 0)} band). ` +
+    "Compactions at this size mostly land idle, about 55 minutes after the last request, with no warning. " +
+    "If your threads changed since your last letter, leave one now (leave_letter: reason, body, assumed); otherwise just stop. " +
+    "This nudge comes once per band."
   );
 }
 
@@ -233,7 +305,16 @@ export function loadState(
         typeof parsed.boundary === "string" || parsed.boundary === null
           ? { boundary: parsed.boundary }
           : {};
-      return { band: parsed.band, tokens: parsed.tokens, ...boundary };
+      const stopBand =
+        typeof parsed.stopBand === "number"
+          ? { stopBand: parsed.stopBand }
+          : {};
+      return {
+        band: parsed.band,
+        tokens: parsed.tokens,
+        ...boundary,
+        ...stopBand,
+      };
     }
   } catch {
     // No state yet, or unreadable: start the bands again.
@@ -265,6 +346,7 @@ export function pressureHookInput(raw: string): {
   sessionId?: string;
   transcriptPath?: string;
   event?: string;
+  stopHookActive?: boolean;
 } {
   const parsed: unknown = JSON.parse(raw);
   if (typeof parsed !== "object" || parsed === null) {
@@ -280,7 +362,13 @@ export function pressureHookInput(raw: string): {
     ...(sessionId ? { sessionId } : {}),
     ...(transcriptPath ? { transcriptPath } : {}),
     ...(event ? { event } : {}),
+    ...(input.stop_hook_active === true ? { stopHookActive: true } : {}),
   };
+}
+
+/** What the Stop hook prints to continue the turn once: Claude Code's block JSON. */
+export function stopHookOutput(reason: string): string {
+  return JSON.stringify({ decision: "block", reason });
 }
 
 export interface PressureIo {
@@ -301,8 +389,10 @@ export function pressureHookRequested(argv: readonly string[]): boolean {
 /**
  * `frond-ear pressure`. Under --hook (PostToolUse or UserPromptSubmit), reads the
  * hook's JSON on stdin and prints Claude Code's added-context JSON only on crossing
- * into a new band; anything it can't read prints nothing, and it always exits 0, so
- * a gauge never blocks a tool call or a turn. Without --hook, prints the reading
+ * into a new band; under --hook on Stop, prints a block decision once per band from
+ * the second band up, so the ending turn takes one more step to leave a letter.
+ * Anything it can't read prints nothing, and it always exits 0 (never 2), so a gauge
+ * never blocks a tool call, a prompt or a turn by its exit code. Without --hook, prints the reading
  * of --transcript <path> for a person to check.
  */
 export function runPressure(argv: string[], io: PressureIo): number {
@@ -366,6 +456,11 @@ export function runPressure(argv: string[], io: PressureIo): number {
     if (!input.sessionId || !input.transcriptPath) {
       return 0;
     }
+    // Already continuing because of a Stop hook: never ask again, or a turn
+    // could be held open forever.
+    if (input.event === "Stop" && input.stopHookActive) {
+      return 0;
+    }
     const reading = latestReading(readTail(input.transcriptPath));
     const tokens = reading.tokens;
     if (tokens === undefined) {
@@ -373,6 +468,19 @@ export function runPressure(argv: string[], io: PressureIo): number {
       return 0;
     }
     const dir = stateDir(io.env);
+    if (input.event === "Stop") {
+      const { state, nudge } = stopStep(
+        loadState(dir, input.sessionId),
+        tokens,
+        bands,
+        reading.boundary,
+      );
+      saveState(dir, input.sessionId, state);
+      if (nudge !== undefined) {
+        io.stdout.write(`${stopHookOutput(stopLine(tokens, nudge, bands))}\n`);
+      }
+      return 0;
+    }
     const { state, announce } = step(
       loadState(dir, input.sessionId),
       tokens,
