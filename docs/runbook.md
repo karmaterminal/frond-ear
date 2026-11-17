@@ -349,10 +349,30 @@ is in `$XDG_STATE_HOME/frond-ear/pressure/`. It needs no daemon and always exits
           }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/abs/node /abs/frond-ear/src/cli.ts pressure --hook",
+            "timeout": 5
+          }
+        ]
+      }
     ]
   }
 }
 ```
+
+**At the end of a turn (Stop).** Most compactions land idle: in the gloss's sessions, about 55
+minutes after the last request once the context is large. So the turn that ends a stretch is the
+last chance to leave a letter, and no prompt or tool call follows it to carry a line. On Stop,
+from the second band up (200k by default), it prints Claude Code's `{"decision":"block","reason":…}`
+once per band, so the turn takes one more step: leave a letter if threads changed, otherwise stop.
+It is silent when `stop_hook_active` is set (the turn is already continuing because of a Stop
+hook), so a turn is never held open. It keeps its own Stop band, which resets with the others on a
+compaction, and never takes the line a prompt or tool call still owes. It still exits 0, never 2.
 
 `frond-ear pressure --transcript <path>` prints the same reading for a person.
 
