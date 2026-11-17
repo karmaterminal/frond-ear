@@ -134,10 +134,6 @@ export function readTail(path: string, maxBytes = TAIL_BYTES): string {
   }
 }
 
-/**
- * The band crossed by this reading, if it is a new one. Returns the next state and,
- * when a line is due, the band index it announces.
- */
 /** Whether the bands start again: a new compaction marker, or a drop under half. */
 export function isReset(
   previous: PressureState | undefined,
@@ -177,6 +173,10 @@ function keepBoundary(
   return seen !== undefined ? { boundary: seen } : {};
 }
 
+/**
+ * The band crossed by this reading, if it is a new one. Returns the next state and,
+ * when a line is due, the band index it announces.
+ */
 export function step(
   previous: PressureState | undefined,
   tokens: number,
