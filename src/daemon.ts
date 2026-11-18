@@ -1647,8 +1647,10 @@ export class Daemon {
     // Separate hook runs connect separately, so arrival order isn't evidence order:
     // never let older evidence replace newer. A tie is the same row read again only
     // when it says the same thing; a tie that disagrees keeps what is already kept.
+    // A kept reading is always the holder's: turnover (attach or a session
+    // message) clears it, and only the holder's reports get this far.
     const kept = this.pressure.get(ear);
-    if (kept && kept.sessionId === sessionId) {
+    if (kept) {
       const same =
         kept.tokens === tokens &&
         kept.band === band &&
