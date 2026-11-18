@@ -123,18 +123,38 @@ interface Client {
 /** A pressure hook's reading (#98), as the daemon keeps it. */
 interface PressureReport {
   sessionId: string;
-  tokens: number;
+  tokens: number | null;
   band: number | null;
   boundary: string | null;
+  /** When the evidence was written (the transcript row's time). */
   at: number;
+  /** When the daemon took the report. */
+  receivedAt: number;
+  idleFloor: number | undefined;
 }
 
-/** Bounds on a pressure report; anything outside is refused (#98). */
+/**
+ * Bounds on a pressure report; anything outside is refused (#98). `at` is when the
+ * evidence was written, so an idle seat's honest reading can be old: up to maxAgeMs
+ * in the past, and no more than skewMs in the future.
+ */
 export const PRESSURE_LIMITS = {
   maxTokens: 10_000_000,
   maxBand: 31,
   maxBoundary: 80,
   skewMs: 10 * 60 * 1_000,
+  maxAgeMs: 7 * 24 * 60 * 60 * 1_000,
+} as const;
+
+/**
+ * Claude Code compacts an idle interactive session on the one-hour prompt cache once
+ * the context is at least CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS (default 200k). The
+ * gloss's own transcript: 76 of 90 compactions landed 54.4–55.8 min after the last
+ * response (#98, 11-15 amendment). So the forecast is 0.9 × the hour after `at`.
+ */
+export const IDLE_COMPACT = {
+  defaultFloor: 200_000,
+  afterMs: 54 * 60 * 1_000,
 } as const;
 
 /** Discord's enforce_nonce window is "a few minutes"; stay inside it. */
@@ -1282,6 +1302,13 @@ export class Daemon {
         return;
       case "session":
         if (client.ear && typeof message.sessionId === "string") {
+          // The same turnover rule as attach: a reading belongs to its session.
+          if (
+            this.attached.get(client.ear) === client &&
+            this.pressure.get(client.ear)?.sessionId !== message.sessionId
+          ) {
+            this.pressure.delete(client.ear);
+          }
           client.sessionId = message.sessionId;
           this.store.updateEarSession(client.ear, message.sessionId);
         }
@@ -1559,6 +1586,7 @@ export class Daemon {
     band: unknown;
     boundary: unknown;
     at: unknown;
+    idleFloor?: unknown;
   }): { ok: boolean; text: string } {
     const ear = typeof message.ear === "string" ? message.ear : "";
     if (!this.config.ears[ear]) {
@@ -1581,16 +1609,19 @@ export class Daemon {
         text: `ear ${ear} is not held by session ${sessionId.slice(0, 8)}; its pressure is not kept`,
       };
     }
-    const { tokens, band, boundary, at } = message;
+    const { tokens, band, boundary, at, idleFloor } = message;
     const now = this.clock.now();
+    const count = (value: unknown): boolean =>
+      typeof value === "number" &&
+      Number.isInteger(value) &&
+      value >= 0 &&
+      value <= PRESSURE_LIMITS.maxTokens;
     const problem =
-      typeof tokens !== "number" ||
-      !Number.isInteger(tokens) ||
-      tokens < 0 ||
-      tokens > PRESSURE_LIMITS.maxTokens
+      tokens !== null && !count(tokens)
         ? "tokens"
         : band !== null &&
-            (typeof band !== "number" ||
+            (tokens === null ||
+              typeof band !== "number" ||
               !Number.isInteger(band) ||
               band < 0 ||
               band > PRESSURE_LIMITS.maxBand)
@@ -1601,9 +1632,12 @@ export class Daemon {
             ? "boundary"
             : typeof at !== "number" ||
                 !Number.isFinite(at) ||
-                Math.abs(at - now) > PRESSURE_LIMITS.skewMs
+                at > now + PRESSURE_LIMITS.skewMs ||
+                at < now - PRESSURE_LIMITS.maxAgeMs
               ? "at"
-              : undefined;
+              : idleFloor !== undefined && !count(idleFloor)
+                ? "idleFloor"
+                : undefined;
     if (problem) {
       return {
         ok: false,
@@ -1612,10 +1646,12 @@ export class Daemon {
     }
     this.pressure.set(ear, {
       sessionId,
-      tokens: tokens as number,
+      tokens: tokens as number | null,
       band: band as number | null,
       boundary: boundary as string | null,
       at: at as number,
+      receivedAt: now,
+      idleFloor: idleFloor as number | undefined,
     });
     return { ok: true, text: `pressure kept for ear ${ear}` };
   }
@@ -1627,12 +1663,19 @@ export class Daemon {
     if (!report || !client || client.sessionId !== report.sessionId) {
       return null;
     }
+    const floor = report.idleFloor ?? IDLE_COMPACT.defaultFloor;
     return {
       tokens: report.tokens,
       band: report.band,
       boundary: report.boundary,
       at: report.at,
       ageMs: Math.max(0, this.clock.now() - report.at),
+      receivedAt: report.receivedAt,
+      // A forecast, not a fact: any request before then moves it.
+      idleCompactDueAt:
+        report.tokens !== null && report.tokens >= floor
+          ? report.at + IDLE_COMPACT.afterMs
+          : null,
     };
   }
 

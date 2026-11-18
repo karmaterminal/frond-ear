@@ -458,3 +458,46 @@ test("--hook on Stop: block JSON once per band, silent when stop_hook_active, ex
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("reading: sidechain rows never count, and `at` is the chosen row's time (#98 amendment)", () => {
+  const main = JSON.stringify({
+    type: "assistant",
+    timestamp: "2026-11-18T19:50:00.000Z",
+    message: { usage: { input_tokens: 300_000 } },
+  });
+  const side = JSON.stringify({
+    type: "assistant",
+    isSidechain: true,
+    timestamp: "2026-11-18T19:51:00.000Z",
+    message: { usage: { input_tokens: 10_000 } },
+  });
+  const sideMarker = JSON.stringify({
+    type: "system",
+    subtype: "compact_boundary",
+    isSidechain: true,
+    uuid: "side-marker",
+  });
+  assert.deepEqual(latestReading([main, side, sideMarker, ""].join("\n")), {
+    tokens: 300_000,
+    boundary: null,
+    at: Date.parse("2026-11-18T19:50:00.000Z"),
+  });
+  // A sidechain under half the main reading is not a compaction either.
+  const { state } = step(
+    { band: 2, tokens: 300_000, boundary: null },
+    latestReading([main, side].join("\n")).tokens ?? 0,
+    DEFAULT_BANDS,
+    null,
+  );
+  assert.equal(state.band, 2);
+  const marker = JSON.stringify({
+    type: "system",
+    subtype: "compact_boundary",
+    uuid: "m1",
+    timestamp: "2026-11-18T19:55:00.000Z",
+  });
+  assert.deepEqual(latestReading([main, marker].join("\n")), {
+    boundary: "m1",
+    at: Date.parse("2026-11-18T19:55:00.000Z"),
+  });
+});

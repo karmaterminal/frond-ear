@@ -58,6 +58,20 @@ export interface PressureReading {
   tokens?: number;
   /** The latest compaction marker's id in the tail, or null for none. */
   boundary: string | null;
+  /**
+   * When that evidence was written (epoch ms, from the row's `timestamp`): the
+   * usage row's time when there is one, else the marker's. Absent when the row
+   * carries no readable time.
+   */
+  at?: number;
+}
+
+function rowTime(value: unknown): number | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : undefined;
 }
 
 /** Tokens in context at the latest assistant turn: its input (cached or not) plus its output. */
@@ -67,11 +81,13 @@ export function latestContextTokens(transcript: string): number | undefined {
 
 /**
  * The latest compaction marker in the transcript's tail, and the latest assistant
- * usage written after it (none yet right after a compaction).
+ * usage written after it (none yet right after a compaction). Sidechain rows (a
+ * subagent's turns, `isSidechain: true`) are another context's usage and never count.
  */
 export function latestReading(transcript: string): PressureReading {
   const lines = transcript.split("\n");
   let tokens: number | undefined;
+  let at: number | undefined;
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i]?.trim();
     if (!line) {
@@ -97,7 +113,11 @@ export function latestReading(transcript: string): PressureReading {
       uuid?: unknown;
       timestamp?: unknown;
       message?: unknown;
+      isSidechain?: unknown;
     };
+    if (record.isSidechain === true) {
+      continue;
+    }
     if (record.type === "system" && record.subtype === "compact_boundary") {
       const id =
         typeof record.uuid === "string" && record.uuid
@@ -105,7 +125,12 @@ export function latestReading(transcript: string): PressureReading {
           : typeof record.timestamp === "string" && record.timestamp
             ? record.timestamp
             : `sha256:${createHash("sha256").update(line).digest("hex").slice(0, 16)}`;
-      return { ...(tokens !== undefined ? { tokens } : {}), boundary: id };
+      const when = tokens !== undefined ? at : rowTime(record.timestamp);
+      return {
+        ...(tokens !== undefined ? { tokens } : {}),
+        boundary: id,
+        ...(when !== undefined ? { at: when } : {}),
+      };
     }
     if (tokens !== undefined || record.type !== "assistant") {
       continue;
@@ -124,9 +149,14 @@ export function latestReading(transcript: string): PressureReading {
       n("output_tokens");
     if (total > 0) {
       tokens = total;
+      at = rowTime(record.timestamp);
     }
   }
-  return { ...(tokens !== undefined ? { tokens } : {}), boundary: null };
+  return {
+    ...(tokens !== undefined ? { tokens } : {}),
+    boundary: null,
+    ...(at !== undefined ? { at } : {}),
+  };
 }
 
 export function readTail(path: string, maxBytes = TAIL_BYTES): string {
@@ -392,11 +422,24 @@ export interface PressureIo {
 export interface PressureReport {
   ear: string;
   sessionId: string;
-  tokens: number;
-  /** The highest band reached, null under the first. */
+  /** null: compacted, with no usage written since (a marker-only PostCompact). */
+  tokens: number | null;
+  /** The highest band reached, null under the first (and for no tokens). */
   band: number | null;
   boundary: string | null;
+  /** When the evidence was written: the usage (or marker) row's time, else the hook's. */
   at: number;
+  /** CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS, when the seat sets it. */
+  idleFloor?: number;
+}
+
+/** The seat's idle-compaction floor, when its environment sets one. */
+export function idleFloorFrom(env: NodeJS.ProcessEnv): number | undefined {
+  const raw = env.CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS;
+  if (!raw || !/^\d{1,8}$/u.test(raw.trim())) {
+    return undefined;
+  }
+  return Number(raw.trim());
 }
 
 /**
@@ -483,28 +526,40 @@ export function runPressure(argv: string[], io: PressureIo): number {
     if (!input.sessionId || !input.transcriptPath) {
       return 0;
     }
-    // Already continuing because of a Stop hook: never ask again, or a turn
-    // could be held open forever.
-    if (input.event === "Stop" && input.stopHookActive) {
-      return 0;
-    }
     const reading = latestReading(readTail(input.transcriptPath));
     const tokens = reading.tokens;
-    if (tokens === undefined) {
-      // Nothing read yet, or compacted with no turn since: the next call reads it.
-      return 0;
-    }
+    // The report comes before every gate below: a continued Stop's final usage
+    // or a marker-only PostCompact is exactly what the outside view must not miss.
     const ear = values.ear || io.env.FROND_EAR_EAR || undefined;
-    if (ear && io.onReading) {
-      const reached = reachedBand(tokens, bands);
+    if (
+      ear &&
+      io.onReading &&
+      (tokens !== undefined || reading.boundary !== null)
+    ) {
+      const reached = tokens !== undefined ? reachedBand(tokens, bands) : -1;
+      const idleFloor = idleFloorFrom(io.env);
       io.onReading({
         ear,
         sessionId: input.sessionId,
-        tokens,
+        tokens: tokens ?? null,
         band: reached >= 0 ? reached : null,
         boundary: reading.boundary,
-        at: Date.now(),
+        at: reading.at ?? Date.now(),
+        ...(idleFloor !== undefined ? { idleFloor } : {}),
       });
+    }
+    // Already continuing because of a Stop hook: never ask again, or a turn
+    // could be held open forever. PostCompact only reports: the next prompt or
+    // tool call sees the new marker and starts the bands again.
+    if (
+      (input.event === "Stop" && input.stopHookActive) ||
+      input.event === "PostCompact"
+    ) {
+      return 0;
+    }
+    if (tokens === undefined) {
+      // Nothing read yet, or compacted with no turn since: the next call reads it.
+      return 0;
     }
     const dir = stateDir(io.env);
     if (input.event === "Stop") {

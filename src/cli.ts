@@ -70,8 +70,8 @@ usage:
                                       context pressure for a PostToolUse / UserPromptSubmit / Stop hook: reads
                                       the transcript's latest token usage and adds one line to the session's
                                       context on crossing into a new band; with --ear (or FROND_EAR_EAR) also
-                                      reports the reading to the daemon for ear_status (best effort, ≤1 s);
-                                      always exits 0
+                                      reports the reading to the daemon for ear_status (best effort, ≤1 s;
+                                      a PostCompact hook only reports); always exits 0
   frond-ear pressure --transcript <path>
                                       print a transcript's latest context size
   frond-ear inject --chat <id> --author <id> [--guild <id>] [--name <n>] [--bot] [--mention] <text…>

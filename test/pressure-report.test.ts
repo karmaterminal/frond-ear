@@ -19,6 +19,8 @@ const OTHER = "bbbbbbbb-1111-2222-3333-444444444444";
 const CLI = join(import.meta.dirname, "..", "src", "cli.ts");
 
 type H = ReturnType<typeof harness>;
+const WEEK = 7 * 24 * 60 * 60_000;
+const IDLE_MS = 54 * 60_000;
 type Report = Omit<Extract<ClientMessage, { type: "pressure" }>, "id">;
 
 function earPressure(h: H, ear = "scribe"): unknown {
@@ -71,6 +73,8 @@ test("daemon: a report from the session holding the ear shows in ear_status, agi
       boundary: sent.boundary,
       at: sent.at,
       ageMs: 0,
+      receivedAt: sent.at,
+      idleCompactDueAt: sent.at + 54 * 60_000,
     });
     h.clock.advance(42_000);
     assert.equal((earPressure(h) as { ageMs: number }).ageMs, 42_000);
@@ -121,10 +125,13 @@ test("daemon: refusals leave the reading unchanged (session, ear, role, every bo
       ["band a string", { ...good(h), band: "1" }, "cli"],
       ["boundary too long", good(h, { boundary: "x".repeat(81) }), "cli"],
       ["boundary a number", { ...good(h), boundary: 7 }, "cli"],
-      ["at too early", good(h, { at: now - 600_001 }), "cli"],
+      ["at older than a week", good(h, { at: now - WEEK - 1 }), "cli"],
       ["at too late", good(h, { at: now + 600_001 }), "cli"],
       ["at a string", { ...good(h), at: String(now) }, "cli"],
       ["at missing", { ...good(h), at: undefined }, "cli"],
+      ["a band without tokens", good(h, { tokens: null, band: 1 }), "cli"],
+      ["idleFloor negative", good(h, { idleFloor: -1 }), "cli"],
+      ["idleFloor a string", { ...good(h), idleFloor: "200000" }, "cli"],
     ];
     for (const [name, message, role] of cases) {
       const result = await report(h, message, role);
@@ -138,8 +145,10 @@ test("daemon: refusals leave the reading unchanged (session, ear, role, every bo
       { band: 0 },
       { band: 31 },
       { boundary: "x".repeat(80) },
-      { at: now - 600_000 },
+      { at: now - WEEK },
       { at: now + 600_000 },
+      { tokens: null, band: null },
+      { idleFloor: 0 },
     ]) {
       assert.equal(
         (await report(h, good(h, fields))).ok,
@@ -202,6 +211,7 @@ function run(
     const base = { ...process.env };
     delete base.FROND_EAR_EAR;
     delete base.FROND_EAR_TCP;
+    delete base.CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS;
     const child = spawn(
       process.execPath,
       ["--disable-warning=ExperimentalWarning", CLI, "pressure", ...argv],
@@ -329,7 +339,8 @@ test("hook → daemon: one pressure message with the reading; stdout and exit co
         message.at >= before - 1_000 &&
         message.at <= Date.now(),
     );
-    // FROND_EAR_EAR names the ear too; a same-band run still sends (fresh `at`).
+    // FROND_EAR_EAR names the ear too; a same-band run still sends. (These rows
+    // carry no timestamp, so `at` falls back to the hook's clock.)
     const again = await run(["--hook"], input, {
       XDG_STATE_HOME: join(dir, "state-b"),
       FROND_EAR_SOCKET: socket,
@@ -442,4 +453,226 @@ test("hook → real daemon: ear_status shows the hook's reading", async () => {
     h.dispose();
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ---- the 11-15 amendment on #98, and 🌫's review of #106 ------------------------------
+
+test("daemon: an honestly old reading is kept, aged from its evidence time; arrival is stamped apart", async () => {
+  const h = harness();
+  try {
+    h.attach("scribe", { sessionId: SESSION });
+    const at = h.clock.now() - 11 * 60_000; // older than the 10-minute skew
+    assert.equal((await report(h, good(h, { tokens: 300_000, at }))).ok, true);
+    const view = earPressure(h) as Record<string, number>;
+    assert.equal(view.at, at);
+    assert.equal(view.ageMs, 11 * 60_000);
+    assert.equal(view.receivedAt, h.clock.now());
+    assert.equal(view.idleCompactDueAt, at + IDLE_MS);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("daemon: idleCompactDueAt is a forecast at or over the floor, null under it or with no tokens", async () => {
+  const h = harness();
+  try {
+    h.attach("scribe", { sessionId: SESSION });
+    const due = async (fields: Partial<Report>) => {
+      assert.equal((await report(h, good(h, fields))).ok, true);
+      return (earPressure(h) as { idleCompactDueAt: number | null })
+        .idleCompactDueAt;
+    };
+    const at = h.clock.now() - 1_000;
+    assert.equal(await due({ tokens: 199_999, band: 0, at }), null);
+    assert.equal(await due({ tokens: 200_000, band: 1, at }), at + IDLE_MS);
+    // The seat's own CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS moves the floor.
+    assert.equal(
+      await due({ tokens: 150_000, band: 0, at, idleFloor: 100_000 }),
+      at + IDLE_MS,
+    );
+    assert.equal(
+      await due({ tokens: 250_000, band: 1, at, idleFloor: 300_000 }),
+      null,
+    );
+    assert.equal(await due({ tokens: null, band: null, at }), null);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("daemon: a marker-only report replaces the old size, band and forecast, not just the boundary", async () => {
+  const h = harness();
+  try {
+    h.attach("scribe", { sessionId: SESSION });
+    assert.equal(
+      (await report(h, good(h, { tokens: 400_000, band: 2, boundary: "old" })))
+        .ok,
+      true,
+    );
+    assert.equal(
+      (
+        await report(
+          h,
+          good(h, { tokens: null, band: null, boundary: "new-boundary" }),
+        )
+      ).ok,
+      true,
+    );
+    const view = earPressure(h) as Record<string, unknown>;
+    assert.deepEqual(
+      [view.tokens, view.band, view.boundary, view.idleCompactDueAt],
+      [null, null, "new-boundary", null],
+    );
+  } finally {
+    h.dispose();
+  }
+});
+
+test("daemon: a session change on the same connection clears the reading (A → B → A does not revive it)", async () => {
+  const h = harness();
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    assert.equal((await report(h, good(h))).ok, true);
+    await shim.send({ type: "session", sessionId: SESSION });
+    assert.notEqual(earPressure(h), null, "the same session: kept");
+    await shim.send({ type: "session", sessionId: OTHER });
+    assert.equal(earPressure(h), null);
+    await shim.send({ type: "session", sessionId: SESSION });
+    assert.equal(earPressure(h), null, "cleared, not just hidden");
+  } finally {
+    h.dispose();
+  }
+});
+
+function stamped(tokens: number, iso: string, sidechain = false): string {
+  return JSON.stringify({
+    type: "assistant",
+    timestamp: iso,
+    ...(sidechain ? { isSidechain: true } : {}),
+    message: {
+      role: "assistant",
+      usage: {
+        input_tokens: 10,
+        cache_read_input_tokens: tokens - 110,
+        cache_creation_input_tokens: 50,
+        output_tokens: 50,
+      },
+    },
+  });
+}
+
+function compactMarker(uuid: string, iso: string): string {
+  return JSON.stringify({
+    type: "system",
+    subtype: "compact_boundary",
+    uuid,
+    timestamp: iso,
+  });
+}
+
+/** Runs the hook once against a fake daemon; returns its result and the reports sent. */
+async function hookReports(
+  rows: string[],
+  hook: Record<string, unknown>,
+  env: NodeJS.ProcessEnv = {},
+): Promise<{
+  result: Awaited<ReturnType<typeof run>>;
+  reports: Array<Record<string, unknown>>;
+}> {
+  const dir = mkdtempSync(join(tmpdir(), "fe-pressure-amend-"));
+  const socket = join(dir, "d.sock");
+  const fake = await fakeDaemon(socket, "ok");
+  try {
+    const transcript = join(dir, "s.jsonl");
+    writeFileSync(transcript, `${rows.join("\n")}\n`);
+    const result = await run(
+      ["--hook", "--ear", "scribe"],
+      JSON.stringify({
+        session_id: SESSION,
+        transcript_path: transcript,
+        ...hook,
+      }),
+      { XDG_STATE_HOME: join(dir, "state"), FROND_EAR_SOCKET: socket, ...env },
+    );
+    return {
+      result,
+      reports: fake.seen.filter((m) => m.type === "pressure"),
+    };
+  } finally {
+    fake.server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("hook: `at` is the usage row's time, not the hook's", async () => {
+  const iso = "2026-11-18T19:55:00.000Z";
+  const { result, reports } = await hookReports(
+    [stamped(300_000, iso)],
+    { hook_event_name: "UserPromptSubmit" },
+    { CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS: "250000" },
+  );
+  assert.equal(result.code, 0);
+  assert.equal(reports.length, 1);
+  assert.equal(reports[0]?.at, Date.parse(iso));
+  assert.equal(reports[0]?.idleFloor, 250_000, "the seat's floor goes along");
+});
+
+test("hook: a sidechain row never replaces the main session's reading", async () => {
+  const { reports } = await hookReports(
+    [
+      stamped(300_000, "2026-11-18T19:50:00.000Z"),
+      stamped(10_000, "2026-11-18T19:51:00.000Z", true),
+    ],
+    { hook_event_name: "PostToolUse" },
+  );
+  assert.equal(reports.length, 1);
+  assert.equal(reports[0]?.tokens, 300_000);
+  assert.equal(reports[0]?.at, Date.parse("2026-11-18T19:50:00.000Z"));
+});
+
+test("hook: Stop reports a no-tool turn's final row; a continued Stop (stop_hook_active) still reports, prints nothing", async () => {
+  const rows = [stamped(310_000, "2026-11-18T19:58:00.000Z")];
+  const first = await hookReports(rows, { hook_event_name: "Stop" });
+  assert.equal(first.result.code, 0);
+  assert.equal(first.reports[0]?.tokens, 310_000);
+  assert.match(first.result.stdout, /"decision":"block"/u, "the nudge");
+  const continued = await hookReports(
+    [...rows, stamped(312_000, "2026-11-18T19:58:30.000Z")],
+    { hook_event_name: "Stop", stop_hook_active: true },
+  );
+  assert.deepEqual(
+    [continued.result.code, continued.result.stdout, continued.result.stderr],
+    [0, "", ""],
+  );
+  assert.equal(continued.reports.length, 1);
+  assert.equal(continued.reports[0]?.tokens, 312_000);
+});
+
+test("hook: a marker-only PostCompact reports the new boundary with tokens null, prints nothing; the first usage after it reports", async () => {
+  const before = [
+    stamped(400_000, "2026-11-18T19:00:00.000Z"),
+    compactMarker("new-boundary", "2026-11-18T19:55:00.000Z"),
+  ];
+  const compacted = await hookReports(before, {
+    hook_event_name: "PostCompact",
+    trigger: "auto",
+  });
+  assert.deepEqual(
+    [compacted.result.code, compacted.result.stdout, compacted.result.stderr],
+    [0, "", ""],
+  );
+  assert.equal(compacted.reports.length, 1);
+  const [marker] = compacted.reports;
+  assert.deepEqual(
+    [marker?.tokens, marker?.band, marker?.boundary, marker?.at],
+    [null, null, "new-boundary", Date.parse("2026-11-18T19:55:00.000Z")],
+  );
+  const after = await hookReports(
+    [...before, stamped(60_000, "2026-11-18T19:56:00.000Z")],
+    { hook_event_name: "UserPromptSubmit" },
+  );
+  assert.deepEqual(
+    [after.reports[0]?.tokens, after.reports[0]?.boundary],
+    [60_000, "new-boundary"],
+  );
 });

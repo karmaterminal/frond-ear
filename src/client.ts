@@ -47,10 +47,11 @@ export type CliRequest =
       type: "pressure";
       ear: string;
       sessionId: string;
-      tokens: number;
+      tokens: number | null;
       band: number | null;
       boundary: string | null;
       at: number;
+      idleFloor?: number;
     };
 
 /**
