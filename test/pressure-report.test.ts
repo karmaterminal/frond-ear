@@ -86,6 +86,7 @@ test("daemon: a report from the session holding the ear shows in ear_status, agi
     assert.equal(JSON.stringify(h.store.stateCounts("scribe")), counts);
     assert.equal((earPressure(h) as { tokens: number }).tokens, 300_001);
     // A reading under the first band carries band null.
+    h.clock.advance(1);
     assert.equal(
       (await report(h, good(h, { tokens: 1_000, band: null, boundary: null })))
         .ok,
@@ -138,7 +139,7 @@ test("daemon: refusals leave the reading unchanged (session, ear, role, every bo
       assert.equal(result.ok, false, name);
       assert.equal(JSON.stringify(earPressure(h)), before, name);
     }
-    // The edges themselves are in bounds.
+    // The edges themselves are in bounds (each on a fresh daemon: ordering is its own test).
     for (const fields of [
       { tokens: 0 },
       { tokens: 10_000_000 },
@@ -150,11 +151,18 @@ test("daemon: refusals leave the reading unchanged (session, ear, role, every bo
       { tokens: null, band: null },
       { idleFloor: 0 },
     ]) {
-      assert.equal(
-        (await report(h, good(h, fields))).ok,
-        true,
-        JSON.stringify(fields),
-      );
+      const fresh = harness();
+      try {
+        fresh.clock.value = now;
+        fresh.attach("scribe", { sessionId: SESSION });
+        assert.equal(
+          (await report(fresh, good(fresh, fields))).ok,
+          true,
+          JSON.stringify(fields),
+        );
+      } finally {
+        fresh.dispose();
+      }
     }
   } finally {
     h.dispose();
@@ -477,10 +485,15 @@ test("daemon: idleCompactDueAt is a forecast at or over the floor, null under it
   const h = harness();
   try {
     h.attach("scribe", { sessionId: SESSION });
+    let step = 0;
     const due = async (fields: Partial<Report>) => {
-      assert.equal((await report(h, good(h, fields))).ok, true);
-      return (earPressure(h) as { idleCompactDueAt: number | null })
+      // Each report is newer evidence than the last (ordering is pinned below).
+      const offset = step++;
+      const later = { ...fields, at: (fields.at ?? h.clock.now()) + offset };
+      assert.equal((await report(h, good(h, later))).ok, true);
+      const dueAt = (earPressure(h) as { idleCompactDueAt: number | null })
         .idleCompactDueAt;
+      return dueAt === null ? null : dueAt - offset;
     };
     const at = h.clock.now() - 1_000;
     assert.equal(await due({ tokens: 199_999, band: 0, at }), null);
@@ -509,6 +522,7 @@ test("daemon: a marker-only report replaces the old size, band and forecast, not
         .ok,
       true,
     );
+    h.clock.advance(1_000);
     assert.equal(
       (
         await report(
@@ -675,4 +689,107 @@ test("hook: a marker-only PostCompact reports the new boundary with tokens null,
     [after.reports[0]?.tokens, after.reports[0]?.boundary],
     [60_000, "new-boundary"],
   );
+});
+
+test("daemon: older evidence arriving late never replaces newer (🌫 F6); ties keep the reading unless identical", async () => {
+  const h = harness();
+  try {
+    h.attach("scribe", { sessionId: SESSION });
+    const t0 = h.clock.now() - 60_000;
+    const t1 = h.clock.now() - 1_000;
+    const old = good(h, { tokens: 400_000, band: 2, boundary: "old", at: t0 });
+    const marker = good(h, {
+      tokens: null,
+      band: null,
+      boundary: "new-boundary",
+      at: t1,
+    });
+    // The newer marker-only report lands first; the older 400k arrives after it.
+    assert.equal((await report(h, marker)).ok, true);
+    const late = await report(h, old);
+    assert.equal(late.ok, false);
+    assert.match(late.text, /not newer than the reading kept/u);
+    const view = earPressure(h) as Record<string, unknown>;
+    assert.deepEqual(
+      [view.tokens, view.band, view.boundary, view.idleCompactDueAt, view.at],
+      [null, null, "new-boundary", null, t1],
+    );
+    // A tie that says the same thing is the same row read again: kept, arrival refreshed.
+    h.clock.advance(5_000);
+    assert.equal((await report(h, marker)).ok, true);
+    assert.equal(
+      (earPressure(h) as { receivedAt: number }).receivedAt,
+      h.clock.now(),
+    );
+    // A tie that disagrees keeps what is already kept.
+    const clash = await report(
+      h,
+      good(h, { tokens: 90_000, band: null, boundary: "new-boundary", at: t1 }),
+    );
+    assert.equal(clash.ok, false);
+    assert.equal((earPressure(h) as { tokens: unknown }).tokens, null);
+    // Newer evidence still moves it.
+    assert.equal(
+      (
+        await report(
+          h,
+          good(h, {
+            tokens: 90_000,
+            band: null,
+            boundary: "new-boundary",
+            at: t1 + 1,
+          }),
+        )
+      ).ok,
+      true,
+    );
+    assert.equal((earPressure(h) as { tokens: unknown }).tokens, 90_000);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("hook → real daemon: a pre-compaction hook run delivered after the PostCompact one leaves the new marker in place (🌫 F6)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "fe-pressure-order-"));
+  const socketPath = join(dir, "d.sock");
+  const h = harness();
+  h.clock.value = Date.parse("2026-11-18T20:00:00.000Z");
+  const server = await listenUnix(h.daemon, socketPath);
+  try {
+    h.attach("scribe", { sessionId: SESSION });
+    const pre = join(dir, "pre.jsonl");
+    const post = join(dir, "post.jsonl");
+    const usage = stamped(400_000, "2026-11-18T19:00:00.000Z");
+    writeFileSync(pre, `${usage}\n`);
+    writeFileSync(
+      post,
+      `${usage}\n${compactMarker("new-boundary", "2026-11-18T19:55:00.000Z")}\n`,
+    );
+    const env = {
+      XDG_STATE_HOME: join(dir, "state"),
+      FROND_EAR_SOCKET: socketPath,
+    };
+    const hook = (transcript: string, event: string) =>
+      run(
+        ["--hook", "--ear", "scribe"],
+        JSON.stringify({
+          session_id: SESSION,
+          transcript_path: transcript,
+          hook_event_name: event,
+        }),
+        env,
+      );
+    assert.equal((await hook(post, "PostCompact")).code, 0);
+    const late = await hook(pre, "PostToolUse");
+    assert.deepEqual([late.code, late.stderr], [0, ""]);
+    const view = earPressure(h) as Record<string, unknown>;
+    assert.deepEqual(
+      [view.tokens, view.boundary, view.idleCompactDueAt],
+      [null, "new-boundary", null],
+    );
+  } finally {
+    server.close();
+    h.dispose();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

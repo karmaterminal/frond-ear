@@ -1644,6 +1644,22 @@ export class Daemon {
         text: `pressure report refused: ${problem} is out of bounds; nothing kept`,
       };
     }
+    // Separate hook runs connect separately, so arrival order isn't evidence order:
+    // never let older evidence replace newer. A tie is the same row read again only
+    // when it says the same thing; a tie that disagrees keeps what is already kept.
+    const kept = this.pressure.get(ear);
+    if (kept && kept.sessionId === sessionId) {
+      const same =
+        kept.tokens === tokens &&
+        kept.band === band &&
+        kept.boundary === boundary;
+      if ((at as number) < kept.at || ((at as number) === kept.at && !same)) {
+        return {
+          ok: false,
+          text: `pressure report refused: its evidence (at ${String(at)}) is not newer than the reading kept (at ${String(kept.at)}); nothing changed`,
+        };
+      }
+    }
     this.pressure.set(ear, {
       sessionId,
       tokens: tokens as number | null,
