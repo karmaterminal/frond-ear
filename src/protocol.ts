@@ -60,6 +60,8 @@ export type ClientMessage =
       boundary: string | null;
       at: number;
       idleFloor?: number;
+      /** The hook event that read it; only PostToolUse and UserPromptSubmit can show a notice (#107). */
+      event?: string;
     };
 
 /** Messages from the daemon to a client. */
@@ -86,6 +88,8 @@ export type DaemonMessage =
       text: string;
       /** precompact only (#107): why the session's hold blocks this compaction. */
       block?: string;
+      /** pressure only (#107): a one-time line for the session, e.g. its hold ended. */
+      notice?: string;
     }
   | { type: "detached"; reason: string };
 

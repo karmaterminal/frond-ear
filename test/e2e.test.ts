@@ -193,6 +193,7 @@ test("dry-run daemon + channel shim + MCP client: inject → <channel> notificat
     "fetch_attachment",
     "fetch_messages",
     "hear",
+    "hold_compaction",
     "inbox",
     "leave_letter",
     "letters",

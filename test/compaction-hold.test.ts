@@ -1,7 +1,7 @@
 // frond-ear#107: a session can hold off its own auto compaction while it waits
 // mid-task. The PreCompact hook blocks (exit 2) only for an auto compaction of the
-// holding session, before the hold expires, with a reading under the ceiling.
-// Everything else fails open: the compaction goes ahead as stock.
+// holding session, before the hold expires, with a fresh transcript reading under the
+// seat's own ceiling. Everything else allows: the compaction goes ahead as stock.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -10,23 +10,21 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { HOLD_LIMITS } from "../src/daemon.ts";
+import { holdReading, pendingTokens, withNotice } from "../src/pressure.ts";
 import { listenUnix } from "../src/server.ts";
 import { harness, testConfig } from "./helpers.ts";
 
 const SESSION = "aaaaaaaa-1111-2222-3333-444444444444";
 const OTHER = "bbbbbbbb-1111-2222-3333-444444444444";
 const CLI = join(import.meta.dirname, "..", "src", "cli.ts");
+const CEILING = 600_000;
 
 type H = ReturnType<typeof harness>;
+type Shim = ReturnType<H["attach"]>;
 
 async function precompact(
   h: H,
-  fields: {
-    sessionId?: string;
-    trigger?: unknown;
-    tokens?: unknown;
-    ceiling?: unknown;
-  },
+  fields: Record<string, unknown>,
 ): Promise<{ ok: boolean; text: string; block?: string }> {
   const client = h.attach(undefined, { role: "cli" });
   const id = 7_000 + Math.floor(Math.random() * 1_000);
@@ -41,14 +39,46 @@ async function precompact(
   return result;
 }
 
+/** An auto compaction of SESSION under the ceiling: blocks whenever a hold stands. */
+const auto = (h: H, extra: Record<string, unknown> = {}) =>
+  precompact(h, {
+    sessionId: SESSION,
+    trigger: "auto",
+    tokens: 250_000,
+    ceiling: CEILING,
+    ...extra,
+  });
+
+async function pressure(
+  h: H,
+  fields: Record<string, unknown>,
+): Promise<{ ok: boolean; text: string; notice?: string }> {
+  const client = h.attach(undefined, { role: "cli" });
+  const id = 8_000 + Math.floor(Math.random() * 1_000);
+  await client.send({
+    type: "pressure",
+    id,
+    ear: "scribe",
+    sessionId: SESSION,
+    tokens: 250_000,
+    band: 1,
+    boundary: null,
+    at: h.clock.now(),
+    ...(fields as Record<string, never>),
+  });
+  const result = client.connection.results().find((item) => item.id === id);
+  assert.ok(result, "pressure answered");
+  return result;
+}
+
 async function holdView(
   h: H,
-  shim: ReturnType<H["attach"]>,
+  shim: Shim,
 ): Promise<{
   reason: string;
   setAt: number;
   expiresAt: number;
-  blocks: number;
+  blocksAnswered: number;
 } | null> {
   const status = await h.call(shim, "ear_status", {});
   const parsed = JSON.parse(status.text) as {
@@ -59,138 +89,122 @@ async function holdView(
   return ear.hold as never;
 }
 
-test("a hold blocks an auto compaction of its own session under the ceiling, says why, and counts it", async () => {
+test("a hold blocks an auto compaction of its own session under the seat's ceiling, says why, and counts it", async () => {
   const h = harness(testConfig(), { nonce: "hold01" });
   try {
     const shim = h.attach("scribe", { sessionId: SESSION });
     await h.call(shim, "leave_letter", { reason: "r", body: "carry me" });
+    assert.equal((await auto(h)).block, undefined, "no hold: stock");
     const set = await h.call(shim, "hold_compaction", {
       reason: "waiting on CI run 42",
       ttl_seconds: 3_600,
     });
     assert.equal(set.ok, true, set.text);
-    assert.match(set.text, /compaction held until/u);
-    const view = await holdView(h, shim);
-    assert.deepEqual(view, {
+    assert.match(set.text, /compaction held until \S+Z, then allowed again/u);
+    assert.deepEqual(await holdView(h, shim), {
       reason: "waiting on CI run 42",
       setAt: h.clock.now(),
       expiresAt: h.clock.now() + 3_600_000,
-      blocks: 0,
+      blocksAnswered: 0,
     });
 
-    const held = await precompact(h, {
-      sessionId: SESSION,
-      trigger: "auto",
-      tokens: 250_000,
-    });
+    const held = await auto(h);
     assert.equal(held.ok, true, held.text);
     assert.match(held.block ?? "", /waiting on CI run 42/u);
-    assert.match(held.block ?? "", /250000 tokens, under the 600000 ceiling/u);
+    assert.match(held.block ?? "", /about 250000 tokens, under its 600000/u);
     assert.match(held.text, /carry me/u, "letters still answer");
-    assert.equal((await holdView(h, shim))?.blocks, 1);
-    assert.ok(
-      h.logs.some((line) => line.includes("compaction.held")),
-      "a block is logged",
-    );
+    assert.equal((await holdView(h, shim))?.blocksAnswered, 1);
+    const line = h.logs.find((item) => item.includes("compaction.held"));
+    assert.ok(line, "a block is logged");
+    for (const field of ["aaaaaaaa", "250000", "600000", "expiresAt"]) {
+      assert.ok(line.includes(field), `log carries ${field}: ${line}`);
+    }
 
-    // A just-under reading still blocks; the ceiling itself does not.
-    const under = await precompact(h, {
-      sessionId: SESSION,
-      trigger: "auto",
-      tokens: HOLD_LIMITS.ceiling - 1,
-    });
-    assert.ok(under.block);
-    const at = await precompact(h, {
-      sessionId: SESSION,
-      trigger: "auto",
-      tokens: HOLD_LIMITS.ceiling,
-    });
-    assert.equal(at.ok, true);
+    // Just under blocks; at the ceiling allows; status reads count nothing.
+    assert.ok((await auto(h, { tokens: CEILING - 1 })).block);
+    assert.equal((await auto(h, { tokens: CEILING })).block, undefined);
+    await holdView(h, shim);
+    await holdView(h, shim);
+    assert.equal((await holdView(h, shim))?.blocksAnswered, 2);
+    // Repeated blocks never extend the lease.
     assert.equal(
-      at.block,
-      undefined,
-      "at the ceiling the compaction goes ahead",
+      (await holdView(h, shim))?.expiresAt,
+      h.clock.now() + 3_600_000,
     );
-    assert.equal((await holdView(h, shim))?.blocks, 2);
   } finally {
     h.dispose();
   }
 });
 
-test("a hold never blocks manual, an unknown trigger, or a missing or odd token reading", async () => {
+test("a hold never blocks manual, an unknown trigger, unknown pressure, or an unusable ceiling", async () => {
   const h = harness(testConfig(), { nonce: "hold02" });
   try {
     const shim = h.attach("scribe", { sessionId: SESSION });
     await h.call(shim, "hold_compaction", { reason: "wait" });
     const cases: Array<Record<string, unknown>> = [
-      { trigger: "manual", tokens: 1_000 },
-      { trigger: "AUTO", tokens: 1_000 },
-      { tokens: 1_000 },
-      { trigger: "auto" },
-      { trigger: "auto", tokens: "1000" },
-      { trigger: "auto", tokens: 1.5 },
-      { trigger: "auto", tokens: -1 },
-      { trigger: "auto", tokens: Number.NaN },
-      { trigger: "auto", tokens: null },
+      { trigger: "manual" },
+      { trigger: "AUTO" },
+      { trigger: undefined },
+      { tokens: undefined },
+      { tokens: "1000" },
+      { tokens: 1.5 },
+      { tokens: -1 },
+      { tokens: Number.NaN },
+      { tokens: null },
+      { ceiling: undefined },
+      { ceiling: 0 },
+      { ceiling: -5 },
+      { ceiling: 1.5 },
+      { ceiling: "600000" },
+      { ceiling: null },
+      { ceiling: HOLD_LIMITS.maxCeiling + 1 },
     ];
     for (const fields of cases) {
-      const result = await precompact(h, { sessionId: SESSION, ...fields });
+      const result = await auto(h, fields);
       assert.equal(result.ok, true, JSON.stringify(fields));
       assert.equal(result.block, undefined, JSON.stringify(fields));
     }
-    assert.equal((await holdView(h, shim))?.blocks, 0);
+    assert.equal((await holdView(h, shim))?.blocksAnswered, 0);
     // The control: the same hold does block a plain auto reading.
-    const control = await precompact(h, {
-      sessionId: SESSION,
-      trigger: "auto",
-      tokens: 1_000,
-    });
-    assert.ok(control.block);
+    assert.ok((await auto(h)).block);
+    assert.ok((await auto(h, { ceiling: HOLD_LIMITS.maxCeiling })).block);
   } finally {
     h.dispose();
   }
 });
 
-test("a seat's ceiling can only lower the daemon's", async () => {
-  const h = harness(testConfig(), { nonce: "hold03" });
-  try {
-    const shim = h.attach("scribe", { sessionId: SESSION });
-    await h.call(shim, "hold_compaction", { reason: "wait" });
-    const ask = (tokens: number, ceiling: unknown) =>
-      precompact(h, { sessionId: SESSION, trigger: "auto", tokens, ceiling });
-    assert.equal((await ask(300_000, 300_000)).block, undefined);
-    assert.ok((await ask(299_999, 300_000)).block);
-    // Higher than the daemon's, zero, negative or odd: the daemon's own applies.
-    for (const ceiling of [900_000, 0, -5, 1.5, "100", null]) {
-      assert.ok(
-        (await ask(500_000, ceiling)).block,
-        `ceiling ${String(ceiling)} must not lift or drop the default`,
-      );
-      assert.equal(
-        (await ask(HOLD_LIMITS.ceiling, ceiling)).block,
-        undefined,
-        `ceiling ${String(ceiling)} must not raise the default`,
-      );
-    }
-  } finally {
-    h.dispose();
-  }
-});
-
-test("a hold lapses at its expiry, and release drops it", async () => {
+test("a hold lapses at its expiry and owes the session one notice; its own release owes none", async () => {
   const h = harness(testConfig(), { nonce: "hold04" });
   try {
     const shim = h.attach("scribe", { sessionId: SESSION });
     await h.call(shim, "hold_compaction", { reason: "wait", ttl_seconds: 60 });
-    const auto = () =>
-      precompact(h, { sessionId: SESSION, trigger: "auto", tokens: 1_000 });
     h.clock.advance(59_999);
-    assert.ok((await auto()).block, "still held a millisecond before expiry");
+    assert.ok((await auto(h)).block, "still held a millisecond before expiry");
     h.clock.advance(1);
-    assert.equal((await auto()).block, undefined, "lapsed at expiry");
+    assert.equal((await auto(h)).block, undefined, "lapsed at expiry");
     assert.equal(await holdView(h, shim), null);
 
-    // Default TTL is 2 h.
+    // The notice waits for an event that can show it, then comes once.
+    assert.equal((await pressure(h, { event: "Stop" })).notice, undefined);
+    assert.equal(
+      (await pressure(h, { event: "PostCompact" })).notice,
+      undefined,
+    );
+    const shown = await pressure(h, { event: "PostToolUse" });
+    assert.match(shown.notice ?? "", /hold \(wait\) has ended: it expired at/u);
+    assert.equal(
+      (await pressure(h, { event: "UserPromptSubmit" })).notice,
+      undefined,
+      "once only",
+    );
+
+    // Expiry noticed by a pressure report alone (no compaction attempt).
+    await h.call(shim, "hold_compaction", { reason: "quiet", ttl_seconds: 60 });
+    h.clock.advance(60_000);
+    const quiet = await pressure(h, { event: "UserPromptSubmit" });
+    assert.match(quiet.notice ?? "", /hold \(quiet\) has ended: it expired/u);
+
+    // Default TTL is 2 h; release drops it and owes nothing.
     await h.call(shim, "hold_compaction", { reason: "again" });
     assert.equal(
       (await holdView(h, shim))?.expiresAt,
@@ -199,7 +213,11 @@ test("a hold lapses at its expiry, and release drops it", async () => {
     const released = await h.call(shim, "hold_compaction", { release: true });
     assert.match(released.text, /hold released/u);
     assert.equal(await holdView(h, shim), null);
-    assert.equal((await auto()).block, undefined);
+    assert.equal((await auto(h)).block, undefined);
+    assert.equal(
+      (await pressure(h, { event: "PostToolUse" })).notice,
+      undefined,
+    );
     const again = await h.call(shim, "hold_compaction", { release: true });
     assert.match(again.text, /no hold to release/u);
   } finally {
@@ -207,7 +225,36 @@ test("a hold lapses at its expiry, and release drops it", async () => {
   }
 });
 
-test("a hold is its session's alone: another session's compaction, a new attach, or a session change drops or ignores it", async () => {
+test("a compaction ends the hold: a marker-only reading clears it, whatever kind of compaction ran", async () => {
+  const h = harness(testConfig(), { nonce: "hold07" });
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    await h.call(shim, "hold_compaction", { reason: "ci" });
+    // A reading with tokens and an old boundary leaves it.
+    await pressure(h, { boundary: "old-marker", event: "PostToolUse" });
+    assert.ok(await holdView(h, shim));
+    h.clock.advance(1_000);
+    // The marker-only PostCompact reading ends it (manual /compact included).
+    await pressure(h, {
+      tokens: null,
+      band: null,
+      boundary: "new-marker",
+      event: "PostCompact",
+    });
+    assert.equal(await holdView(h, shim), null);
+    assert.equal((await auto(h)).block, undefined);
+    h.clock.advance(1_000);
+    const next = await pressure(h, {
+      boundary: "new-marker",
+      event: "UserPromptSubmit",
+    });
+    assert.match(next.notice ?? "", /has ended: a compaction ran/u);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("a hold is its session's alone: turnover, A→B→A and a late release never carry or erase it", async () => {
   const h = harness(testConfig(), { nonce: "hold05" });
   try {
     const shim = h.attach("scribe", { sessionId: SESSION });
@@ -217,6 +264,7 @@ test("a hold is its session's alone: another session's compaction, a new attach,
       sessionId: OTHER,
       trigger: "auto",
       tokens: 1_000,
+      ceiling: CEILING,
     });
     assert.equal(other.ok, false);
     assert.equal(other.block, undefined);
@@ -224,33 +272,33 @@ test("a hold is its session's alone: another session's compaction, a new attach,
     // Another session takes the ear: the hold goes with the old one.
     const taker = h.attach("scribe", { sessionId: OTHER });
     assert.equal(await holdView(h, taker), null);
+    // The superseded shim's late release can't touch the taker's hold.
+    await h.call(taker, "hold_compaction", { reason: "taker's" });
+    const late = await h.call(shim, "hold_compaction", { release: true });
+    assert.equal(late.ok, false, "a detached shim is not the holder");
+    assert.equal((await holdView(h, taker))?.reason, "taker's");
+
     const back = h.attach("scribe", { sessionId: SESSION });
     assert.equal(await holdView(h, back), null, "not restored by coming back");
-    assert.equal(
-      (
-        await precompact(h, {
-          sessionId: SESSION,
-          trigger: "auto",
-          tokens: 1_000,
-        })
-      ).block,
-      undefined,
-    );
+    assert.equal((await auto(h)).block, undefined);
 
-    // The same session re-attaching (a resume) keeps it.
+    // The same session re-attaching (a resume) keeps its hold.
     await h.call(back, "hold_compaction", { reason: "kept" });
     const resumed = h.attach("scribe", { sessionId: SESSION });
     assert.equal((await holdView(h, resumed))?.reason, "kept");
 
-    // A session message naming a new id drops it.
+    // An in-place rename A→B drops it, and B→A does not bring it back.
     await resumed.send({ type: "session", sessionId: OTHER });
     assert.equal(await holdView(h, resumed), null);
+    await resumed.send({ type: "session", sessionId: SESSION });
+    assert.equal(await holdView(h, resumed), null);
+    assert.equal((await auto(h)).block, undefined);
   } finally {
     h.dispose();
   }
 });
 
-test("hold_compaction checks its arguments and its caller", async () => {
+test("hold_compaction checks its arguments and its caller, and a refused set keeps the standing hold", async () => {
   const h = harness(testConfig(), { nonce: "hold06" });
   try {
     const shim = h.attach("scribe", { sessionId: SESSION });
@@ -262,6 +310,7 @@ test("hold_compaction checks its arguments and its caller", async () => {
       [{ reason: "x", ttl_seconds: 21_601 }, /ttl_seconds must be/u],
       [{ reason: "x", ttl_seconds: 90.5 }, /ttl_seconds must be/u],
       [{ reason: "x", ttl_seconds: "soon" }, /ttl_seconds must be/u],
+      [{ reason: "x", ttl_seconds: Number.POSITIVE_INFINITY }, /ttl_seconds/u],
       [{ release: true, reason: "x" }, /release takes no reason/u],
       [{ release: "yes", reason: "x" }, /release must be true/u],
     ];
@@ -271,6 +320,21 @@ test("hold_compaction checks its arguments and its caller", async () => {
       assert.match(result.text, pattern, JSON.stringify(args));
     }
     assert.equal(await holdView(h, shim), null, "nothing held after refusals");
+
+    await h.call(shim, "hold_compaction", {
+      reason: "standing",
+      ttl_seconds: 600,
+    });
+    const standing = await holdView(h, shim);
+    for (const [args] of bad) {
+      await h.call(shim, "hold_compaction", args);
+    }
+    assert.deepEqual(
+      await holdView(h, shim),
+      standing,
+      "refusals change nothing",
+    );
+
     for (const ttl of [60, 21_600]) {
       const ok = await h.call(shim, "hold_compaction", {
         reason: "edge",
@@ -279,10 +343,7 @@ test("hold_compaction checks its arguments and its caller", async () => {
       assert.equal(ok.ok, true, ok.text);
     }
 
-    // A shim that does not hold the ear, and one with no session id.
-    const stranger = h.attach("scribe-two" as never, { sessionId: OTHER });
-    const refused = await h.call(stranger, "hold_compaction", { reason: "x" });
-    assert.equal(refused.ok, false);
+    // A shim with no session id.
     const anon = h.attach("scribe");
     const noId = await h.call(anon, "hold_compaction", { reason: "x" });
     assert.equal(noId.ok, false);
@@ -292,12 +353,12 @@ test("hold_compaction checks its arguments and its caller", async () => {
   }
 });
 
-// ---- the hook, through the real CLI --------------------------------------------------
+// ---- the reading at PreCompact ------------------------------------------------------
 
-function turn(tokens: number): string {
+function turn(tokens: number, extra: Record<string, unknown> = {}): string {
   return JSON.stringify({
     type: "assistant",
-    timestamp: new Date().toISOString(),
+    timestamp: "2026-11-18T20:00:00.000Z",
     message: {
       role: "assistant",
       usage: {
@@ -307,14 +368,86 @@ function turn(tokens: number): string {
         output_tokens: 50,
       },
     },
+    ...extra,
   });
 }
+
+const marker = JSON.stringify({
+  type: "system",
+  subtype: "compact_boundary",
+  uuid: "m1",
+  timestamp: "2026-11-18T20:10:00.000Z",
+});
+
+test("holdReading: the latest main usage plus the bytes after it; a newer marker or none means unknown", () => {
+  const tool = JSON.stringify({
+    type: "user",
+    message: { content: "x".repeat(3_000) },
+  });
+  assert.deepEqual(holdReading(`${turn(250_000)}\n`), {
+    tokens: 250_000,
+    pendingBytes: 1,
+  });
+  const after = holdReading(`${turn(250_000)}\n${tool}\n`);
+  assert.equal(after.tokens, 250_000);
+  assert.equal(after.pendingBytes, Buffer.byteLength(tool) + 2);
+  assert.ok(pendingTokens(after.pendingBytes) >= 1_000, "3 bytes a token");
+
+  // A newer sidechain row never supplies tokens, but its bytes count.
+  const side = turn(10_000, { isSidechain: true });
+  const sided = holdReading(`${turn(250_000)}\n${side}\n`);
+  assert.equal(sided.tokens, 250_000);
+  assert.ok(sided.pendingBytes > Buffer.byteLength(side));
+  // An older high main row behind a newer low one: the newer wins.
+  assert.equal(
+    holdReading(`${turn(900_000)}\n${turn(100_000)}\n`).tokens,
+    100_000,
+  );
+  // A marker newer than every usage row, or no usage at all: unknown.
+  assert.equal(holdReading(`${turn(250_000)}\n${marker}\n`).tokens, undefined);
+  assert.equal(holdReading(`${tool}\n`).tokens, undefined);
+  assert.equal(holdReading("").tokens, undefined);
+  // Usage after the marker counts again.
+  assert.equal(holdReading(`${marker}\n${turn(40_000)}\n`).tokens, 40_000);
+});
+
+test("withNotice: added once to PostToolUse or UserPromptSubmit output, beside any band line", () => {
+  const notice = "frond-ear: your compaction hold (x) has ended";
+  const band = `${JSON.stringify({ hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: "band line" } })}\n`;
+  const merged = JSON.parse(withNotice(band, "PostToolUse", notice)) as {
+    hookSpecificOutput: { additionalContext: string };
+  };
+  assert.equal(
+    merged.hookSpecificOutput.additionalContext,
+    `band line\n${notice}`,
+  );
+  const alone = JSON.parse(withNotice("", "UserPromptSubmit", notice)) as {
+    hookSpecificOutput: { hookEventName: string; additionalContext: string };
+  };
+  assert.deepEqual(alone.hookSpecificOutput, {
+    hookEventName: "UserPromptSubmit",
+    additionalContext: notice,
+  });
+  const stop = '{"decision":"block","reason":"r"}\n';
+  assert.equal(withNotice(stop, "Stop", notice), stop);
+  assert.equal(withNotice("", "Stop", notice), "");
+  assert.equal(withNotice("", "PostCompact", notice), "");
+  assert.equal(withNotice(band, "PostToolUse", undefined), band);
+});
+
+// ---- the hook, through the real CLI --------------------------------------------------
 
 function run(
   args: string[],
   env: NodeJS.ProcessEnv,
-  stdin: string,
-): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  stdin: string | null,
+): Promise<{
+  code: number | null;
+  stdout: string;
+  stderr: string;
+  ms: number;
+}> {
+  const started = Date.now();
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [CLI, ...args], {
       env,
@@ -324,8 +457,15 @@ function run(
     let stderr = "";
     child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
     child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
-    child.on("close", (code) => resolve({ code, stdout, stderr }));
-    child.stdin.end(stdin);
+    child.on("close", (code) =>
+      resolve({ code, stdout, stderr, ms: Date.now() - started }),
+    );
+    if (stdin === null) {
+      // stdin left open: a hook whose input never ends.
+      child.stdin.write('{"session_id":');
+    } else {
+      child.stdin.end(stdin);
+    }
   });
 }
 
@@ -334,14 +474,26 @@ test("frond-ear precompact --hook exits 2 only for a held auto compaction under 
   const socketPath = join(directory, "d.sock");
   const transcript = join(directory, "t.jsonl");
   const big = join(directory, "big.jsonl");
+  const pending = join(directory, "pending.jsonl");
+  const compacted = join(directory, "compacted.jsonl");
   writeFileSync(transcript, `${turn(250_000)}\n`);
   writeFileSync(big, `${turn(700_000)}\n`);
+  // A low reading, then a tool result big enough to cross the ceiling.
+  writeFileSync(
+    pending,
+    `${turn(250_000)}\n${JSON.stringify({ type: "user", message: { content: "y".repeat(1_200_000) } })}\n`,
+  );
+  writeFileSync(compacted, `${turn(250_000)}\n${marker}\n`);
   const h = harness();
   const server = await listenUnix(h.daemon, socketPath);
   try {
     const shim = h.attach("scribe", { sessionId: SESSION });
-    const env = { ...process.env, FROND_EAR_SOCKET: socketPath };
-    delete env.FROND_EAR_HOLD_CEILING;
+    await h.call(shim, "leave_letter", { reason: "r", body: "the thread" });
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      FROND_EAR_SOCKET: socketPath,
+      FROND_EAR_HOLD_CEILING: String(CEILING),
+    };
     const hook = (fields: Record<string, unknown>) =>
       JSON.stringify({
         session_id: SESSION,
@@ -353,21 +505,31 @@ test("frond-ear precompact --hook exits 2 only for a held auto compaction under 
       });
     const args = ["precompact", "--ear", "scribe", "--hook"];
 
-    // No hold yet: stock behavior.
+    // No hold yet: stock behavior, letters on stdout.
     const none = await run(args, env, hook({}));
     assert.equal(none.code, 0, none.stderr);
+    assert.match(none.stdout, /the thread/u);
 
     await h.call(shim, "hold_compaction", { reason: "waiting on review" });
     const held = await run(args, env, hook({}));
     assert.equal(held.code, 2, held.stderr);
     assert.equal(held.stdout, "", "nothing for a summary that isn't written");
     assert.match(held.stderr, /held by this session \(waiting on review\)/u);
-    assert.match(held.stderr, /250000 tokens/u);
+    assert.match(held.stderr, /about 250001 tokens/u);
+    assert.equal(held.stderr.trim().split("\n").length, 1, "one line");
 
+    const noCeiling = { ...env };
+    delete noCeiling.FROND_EAR_HOLD_CEILING;
     const cases: Array<[string, NodeJS.ProcessEnv, string]> = [
       ["manual", env, hook({ trigger: "manual" })],
       ["no trigger", env, hook({ trigger: undefined })],
       ["over the ceiling", env, hook({ transcript_path: big })],
+      [
+        "pending bytes cross the ceiling",
+        env,
+        hook({ transcript_path: pending }),
+      ],
+      ["marker newer than usage", env, hook({ transcript_path: compacted })],
       [
         "missing transcript",
         env,
@@ -375,36 +537,36 @@ test("frond-ear precompact --hook exits 2 only for a held auto compaction under 
       ],
       ["no transcript path", env, hook({ transcript_path: undefined })],
       ["another session", env, hook({ session_id: OTHER })],
-      [
-        "lower seat ceiling",
-        { ...env, FROND_EAR_HOLD_CEILING: "200000" },
-        hook({}),
-      ],
+      ["no ceiling set", noCeiling, hook({})],
+      ["junk ceiling", { ...env, FROND_EAR_HOLD_CEILING: "lots" }, hook({})],
+      ["zero ceiling", { ...env, FROND_EAR_HOLD_CEILING: "0" }, hook({})],
+      ["lower ceiling", { ...env, FROND_EAR_HOLD_CEILING: "200000" }, hook({})],
       [
         "daemon down",
         { ...env, FROND_EAR_SOCKET: join(directory, "nobody.sock") },
         hook({}),
       ],
       ["garbage stdin", env, "not json"],
+      ["oversized stdin", env, `{"x":"${"z".repeat(70 * 1024)}"}`],
     ];
     for (const [name, caseEnv, stdin] of cases) {
       const result = await run(args, caseEnv, stdin);
       assert.equal(result.code, 0, `${name}: ${result.stderr}`);
     }
-    // A seat ceiling that is junk or higher leaves the default, so this still blocks.
-    for (const value of ["lots", "900000", "0", "-1"]) {
-      const result = await run(
-        args,
-        { ...env, FROND_EAR_HOLD_CEILING: value },
-        hook({}),
-      );
-      assert.equal(result.code, 2, `ceiling ${value}: ${result.stderr}`);
-    }
+    // Where letters can be read, an allow still prints them.
+    const manual = await run(args, env, hook({ trigger: "manual" }));
+    assert.match(manual.stdout, /the thread/u);
 
-    // Released: back to exit 0.
+    // A hook whose stdin never ends still finishes, and allows.
+    const hung = await run(args, env, null);
+    assert.equal(hung.code, 0, hung.stderr);
+    assert.ok(hung.ms < 6_000, `bounded: ${hung.ms} ms`);
+
+    // Released: back to exit 0, letters on stdout.
     await h.call(shim, "hold_compaction", { release: true });
     const after = await run(args, env, hook({}));
     assert.equal(after.code, 0, after.stderr);
+    assert.match(after.stdout, /the thread/u);
   } finally {
     server.close();
     h.dispose();

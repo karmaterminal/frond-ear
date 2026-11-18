@@ -59,6 +59,7 @@ export type CliRequest =
       boundary: string | null;
       at: number;
       idleFloor?: number;
+      event?: string;
     };
 
 /**
@@ -76,7 +77,7 @@ export function request(
   message: CliRequest,
   env: NodeJS.ProcessEnv = process.env,
   timeoutMs?: number,
-): Promise<{ ok: boolean; text: string; block?: string }> {
+): Promise<{ ok: boolean; text: string; block?: string; notice?: string }> {
   return new Promise((resolve, reject) => {
     // Read before connecting: an unreadable token file rejects here instead of
     // throwing from the socket's connect handler.
@@ -113,6 +114,9 @@ export function request(
             ok: reply.ok,
             text: reply.text,
             ...(typeof reply.block === "string" ? { block: reply.block } : {}),
+            ...(typeof reply.notice === "string"
+              ? { notice: reply.notice }
+              : {}),
           });
         }
       },

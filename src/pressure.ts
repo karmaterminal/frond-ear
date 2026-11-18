@@ -491,6 +491,8 @@ export interface PressureReport {
   at: number;
   /** CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS, when the seat sets it. */
   idleFloor?: number;
+  /** The hook event that read it (#107: only some can show the daemon's notice). */
+  event?: string;
 }
 
 /** The seat's idle-compaction floor, when its environment sets one. */
@@ -606,6 +608,7 @@ export function runPressure(argv: string[], io: PressureIo): number {
         boundary: reading.boundary,
         at: reading.at ?? Date.now(),
         ...(idleFloor !== undefined ? { idleFloor } : {}),
+        ...(input.event ? { event: input.event } : {}),
       });
     }
     // Already continuing because of a Stop hook: never ask again, or a turn
@@ -665,18 +668,64 @@ export async function runPressureCommand(
   io: PressureIo,
 ): Promise<number> {
   let report: PressureReport | undefined;
+  let printed = "";
   const code = runPressure(argv, {
     ...io,
+    // Held until the daemon answers, so a notice can join the same hook output.
+    stdout: { write: (text: string) => (printed += text) },
     onReading: (reading) => {
       report = reading;
     },
   });
+  let notice: string | undefined;
   if (report) {
     try {
-      await request({ type: "pressure", ...report }, io.env, REPORT_TIMEOUT_MS);
+      const result = await request(
+        { type: "pressure", ...report },
+        io.env,
+        REPORT_TIMEOUT_MS,
+      );
+      notice = typeof result.notice === "string" ? result.notice : undefined;
     } catch {
       // Best effort: the gauge in the session's own context is unchanged.
     }
   }
+  io.stdout.write(withNotice(printed, report?.event, notice));
   return code;
+}
+
+/**
+ * A daemon notice (#107) added to what the hook already prints: on PostToolUse and
+ * UserPromptSubmit only, as added context, beside a band line when there is one.
+ * Anything else, or output it can't read, prints unchanged.
+ */
+export function withNotice(
+  printed: string,
+  event: string | undefined,
+  notice: string | undefined,
+): string {
+  if (!notice || (event !== "PostToolUse" && event !== "UserPromptSubmit")) {
+    return printed;
+  }
+  if (printed.trim() === "") {
+    return `${hookOutput(event, notice)}\n`;
+  }
+  try {
+    const parsed = JSON.parse(printed) as {
+      hookSpecificOutput?: {
+        hookEventName?: unknown;
+        additionalContext?: unknown;
+      };
+    };
+    const line = parsed.hookSpecificOutput?.additionalContext;
+    if (
+      typeof line === "string" &&
+      parsed.hookSpecificOutput?.hookEventName === event
+    ) {
+      return `${hookOutput(event, `${line}\n${notice}`)}\n`;
+    }
+  } catch {
+    // Not the shape we print: leave it alone.
+  }
+  return printed;
 }
