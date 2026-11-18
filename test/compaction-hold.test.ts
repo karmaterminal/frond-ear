@@ -204,6 +204,21 @@ test("a hold lapses at its expiry and owes the session one notice; its own relea
     const quiet = await pressure(h, { event: "UserPromptSubmit" });
     assert.match(quiet.notice ?? "", /hold \(quiet\) has ended: it expired/u);
 
+    // A new hold voids a notice still owed for the old one.
+    await h.call(shim, "hold_compaction", { reason: "stale", ttl_seconds: 60 });
+    h.clock.advance(60_000);
+    assert.equal((await auto(h)).block, undefined, "stale lapsed");
+    await h.call(shim, "hold_compaction", {
+      reason: "fresh",
+      ttl_seconds: 600,
+    });
+    assert.equal(
+      (await pressure(h, { event: "PostToolUse" })).notice,
+      undefined,
+      "no 'ended' notice while the fresh hold stands",
+    );
+    await h.call(shim, "hold_compaction", { release: true });
+
     // Default TTL is 2 h; release drops it and owes nothing.
     await h.call(shim, "hold_compaction", { reason: "again" });
     assert.equal(
@@ -268,6 +283,13 @@ test("a hold is its session's alone: turnover, A→B→A and a late release neve
     });
     assert.equal(other.ok, false);
     assert.equal(other.block, undefined);
+
+    // A→B→A by attach, with nothing set in between: the hold is not resurrected.
+    h.attach("scribe", { sessionId: OTHER });
+    const home = h.attach("scribe", { sessionId: SESSION });
+    assert.equal(await holdView(h, home), null, "A→B→A by attach");
+    assert.equal((await auto(h)).block, undefined);
+    await h.call(home, "hold_compaction", { reason: "mine again" });
 
     // Another session takes the ear: the hold goes with the old one.
     const taker = h.attach("scribe", { sessionId: OTHER });
@@ -398,6 +420,17 @@ test("holdReading: the latest main usage plus the bytes after it; a newer marker
   const sided = holdReading(`${turn(250_000)}\n${side}\n`);
   assert.equal(sided.tokens, 250_000);
   assert.ok(sided.pendingBytes > Buffer.byteLength(side));
+  // A subagent's own compaction marker is not this session's.
+  const sideMarker = JSON.stringify({
+    type: "system",
+    subtype: "compact_boundary",
+    uuid: "s1",
+    isSidechain: true,
+  });
+  assert.equal(
+    holdReading(`${turn(250_000)}\n${sideMarker}\n`).tokens,
+    250_000,
+  );
   // An older high main row behind a newer low one: the newer wins.
   assert.equal(
     holdReading(`${turn(900_000)}\n${turn(100_000)}\n`).tokens,
