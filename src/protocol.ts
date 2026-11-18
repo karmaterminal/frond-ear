@@ -28,12 +28,20 @@ export type ClientMessage =
       source?: string;
       sessionId?: string;
     }
-  /** A seat's PreCompact hook: the letters to carry into the summary (#102). */
+  /**
+   * A seat's PreCompact hook: the letters to carry into the summary (#102), and
+   * whether the session's compaction hold (#107) blocks this compaction. `trigger`
+   * is the hook's own ("auto" or "manual"); `tokens` the transcript's latest context
+   * reading; `ceiling` the seat's lower ceiling, if it set one.
+   */
   | {
       type: "precompact";
       id: number;
       ear: string;
       sessionId?: string;
+      trigger?: string;
+      tokens?: number;
+      ceiling?: number;
     }
   /**
    * A seat's pressure hook: its latest context reading, for ear_status (#98).
@@ -76,6 +84,8 @@ export type DaemonMessage =
       id: number;
       ok: boolean;
       text: string;
+      /** precompact only (#107): why the session's hold blocks this compaction. */
+      block?: string;
     }
   | { type: "detached"; reason: string };
 

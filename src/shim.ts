@@ -277,6 +277,29 @@ export const TOOLS = [
     },
   },
   {
+    name: "hold_compaction",
+    description:
+      "Hold off Claude Code's automatic compaction while you wait mid-task (for a CI run, a review, a Monitor) with a thread you don't want summarized away. While the hold stands, the seat's PreCompact hook (frond-ear precompact --hook) blocks an auto compaction, idle or size, as long as the context is under 600,000 tokens (or the seat's lower FROND_EAR_HOLD_CEILING). A manual /compact always runs, and a compaction that recovers from a context-limit error can't be blocked. Costs tokens: a blocked idle compaction means the next turn re-reads the whole context uncached. The hold lapses after ttl_seconds (60 to 21600, default 7200), on a daemon restart, or when another session takes the ear; release it yourself (release: true) when the wait is over. ear_status shows it under hold. Only the session holding the ear.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        reason: {
+          type: "string",
+          description:
+            "What you're waiting on (at most 200 characters); shown in ear_status and the hook's message",
+        },
+        ttl_seconds: {
+          type: "number",
+          description: "60 to 21600; default 7200 (2 h)",
+        },
+        release: {
+          type: "boolean",
+          description: "true drops this session's hold (no reason or ttl)",
+        },
+      },
+    },
+  },
+  {
     name: "letters",
     description:
       'List this ear\'s letters (ids, states, sizes, reasons; never bodies), read one (read: id), or drop one or all (drop: id or "all"). Reading shows the text without delivering or settling it. Only the session holding the ear.',
@@ -294,7 +317,7 @@ export const TOOLS = [
   {
     name: "ear_status",
     description:
-      'Check that your ear works: after a restart, resume or compaction, and whenever Discord has been quiet longer than you expect. Healthy: gateway.state "connected" ("dry-run" under --dry-run) and your ear\'s delivery "confirmed" ("pending": attached under 2 minutes ago, confirmed by acking the kind="attach" event\'s nonce; "unconfirmed": read its hint; "detached": no session holds the ear). Also shows who holds the ear (sessionId, shimPid), attention, event counts, ambiguousSends, and the session\'s last context reading (pressure: tokens, ageMs from the transcript row\'s time, and idleCompactDueAt, a forecast; reported by the pressure hook run with --ear). Read-only. Never start a second session or shim for this ear to check it (in Claude Code, claude mcp list and claude mcp get each start one): the newest attach takes the ear.',
+      'Check that your ear works: after a restart, resume or compaction, and whenever Discord has been quiet longer than you expect. Healthy: gateway.state "connected" ("dry-run" under --dry-run) and your ear\'s delivery "confirmed" ("pending": attached under 2 minutes ago, confirmed by acking the kind="attach" event\'s nonce; "unconfirmed": read its hint; "detached": no session holds the ear). Also shows who holds the ear (sessionId, shimPid), attention, event counts, ambiguousSends, and the session\'s last context reading (pressure: tokens, ageMs from the transcript row\'s time, and idleCompactDueAt, a forecast; reported by the pressure hook run with --ear), and the session\'s compaction hold if it set one (hold: reason, expiresAt, blocks). Read-only. Never start a second session or shim for this ear to check it (in Claude Code, claude mcp list and claude mcp get each start one): the newest attach takes the ear.',
     inputSchema: {
       type: "object",
       properties: {

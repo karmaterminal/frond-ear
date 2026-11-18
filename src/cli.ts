@@ -29,7 +29,13 @@ import { LETTER_HINT, hookInput } from "./letters.ts";
 import { DiscordGateway } from "./gateway.ts";
 import { StructuredLogger } from "./logger.ts";
 import { runDoctor, runInit } from "./onboard.ts";
-import { pressureHookRequested, runPressureCommand } from "./pressure.ts";
+import {
+  holdReading,
+  pendingTokens,
+  pressureHookRequested,
+  readTail,
+  runPressureCommand,
+} from "./pressure.ts";
 import type { DaemonMessage } from "./protocol.ts";
 import { EAR_PROTOCOL_VERSION, LineConnection } from "./protocol.ts";
 import { HttpDiscordRest, RecordingRest } from "./rest.ts";
@@ -65,7 +71,9 @@ usage:
   frond-ear precompact --ear <name> [--session <id>] [--hook]
                                       print the session's unsettled letters (#102) as compaction-summary
                                       instructions; for a PreCompact hook: --hook reads session_id on
-                                      stdin, prints nothing on any failure and always exits 0
+                                      stdin, prints nothing on any failure and exits 0, except exit 2 when
+                                      the session's hold_compaction blocks an auto compaction under
+                                      FROND_EAR_HOLD_CEILING tokens (#107; unset: never blocks)
   frond-ear pressure --hook [--ear <name>] [--bands 150k,200k,300k,450k,650k]
                                       context pressure for a PostToolUse / UserPromptSubmit / Stop hook: reads
                                       the transcript's latest token usage and adds one line to the session's
@@ -338,7 +346,8 @@ async function runRelease(argv: string[]): Promise<void> {
  * A PreCompact hook (#102). Claude Code uses the hook's stdout as instructions for the
  * compaction summary, so stdout carries the letters or nothing at all: an error there
  * would land in the summary. Under --hook every failure goes to stderr and the exit
- * code is 0, since exit 2 would block the compaction.
+ * code is 0, since exit 2 blocks the compaction. Exit 2 comes from one path only: the
+ * daemon answered that this session's hold blocks this compaction (#107).
  */
 async function runPrecompact(argv: string[]): Promise<void> {
   const hookRequested = argv.includes("--hook");
@@ -371,23 +380,70 @@ async function runPrecompact(argv: string[]): Promise<void> {
       "frond-ear precompact: --session is ignored under --hook; the hook's stdin names the session\n",
     );
   }
+  let trigger: string | undefined;
+  let tokens: number | undefined;
+  if (hook) {
+    // The whole hook is bounded (#107): past the deadline it exits 0 and the
+    // compaction goes ahead, whatever it was waiting on. unref, so it never holds
+    // the process open on its own.
+    setTimeout(() => {
+      process.stderr.write(
+        "frond-ear precompact: deadline passed; the compaction goes ahead\n",
+      );
+      process.exit(0);
+    }, PRECOMPACT_DEADLINE_MS).unref();
+  }
   if (hook && !process.stdin.isTTY) {
     try {
-      sessionId = hookInput(await readStdin(64 * 1024)).sessionId;
+      const input = hookInput(await readStdin(64 * 1024, PRECOMPACT_STDIN_MS));
+      sessionId = input.sessionId;
+      trigger = input.trigger;
+      if (input.transcriptPath) {
+        try {
+          // Read now, at PreCompact: the daemon's last report can predate the tool
+          // result that crossed the ceiling.
+          const reading = holdReading(readTail(input.transcriptPath));
+          if (reading.tokens !== undefined) {
+            tokens = reading.tokens + pendingTokens(reading.pendingBytes);
+          }
+        } catch {
+          // No reading: a hold never blocks without one (#107).
+        }
+      }
     } catch {
       // Unreadable stdin names no session; the daemon prints nothing without one.
     }
   }
+  const ceiling = holdCeiling(process.env.FROND_EAR_HOLD_CEILING);
   const ear = values.ear ?? process.env.FROND_EAR_EAR;
   try {
     if (!ear) {
       throw new Error("precompact needs --ear <name> (or FROND_EAR_EAR)");
     }
     const result = await request(
-      { type: "precompact", ear, ...(sessionId ? { sessionId } : {}) },
+      {
+        type: "precompact",
+        ear,
+        ...(sessionId ? { sessionId } : {}),
+        ...(trigger ? { trigger } : {}),
+        ...(tokens !== undefined ? { tokens } : {}),
+        ...(ceiling !== undefined ? { ceiling } : {}),
+      },
       process.env,
-      5_000,
+      hook ? PRECOMPACT_DAEMON_MS : 5_000,
     );
+    if (
+      hook &&
+      result.ok &&
+      typeof result.block === "string" &&
+      result.block !== ""
+    ) {
+      // The one blocking path (#107): the daemon answered that this session's own
+      // hold blocks this auto compaction. stdout stays empty: no summary is written.
+      process.stderr.write(`${oneLine(result.block, 400)}\n`);
+      process.exitCode = 2;
+      return;
+    }
     if (result.ok && result.text !== "") {
       process.stdout.write(`${result.text}\n`);
     } else {
@@ -404,8 +460,38 @@ async function runPrecompact(argv: string[]): Promise<void> {
   }
 }
 
-function readStdin(maxBytes: number): Promise<string> {
+/** The PreCompact hook's whole run, its stdin read and its daemon ask (#107). */
+const PRECOMPACT_DEADLINE_MS = 4_000;
+const PRECOMPACT_STDIN_MS = 1_000;
+const PRECOMPACT_DAEMON_MS = 2_500;
+
+/**
+ * The seat's hold ceiling (#107) from FROND_EAR_HOLD_CEILING: a whole number of
+ * tokens, about 60% of the model's window. Unset or unusable: undefined, and then a
+ * hold never blocks.
+ */
+function holdCeiling(value: string | undefined): number | undefined {
+  if (value === undefined || !/^\d{1,8}$/u.test(value.trim())) {
+    return undefined;
+  }
+  const number = Number(value.trim());
+  return number > 0 ? number : undefined;
+}
+
+/** One line, no control characters, at most `max` characters. */
+function oneLine(text: string, max: number): string {
+  const flat = text.replace(/[\u0000-\u001f\u007f-\u009f]+/gu, " ").trim();
+  return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
+}
+
+function readStdin(maxBytes: number, timeoutMs?: number): Promise<string> {
   return new Promise((resolve, reject) => {
+    if (timeoutMs !== undefined) {
+      setTimeout(() => {
+        reject(new Error("stdin did not end in time"));
+        process.stdin.destroy();
+      }, timeoutMs).unref();
+    }
     let data = "";
     process.stdin.setEncoding("utf8");
     process.stdin.on("data", (chunk: string) => {

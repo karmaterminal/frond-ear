@@ -159,6 +159,66 @@ export function latestReading(transcript: string): PressureReading {
   };
 }
 
+/**
+ * What a PreCompact hook knows about the context being compacted (#107): the latest
+ * main-session usage row's tokens, plus the bytes written after that row (tool
+ * results, prompts) that no usage row has counted yet. No tokens when the tail has a
+ * compaction marker newer than any usage row, or no usage row at all: unknown.
+ * Sidechain rows never supply the tokens, but their bytes count as pending, which
+ * can only overstate the context.
+ */
+export function holdReading(transcript: string): {
+  tokens?: number;
+  pendingBytes: number;
+} {
+  const lines = transcript.split("\n");
+  let pendingBytes = 0;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i] ?? "";
+    const trimmed = line.trim();
+    if (trimmed) {
+      let row: unknown;
+      try {
+        row = JSON.parse(trimmed);
+      } catch {
+        row = undefined;
+      }
+      if (typeof row === "object" && row !== null) {
+        const record = row as {
+          type?: unknown;
+          subtype?: unknown;
+          message?: unknown;
+          isSidechain?: unknown;
+        };
+        if (record.isSidechain !== true) {
+          if (
+            record.type === "system" &&
+            record.subtype === "compact_boundary"
+          ) {
+            return { pendingBytes };
+          }
+          if (record.type === "assistant") {
+            const tokens = latestReading(trimmed).tokens;
+            if (tokens !== undefined) {
+              return { tokens, pendingBytes };
+            }
+          }
+        }
+      }
+    }
+    pendingBytes += Buffer.byteLength(line) + 1;
+  }
+  return { pendingBytes };
+}
+
+/**
+ * Pending bytes as tokens, rounded up at 3 bytes a token: transcript JSON runs nearer
+ * 4, so this overstates, and an overstated context lets a held compaction go ahead.
+ */
+export function pendingTokens(pendingBytes: number): number {
+  return Math.ceil(pendingBytes / 3);
+}
+
 export function readTail(path: string, maxBytes = TAIL_BYTES): string {
   const fd = openSync(path, "r");
   try {

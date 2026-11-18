@@ -42,7 +42,14 @@ export type CliRequest =
   | { type: "inject"; message: DiscordMessage }
   | { type: "call"; tool: string; args: Record<string, unknown> }
   | { type: "release"; ear: string; source?: string; sessionId?: string }
-  | { type: "precompact"; ear: string; sessionId?: string }
+  | {
+      type: "precompact";
+      ear: string;
+      sessionId?: string;
+      trigger?: string;
+      tokens?: number;
+      ceiling?: number;
+    }
   | {
       type: "pressure";
       ear: string;
@@ -69,7 +76,7 @@ export function request(
   message: CliRequest,
   env: NodeJS.ProcessEnv = process.env,
   timeoutMs?: number,
-): Promise<{ ok: boolean; text: string }> {
+): Promise<{ ok: boolean; text: string; block?: string }> {
   return new Promise((resolve, reject) => {
     // Read before connecting: an unreadable token file rejects here instead of
     // throwing from the socket's connect handler.
@@ -102,7 +109,11 @@ export function request(
           connection.send({ ...message, id: 1 });
         } else if (reply.type === "result") {
           connection.close();
-          done({ ok: reply.ok, text: reply.text });
+          done({
+            ok: reply.ok,
+            text: reply.text,
+            ...(typeof reply.block === "string" ? { block: reply.block } : {}),
+          });
         }
       },
       () => fail(new Error("daemon closed the connection")),
