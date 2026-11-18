@@ -335,7 +335,9 @@ daemon keeps only the latest reading per ear, in memory, and only from the sessi
 it is `null` until that session's hook reports, and cleared when another session attaches. It is
 never an event and never reaches taps. Context doesn't grow while a seat is idle, and no hook runs
 then, so an idle seat shows an aging reading (`ageMs`), not a fresh one. Without an ear nothing is
-sent.
+sent. The cost to look for on a slow seat: `PostToolUse` fires on every tool call, so a daemon that
+accepts the connection but never answers adds up to 1 s to each call (a down daemon refuses at once
+and costs nothing). Check `frond-ear status` answers promptly, or drop `--ear` until it does.
 
 ```json
 {
