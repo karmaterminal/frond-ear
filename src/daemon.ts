@@ -1645,6 +1645,7 @@ export class Daemon {
     at: unknown;
     idleFloor?: unknown;
     event?: unknown;
+    boundaryAt?: unknown;
   }): { ok: boolean; text: string; notice?: string } {
     const ear = typeof message.ear === "string" ? message.ear : "";
     if (!this.config.ears[ear]) {
@@ -1731,9 +1732,25 @@ export class Daemon {
     });
     const hold = this.holds.get(ear);
     if (hold?.sessionId === sessionId) {
-      if (tokens === null && boundary !== null) {
-        // A marker-only reading comes only after a compaction: the hold has done
-        // its work, or was passed by (manual, over the ceiling, unknown pressure).
+      // When the latest compaction happened, by the marker's own time: a report
+      // with usage after it still carries it, so a missed marker-only report can't
+      // leave the hold standing (#108 F3). A marker-only report's `at` is the
+      // marker's time. A marker from before the hold was set never ends it, however
+      // late it arrives (#108 F4).
+      const markedAt =
+        typeof message.boundaryAt === "number" &&
+        Number.isFinite(message.boundaryAt)
+          ? message.boundaryAt
+          : tokens === null
+            ? (at as number)
+            : undefined;
+      if (
+        boundary !== null &&
+        markedAt !== undefined &&
+        markedAt > hold.setAt
+      ) {
+        // The hold did its work, or was passed by (manual, over the ceiling,
+        // unknown pressure): either way the context it guarded is gone.
         this.endHold(ear, "a compaction ran");
       } else if (now >= hold.expiresAt) {
         this.endHold(ear, "expired");

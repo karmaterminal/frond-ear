@@ -3,14 +3,21 @@
 // holding session, before the hold expires, with a fresh transcript reading under the
 // seat's own ceiling. Everything else allows: the compaction goes ahead as stock.
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
 import { HOLD_LIMITS } from "../src/daemon.ts";
-import { holdReading, pendingTokens, withNotice } from "../src/pressure.ts";
+import {
+  holdReading,
+  pendingTokens,
+  strictUsageTokens,
+  withNotice,
+} from "../src/pressure.ts";
+import { TOOLS } from "../src/shim.ts";
+import { watchdogOutcome } from "../src/watchdog.ts";
 import { listenUnix } from "../src/server.ts";
 import { harness, testConfig } from "./helpers.ts";
 
@@ -240,6 +247,74 @@ test("a hold lapses at its expiry and owes the session one notice; its own relea
   }
 });
 
+test("a compaction after the hold ends it even when the marker-only report is missed; one from before never does (#108 F3/F4)", async () => {
+  const h = harness(testConfig(), { nonce: "hold08" });
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    const before = h.clock.now();
+    h.clock.advance(1_000);
+    await h.call(shim, "hold_compaction", { reason: "ci" });
+    const setAt = h.clock.now();
+
+    // F4: a marker from before the hold, arriving late, never ends it: with or
+    // without boundaryAt, as a marker-only report or with usage, and twice over.
+    for (const report of [
+      { tokens: null, band: null, boundary: "m0", at: before },
+      {
+        tokens: null,
+        band: null,
+        boundary: "m0",
+        at: before,
+        boundaryAt: before,
+      },
+      { boundary: "m0", boundaryAt: before, at: setAt + 1 },
+      { boundary: "m0", boundaryAt: setAt, at: setAt + 2 },
+    ]) {
+      h.clock.advance(10);
+      await pressure(h, { ...report, event: "PostToolUse" });
+      assert.ok(await holdView(h, shim), JSON.stringify(report));
+    }
+    assert.ok((await auto(h)).block, "still held");
+
+    // F3: the marker-only PostCompact report never came; the next report has
+    // usage and the new marker's time, and that ends the hold.
+    h.clock.advance(60_000);
+    const after = await pressure(h, {
+      tokens: 90_000,
+      boundary: "m1",
+      boundaryAt: h.clock.now() - 5_000,
+      at: h.clock.now(),
+      event: "PostToolUse",
+    });
+    assert.equal(await holdView(h, shim), null);
+    assert.equal((await auto(h)).block, undefined);
+    assert.match(after.notice ?? "", /has ended: a compaction ran/u);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("the advertised tool contract says what the hook does (#108 F5)", () => {
+  const tool = TOOLS.find((item) => item.name === "hold_compaction");
+  assert.ok(tool);
+  const text = tool.description;
+  for (const needed of [
+    "FROND_EAR_HOLD_CEILING",
+    "blocks nothing",
+    "makes the request fail",
+    "after any compaction",
+    "manual /compact always runs",
+    "blocksAnswered",
+  ]) {
+    assert.ok(text.includes(needed), `says ${needed}`);
+  }
+  for (const withdrawn of ["can't be blocked", "600,000", "600000"]) {
+    assert.ok(!text.includes(withdrawn), `no longer says ${withdrawn}`);
+  }
+  const status = TOOLS.find((item) => item.name === "ear_status");
+  assert.ok(status?.description.includes("blocksAnswered"));
+});
+
 test("a compaction ends the hold: a marker-only reading clears it, whatever kind of compaction ran", async () => {
   const h = harness(testConfig(), { nonce: "hold07" });
   try {
@@ -401,6 +476,53 @@ const marker = JSON.stringify({
   timestamp: "2026-11-18T20:10:00.000Z",
 });
 
+test("holdReading: invalid newest usage is unknown, never a small number or a fall back (#108 F1)", () => {
+  const row = (usage: string) =>
+    `{"type":"assistant","message":{"role":"assistant","usage":${usage}}}`;
+  const big = turn(700_000);
+  for (const usage of [
+    '{"input_tokens":null,"output_tokens":1}',
+    '{"output_tokens":1}',
+    '{"input_tokens":1,"output_tokens":null}',
+    '{"input_tokens":1}',
+    '{"input_tokens":700000,"output_tokens":1,"cache_read_input_tokens":-699999}',
+    '{"input_tokens":1e999,"output_tokens":1}',
+    '{"input_tokens":1.5,"output_tokens":1}',
+    '{"input_tokens":"700000","output_tokens":1}',
+    '{"input_tokens":0,"output_tokens":0}',
+    '{"input_tokens":1,"output_tokens":1,"cache_creation_input_tokens":null}',
+    "null",
+    "[]",
+    '"lots"',
+  ]) {
+    assert.equal(
+      holdReading(`${big}\n${row(usage)}\n`).tokens,
+      undefined,
+      usage,
+    );
+  }
+  // Valid controls: cache counters optional, then summed.
+  assert.equal(
+    holdReading(`${big}\n${row('{"input_tokens":3,"output_tokens":4}')}\n`)
+      .tokens,
+    7,
+  );
+  assert.equal(
+    strictUsageTokens({
+      input_tokens: 10,
+      output_tokens: 5,
+      cache_read_input_tokens: 100,
+      cache_creation_input_tokens: 0,
+    }),
+    115,
+  );
+  // An assistant row with no usage at all is passed over, its bytes pending.
+  const bare = '{"type":"assistant","message":{"role":"assistant"}}';
+  const passed = holdReading(`${big}\n${bare}\n`);
+  assert.equal(passed.tokens, 700_000);
+  assert.ok(passed.pendingBytes > Buffer.byteLength(bare));
+});
+
 test("holdReading: the latest main usage plus the bytes after it; a newer marker or none means unknown", () => {
   const tool = JSON.stringify({
     type: "user",
@@ -549,7 +671,13 @@ test("frond-ear precompact --hook exits 2 only for a held auto compaction under 
     assert.equal(held.stdout, "", "nothing for a summary that isn't written");
     assert.match(held.stderr, /held by this session \(waiting on review\)/u);
     assert.match(held.stderr, /about 250001 tokens/u);
-    assert.equal(held.stderr.trim().split("\n").length, 1, "one line");
+    // Node 22 prints its own type-stripping warning; ours is one line.
+    assert.equal(
+      held.stderr.split("\n").filter((line) => line.startsWith("frond-ear"))
+        .length,
+      1,
+      `one line of ours: ${held.stderr}`,
+    );
 
     const noCeiling = { ...env };
     delete noCeiling.FROND_EAR_HOLD_CEILING;
@@ -604,5 +732,95 @@ test("frond-ear precompact --hook exits 2 only for a held auto compaction under 
     server.close();
     h.dispose();
     rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a transcript read that blocks (a FIFO with no writer) still ends by the deadline, and allows (#108 F2)", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "frond-ear-fifo-"));
+  const socketPath = join(directory, "d.sock");
+  const fifo = join(directory, "t.fifo");
+  execFileSync("mkfifo", [fifo]);
+  const h = harness();
+  const server = await listenUnix(h.daemon, socketPath);
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    await h.call(shim, "hold_compaction", { reason: "wait" });
+    const started = Date.now();
+    const child = spawn(
+      process.execPath,
+      [CLI, "precompact", "--ear", "scribe", "--hook"],
+      {
+        env: {
+          ...process.env,
+          FROND_EAR_SOCKET: socketPath,
+          FROND_EAR_HOLD_CEILING: String(CEILING),
+        },
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+    );
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
+    child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
+    child.stdin.end(
+      JSON.stringify({
+        session_id: SESSION,
+        hook_event_name: "PreCompact",
+        trigger: "auto",
+        transcript_path: fifo,
+      }),
+    );
+    // A hard watchdog outside the hook: if it has to fire, the bound failed.
+    let killed = false;
+    const watchdog = setTimeout(() => {
+      killed = true;
+      child.kill("SIGKILL");
+    }, 9_000);
+    const code = await new Promise<number | null>((resolve) =>
+      child.on("close", (value) => resolve(value)),
+    );
+    clearTimeout(watchdog);
+    const ms = Date.now() - started;
+    assert.equal(killed, false, `the hook outlived 9 s: ${stderr}`);
+    assert.equal(code, 0, stderr);
+    assert.equal(stdout, "");
+    assert.match(stderr, /deadline \(4000 ms\) passed/u);
+    assert.ok(ms >= 3_900 && ms < 7_000, `bounded near 4 s: ${ms} ms`);
+  } finally {
+    server.close();
+    h.dispose();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("watchdogOutcome: only a worker's own exit 2 blocks, only its own exit 0 prints letters (#108 F2)", () => {
+  const base = { signal: null, overflow: false, out: "letters", err: "why\n" };
+  assert.deepEqual(watchdogOutcome({ ...base, code: 2 }), {
+    code: 2,
+    stdout: "",
+    stderr: "why\n",
+  });
+  assert.deepEqual(watchdogOutcome({ ...base, code: 0 }), {
+    code: 0,
+    stdout: "letters",
+    stderr: "why\n",
+  });
+  for (const code of [1, 3, 137, null]) {
+    assert.deepEqual(
+      watchdogOutcome({ ...base, code }),
+      { code: 0, stdout: "", stderr: "why\n" },
+      `code ${String(code)}`,
+    );
+  }
+  for (const ended of [
+    { ...base, code: 2, signal: "SIGTERM" },
+    { ...base, code: 0, signal: "SIGKILL" },
+    { ...base, code: 2, overflow: true },
+    { ...base, code: 0, overflow: true },
+  ]) {
+    const outcome = watchdogOutcome(ended);
+    assert.equal(outcome.code, 0, JSON.stringify(ended));
+    assert.equal(outcome.stdout, "", JSON.stringify(ended));
+    assert.match(outcome.stderr, /the compaction goes ahead/u);
   }
 });

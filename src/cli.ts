@@ -6,6 +6,7 @@ import {
   readFileSync,
   writeFileSync,
 } from "node:fs";
+import { spawn } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
@@ -27,6 +28,7 @@ import { runConnectorEcho } from "./connector/echo.ts";
 import { Daemon } from "./daemon.ts";
 import { LETTER_HINT, hookInput } from "./letters.ts";
 import { DiscordGateway } from "./gateway.ts";
+import { watchdogOutcome } from "./watchdog.ts";
 import { StructuredLogger } from "./logger.ts";
 import { runDoctor, runInit } from "./onboard.ts";
 import {
@@ -382,16 +384,12 @@ async function runPrecompact(argv: string[]): Promise<void> {
   }
   let trigger: string | undefined;
   let tokens: number | undefined;
-  if (hook) {
-    // The whole hook is bounded (#107): past the deadline it exits 0 and the
-    // compaction goes ahead, whatever it was waiting on. unref, so it never holds
-    // the process open on its own.
-    setTimeout(() => {
-      process.stderr.write(
-        "frond-ear precompact: deadline passed; the compaction goes ahead\n",
-      );
-      process.exit(0);
-    }, PRECOMPACT_DEADLINE_MS).unref();
+  if (hook && process.env[PRECOMPACT_CHILD] !== "1") {
+    // The whole hook is bounded (#107): the work runs in a child this process can
+    // kill, since a timer can't fire while its own thread is stuck in a synchronous
+    // read (a FIFO, a stalled filesystem, a token file; #108 F2).
+    await precompactWatchdog(argv);
+    return;
   }
   if (hook && !process.stdin.isTTY) {
     try {
@@ -462,6 +460,104 @@ async function runPrecompact(argv: string[]): Promise<void> {
 
 /** The PreCompact hook's whole run, its stdin read and its daemon ask (#107). */
 const PRECOMPACT_DEADLINE_MS = 4_000;
+const PRECOMPACT_CHILD = "FROND_EAR_PRECOMPACT_CHILD";
+/** Letters stay under 9,500 characters; anything past this is not ours to print. */
+const PRECOMPACT_MAX_OUTPUT = 64 * 1024;
+
+/**
+ * Runs `precompact --hook` in a child with the same arguments and stdin, and kills it
+ * at the deadline (#108 F2). Only a child that exits by itself is believed: exit 2
+ * passes through with its stderr and an empty stdout, exit 0 with its stdout (the
+ * letters). Killed, crashed, oversized or anything else: nothing on stdout, exit 0,
+ * and the compaction goes ahead.
+ */
+function precompactWatchdog(argv: string[]): Promise<void> {
+  return new Promise((resolve) => {
+    let out = "";
+    let err = "";
+    let overflow = false;
+    let settled = false;
+    const finish = (code: number, stdout: string, stderr: string) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      if (stdout !== "") {
+        process.stdout.write(stdout);
+      }
+      if (stderr !== "") {
+        process.stderr.write(stderr);
+      }
+      process.exitCode = code;
+      // Our own stdin may never end; nothing else is left to wait for.
+      process.stdin.destroy();
+      resolve();
+    };
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(
+        process.execPath,
+        [...process.execArgv, process.argv[1] ?? "", "precompact", ...argv],
+        {
+          env: {
+            ...process.env,
+            [PRECOMPACT_CHILD]: "1",
+            NODE_NO_WARNINGS: "1",
+          },
+          stdio: ["pipe", "pipe", "pipe"],
+        },
+      );
+    } catch (error) {
+      finish(
+        0,
+        "",
+        `frond-ear precompact: ${error instanceof Error ? error.message : String(error)}; the compaction goes ahead\n`,
+      );
+      return;
+    }
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      finish(
+        0,
+        "",
+        `frond-ear precompact: deadline (${PRECOMPACT_DEADLINE_MS} ms) passed; the compaction goes ahead\n`,
+      );
+    }, PRECOMPACT_DEADLINE_MS);
+    const take = (chunk: Buffer, into: "out" | "err") => {
+      if (into === "out") {
+        out += chunk.toString();
+      } else {
+        err += chunk.toString();
+      }
+      if (out.length + err.length > PRECOMPACT_MAX_OUTPUT && !overflow) {
+        overflow = true;
+        child.kill("SIGKILL");
+      }
+    };
+    child.stdout?.on("data", (chunk: Buffer) => take(chunk, "out"));
+    child.stderr?.on("data", (chunk: Buffer) => take(chunk, "err"));
+    child.stdin?.on("error", () => {
+      // The child stopped reading (it timed out or exited): nothing to do.
+    });
+    if (!process.stdin.isTTY && child.stdin) {
+      process.stdin.pipe(child.stdin);
+    } else {
+      child.stdin?.end();
+    }
+    child.on("error", (error) =>
+      finish(
+        0,
+        "",
+        `frond-ear precompact: ${error.message}; the compaction goes ahead\n`,
+      ),
+    );
+    child.on("close", (code, signal) => {
+      const outcome = watchdogOutcome({ code, signal, overflow, out, err });
+      finish(outcome.code, outcome.stdout, outcome.stderr);
+    });
+  });
+}
 const PRECOMPACT_STDIN_MS = 1_000;
 const PRECOMPACT_DAEMON_MS = 2_500;
 

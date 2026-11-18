@@ -58,6 +58,8 @@ export interface PressureReading {
   tokens?: number;
   /** The latest compaction marker's id in the tail, or null for none. */
   boundary: string | null;
+  /** That marker's own time (epoch ms), when it has one (#108 F3/F4). */
+  boundaryAt?: number;
   /**
    * When that evidence was written (epoch ms, from the row's `timestamp`): the
    * usage row's time when there is one, else the marker's. Absent when the row
@@ -125,10 +127,12 @@ export function latestReading(transcript: string): PressureReading {
           : typeof record.timestamp === "string" && record.timestamp
             ? record.timestamp
             : `sha256:${createHash("sha256").update(line).digest("hex").slice(0, 16)}`;
-      const when = tokens !== undefined ? at : rowTime(record.timestamp);
+      const markedAt = rowTime(record.timestamp);
+      const when = tokens !== undefined ? at : markedAt;
       return {
         ...(tokens !== undefined ? { tokens } : {}),
         boundary: id,
+        ...(markedAt !== undefined ? { boundaryAt: markedAt } : {}),
         ...(when !== undefined ? { at: when } : {}),
       };
     }
@@ -198,9 +202,15 @@ export function holdReading(transcript: string): {
             return { pendingBytes };
           }
           if (record.type === "assistant") {
-            const tokens = latestReading(trimmed).tokens;
-            if (tokens !== undefined) {
-              return { tokens, pendingBytes };
+            const usage = (record.message as { usage?: unknown } | undefined)
+              ?.usage;
+            if (usage !== undefined) {
+              // The newest main usage decides: invalid is unknown, never a
+              // small number, and never a fall back to an older row (#108 F1).
+              const tokens = strictUsageTokens(usage);
+              return tokens === undefined
+                ? { pendingBytes }
+                : { tokens, pendingBytes };
             }
           }
         }
@@ -209,6 +219,37 @@ export function holdReading(transcript: string): {
     pendingBytes += Buffer.byteLength(line) + 1;
   }
   return { pendingBytes };
+}
+
+/**
+ * A usage object's context size for a blocking decision (#108 F1): input and output
+ * must be whole numbers ≥ 0, the cache counters absent or the same, and the total
+ * above 0. Anything else is undefined (unknown), never coerced to 0.
+ */
+export function strictUsageTokens(usage: unknown): number | undefined {
+  if (typeof usage !== "object" || usage === null || Array.isArray(usage)) {
+    return undefined;
+  }
+  const u = usage as Record<string, unknown>;
+  const whole = (value: unknown) =>
+    typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+  if (!whole(u.input_tokens) || !whole(u.output_tokens)) {
+    return undefined;
+  }
+  let total = (u.input_tokens as number) + (u.output_tokens as number);
+  for (const key of [
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+  ]) {
+    if (u[key] === undefined) {
+      continue;
+    }
+    if (!whole(u[key])) {
+      return undefined;
+    }
+    total += u[key] as number;
+  }
+  return total > 0 ? total : undefined;
 }
 
 /**
@@ -487,6 +528,8 @@ export interface PressureReport {
   /** The highest band reached, null under the first (and for no tokens). */
   band: number | null;
   boundary: string | null;
+  /** The boundary marker's own time, when known: a hold ends on a newer one (#107). */
+  boundaryAt?: number;
   /** When the evidence was written: the usage (or marker) row's time, else the hook's. */
   at: number;
   /** CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS, when the seat sets it. */
@@ -606,6 +649,9 @@ export function runPressure(argv: string[], io: PressureIo): number {
         tokens: tokens ?? null,
         band: reached >= 0 ? reached : null,
         boundary: reading.boundary,
+        ...(reading.boundaryAt !== undefined
+          ? { boundaryAt: reading.boundaryAt }
+          : {}),
         at: reading.at ?? Date.now(),
         ...(idleFloor !== undefined ? { idleFloor } : {}),
         ...(input.event ? { event: input.event } : {}),

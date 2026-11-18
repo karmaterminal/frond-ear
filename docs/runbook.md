@@ -330,18 +330,28 @@ minutes after its last request. The `hold_compaction` tool lets the session say 
   Otherwise the hook prints the letters as before.
 - **The context is read fresh at PreCompact**: the latest main-session usage row (sidechain rows
   excluded), plus the bytes written after it at 3 bytes a token, so a big tool result that no usage
-  row has counted yet pushes the reading up. A compaction marker newer than any usage row, a
-  missing or unreadable transcript, or no usage at all is unknown, and unknown allows.
+  row has counted yet pushes the reading up. That newest usage row must be valid: whole
+  `input_tokens` and `output_tokens` ≥ 0, cache counters absent or the same, a total above 0.
+  An invalid one is unknown; it never counts as zero, and the hook never falls back past it to an
+  older row. A compaction marker newer than any usage row, a missing or unreadable transcript, or
+  no usage at all is unknown too, and unknown allows.
 - **`FROND_EAR_HOLD_CEILING` is required.** frond-ear can't know the model's window. Set it to about
   60% of it (600000 for a 1M window, 120000 for 200k), for example by prefixing the hook's
   command: `FROND_EAR_HOLD_CEILING=600000 node /path/to/frond-ear/src/cli.ts precompact --ear <ear> --hook`.
   Unset or unusable, a hold blocks nothing.
 - **Everything else allows**: a manual `/compact`, another session, an expired hold, a down
-  daemon, stdin that is malformed, oversized or never ends, and anything past the hook's 4 s
-  deadline (stdin 1 s, daemon 2.5 s).
+  daemon, and stdin that is malformed, oversized or never ends. The hook does its work in a child
+  process and kills it at 4 s (stdin 1 s, daemon 2.5 s inside), so even a read that blocks
+  (a FIFO, a stalled filesystem) can't hold the compaction past the deadline. Only the child's
+  own exit 2 blocks, and only its own exit 0 prints letters. Killed, crashed or too much output:
+  nothing on stdout, exit 0.
 - **A hold ends** at its expiry, on `release`, when another session takes the ear (an in-place
   session change too; coming back doesn't bring it back), on a daemon restart, and after any
-  compaction: the `PostCompact` pressure hook's marker-only reading clears it. A hold that ended
+  compaction. A pressure report (needs `--ear`) whose compaction marker is newer than the hold
+  ends it: the `PostCompact` marker-only reading, or, if that one was missed, the next reading
+  with usage, which carries the marker's own time. A marker from before the hold never ends it,
+  however late its report arrives. The marker's time is the transcript's, so this assumes the
+  daemon and the seat share a clock (the same host, or synced). A hold that ended
   without a release owes the session one line, on its next `PostToolUse` or `UserPromptSubmit`
   pressure hook (needs `--ear`), since the tool's result still says "held".
 - `ear_status` shows `hold: {reason, setAt, expiresAt, blocksAnswered}` (null for none).

@@ -59,6 +59,8 @@ export type ClientMessage =
       band: number | null;
       boundary: string | null;
       at: number;
+      /** The boundary marker's own time, when known (#108). */
+      boundaryAt?: number;
       idleFloor?: number;
       /** The hook event that read it; only PostToolUse and UserPromptSubmit can show a notice (#107). */
       event?: string;

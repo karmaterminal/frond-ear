@@ -58,6 +58,7 @@ export type CliRequest =
       band: number | null;
       boundary: string | null;
       at: number;
+      boundaryAt?: number;
       idleFloor?: number;
       event?: string;
     };
