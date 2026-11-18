@@ -34,6 +34,24 @@ export type ClientMessage =
       id: number;
       ear: string;
       sessionId?: string;
+    }
+  /**
+   * A seat's pressure hook: its latest context reading, for ear_status (#98).
+   * `tokens` is null right after a compaction with no usage since; `band` the
+   * highest band reached (null under the first); `boundary` the latest compaction
+   * marker the hook read; `at` when that evidence was written (epoch ms);
+   * `idleFloor` the seat's CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS, when set.
+   */
+  | {
+      type: "pressure";
+      id: number;
+      ear: string;
+      sessionId: string;
+      tokens: number | null;
+      band: number | null;
+      boundary: string | null;
+      at: number;
+      idleFloor?: number;
     };
 
 /** Messages from the daemon to a client. */

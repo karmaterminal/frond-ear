@@ -325,6 +325,38 @@ session was auto-compacted anywhere from 200k to 970k tokens, so there is no fix
 share of. Once per band; a compaction starts them again (a new `compact_boundary` row in the transcript, or a drop to under half). Per-session state
 is in `$XDG_STATE_HOME/frond-ear/pressure/`. It needs no daemon and always exits 0.
 
+**Seen from outside (`--ear`, #98).** With `--ear <name>` (or `FROND_EAR_EAR`), every hook run that
+reads a size or a new compaction marker also hands it to the daemon, and `ear_status` (and
+`frond-ear status`) shows it on that ear:
+
+- `pressure: { tokens, band, boundary, at, ageMs, receivedAt, idleCompactDueAt }`.
+- `at` is when the evidence was written (the transcript row's `timestamp`), not when a hook ran, and
+  `ageMs` counts from it; `receivedAt` is when the daemon took the report. A hook re-reading the same
+  row never makes it look fresh. Rows with `isSidechain: true` (a subagent's turns) never count.
+- `band` is the highest band reached (null under the first). `boundary` is the latest compaction
+  marker the hook read. After a compaction with no turn since (a `PostCompact` hook), `tokens`, `band`
+  and `idleCompactDueAt` are `null` and `boundary` is the new marker, so the old size isn't shown.
+- `idleCompactDueAt` is a **forecast**, not a fact: `at` + 54 min when `tokens` is at or over the
+  seat's idle-compaction floor (`CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS`, which the hook passes along,
+  default 200k), else `null`. Claude Code compacts an idle interactive session on the one-hour cache;
+  in the gloss's transcript 76 of 90 compactions landed 54–56 min after the last response. Any
+  request before then moves it.
+
+`Stop` reports the turn's final usage (no tool call follows it), even when `stop_hook_active`
+suppresses a second nudge. The send is best effort within 1 s: no daemon, a refusal or a timeout
+changes nothing the hook prints and never its exit code. The daemon keeps only the latest reading per
+ear, in memory, and only from the session holding the ear, with `at` no more than 10 min ahead or 7
+days behind its clock. Hook runs connect separately, so a report can arrive after a newer one; the
+daemon never lets older evidence (an earlier `at`) replace newer, and a report with the same `at`
+replaces the kept one only when it says the same thing. It is `null` until that session's hook reports, and cleared when another
+session attaches or the attached shim names another session. It is never an event and never
+reaches taps. Context doesn't grow while a seat is idle, and no hook runs then, so an idle seat shows
+an aging reading (`ageMs`), not a fresh one. Without an ear nothing is sent. The cost to look for on a
+slow seat: `PostToolUse` fires on every tool call, so a daemon that accepts the connection but never
+answers adds up to 1 s to each call (a down daemon refuses at once and costs nothing). Check
+`frond-ear status` answers promptly, or drop `--ear` until it does. Add `PostCompact` beside the
+other three hooks so a compaction shows at once; it only reports and prints nothing.
+
 ```json
 {
   "hooks": {
@@ -333,7 +365,7 @@ is in `$XDG_STATE_HOME/frond-ear/pressure/`. It needs no daemon and always exits
         "hooks": [
           {
             "type": "command",
-            "command": "/abs/node /abs/frond-ear/src/cli.ts pressure --hook",
+            "command": "/abs/node /abs/frond-ear/src/cli.ts pressure --hook --ear <seat>",
             "timeout": 5
           }
         ]
@@ -344,7 +376,7 @@ is in `$XDG_STATE_HOME/frond-ear/pressure/`. It needs no daemon and always exits
         "hooks": [
           {
             "type": "command",
-            "command": "/abs/node /abs/frond-ear/src/cli.ts pressure --hook",
+            "command": "/abs/node /abs/frond-ear/src/cli.ts pressure --hook --ear <seat>",
             "timeout": 5
           }
         ]
@@ -355,7 +387,18 @@ is in `$XDG_STATE_HOME/frond-ear/pressure/`. It needs no daemon and always exits
         "hooks": [
           {
             "type": "command",
-            "command": "/abs/node /abs/frond-ear/src/cli.ts pressure --hook",
+            "command": "/abs/node /abs/frond-ear/src/cli.ts pressure --hook --ear <seat>",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/abs/node /abs/frond-ear/src/cli.ts pressure --hook --ear <seat>",
             "timeout": 5
           }
         ]

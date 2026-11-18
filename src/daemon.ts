@@ -120,6 +120,43 @@ interface Client {
   pid: number | undefined;
 }
 
+/** A pressure hook's reading (#98), as the daemon keeps it. */
+interface PressureReport {
+  sessionId: string;
+  tokens: number | null;
+  band: number | null;
+  boundary: string | null;
+  /** When the evidence was written (the transcript row's time). */
+  at: number;
+  /** When the daemon took the report. */
+  receivedAt: number;
+  idleFloor: number | undefined;
+}
+
+/**
+ * Bounds on a pressure report; anything outside is refused (#98). `at` is when the
+ * evidence was written, so an idle seat's honest reading can be old: up to maxAgeMs
+ * in the past, and no more than skewMs in the future.
+ */
+export const PRESSURE_LIMITS = {
+  maxTokens: 10_000_000,
+  maxBand: 31,
+  maxBoundary: 80,
+  skewMs: 10 * 60 * 1_000,
+  maxAgeMs: 7 * 24 * 60 * 60 * 1_000,
+} as const;
+
+/**
+ * Claude Code compacts an idle interactive session on the one-hour prompt cache once
+ * the context is at least CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS (default 200k). The
+ * gloss's own transcript: 76 of 90 compactions landed 54.4–55.8 min after the last
+ * response (#98, 11-15 amendment). So the forecast is 0.9 × the hour after `at`.
+ */
+export const IDLE_COMPACT = {
+  defaultFloor: 200_000,
+  afterMs: 54 * 60 * 1_000,
+} as const;
+
 /** Discord's enforce_nonce window is "a few minutes"; stay inside it. */
 const SEND_DEDUPE_WINDOW_MS = 5 * 60 * 1_000;
 /**
@@ -437,6 +474,11 @@ export class Daemon {
    * woken by the same push without polling.
    */
   private readonly taps = new Map<string, Set<Client>>();
+  /**
+   * The latest context reading per ear (#98), from the attached session's pressure
+   * hook. In memory only: never an event, never in the store, never to taps.
+   */
+  private readonly pressure = new Map<string, PressureReport>();
   /**
    * Keys the delivery token in a pushed batch_id (#21). Never stored, logged or sent
    * to a tap, so only the push itself carries a token.
@@ -1244,8 +1286,29 @@ export class Daemon {
               }),
         });
         return;
+      case "pressure":
+        // The pressure hook's reading (#98) comes as a CLI client, like a release.
+        // A shim or tap could otherwise write another session's gauge.
+        client.connection.send({
+          type: "result",
+          id: message.id,
+          ...(client.role === "cli"
+            ? this.pressureRequest(message)
+            : {
+                ok: false,
+                text: `only a CLI client (frond-ear pressure --hook) can report pressure, not a ${client.role ?? "client"}`,
+              }),
+        });
+        return;
       case "session":
         if (client.ear && typeof message.sessionId === "string") {
+          // The same turnover rule as attach: a reading belongs to its session.
+          if (
+            this.attached.get(client.ear) === client &&
+            this.pressure.get(client.ear)?.sessionId !== message.sessionId
+          ) {
+            this.pressure.delete(client.ear);
+          }
           client.sessionId = message.sessionId;
           this.store.updateEarSession(client.ear, message.sessionId);
         }
@@ -1399,6 +1462,10 @@ export class Daemon {
       ? (this.options.nonce ?? (() => randomBytes(6).toString("hex")))()
       : null;
     const record = this.store.attachEar(ear, message.sessionId ?? null, nonce);
+    // A reading belongs to the session that reported it; a new session starts with none.
+    if (this.pressure.get(ear)?.sessionId !== message.sessionId) {
+      this.pressure.delete(ear);
+    }
     client.ear = ear;
     client.attachedAs = ear;
     client.attachGeneration = record.generation;
@@ -1505,6 +1572,129 @@ export class Daemon {
     }
     this.store.clearRuntimeState(`letters.armed.${ear}`);
     return { ok: true, text: this.deliverLetters(ear, client, source) };
+  }
+
+  /**
+   * The pressure hook's reading (#98). Kept only for a configured ear, from the
+   * session that holds it now, with every field in bounds; anything else is refused
+   * and nothing is stored.
+   */
+  private pressureRequest(message: {
+    ear: unknown;
+    sessionId: unknown;
+    tokens: unknown;
+    band: unknown;
+    boundary: unknown;
+    at: unknown;
+    idleFloor?: unknown;
+  }): { ok: boolean; text: string } {
+    const ear = typeof message.ear === "string" ? message.ear : "";
+    if (!this.config.ears[ear]) {
+      return { ok: false, text: `unknown ear ${ear || "(none)"}` };
+    }
+    const sessionId =
+      typeof message.sessionId === "string" && message.sessionId
+        ? message.sessionId
+        : undefined;
+    if (!sessionId) {
+      return {
+        ok: false,
+        text: "the pressure report named no session; nothing kept",
+      };
+    }
+    const client = this.attached.get(ear);
+    if (!client || client.sessionId !== sessionId) {
+      return {
+        ok: false,
+        text: `ear ${ear} is not held by session ${sessionId.slice(0, 8)}; its pressure is not kept`,
+      };
+    }
+    const { tokens, band, boundary, at, idleFloor } = message;
+    const now = this.clock.now();
+    const count = (value: unknown): boolean =>
+      typeof value === "number" &&
+      Number.isInteger(value) &&
+      value >= 0 &&
+      value <= PRESSURE_LIMITS.maxTokens;
+    const problem =
+      tokens !== null && !count(tokens)
+        ? "tokens"
+        : band !== null &&
+            (tokens === null ||
+              typeof band !== "number" ||
+              !Number.isInteger(band) ||
+              band < 0 ||
+              band > PRESSURE_LIMITS.maxBand)
+          ? "band"
+          : boundary !== null &&
+              (typeof boundary !== "string" ||
+                boundary.length > PRESSURE_LIMITS.maxBoundary)
+            ? "boundary"
+            : typeof at !== "number" ||
+                !Number.isFinite(at) ||
+                at > now + PRESSURE_LIMITS.skewMs ||
+                at < now - PRESSURE_LIMITS.maxAgeMs
+              ? "at"
+              : idleFloor !== undefined && !count(idleFloor)
+                ? "idleFloor"
+                : undefined;
+    if (problem) {
+      return {
+        ok: false,
+        text: `pressure report refused: ${problem} is out of bounds; nothing kept`,
+      };
+    }
+    // Separate hook runs connect separately, so arrival order isn't evidence order:
+    // never let older evidence replace newer. A tie is the same row read again only
+    // when it says the same thing; a tie that disagrees keeps what is already kept.
+    // A kept reading is always the holder's: turnover (attach or a session
+    // message) clears it, and only the holder's reports get this far.
+    const kept = this.pressure.get(ear);
+    if (kept) {
+      const same =
+        kept.tokens === tokens &&
+        kept.band === band &&
+        kept.boundary === boundary;
+      if ((at as number) < kept.at || ((at as number) === kept.at && !same)) {
+        return {
+          ok: false,
+          text: `pressure report refused: its evidence (at ${String(at)}) is not newer than the reading kept (at ${String(kept.at)}); nothing changed`,
+        };
+      }
+    }
+    this.pressure.set(ear, {
+      sessionId,
+      tokens: tokens as number | null,
+      band: band as number | null,
+      boundary: boundary as string | null,
+      at: at as number,
+      receivedAt: now,
+      idleFloor: idleFloor as number | undefined,
+    });
+    return { ok: true, text: `pressure kept for ear ${ear}` };
+  }
+
+  /** The attached session's latest reading, for ear_status; null for none. */
+  private pressureView(ear: string): object | null {
+    const report = this.pressure.get(ear);
+    const client = this.attached.get(ear);
+    if (!report || !client || client.sessionId !== report.sessionId) {
+      return null;
+    }
+    const floor = report.idleFloor ?? IDLE_COMPACT.defaultFloor;
+    return {
+      tokens: report.tokens,
+      band: report.band,
+      boundary: report.boundary,
+      at: report.at,
+      ageMs: Math.max(0, this.clock.now() - report.at),
+      receivedAt: report.receivedAt,
+      // A forecast, not a fact: any request before then moves it.
+      idleCompactDueAt:
+        report.tokens !== null && report.tokens >= floor
+          ? report.at + IDLE_COMPACT.afterMs
+          : null,
+    };
   }
 
   /**
@@ -2538,6 +2728,7 @@ export class Daemon {
           nextFlushAt: this.store.nextDue(name) ?? null,
           attention: this.attentionView(name),
           letters: this.lettersView(name),
+          pressure: this.pressureView(name),
           ...(canticleDelivery ? { canticleDelivery } : {}),
         };
       });

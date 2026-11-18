@@ -21,7 +21,15 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 
+import { request } from "./client.ts";
+
 export const DEFAULT_BANDS = [150_000, 200_000, 300_000, 450_000, 650_000];
+
+/**
+ * How long the hook waits on the daemon for its pressure report (#98). Best
+ * effort: a slow or absent daemon costs the hook at most this, and nothing else.
+ */
+export const REPORT_TIMEOUT_MS = 1_000;
 
 /** How much of the transcript's end to read for the latest usage. */
 const TAIL_BYTES = 4 * 1024 * 1024;
@@ -50,6 +58,20 @@ export interface PressureReading {
   tokens?: number;
   /** The latest compaction marker's id in the tail, or null for none. */
   boundary: string | null;
+  /**
+   * When that evidence was written (epoch ms, from the row's `timestamp`): the
+   * usage row's time when there is one, else the marker's. Absent when the row
+   * carries no readable time.
+   */
+  at?: number;
+}
+
+function rowTime(value: unknown): number | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : undefined;
 }
 
 /** Tokens in context at the latest assistant turn: its input (cached or not) plus its output. */
@@ -59,11 +81,13 @@ export function latestContextTokens(transcript: string): number | undefined {
 
 /**
  * The latest compaction marker in the transcript's tail, and the latest assistant
- * usage written after it (none yet right after a compaction).
+ * usage written after it (none yet right after a compaction). Sidechain rows (a
+ * subagent's turns, `isSidechain: true`) are another context's usage and never count.
  */
 export function latestReading(transcript: string): PressureReading {
   const lines = transcript.split("\n");
   let tokens: number | undefined;
+  let at: number | undefined;
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i]?.trim();
     if (!line) {
@@ -89,7 +113,11 @@ export function latestReading(transcript: string): PressureReading {
       uuid?: unknown;
       timestamp?: unknown;
       message?: unknown;
+      isSidechain?: unknown;
     };
+    if (record.isSidechain === true) {
+      continue;
+    }
     if (record.type === "system" && record.subtype === "compact_boundary") {
       const id =
         typeof record.uuid === "string" && record.uuid
@@ -97,7 +125,12 @@ export function latestReading(transcript: string): PressureReading {
           : typeof record.timestamp === "string" && record.timestamp
             ? record.timestamp
             : `sha256:${createHash("sha256").update(line).digest("hex").slice(0, 16)}`;
-      return { ...(tokens !== undefined ? { tokens } : {}), boundary: id };
+      const when = tokens !== undefined ? at : rowTime(record.timestamp);
+      return {
+        ...(tokens !== undefined ? { tokens } : {}),
+        boundary: id,
+        ...(when !== undefined ? { at: when } : {}),
+      };
     }
     if (tokens !== undefined || record.type !== "assistant") {
       continue;
@@ -116,9 +149,14 @@ export function latestReading(transcript: string): PressureReading {
       n("output_tokens");
     if (total > 0) {
       tokens = total;
+      at = rowTime(record.timestamp);
     }
   }
-  return { ...(tokens !== undefined ? { tokens } : {}), boundary: null };
+  return {
+    ...(tokens !== undefined ? { tokens } : {}),
+    boundary: null,
+    ...(at !== undefined ? { at } : {}),
+  };
 }
 
 export function readTail(path: string, maxBytes = TAIL_BYTES): string {
@@ -376,6 +414,32 @@ export interface PressureIo {
   stdout: { write(text: string): unknown };
   stderr: { write(text: string): unknown };
   env: NodeJS.ProcessEnv;
+  /** Handed each hook reading, when an ear is named (#98). */
+  onReading?: (report: PressureReport) => void;
+}
+
+/** What the hook tells the daemon (#98): one reading of one session, for one ear. */
+export interface PressureReport {
+  ear: string;
+  sessionId: string;
+  /** null: compacted, with no usage written since (a marker-only PostCompact). */
+  tokens: number | null;
+  /** The highest band reached, null under the first (and for no tokens). */
+  band: number | null;
+  boundary: string | null;
+  /** When the evidence was written: the usage (or marker) row's time, else the hook's. */
+  at: number;
+  /** CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS, when the seat sets it. */
+  idleFloor?: number;
+}
+
+/** The seat's idle-compaction floor, when its environment sets one. */
+export function idleFloorFrom(env: NodeJS.ProcessEnv): number | undefined {
+  const raw = env.CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS;
+  if (!raw || !/^\d{1,8}$/u.test(raw.trim())) {
+    return undefined;
+  }
+  return Number(raw.trim());
 }
 
 /**
@@ -396,7 +460,12 @@ export function pressureHookRequested(argv: readonly string[]): boolean {
  * of --transcript <path> for a person to check.
  */
 export function runPressure(argv: string[], io: PressureIo): number {
-  let values: { hook?: boolean; bands?: string; transcript?: string };
+  let values: {
+    hook?: boolean;
+    bands?: string;
+    transcript?: string;
+    ear?: string;
+  };
   try {
     values = parseArgs({
       args: argv,
@@ -404,6 +473,7 @@ export function runPressure(argv: string[], io: PressureIo): number {
         hook: { type: "boolean" },
         bands: { type: "string" },
         transcript: { type: "string" },
+        ear: { type: "string" },
       },
     }).values;
   } catch (error) {
@@ -456,13 +526,37 @@ export function runPressure(argv: string[], io: PressureIo): number {
     if (!input.sessionId || !input.transcriptPath) {
       return 0;
     }
-    // Already continuing because of a Stop hook: never ask again, or a turn
-    // could be held open forever.
-    if (input.event === "Stop" && input.stopHookActive) {
-      return 0;
-    }
     const reading = latestReading(readTail(input.transcriptPath));
     const tokens = reading.tokens;
+    // The report comes before every gate below: a continued Stop's final usage
+    // or a marker-only PostCompact is exactly what the outside view must not miss.
+    const ear = values.ear || io.env.FROND_EAR_EAR || undefined;
+    if (
+      ear &&
+      io.onReading &&
+      (tokens !== undefined || reading.boundary !== null)
+    ) {
+      const reached = tokens !== undefined ? reachedBand(tokens, bands) : -1;
+      const idleFloor = idleFloorFrom(io.env);
+      io.onReading({
+        ear,
+        sessionId: input.sessionId,
+        tokens: tokens ?? null,
+        band: reached >= 0 ? reached : null,
+        boundary: reading.boundary,
+        at: reading.at ?? Date.now(),
+        ...(idleFloor !== undefined ? { idleFloor } : {}),
+      });
+    }
+    // Already continuing because of a Stop hook: never ask again, or a turn
+    // could be held open forever. PostCompact only reports: the next prompt or
+    // tool call sees the new marker and starts the bands again.
+    if (
+      (input.event === "Stop" && input.stopHookActive) ||
+      input.event === "PostCompact"
+    ) {
+      return 0;
+    }
     if (tokens === undefined) {
       // Nothing read yet, or compacted with no turn since: the next call reads it.
       return 0;
@@ -497,4 +591,32 @@ export function runPressure(argv: string[], io: PressureIo): number {
     // A gauge that can't read says nothing rather than block the session.
   }
   return 0;
+}
+
+/**
+ * `frond-ear pressure` from the command line: runPressure, then, under --hook with an
+ * ear named (--ear or FROND_EAR_EAR), the reading goes to the daemon so ear_status
+ * can show it (#98). Every hook run with a reading sends, so its age stays honest.
+ * The send is best effort within REPORT_TIMEOUT_MS: no daemon, a refusal or a
+ * timeout changes nothing the hook prints and never its exit code.
+ */
+export async function runPressureCommand(
+  argv: string[],
+  io: PressureIo,
+): Promise<number> {
+  let report: PressureReport | undefined;
+  const code = runPressure(argv, {
+    ...io,
+    onReading: (reading) => {
+      report = reading;
+    },
+  });
+  if (report) {
+    try {
+      await request({ type: "pressure", ...report }, io.env, REPORT_TIMEOUT_MS);
+    } catch {
+      // Best effort: the gauge in the session's own context is unchanged.
+    }
+  }
+  return code;
 }
