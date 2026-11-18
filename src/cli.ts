@@ -477,12 +477,15 @@ function precompactWatchdog(argv: string[]): Promise<void> {
     let err = "";
     let overflow = false;
     let settled = false;
+    // Set once the worker exists: drops the signal and exit handlers below.
+    let release = () => {};
     const finish = (code: number, stdout: string, stderr: string) => {
       if (settled) {
         return;
       }
       settled = true;
       clearTimeout(timer);
+      release();
       if (stdout !== "") {
         process.stdout.write(stdout);
       }
@@ -516,6 +519,32 @@ function precompactWatchdog(argv: string[]): Promise<void> {
       );
       return;
     }
+    // The worker is ours: if this process is told to stop (Claude Code cancelling
+    // the hook, a hook timeout, ^C) or exits any other way, the worker goes with it,
+    // even while it is stuck in a read no timer of its own could interrupt (#108 F6).
+    const killWorker = () => {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGKILL");
+      }
+    };
+    const onSignal = (signal: NodeJS.Signals) => {
+      killWorker();
+      process.stderr.write(
+        `frond-ear precompact: ${signal}; the worker was stopped and the compaction goes ahead\n`,
+      );
+      process.exit(0);
+    };
+    const signals: NodeJS.Signals[] = ["SIGTERM", "SIGINT", "SIGHUP"];
+    for (const signal of signals) {
+      process.on(signal, onSignal);
+    }
+    process.on("exit", killWorker);
+    release = () => {
+      for (const signal of signals) {
+        process.off(signal, onSignal);
+      }
+      process.off("exit", killWorker);
+    };
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
       finish(

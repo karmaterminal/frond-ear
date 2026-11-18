@@ -344,7 +344,9 @@ minutes after its last request. The `hold_compaction` tool lets the session say 
   process and kills it at 4 s (stdin 1 s, daemon 2.5 s inside), so even a read that blocks
   (a FIFO, a stalled filesystem) can't hold the compaction past the deadline. Only the child's
   own exit 2 blocks, and only its own exit 0 prints letters. Killed, crashed or too much output:
-  nothing on stdout, exit 0.
+  nothing on stdout, exit 0. If the hook itself is stopped (SIGTERM, SIGINT, SIGHUP: a hook
+  timeout, a cancel) or exits any other way, it kills its worker first; only an uncatchable
+  SIGKILL of the hook can leave a blocked worker behind.
 - **A hold ends** at its expiry, on `release`, when another session takes the ear (an in-place
   session change too; coming back doesn't bring it back), on a daemon restart, and after any
   compaction. A pressure report (needs `--ear`) whose compaction marker is newer than the hold

@@ -4,7 +4,7 @@
 // seat's own ceiling. Everything else allows: the compaction goes ahead as stock.
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -774,6 +774,10 @@ test("a transcript read that blocks (a FIFO with no writer) still ends by the de
     let killed = false;
     const watchdog = setTimeout(() => {
       killed = true;
+      // SIGKILL can't be caught, so take the worker down with it here.
+      for (const pid of childrenOf(child.pid ?? -1)) {
+        process.kill(pid, "SIGKILL");
+      }
       child.kill("SIGKILL");
     }, 9_000);
     const code = await new Promise<number | null>((resolve) =>
@@ -822,5 +826,123 @@ test("watchdogOutcome: only a worker's own exit 2 blocks, only its own exit 0 pr
     assert.equal(outcome.code, 0, JSON.stringify(ended));
     assert.equal(outcome.stdout, "", JSON.stringify(ended));
     assert.match(outcome.stderr, /the compaction goes ahead/u);
+  }
+});
+
+function childrenOf(pid: number): number[] {
+  try {
+    return execFileSync("ps", ["-o", "pid=", "--ppid", String(pid)], {
+      encoding: "utf8",
+    })
+      .split("\n")
+      .map((line) => Number(line.trim()))
+      .filter((value) => Number.isInteger(value) && value > 0);
+  } catch {
+    return [];
+  }
+}
+
+/** Gone, or a zombie waiting for its new parent to reap it: either way, not running. */
+function running(pid: number): boolean {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    return !/^\d+ \(.*\) Z /u.test(stat);
+  } catch {
+    return false;
+  }
+}
+
+test("stopping the hook (SIGTERM, SIGINT) while its worker is blocked stops the worker too (#108 F6)", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "frond-ear-f6-"));
+  const transcriptFifo = join(directory, "t.fifo");
+  const tokenFifo = join(directory, "token.fifo");
+  execFileSync("mkfifo", [transcriptFifo]);
+  execFileSync("mkfifo", [tokenFifo]);
+  const workers: number[] = [];
+  try {
+    const cases: Array<[string, NodeJS.Signals, NodeJS.ProcessEnv]> = [
+      [
+        "transcript read",
+        "SIGTERM",
+        { FROND_EAR_SOCKET: join(directory, "none.sock") },
+      ],
+      [
+        "transcript read",
+        "SIGINT",
+        { FROND_EAR_SOCKET: join(directory, "none.sock") },
+      ],
+      // The token file is read before connecting: a FIFO there blocks the worker
+      // after its (empty) transcript read.
+      [
+        "token read",
+        "SIGTERM",
+        { FROND_EAR_TCP: "127.0.0.1:9", FROND_EAR_TOKEN_FILE: tokenFifo },
+      ],
+    ];
+    for (const [where, signal, extra] of cases) {
+      const parent = spawn(
+        process.execPath,
+        [CLI, "precompact", "--ear", "scribe", "--hook"],
+        {
+          env: {
+            ...process.env,
+            FROND_EAR_HOLD_CEILING: String(CEILING),
+            ...extra,
+          },
+          stdio: ["pipe", "pipe", "pipe"],
+        },
+      );
+      let stderr = "";
+      parent.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
+      const closed = new Promise<[number | null, NodeJS.Signals | null]>(
+        (resolve) => parent.on("close", (code, sig) => resolve([code, sig])),
+      );
+      parent.stdin.end(
+        JSON.stringify({
+          session_id: SESSION,
+          hook_event_name: "PreCompact",
+          trigger: "auto",
+          transcript_path:
+            where === "transcript read"
+              ? transcriptFifo
+              : join(directory, "none.jsonl"),
+        }),
+      );
+      // Wait for the worker to exist and settle into its blocked read.
+      let worker: number | undefined;
+      for (let i = 0; i < 60 && worker === undefined; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        worker = childrenOf(parent.pid ?? -1)[0];
+      }
+      assert.ok(worker, `${where}: a worker started`);
+      workers.push(worker);
+      await new Promise((resolve) => setTimeout(resolve, 1_500));
+      assert.ok(
+        running(worker),
+        `${where}: the worker is still blocked before the signal`,
+      );
+      parent.kill(signal);
+      const [code] = await closed;
+      assert.equal(code, 0, `${where}/${signal}: ${stderr}`);
+      assert.match(
+        stderr,
+        new RegExp(`${signal}; the worker was stopped`, "u"),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      assert.equal(
+        running(worker),
+        false,
+        `${where}/${signal}: no surviving worker`,
+      );
+    }
+  } finally {
+    for (const pid of workers) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        // already gone, as it should be
+      }
+    }
+    rmSync(directory, { recursive: true, force: true });
   }
 });
