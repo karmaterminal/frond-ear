@@ -29,7 +29,7 @@ import { LETTER_HINT, hookInput } from "./letters.ts";
 import { DiscordGateway } from "./gateway.ts";
 import { StructuredLogger } from "./logger.ts";
 import { runDoctor, runInit } from "./onboard.ts";
-import { pressureHookRequested, runPressure } from "./pressure.ts";
+import { pressureHookRequested, runPressureCommand } from "./pressure.ts";
 import type { DaemonMessage } from "./protocol.ts";
 import { EAR_PROTOCOL_VERSION, LineConnection } from "./protocol.ts";
 import { HttpDiscordRest, RecordingRest } from "./rest.ts";
@@ -66,10 +66,12 @@ usage:
                                       print the session's unsettled letters (#102) as compaction-summary
                                       instructions; for a PreCompact hook: --hook reads session_id on
                                       stdin, prints nothing on any failure and always exits 0
-  frond-ear pressure --hook [--bands 150k,200k,300k,450k,650k]
-                                      context pressure for a PostToolUse / UserPromptSubmit hook: reads the
-                                      transcript's latest token usage and adds one line to the session's
-                                      context on crossing into a new band; always exits 0
+  frond-ear pressure --hook [--ear <name>] [--bands 150k,200k,300k,450k,650k]
+                                      context pressure for a PostToolUse / UserPromptSubmit / Stop hook: reads
+                                      the transcript's latest token usage and adds one line to the session's
+                                      context on crossing into a new band; with --ear (or FROND_EAR_EAR) also
+                                      reports the reading to the daemon for ear_status (best effort, ≤1 s);
+                                      always exits 0
   frond-ear pressure --transcript <path>
                                       print a transcript's latest context size
   frond-ear inject --chat <id> --author <id> [--guild <id>] [--name <n>] [--bot] [--mention] <text…>
@@ -656,7 +658,7 @@ async function main(): Promise<void> {
       await runPrecompact(rest);
       return;
     case "pressure":
-      process.exitCode = runPressure(rest, {
+      process.exitCode = await runPressureCommand(rest, {
         // Only the hook reads stdin. A hand run from a shell whose stdin is a
         // pipe or socket that never ends (an agent's tool shell) would wait on it
         // forever. PostToolUse's JSON carries the whole tool response, so the cap

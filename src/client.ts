@@ -42,7 +42,16 @@ export type CliRequest =
   | { type: "inject"; message: DiscordMessage }
   | { type: "call"; tool: string; args: Record<string, unknown> }
   | { type: "release"; ear: string; source?: string; sessionId?: string }
-  | { type: "precompact"; ear: string; sessionId?: string };
+  | { type: "precompact"; ear: string; sessionId?: string }
+  | {
+      type: "pressure";
+      ear: string;
+      sessionId: string;
+      tokens: number;
+      band: number | null;
+      boundary: string | null;
+      at: number;
+    };
 
 /**
  * `request` stopped waiting. The daemon may have taken the request and still be

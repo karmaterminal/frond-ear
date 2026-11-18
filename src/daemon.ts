@@ -120,6 +120,23 @@ interface Client {
   pid: number | undefined;
 }
 
+/** A pressure hook's reading (#98), as the daemon keeps it. */
+interface PressureReport {
+  sessionId: string;
+  tokens: number;
+  band: number | null;
+  boundary: string | null;
+  at: number;
+}
+
+/** Bounds on a pressure report; anything outside is refused (#98). */
+export const PRESSURE_LIMITS = {
+  maxTokens: 10_000_000,
+  maxBand: 31,
+  maxBoundary: 80,
+  skewMs: 10 * 60 * 1_000,
+} as const;
+
 /** Discord's enforce_nonce window is "a few minutes"; stay inside it. */
 const SEND_DEDUPE_WINDOW_MS = 5 * 60 * 1_000;
 /**
@@ -437,6 +454,11 @@ export class Daemon {
    * woken by the same push without polling.
    */
   private readonly taps = new Map<string, Set<Client>>();
+  /**
+   * The latest context reading per ear (#98), from the attached session's pressure
+   * hook. In memory only: never an event, never in the store, never to taps.
+   */
+  private readonly pressure = new Map<string, PressureReport>();
   /**
    * Keys the delivery token in a pushed batch_id (#21). Never stored, logged or sent
    * to a tap, so only the push itself carries a token.
@@ -1244,6 +1266,20 @@ export class Daemon {
               }),
         });
         return;
+      case "pressure":
+        // The pressure hook's reading (#98) comes as a CLI client, like a release.
+        // A shim or tap could otherwise write another session's gauge.
+        client.connection.send({
+          type: "result",
+          id: message.id,
+          ...(client.role === "cli"
+            ? this.pressureRequest(message)
+            : {
+                ok: false,
+                text: `only a CLI client (frond-ear pressure --hook) can report pressure, not a ${client.role ?? "client"}`,
+              }),
+        });
+        return;
       case "session":
         if (client.ear && typeof message.sessionId === "string") {
           client.sessionId = message.sessionId;
@@ -1399,6 +1435,10 @@ export class Daemon {
       ? (this.options.nonce ?? (() => randomBytes(6).toString("hex")))()
       : null;
     const record = this.store.attachEar(ear, message.sessionId ?? null, nonce);
+    // A reading belongs to the session that reported it; a new session starts with none.
+    if (this.pressure.get(ear)?.sessionId !== message.sessionId) {
+      this.pressure.delete(ear);
+    }
     client.ear = ear;
     client.attachedAs = ear;
     client.attachGeneration = record.generation;
@@ -1505,6 +1545,95 @@ export class Daemon {
     }
     this.store.clearRuntimeState(`letters.armed.${ear}`);
     return { ok: true, text: this.deliverLetters(ear, client, source) };
+  }
+
+  /**
+   * The pressure hook's reading (#98). Kept only for a configured ear, from the
+   * session that holds it now, with every field in bounds; anything else is refused
+   * and nothing is stored.
+   */
+  private pressureRequest(message: {
+    ear: unknown;
+    sessionId: unknown;
+    tokens: unknown;
+    band: unknown;
+    boundary: unknown;
+    at: unknown;
+  }): { ok: boolean; text: string } {
+    const ear = typeof message.ear === "string" ? message.ear : "";
+    if (!this.config.ears[ear]) {
+      return { ok: false, text: `unknown ear ${ear || "(none)"}` };
+    }
+    const sessionId =
+      typeof message.sessionId === "string" && message.sessionId
+        ? message.sessionId
+        : undefined;
+    if (!sessionId) {
+      return {
+        ok: false,
+        text: "the pressure report named no session; nothing kept",
+      };
+    }
+    const client = this.attached.get(ear);
+    if (!client || client.sessionId !== sessionId) {
+      return {
+        ok: false,
+        text: `ear ${ear} is not held by session ${sessionId.slice(0, 8)}; its pressure is not kept`,
+      };
+    }
+    const { tokens, band, boundary, at } = message;
+    const now = this.clock.now();
+    const problem =
+      typeof tokens !== "number" ||
+      !Number.isInteger(tokens) ||
+      tokens < 0 ||
+      tokens > PRESSURE_LIMITS.maxTokens
+        ? "tokens"
+        : band !== null &&
+            (typeof band !== "number" ||
+              !Number.isInteger(band) ||
+              band < 0 ||
+              band > PRESSURE_LIMITS.maxBand)
+          ? "band"
+          : boundary !== null &&
+              (typeof boundary !== "string" ||
+                boundary.length > PRESSURE_LIMITS.maxBoundary)
+            ? "boundary"
+            : typeof at !== "number" ||
+                !Number.isFinite(at) ||
+                Math.abs(at - now) > PRESSURE_LIMITS.skewMs
+              ? "at"
+              : undefined;
+    if (problem) {
+      return {
+        ok: false,
+        text: `pressure report refused: ${problem} is out of bounds; nothing kept`,
+      };
+    }
+    this.pressure.set(ear, {
+      sessionId,
+      tokens: tokens as number,
+      band: band as number | null,
+      boundary: boundary as string | null,
+      at: at as number,
+    });
+    return { ok: true, text: `pressure kept for ear ${ear}` };
+  }
+
+  /** The attached session's latest reading, for ear_status; null for none. */
+  private pressureView(ear: string): object | null {
+    const report = this.pressure.get(ear);
+    const client = this.attached.get(ear);
+    if (!report || !client || client.sessionId !== report.sessionId) {
+      return null;
+    }
+    return {
+      tokens: report.tokens,
+      band: report.band,
+      boundary: report.boundary,
+      at: report.at,
+      ageMs: Math.max(0, this.clock.now() - report.at),
+    };
   }
 
   /**
@@ -2538,6 +2667,7 @@ export class Daemon {
           nextFlushAt: this.store.nextDue(name) ?? null,
           attention: this.attentionView(name),
           letters: this.lettersView(name),
+          pressure: this.pressureView(name),
           ...(canticleDelivery ? { canticleDelivery } : {}),
         };
       });

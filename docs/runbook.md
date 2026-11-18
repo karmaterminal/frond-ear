@@ -325,6 +325,18 @@ session was auto-compacted anywhere from 200k to 970k tokens, so there is no fix
 share of. Once per band; a compaction starts them again (a new `compact_boundary` row in the transcript, or a drop to under half). Per-session state
 is in `$XDG_STATE_HOME/frond-ear/pressure/`. It needs no daemon and always exits 0.
 
+**Seen from outside (`--ear`, #98).** With `--ear <name>` (or `FROND_EAR_EAR`), every hook run that
+reads a size also hands it to the daemon, and `ear_status` (and `frond-ear status`) shows it on that
+ear: `pressure: { tokens, band, boundary, at, ageMs }`, where `band` is the highest band reached
+(null under the first) and `boundary` the latest compaction marker the hook read. So 🌿, figs or
+seat-pulse can see a seat's size without reading its transcript. The send is best effort within 1 s:
+no daemon, a refusal or a timeout changes nothing the hook prints and never its exit code. The
+daemon keeps only the latest reading per ear, in memory, and only from the session holding the ear;
+it is `null` until that session's hook reports, and cleared when another session attaches. It is
+never an event and never reaches taps. Context doesn't grow while a seat is idle, and no hook runs
+then, so an idle seat shows an aging reading (`ageMs`), not a fresh one. Without an ear nothing is
+sent.
+
 ```json
 {
   "hooks": {
@@ -333,7 +345,7 @@ is in `$XDG_STATE_HOME/frond-ear/pressure/`. It needs no daemon and always exits
         "hooks": [
           {
             "type": "command",
-            "command": "/abs/node /abs/frond-ear/src/cli.ts pressure --hook",
+            "command": "/abs/node /abs/frond-ear/src/cli.ts pressure --hook --ear <seat>",
             "timeout": 5
           }
         ]
@@ -344,7 +356,7 @@ is in `$XDG_STATE_HOME/frond-ear/pressure/`. It needs no daemon and always exits
         "hooks": [
           {
             "type": "command",
-            "command": "/abs/node /abs/frond-ear/src/cli.ts pressure --hook",
+            "command": "/abs/node /abs/frond-ear/src/cli.ts pressure --hook --ear <seat>",
             "timeout": 5
           }
         ]
@@ -355,7 +367,7 @@ is in `$XDG_STATE_HOME/frond-ear/pressure/`. It needs no daemon and always exits
         "hooks": [
           {
             "type": "command",
-            "command": "/abs/node /abs/frond-ear/src/cli.ts pressure --hook",
+            "command": "/abs/node /abs/frond-ear/src/cli.ts pressure --hook --ear <seat>",
             "timeout": 5
           }
         ]

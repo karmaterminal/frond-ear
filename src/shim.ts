@@ -294,7 +294,7 @@ export const TOOLS = [
   {
     name: "ear_status",
     description:
-      'Check that your ear works: after a restart, resume or compaction, and whenever Discord has been quiet longer than you expect. Healthy: gateway.state "connected" ("dry-run" under --dry-run) and your ear\'s delivery "confirmed" ("pending": attached under 2 minutes ago, confirmed by acking the kind="attach" event\'s nonce; "unconfirmed": read its hint; "detached": no session holds the ear). Also shows who holds the ear (sessionId, shimPid), attention, event counts and ambiguousSends. Read-only. Never start a second session or shim for this ear to check it (in Claude Code, claude mcp list and claude mcp get each start one): the newest attach takes the ear.',
+      'Check that your ear works: after a restart, resume or compaction, and whenever Discord has been quiet longer than you expect. Healthy: gateway.state "connected" ("dry-run" under --dry-run) and your ear\'s delivery "confirmed" ("pending": attached under 2 minutes ago, confirmed by acking the kind="attach" event\'s nonce; "unconfirmed": read its hint; "detached": no session holds the ear). Also shows who holds the ear (sessionId, shimPid), attention, event counts, ambiguousSends, and the session\'s last context reading (pressure, with ageMs; reported by the pressure hook run with --ear). Read-only. Never start a second session or shim for this ear to check it (in Claude Code, claude mcp list and claude mcp get each start one): the newest attach takes the ear.',
     inputSchema: {
       type: "object",
       properties: {

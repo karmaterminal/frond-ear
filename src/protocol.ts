@@ -34,6 +34,21 @@ export type ClientMessage =
       id: number;
       ear: string;
       sessionId?: string;
+    }
+  /**
+   * A seat's pressure hook: its latest context reading, for ear_status (#98).
+   * `band` is the highest band reached (null under the first); `boundary` the
+   * latest compaction marker the hook read; `at` the hook's clock (epoch ms).
+   */
+  | {
+      type: "pressure";
+      id: number;
+      ear: string;
+      sessionId: string;
+      tokens: number;
+      band: number | null;
+      boundary: string | null;
+      at: number;
     };
 
 /** Messages from the daemon to a client. */

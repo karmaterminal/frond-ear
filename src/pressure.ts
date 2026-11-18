@@ -21,7 +21,15 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 
+import { request } from "./client.ts";
+
 export const DEFAULT_BANDS = [150_000, 200_000, 300_000, 450_000, 650_000];
+
+/**
+ * How long the hook waits on the daemon for its pressure report (#98). Best
+ * effort: a slow or absent daemon costs the hook at most this, and nothing else.
+ */
+export const REPORT_TIMEOUT_MS = 1_000;
 
 /** How much of the transcript's end to read for the latest usage. */
 const TAIL_BYTES = 4 * 1024 * 1024;
@@ -376,6 +384,19 @@ export interface PressureIo {
   stdout: { write(text: string): unknown };
   stderr: { write(text: string): unknown };
   env: NodeJS.ProcessEnv;
+  /** Handed each hook reading, when an ear is named (#98). */
+  onReading?: (report: PressureReport) => void;
+}
+
+/** What the hook tells the daemon (#98): one reading of one session, for one ear. */
+export interface PressureReport {
+  ear: string;
+  sessionId: string;
+  tokens: number;
+  /** The highest band reached, null under the first. */
+  band: number | null;
+  boundary: string | null;
+  at: number;
 }
 
 /**
@@ -396,7 +417,12 @@ export function pressureHookRequested(argv: readonly string[]): boolean {
  * of --transcript <path> for a person to check.
  */
 export function runPressure(argv: string[], io: PressureIo): number {
-  let values: { hook?: boolean; bands?: string; transcript?: string };
+  let values: {
+    hook?: boolean;
+    bands?: string;
+    transcript?: string;
+    ear?: string;
+  };
   try {
     values = parseArgs({
       args: argv,
@@ -404,6 +430,7 @@ export function runPressure(argv: string[], io: PressureIo): number {
         hook: { type: "boolean" },
         bands: { type: "string" },
         transcript: { type: "string" },
+        ear: { type: "string" },
       },
     }).values;
   } catch (error) {
@@ -467,6 +494,18 @@ export function runPressure(argv: string[], io: PressureIo): number {
       // Nothing read yet, or compacted with no turn since: the next call reads it.
       return 0;
     }
+    const ear = values.ear || io.env.FROND_EAR_EAR || undefined;
+    if (ear && io.onReading) {
+      const reached = reachedBand(tokens, bands);
+      io.onReading({
+        ear,
+        sessionId: input.sessionId,
+        tokens,
+        band: reached >= 0 ? reached : null,
+        boundary: reading.boundary,
+        at: Date.now(),
+      });
+    }
     const dir = stateDir(io.env);
     if (input.event === "Stop") {
       const { state, nudge } = stopStep(
@@ -497,4 +536,32 @@ export function runPressure(argv: string[], io: PressureIo): number {
     // A gauge that can't read says nothing rather than block the session.
   }
   return 0;
+}
+
+/**
+ * `frond-ear pressure` from the command line: runPressure, then, under --hook with an
+ * ear named (--ear or FROND_EAR_EAR), the reading goes to the daemon so ear_status
+ * can show it (#98). Every hook run with a reading sends, so its age stays honest.
+ * The send is best effort within REPORT_TIMEOUT_MS: no daemon, a refusal or a
+ * timeout changes nothing the hook prints and never its exit code.
+ */
+export async function runPressureCommand(
+  argv: string[],
+  io: PressureIo,
+): Promise<number> {
+  let report: PressureReport | undefined;
+  const code = runPressure(argv, {
+    ...io,
+    onReading: (reading) => {
+      report = reading;
+    },
+  });
+  if (report) {
+    try {
+      await request({ type: "pressure", ...report }, io.env, REPORT_TIMEOUT_MS);
+    } catch {
+      // Best effort: the gauge in the session's own context is unchanged.
+    }
+  }
+  return code;
 }
