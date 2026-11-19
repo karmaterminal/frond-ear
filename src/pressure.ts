@@ -58,6 +58,8 @@ export interface PressureReading {
   tokens?: number;
   /** The latest compaction marker's id in the tail, or null for none. */
   boundary: string | null;
+  /** That marker's own time (epoch ms), when it has one (#108 F3/F4). */
+  boundaryAt?: number;
   /**
    * When that evidence was written (epoch ms, from the row's `timestamp`): the
    * usage row's time when there is one, else the marker's. Absent when the row
@@ -125,10 +127,12 @@ export function latestReading(transcript: string): PressureReading {
           : typeof record.timestamp === "string" && record.timestamp
             ? record.timestamp
             : `sha256:${createHash("sha256").update(line).digest("hex").slice(0, 16)}`;
-      const when = tokens !== undefined ? at : rowTime(record.timestamp);
+      const markedAt = rowTime(record.timestamp);
+      const when = tokens !== undefined ? at : markedAt;
       return {
         ...(tokens !== undefined ? { tokens } : {}),
         boundary: id,
+        ...(markedAt !== undefined ? { boundaryAt: markedAt } : {}),
         ...(when !== undefined ? { at: when } : {}),
       };
     }
@@ -157,6 +161,103 @@ export function latestReading(transcript: string): PressureReading {
     boundary: null,
     ...(at !== undefined ? { at } : {}),
   };
+}
+
+/**
+ * What a PreCompact hook knows about the context being compacted (#107): the latest
+ * main-session usage row's tokens, plus the bytes written after that row (tool
+ * results, prompts) that no usage row has counted yet. No tokens when the tail has a
+ * compaction marker newer than any usage row, or no usage row at all: unknown.
+ * Sidechain rows never supply the tokens, but their bytes count as pending, which
+ * can only overstate the context.
+ */
+export function holdReading(transcript: string): {
+  tokens?: number;
+  pendingBytes: number;
+} {
+  const lines = transcript.split("\n");
+  let pendingBytes = 0;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i] ?? "";
+    const trimmed = line.trim();
+    if (trimmed) {
+      let row: unknown;
+      try {
+        row = JSON.parse(trimmed);
+      } catch {
+        row = undefined;
+      }
+      if (typeof row === "object" && row !== null) {
+        const record = row as {
+          type?: unknown;
+          subtype?: unknown;
+          message?: unknown;
+          isSidechain?: unknown;
+        };
+        if (record.isSidechain !== true) {
+          if (
+            record.type === "system" &&
+            record.subtype === "compact_boundary"
+          ) {
+            return { pendingBytes };
+          }
+          if (record.type === "assistant") {
+            const usage = (record.message as { usage?: unknown } | undefined)
+              ?.usage;
+            if (usage !== undefined) {
+              // The newest main usage decides: invalid is unknown, never a
+              // small number, and never a fall back to an older row (#108 F1).
+              const tokens = strictUsageTokens(usage);
+              return tokens === undefined
+                ? { pendingBytes }
+                : { tokens, pendingBytes };
+            }
+          }
+        }
+      }
+    }
+    pendingBytes += Buffer.byteLength(line) + 1;
+  }
+  return { pendingBytes };
+}
+
+/**
+ * A usage object's context size for a blocking decision (#108 F1): input and output
+ * must be whole numbers ≥ 0, the cache counters absent or the same, and the total
+ * above 0. Anything else is undefined (unknown), never coerced to 0.
+ */
+export function strictUsageTokens(usage: unknown): number | undefined {
+  if (typeof usage !== "object" || usage === null || Array.isArray(usage)) {
+    return undefined;
+  }
+  const u = usage as Record<string, unknown>;
+  const whole = (value: unknown) =>
+    typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+  if (!whole(u.input_tokens) || !whole(u.output_tokens)) {
+    return undefined;
+  }
+  let total = (u.input_tokens as number) + (u.output_tokens as number);
+  for (const key of [
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+  ]) {
+    if (u[key] === undefined) {
+      continue;
+    }
+    if (!whole(u[key])) {
+      return undefined;
+    }
+    total += u[key] as number;
+  }
+  return total > 0 ? total : undefined;
+}
+
+/**
+ * Pending bytes as tokens, rounded up at 3 bytes a token: transcript JSON runs nearer
+ * 4, so this overstates, and an overstated context lets a held compaction go ahead.
+ */
+export function pendingTokens(pendingBytes: number): number {
+  return Math.ceil(pendingBytes / 3);
 }
 
 export function readTail(path: string, maxBytes = TAIL_BYTES): string {
@@ -427,10 +528,14 @@ export interface PressureReport {
   /** The highest band reached, null under the first (and for no tokens). */
   band: number | null;
   boundary: string | null;
+  /** The boundary marker's own time, when known: a hold ends on a newer one (#107). */
+  boundaryAt?: number;
   /** When the evidence was written: the usage (or marker) row's time, else the hook's. */
   at: number;
   /** CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS, when the seat sets it. */
   idleFloor?: number;
+  /** The hook event that read it (#107: only some can show the daemon's notice). */
+  event?: string;
 }
 
 /** The seat's idle-compaction floor, when its environment sets one. */
@@ -544,8 +649,12 @@ export function runPressure(argv: string[], io: PressureIo): number {
         tokens: tokens ?? null,
         band: reached >= 0 ? reached : null,
         boundary: reading.boundary,
+        ...(reading.boundaryAt !== undefined
+          ? { boundaryAt: reading.boundaryAt }
+          : {}),
         at: reading.at ?? Date.now(),
         ...(idleFloor !== undefined ? { idleFloor } : {}),
+        ...(input.event ? { event: input.event } : {}),
       });
     }
     // Already continuing because of a Stop hook: never ask again, or a turn
@@ -605,18 +714,64 @@ export async function runPressureCommand(
   io: PressureIo,
 ): Promise<number> {
   let report: PressureReport | undefined;
+  let printed = "";
   const code = runPressure(argv, {
     ...io,
+    // Held until the daemon answers, so a notice can join the same hook output.
+    stdout: { write: (text: string) => (printed += text) },
     onReading: (reading) => {
       report = reading;
     },
   });
+  let notice: string | undefined;
   if (report) {
     try {
-      await request({ type: "pressure", ...report }, io.env, REPORT_TIMEOUT_MS);
+      const result = await request(
+        { type: "pressure", ...report },
+        io.env,
+        REPORT_TIMEOUT_MS,
+      );
+      notice = typeof result.notice === "string" ? result.notice : undefined;
     } catch {
       // Best effort: the gauge in the session's own context is unchanged.
     }
   }
+  io.stdout.write(withNotice(printed, report?.event, notice));
   return code;
+}
+
+/**
+ * A daemon notice (#107) added to what the hook already prints: on PostToolUse and
+ * UserPromptSubmit only, as added context, beside a band line when there is one.
+ * Anything else, or output it can't read, prints unchanged.
+ */
+export function withNotice(
+  printed: string,
+  event: string | undefined,
+  notice: string | undefined,
+): string {
+  if (!notice || (event !== "PostToolUse" && event !== "UserPromptSubmit")) {
+    return printed;
+  }
+  if (printed.trim() === "") {
+    return `${hookOutput(event, notice)}\n`;
+  }
+  try {
+    const parsed = JSON.parse(printed) as {
+      hookSpecificOutput?: {
+        hookEventName?: unknown;
+        additionalContext?: unknown;
+      };
+    };
+    const line = parsed.hookSpecificOutput?.additionalContext;
+    if (
+      typeof line === "string" &&
+      parsed.hookSpecificOutput?.hookEventName === event
+    ) {
+      return `${hookOutput(event, `${line}\n${notice}`)}\n`;
+    }
+  } catch {
+    // Not the shape we print: leave it alone.
+  }
+  return printed;
 }

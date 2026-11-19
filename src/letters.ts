@@ -111,11 +111,14 @@ export const LETTER_HINT =
  * The session and source a hook names on stdin. Claude Code's hooks send `session_id`
  * and `source`; Copilot CLI's (preCompact, sessionStart) send `sessionId` and, for
  * preCompact, `trigger` instead of a source. Either spelling names the session; a
- * payload that isn't a JSON object names nothing.
+ * payload that isn't a JSON object names nothing. A PreCompact hook's `trigger` and
+ * `transcript_path` come back too, for the compaction hold (#107).
  */
 export function hookInput(raw: string): {
   sessionId?: string;
   source?: string;
+  trigger?: string;
+  transcriptPath?: string;
 } {
   let input: unknown;
   try {
@@ -131,9 +134,17 @@ export function hookInput(raw: string): {
     (value): value is string => typeof value === "string" && value !== "",
   );
   const source = typeof fields.source === "string" ? fields.source : undefined;
+  const trigger =
+    typeof fields.trigger === "string" ? fields.trigger : undefined;
+  const transcriptPath =
+    typeof fields.transcript_path === "string" && fields.transcript_path !== ""
+      ? fields.transcript_path
+      : undefined;
   return {
     ...(sessionId ? { sessionId } : {}),
     ...(source ? { source } : {}),
+    ...(trigger ? { trigger } : {}),
+    ...(transcriptPath ? { transcriptPath } : {}),
   };
 }
 

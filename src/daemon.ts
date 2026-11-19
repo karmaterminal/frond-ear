@@ -157,6 +157,36 @@ export const IDLE_COMPACT = {
   afterMs: 54 * 60 * 1_000,
 } as const;
 
+/**
+ * A session's hold on its own compaction (#107): while it stands, the PreCompact
+ * hook blocks an `auto` compaction under the ceiling. Kept in memory only, so a
+ * daemon restart drops it and compaction goes ahead as stock.
+ */
+interface CompactionHold {
+  sessionId: string;
+  reason: string;
+  setAt: number;
+  expiresAt: number;
+  /** Block answers given to this session's PreCompact hook: not proof Claude Code skipped. */
+  blocksAnswered: number;
+}
+
+/**
+ * Bounds on a compaction hold (#107). A forgotten hold lapses within maxTtlS. The
+ * ceiling is the seat's own (FROND_EAR_HOLD_CEILING in the hook's env, about 60% of
+ * its model's window): the daemon can't know the window, so without a usable ceiling
+ * a hold never blocks. Blocking a compaction that recovers from a context-limit
+ * error fails the request, and the hook's `auto` trigger can't tell the two apart;
+ * the ceiling keeps a hold far from that size.
+ */
+export const HOLD_LIMITS = {
+  minTtlS: 60,
+  maxTtlS: 6 * 60 * 60,
+  defaultTtlS: 2 * 60 * 60,
+  maxReason: 200,
+  maxCeiling: 10_000_000,
+} as const;
+
 /** Discord's enforce_nonce window is "a few minutes"; stay inside it. */
 const SEND_DEDUPE_WINDOW_MS = 5 * 60 * 1_000;
 /**
@@ -479,6 +509,17 @@ export class Daemon {
    * hook. In memory only: never an event, never in the store, never to taps.
    */
   private readonly pressure = new Map<string, PressureReport>();
+  /** Each ear's compaction hold (#107), set by its attached session. */
+  private readonly holds = new Map<string, CompactionHold>();
+  /**
+   * A hold that ended without its session releasing it (expired, or a compaction
+   * ran), owed to that session once, on its next PostToolUse or UserPromptSubmit
+   * pressure report (#107): its tool result still says "held".
+   */
+  private readonly holdNotices = new Map<
+    string,
+    { sessionId: string; text: string }
+  >();
   /**
    * Keys the delivery token in a pushed batch_id (#21). Never stored, logged or sent
    * to a tap, so only the push itself carries a token.
@@ -1303,11 +1344,20 @@ export class Daemon {
       case "session":
         if (client.ear && typeof message.sessionId === "string") {
           // The same turnover rule as attach: a reading belongs to its session.
-          if (
-            this.attached.get(client.ear) === client &&
-            this.pressure.get(client.ear)?.sessionId !== message.sessionId
-          ) {
-            this.pressure.delete(client.ear);
+          if (this.attached.get(client.ear) === client) {
+            if (
+              this.pressure.get(client.ear)?.sessionId !== message.sessionId
+            ) {
+              this.pressure.delete(client.ear);
+            }
+            if (this.holds.get(client.ear)?.sessionId !== message.sessionId) {
+              this.holds.delete(client.ear);
+            }
+            if (
+              this.holdNotices.get(client.ear)?.sessionId !== message.sessionId
+            ) {
+              this.holdNotices.delete(client.ear);
+            }
           }
           client.sessionId = message.sessionId;
           this.store.updateEarSession(client.ear, message.sessionId);
@@ -1466,6 +1516,13 @@ export class Daemon {
     if (this.pressure.get(ear)?.sessionId !== message.sessionId) {
       this.pressure.delete(ear);
     }
+    // So is a hold: another session never inherits one.
+    if (this.holds.get(ear)?.sessionId !== message.sessionId) {
+      this.holds.delete(ear);
+    }
+    if (this.holdNotices.get(ear)?.sessionId !== message.sessionId) {
+      this.holdNotices.delete(ear);
+    }
     client.ear = ear;
     client.attachedAs = ear;
     client.attachGeneration = record.generation;
@@ -1587,7 +1644,9 @@ export class Daemon {
     boundary: unknown;
     at: unknown;
     idleFloor?: unknown;
-  }): { ok: boolean; text: string } {
+    event?: unknown;
+    boundaryAt?: unknown;
+  }): { ok: boolean; text: string; notice?: string } {
     const ear = typeof message.ear === "string" ? message.ear : "";
     if (!this.config.ears[ear]) {
       return { ok: false, text: `unknown ear ${ear || "(none)"}` };
@@ -1671,7 +1730,68 @@ export class Daemon {
       receivedAt: now,
       idleFloor: idleFloor as number | undefined,
     });
+    const hold = this.holds.get(ear);
+    if (hold?.sessionId === sessionId) {
+      // When the latest compaction happened, by the marker's own time: a report
+      // with usage after it still carries it, so a missed marker-only report can't
+      // leave the hold standing (#108 F3). A marker-only report's `at` is the
+      // marker's time. A marker from before the hold was set never ends it, however
+      // late it arrives (#108 F4).
+      const markedAt =
+        typeof message.boundaryAt === "number" &&
+        Number.isFinite(message.boundaryAt)
+          ? message.boundaryAt
+          : tokens === null
+            ? (at as number)
+            : undefined;
+      if (
+        boundary !== null &&
+        markedAt !== undefined &&
+        markedAt > hold.setAt
+      ) {
+        // The hold did its work, or was passed by (manual, over the ceiling,
+        // unknown pressure): either way the context it guarded is gone.
+        this.endHold(ear, "a compaction ran");
+      } else if (now >= hold.expiresAt) {
+        this.endHold(ear, "expired");
+      }
+    }
+    const owed = this.holdNotices.get(ear);
+    if (
+      owed?.sessionId === sessionId &&
+      (message.event === "PostToolUse" || message.event === "UserPromptSubmit")
+    ) {
+      this.holdNotices.delete(ear);
+      return {
+        ok: true,
+        text: `pressure kept for ear ${ear}`,
+        notice: owed.text,
+      };
+    }
     return { ok: true, text: `pressure kept for ear ${ear}` };
+  }
+
+  /** A hold ends without its session's release: drop it and owe the session a notice. */
+  private endHold(ear: string, why: "expired" | "a compaction ran"): void {
+    const hold = this.holds.get(ear);
+    if (!hold) {
+      return;
+    }
+    this.holds.delete(ear);
+    const when =
+      why === "expired"
+        ? `it expired at ${new Date(hold.expiresAt).toISOString()}`
+        : "a compaction ran";
+    this.holdNotices.set(ear, {
+      sessionId: hold.sessionId,
+      text: `frond-ear: your compaction hold (${hold.reason}) has ended: ${when}. Auto compaction is allowed again; hold_compaction sets a new one.`,
+    });
+    this.logger.log("info", "compaction.hold_ended", {
+      ear,
+      session: hold.sessionId.slice(0, 8),
+      why,
+      blocksAnswered: hold.blocksAnswered,
+    });
   }
 
   /** The attached session's latest reading, for ear_status; null for none. */
@@ -1702,9 +1822,16 @@ export class Daemon {
    * summary instructions. Fails closed like a release: the hook must name a session,
    * and that session must hold the ear now.
    */
-  private precompactRequest(message: { ear: string; sessionId?: string }): {
+  private precompactRequest(message: {
+    ear: string;
+    sessionId?: string;
+    trigger?: unknown;
+    tokens?: unknown;
+    ceiling?: unknown;
+  }): {
     ok: boolean;
     text: string;
+    block?: string;
   } {
     const ear = typeof message.ear === "string" ? message.ear : "";
     if (!this.config.ears[ear]) {
@@ -1727,10 +1854,169 @@ export class Daemon {
         text: `ear ${ear} is not held by session ${sessionId.slice(0, 8)}; its letters are not printed`,
       };
     }
+    const now = this.clock.now();
+    const block = this.holdBlocks(ear, sessionId, message, now);
     return {
       ok: true,
-      text: summaryLetters(this.store, ear, sessionId, this.clock.now()),
+      text: summaryLetters(this.store, ear, sessionId, now),
+      ...(block ? { block } : {}),
     };
+  }
+
+  /**
+   * Whether the session's hold blocks this compaction (#107), and why. It blocks
+   * only an `auto` compaction, for the session that set the hold, before it
+   * expires, with a token reading under the ceiling. Anything missing or odd lets
+   * the compaction go ahead: a hold may delay a compaction, never cause a worse one.
+   */
+  private holdBlocks(
+    ear: string,
+    sessionId: string,
+    message: { trigger?: unknown; tokens?: unknown; ceiling?: unknown },
+    now: number,
+  ): string | undefined {
+    const hold = this.holds.get(ear);
+    if (!hold || hold.sessionId !== sessionId) {
+      return undefined;
+    }
+    if (now >= hold.expiresAt) {
+      this.endHold(ear, "expired");
+      return undefined;
+    }
+    if (message.trigger !== "auto") {
+      return undefined;
+    }
+    const tokens = message.tokens;
+    if (typeof tokens !== "number" || !Number.isInteger(tokens) || tokens < 0) {
+      return undefined;
+    }
+    const ceiling = message.ceiling;
+    if (
+      typeof ceiling !== "number" ||
+      !Number.isInteger(ceiling) ||
+      ceiling < 1 ||
+      ceiling > HOLD_LIMITS.maxCeiling
+    ) {
+      this.logger.log("info", "compaction.hold_passed", {
+        ear,
+        session: sessionId.slice(0, 8),
+        why: "no usable ceiling (FROND_EAR_HOLD_CEILING)",
+      });
+      return undefined;
+    }
+    if (tokens >= ceiling) {
+      this.logger.log("info", "compaction.hold_passed", {
+        ear,
+        session: sessionId.slice(0, 8),
+        why: "at or over the ceiling",
+        size: tokens,
+        ceiling,
+      });
+      return undefined;
+    }
+    hold.blocksAnswered += 1;
+    this.logger.log("info", "compaction.held", {
+      ear,
+      session: sessionId.slice(0, 8),
+      size: tokens,
+      ceiling,
+      setAt: hold.setAt,
+      expiresAt: hold.expiresAt,
+      blocksAnswered: hold.blocksAnswered,
+    });
+    return `frond-ear: compaction held by this session (${hold.reason}); about ${tokens} tokens, under its ${ceiling} ceiling; the hold lapses at ${new Date(hold.expiresAt).toISOString()}`;
+  }
+
+  /** The attached session's standing hold, for ear_status; null for none. */
+  private holdView(ear: string): object | null {
+    const hold = this.holds.get(ear);
+    const client = this.attached.get(ear);
+    if (
+      !hold ||
+      !client ||
+      client.sessionId !== hold.sessionId ||
+      this.clock.now() >= hold.expiresAt
+    ) {
+      return null;
+    }
+    return {
+      reason: hold.reason,
+      setAt: hold.setAt,
+      expiresAt: hold.expiresAt,
+      blocksAnswered: hold.blocksAnswered,
+    };
+  }
+
+  /** The hold_compaction tool (#107): set, replace or release this session's hold. */
+  private holdCompaction(
+    client: Client,
+    args: Record<string, unknown>,
+  ): string {
+    const ear = this.requireHolder(client, "hold its compaction");
+    if (!client.sessionId) {
+      throw new Error(
+        "frond-ear does not know this session's id (its shim had no CLAUDE_CODE_SESSION_ID), so the PreCompact hook could not match a hold to it; nothing was held",
+      );
+    }
+    if (args.release === true) {
+      if (args.reason !== undefined || args.ttl_seconds !== undefined) {
+        throw new Error("release takes no reason or ttl_seconds");
+      }
+      // Only this session's own hold: a late release never erases a successor's.
+      const had = this.holds.get(ear)?.sessionId === client.sessionId;
+      if (this.holdNotices.get(ear)?.sessionId === client.sessionId) {
+        this.holdNotices.delete(ear);
+      }
+      if (had) {
+        this.holds.delete(ear);
+        this.logger.log("info", "compaction.hold_released", { ear });
+      }
+      return had
+        ? "hold released: compaction goes ahead as stock"
+        : "no hold to release";
+    }
+    if (args.release !== undefined && args.release !== false) {
+      throw new Error("release must be true");
+    }
+    const reason = stringArg(args, "reason", true).trim();
+    if (reason === "" || reason.length > HOLD_LIMITS.maxReason) {
+      throw new Error(
+        `reason must be 1 to ${HOLD_LIMITS.maxReason} characters`,
+      );
+    }
+    const raw = args.ttl_seconds;
+    const ttl =
+      raw === undefined || raw === null ? HOLD_LIMITS.defaultTtlS : Number(raw);
+    if (
+      !Number.isInteger(ttl) ||
+      ttl < HOLD_LIMITS.minTtlS ||
+      ttl > HOLD_LIMITS.maxTtlS
+    ) {
+      throw new Error(
+        `ttl_seconds must be a whole number from ${HOLD_LIMITS.minTtlS} to ${HOLD_LIMITS.maxTtlS}`,
+      );
+    }
+    const now = this.clock.now();
+    const previous = this.holds.get(ear);
+    const hold: CompactionHold = {
+      sessionId: client.sessionId,
+      reason,
+      setAt: now,
+      expiresAt: now + ttl * 1_000,
+      blocksAnswered:
+        previous?.sessionId === client.sessionId && now < previous.expiresAt
+          ? previous.blocksAnswered
+          : 0,
+    };
+    this.holds.set(ear, hold);
+    this.holdNotices.delete(ear);
+    this.logger.log("info", "compaction.hold_set", {
+      ear,
+      session: client.sessionId.slice(0, 8),
+      ttlS: ttl,
+      expiresAt: hold.expiresAt,
+    });
+    return `compaction held until ${new Date(hold.expiresAt).toISOString()}, then allowed again. Until then the PreCompact hook (frond-ear precompact --hook) blocks an auto compaction while the context is under the seat's FROND_EAR_HOLD_CEILING; with no ceiling set it blocks nothing. A manual /compact still runs, and the next compaction (any kind) ends the hold. Release it with release: true when the wait is over.`;
   }
 
   /**
@@ -2107,6 +2393,8 @@ export class Daemon {
       }
       case "fetch_attachment":
         return this.fetchAttachment(args);
+      case "hold_compaction":
+        return this.holdCompaction(client, args);
       case "leave_letter": {
         const ear = this.requireHolder(client, "leave a letter");
         if (!client.sessionId) {
@@ -2729,6 +3017,7 @@ export class Daemon {
           attention: this.attentionView(name),
           letters: this.lettersView(name),
           pressure: this.pressureView(name),
+          hold: this.holdView(name),
           ...(canticleDelivery ? { canticleDelivery } : {}),
         };
       });

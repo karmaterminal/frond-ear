@@ -340,6 +340,7 @@ test("hook → daemon: one pressure message with the reading; stdout and exit co
         band: 1,
         boundary: null,
         at: undefined,
+        event: "PostToolUse",
       },
     );
     assert.ok(

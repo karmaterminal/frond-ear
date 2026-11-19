@@ -413,7 +413,8 @@ test("letters: a hook's stdin names the session in either spelling (#92)", () =>
         customInstructions: "",
       }),
     ),
-    { sessionId: SESSION },
+    // trigger comes back too (#107); only Claude Code's transcript_path does.
+    { sessionId: SESSION, trigger: "manual" },
   );
   // Both present: Claude's spelling wins, as before.
   assert.deepEqual(

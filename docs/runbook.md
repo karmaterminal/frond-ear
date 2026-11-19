@@ -290,10 +290,12 @@ under "Letters from before this compaction", as the session's own evidence, neve
   hands the letters back afterwards.
 - **It fails closed on the session, like a release.** The hook must name the session that holds
   the ear now, and only a CLI client may ask.
-- **It never blocks a compaction.** Under `--hook` stdout carries the letters or nothing (an error
-  there would land in the summary), every reason goes to stderr, and the exit code is always 0.
-  Exit 2 would block the compaction. The output never starts with `{`, so it can't be read as a
-  JSON decision.
+- **It blocks a compaction only for a hold the session set itself (#107).** Under `--hook` stdout
+  carries the letters or nothing (an error there would land in the summary), every reason goes to
+  stderr, and the exit code is 0. **Exactly one path exits 2:** `precompact --hook`, when an
+  unexpired `hold_compaction` of this session blocks an `auto` trigger under the seat's ceiling
+  (below). Every other frond-ear command a hook can run exits 0 under `--hook`, and 1 (never 2) on
+  bad usage without it. The output never starts with `{`, so it can't be read as a JSON decision.
 
 ```json
 {
@@ -313,6 +315,62 @@ under "Letters from before this compaction", as the session's own evidence, neve
   }
 }
 ```
+
+**Holding off a compaction while you wait (#107).** A seat that goes quiet on purpose mid-task
+(waiting on a CI run, a review or a Monitor) is exactly what an idle compaction catches, about 55
+minutes after its last request. The `hold_compaction` tool lets the session say "not now":
+
+- `hold_compaction {reason, ttl_seconds}` sets or replaces this session's hold (60 s to 6 h,
+  default 2 h); `{release: true}` drops it. Only the session holding the ear can set or release
+  one, and only its own.
+- While it stands, the same `PreCompact` hook above (`precompact --ear <ear> --hook`) exits 2,
+  with one line on stderr and nothing on stdout, when **all** of these hold: the trigger is
+  `auto`; the hold is this session's and unexpired; the seat set `FROND_EAR_HOLD_CEILING` in the
+  hook's environment; and the context, read from the main transcript at that moment, is under it.
+  Otherwise the hook prints the letters as before.
+- **The context is read fresh at PreCompact**: the latest main-session usage row (sidechain rows
+  excluded), plus the bytes written after it at 3 bytes a token, so a big tool result that no usage
+  row has counted yet pushes the reading up. That newest usage row must be valid: whole
+  `input_tokens` and `output_tokens` ≥ 0, cache counters absent or the same, a total above 0.
+  An invalid one is unknown; it never counts as zero, and the hook never falls back past it to an
+  older row. A compaction marker newer than any usage row, a missing or unreadable transcript, or
+  no usage at all is unknown too, and unknown allows.
+- **`FROND_EAR_HOLD_CEILING` is required.** frond-ear can't know the model's window. Set it to about
+  60% of it (600000 for a 1M window, 120000 for 200k), for example by prefixing the hook's
+  command: `FROND_EAR_HOLD_CEILING=600000 node /path/to/frond-ear/src/cli.ts precompact --ear <ear> --hook`.
+  Unset or unusable, a hold blocks nothing.
+- **Everything else allows**: a manual `/compact`, another session, an expired hold, a down
+  daemon, and stdin that is malformed, oversized or never ends. The hook does its work in a child
+  process and kills it at 4 s (stdin 1 s, daemon 2.5 s inside), so even a read that blocks
+  (a FIFO, a stalled filesystem) can't hold the compaction past the deadline. Only the child's
+  own exit 2 blocks, and only its own exit 0 prints letters. Killed, crashed or too much output:
+  nothing on stdout, exit 0. If the hook itself is stopped (SIGTERM, SIGINT, SIGHUP: a hook
+  timeout, a cancel) or exits any other way, it kills its worker first; only an uncatchable
+  SIGKILL of the hook can leave a blocked worker behind.
+- **A hold ends** at its expiry, on `release`, when another session takes the ear (an in-place
+  session change too; coming back doesn't bring it back), on a daemon restart, and after any
+  compaction. A pressure report (needs `--ear`) whose compaction marker is newer than the hold
+  ends it: the `PostCompact` marker-only reading, or, if that one was missed, the next reading
+  with usage, which carries the marker's own time. A marker from before the hold never ends it,
+  however late its report arrives. The marker's time is the transcript's, so this assumes the
+  daemon and the seat share a clock (the same host, or synced). A hold that ended
+  without a release owes the session one line, on its next `PostToolUse` or `UserPromptSubmit`
+  pressure hook (needs `--ear`), since the tool's result still says "held".
+- `ear_status` shows `hold: {reason, setAt, expiresAt, blocksAnswered}` (null for none).
+  `blocksAnswered` counts block answers given to the hook, not compactions Claude Code skipped.
+  `expiresAt` is the lease's end, not a promise that nothing compacts before it. `pressure`'s
+  `idleCompactDueAt` stays the raw forecast. The daemon logs `compaction.hold_set`,
+  `compaction.held` (session, size, ceiling, setAt, expiresAt, count), `compaction.hold_passed`
+  and `compaction.hold_ended`.
+
+**The limitation, stated plainly.** Claude Code's hooks reference (read 2026-11-18, Claude Code
+2.1.316) says a blocked proactive compaction is skipped and the conversation continues, but
+blocking the compaction that recovers from a context-limit error makes that error surface and the
+**request fails**. The hook's input says only `auto` or `manual`, so frond-ear cannot tell the two
+apart. The ceiling and the pending-bytes reading keep a hold far from the limit, but they are not
+proof. Until a seat's own trial shows what happens, treat a hold as an opt-in experiment, and keep
+it short. It costs tokens too: idle compaction exists because the one-hour cache has expired, so
+the next turn after a blocked one re-reads the whole context uncached.
 
 ### Context pressure (Claude Code)
 

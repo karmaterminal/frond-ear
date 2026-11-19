@@ -498,6 +498,8 @@ test("reading: sidechain rows never count, and `at` is the chosen row's time (#9
   });
   assert.deepEqual(latestReading([main, marker].join("\n")), {
     boundary: "m1",
+    // The marker's own time too (#108): a hold ends on a marker newer than it.
+    boundaryAt: Date.parse("2026-11-18T19:55:00.000Z"),
     at: Date.parse("2026-11-18T19:55:00.000Z"),
   });
 });
