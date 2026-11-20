@@ -90,13 +90,17 @@ export function latestReading(transcript: string): PressureReading {
   const lines = transcript.split("\n");
   let tokens: number | undefined;
   let at: number | undefined;
+  // Set once the newest usage row is read: a valid one gives tokens, an invalid one
+  // leaves them unknown. Either way no older row is consulted (#109: the gauge and the
+  // hold agree on unknown). An all-zero synthetic row carries no reading and is passed.
+  let decided = false;
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i]?.trim();
     if (!line) {
       continue;
     }
     const marker = line.includes('"compact_boundary"');
-    if (!marker && (tokens !== undefined || !line.includes('"usage"'))) {
+    if (!marker && (decided || !line.includes('"usage"'))) {
       continue;
     }
     let row: unknown;
@@ -136,23 +140,20 @@ export function latestReading(transcript: string): PressureReading {
         ...(when !== undefined ? { at: when } : {}),
       };
     }
-    if (tokens !== undefined || record.type !== "assistant") {
+    if (decided || record.type !== "assistant") {
       continue;
     }
     const usage = (record.message as { usage?: unknown } | undefined)?.usage;
-    if (typeof usage !== "object" || usage === null) {
+    if (usage === undefined) {
       continue;
     }
-    const u = usage as Record<string, unknown>;
-    const n = (key: string) =>
-      typeof u[key] === "number" && Number.isFinite(u[key]) ? u[key] : 0;
-    const total =
-      n("input_tokens") +
-      n("cache_read_input_tokens") +
-      n("cache_creation_input_tokens") +
-      n("output_tokens");
-    if (total > 0) {
-      tokens = total;
+    const verdict = usageVerdict(usage);
+    if (verdict.kind === "zero") {
+      continue;
+    }
+    decided = true;
+    if (verdict.kind === "ok") {
+      tokens = verdict.tokens;
       at = rowTime(record.timestamp);
     }
   }
@@ -207,10 +208,15 @@ export function holdReading(transcript: string): {
             if (usage !== undefined) {
               // The newest main usage decides: invalid is unknown, never a
               // small number, and never a fall back to an older row (#108 F1).
-              const tokens = strictUsageTokens(usage);
-              return tokens === undefined
-                ? { pendingBytes }
-                : { tokens, pendingBytes };
+              // An all-zero synthetic row carries no reading: pass it, its bytes
+              // counted as pending, as the gauge does (#109).
+              const verdict = usageVerdict(usage);
+              if (verdict.kind === "ok") {
+                return { tokens: verdict.tokens, pendingBytes };
+              }
+              if (verdict.kind === "invalid") {
+                return { pendingBytes };
+              }
             }
           }
         }
@@ -227,14 +233,27 @@ export function holdReading(transcript: string): {
  * above 0. Anything else is undefined (unknown), never coerced to 0.
  */
 export function strictUsageTokens(usage: unknown): number | undefined {
+  const verdict = usageVerdict(usage);
+  return verdict.kind === "ok" ? verdict.tokens : undefined;
+}
+
+/**
+ * How a usage object reads (frond-ear#109): `invalid` (a required counter missing or
+ * not a whole number ≥ 0, or a cache counter present and not one), `zero` (all
+ * valid, total 0: a synthetic row, such as the one written after an API error, that
+ * carries no reading), or `ok` with the total.
+ */
+export function usageVerdict(
+  usage: unknown,
+): { kind: "invalid" } | { kind: "zero" } | { kind: "ok"; tokens: number } {
   if (typeof usage !== "object" || usage === null || Array.isArray(usage)) {
-    return undefined;
+    return { kind: "invalid" };
   }
   const u = usage as Record<string, unknown>;
   const whole = (value: unknown) =>
     typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
   if (!whole(u.input_tokens) || !whole(u.output_tokens)) {
-    return undefined;
+    return { kind: "invalid" };
   }
   let total = (u.input_tokens as number) + (u.output_tokens as number);
   for (const key of [
@@ -245,11 +264,11 @@ export function strictUsageTokens(usage: unknown): number | undefined {
       continue;
     }
     if (!whole(u[key])) {
-      return undefined;
+      return { kind: "invalid" };
     }
     total += u[key] as number;
   }
-  return total > 0 ? total : undefined;
+  return total > 0 ? { kind: "ok", tokens: total } : { kind: "zero" };
 }
 
 /**
