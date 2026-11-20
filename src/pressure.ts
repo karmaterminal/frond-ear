@@ -59,6 +59,8 @@ export interface PressureReading {
   /** The latest compaction marker's id in the tail, or null for none. */
   boundary: string | null;
   /** That marker's own time (epoch ms), when it has one (#108 F3/F4). */
+  /** The newest main usage row was invalid: the size is unknown, and `at` is that row's time (#109). */
+  unknown?: true;
   boundaryAt?: number;
   /**
    * When that evidence was written (epoch ms, from the row's `timestamp`): the
@@ -90,13 +92,18 @@ export function latestReading(transcript: string): PressureReading {
   const lines = transcript.split("\n");
   let tokens: number | undefined;
   let at: number | undefined;
+  // Set once the newest usage row is read: a valid one gives tokens, an invalid one
+  // leaves them unknown. Either way no older row is consulted (#109: the gauge and the
+  // hold agree on unknown). An all-zero synthetic row carries no reading and is passed.
+  let decided = false;
+  let unknown = false;
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i]?.trim();
     if (!line) {
       continue;
     }
     const marker = line.includes('"compact_boundary"');
-    if (!marker && (tokens !== undefined || !line.includes('"usage"'))) {
+    if (!marker && (decided || !line.includes('"usage"'))) {
       continue;
     }
     let row: unknown;
@@ -128,36 +135,37 @@ export function latestReading(transcript: string): PressureReading {
             ? record.timestamp
             : `sha256:${createHash("sha256").update(line).digest("hex").slice(0, 16)}`;
       const markedAt = rowTime(record.timestamp);
-      const when = tokens !== undefined ? at : markedAt;
+      const when = tokens !== undefined || unknown ? at : markedAt;
       return {
         ...(tokens !== undefined ? { tokens } : {}),
+        ...(unknown ? { unknown: true as const } : {}),
         boundary: id,
         ...(markedAt !== undefined ? { boundaryAt: markedAt } : {}),
         ...(when !== undefined ? { at: when } : {}),
       };
     }
-    if (tokens !== undefined || record.type !== "assistant") {
+    if (decided || record.type !== "assistant") {
       continue;
     }
     const usage = (record.message as { usage?: unknown } | undefined)?.usage;
-    if (typeof usage !== "object" || usage === null) {
+    if (usage === undefined) {
       continue;
     }
-    const u = usage as Record<string, unknown>;
-    const n = (key: string) =>
-      typeof u[key] === "number" && Number.isFinite(u[key]) ? u[key] : 0;
-    const total =
-      n("input_tokens") +
-      n("cache_read_input_tokens") +
-      n("cache_creation_input_tokens") +
-      n("output_tokens");
-    if (total > 0) {
-      tokens = total;
-      at = rowTime(record.timestamp);
+    const verdict = usageVerdict(usage);
+    if (verdict.kind === "zero") {
+      continue;
+    }
+    decided = true;
+    at = rowTime(record.timestamp);
+    if (verdict.kind === "ok") {
+      tokens = verdict.tokens;
+    } else {
+      unknown = true;
     }
   }
   return {
     ...(tokens !== undefined ? { tokens } : {}),
+    ...(unknown ? { unknown: true as const } : {}),
     boundary: null,
     ...(at !== undefined ? { at } : {}),
   };
@@ -207,6 +215,8 @@ export function holdReading(transcript: string): {
             if (usage !== undefined) {
               // The newest main usage decides: invalid is unknown, never a
               // small number, and never a fall back to an older row (#108 F1).
+              // Anything but a valid total is unknown, and unknown allows: an
+              // all-zero synthetic row too (unchanged from #108; 🌫 on #110).
               const tokens = strictUsageTokens(usage);
               return tokens === undefined
                 ? { pendingBytes }
@@ -227,14 +237,27 @@ export function holdReading(transcript: string): {
  * above 0. Anything else is undefined (unknown), never coerced to 0.
  */
 export function strictUsageTokens(usage: unknown): number | undefined {
+  const verdict = usageVerdict(usage);
+  return verdict.kind === "ok" ? verdict.tokens : undefined;
+}
+
+/**
+ * How a usage object reads (frond-ear#109): `invalid` (a required counter missing or
+ * not a whole number ≥ 0, or a cache counter present and not one), `zero` (all
+ * valid, total 0: a synthetic row, such as the one written after an API error, that
+ * carries no reading), or `ok` with the total.
+ */
+export function usageVerdict(
+  usage: unknown,
+): { kind: "invalid" } | { kind: "zero" } | { kind: "ok"; tokens: number } {
   if (typeof usage !== "object" || usage === null || Array.isArray(usage)) {
-    return undefined;
+    return { kind: "invalid" };
   }
   const u = usage as Record<string, unknown>;
   const whole = (value: unknown) =>
     typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
   if (!whole(u.input_tokens) || !whole(u.output_tokens)) {
-    return undefined;
+    return { kind: "invalid" };
   }
   let total = (u.input_tokens as number) + (u.output_tokens as number);
   for (const key of [
@@ -245,11 +268,11 @@ export function strictUsageTokens(usage: unknown): number | undefined {
       continue;
     }
     if (!whole(u[key])) {
-      return undefined;
+      return { kind: "invalid" };
     }
     total += u[key] as number;
   }
-  return total > 0 ? total : undefined;
+  return total > 0 ? { kind: "ok", tokens: total } : { kind: "zero" };
 }
 
 /**
@@ -536,6 +559,8 @@ export interface PressureReport {
   idleFloor?: number;
   /** The hook event that read it (#107: only some can show the daemon's notice). */
   event?: string;
+  /** The newest usage row was invalid: tokens are null because unknown, not because compacted (#109). */
+  unknown?: true;
 }
 
 /** The seat's idle-compaction floor, when its environment sets one. */
@@ -639,7 +664,7 @@ export function runPressure(argv: string[], io: PressureIo): number {
     if (
       ear &&
       io.onReading &&
-      (tokens !== undefined || reading.boundary !== null)
+      (tokens !== undefined || reading.boundary !== null || reading.unknown)
     ) {
       const reached = tokens !== undefined ? reachedBand(tokens, bands) : -1;
       const idleFloor = idleFloorFrom(io.env);
@@ -655,6 +680,7 @@ export function runPressure(argv: string[], io: PressureIo): number {
         at: reading.at ?? Date.now(),
         ...(idleFloor !== undefined ? { idleFloor } : {}),
         ...(input.event ? { event: input.event } : {}),
+        ...(reading.unknown ? { unknown: true as const } : {}),
       });
     }
     // Already continuing because of a Stop hook: never ask again, or a turn

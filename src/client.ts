@@ -61,6 +61,7 @@ export type CliRequest =
       boundaryAt?: number;
       idleFloor?: number;
       event?: string;
+      unknown?: true;
     };
 
 /**
