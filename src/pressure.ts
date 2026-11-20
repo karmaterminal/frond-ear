@@ -59,6 +59,8 @@ export interface PressureReading {
   /** The latest compaction marker's id in the tail, or null for none. */
   boundary: string | null;
   /** That marker's own time (epoch ms), when it has one (#108 F3/F4). */
+  /** The newest main usage row was invalid: the size is unknown, and `at` is that row's time (#109). */
+  unknown?: true;
   boundaryAt?: number;
   /**
    * When that evidence was written (epoch ms, from the row's `timestamp`): the
@@ -94,6 +96,7 @@ export function latestReading(transcript: string): PressureReading {
   // leaves them unknown. Either way no older row is consulted (#109: the gauge and the
   // hold agree on unknown). An all-zero synthetic row carries no reading and is passed.
   let decided = false;
+  let unknown = false;
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i]?.trim();
     if (!line) {
@@ -132,9 +135,10 @@ export function latestReading(transcript: string): PressureReading {
             ? record.timestamp
             : `sha256:${createHash("sha256").update(line).digest("hex").slice(0, 16)}`;
       const markedAt = rowTime(record.timestamp);
-      const when = tokens !== undefined ? at : markedAt;
+      const when = tokens !== undefined || unknown ? at : markedAt;
       return {
         ...(tokens !== undefined ? { tokens } : {}),
+        ...(unknown ? { unknown: true as const } : {}),
         boundary: id,
         ...(markedAt !== undefined ? { boundaryAt: markedAt } : {}),
         ...(when !== undefined ? { at: when } : {}),
@@ -152,13 +156,16 @@ export function latestReading(transcript: string): PressureReading {
       continue;
     }
     decided = true;
+    at = rowTime(record.timestamp);
     if (verdict.kind === "ok") {
       tokens = verdict.tokens;
-      at = rowTime(record.timestamp);
+    } else {
+      unknown = true;
     }
   }
   return {
     ...(tokens !== undefined ? { tokens } : {}),
+    ...(unknown ? { unknown: true as const } : {}),
     boundary: null,
     ...(at !== undefined ? { at } : {}),
   };
@@ -208,15 +215,12 @@ export function holdReading(transcript: string): {
             if (usage !== undefined) {
               // The newest main usage decides: invalid is unknown, never a
               // small number, and never a fall back to an older row (#108 F1).
-              // An all-zero synthetic row carries no reading: pass it, its bytes
-              // counted as pending, as the gauge does (#109).
-              const verdict = usageVerdict(usage);
-              if (verdict.kind === "ok") {
-                return { tokens: verdict.tokens, pendingBytes };
-              }
-              if (verdict.kind === "invalid") {
-                return { pendingBytes };
-              }
+              // Anything but a valid total is unknown, and unknown allows: an
+              // all-zero synthetic row too (unchanged from #108; 🌫 on #110).
+              const tokens = strictUsageTokens(usage);
+              return tokens === undefined
+                ? { pendingBytes }
+                : { tokens, pendingBytes };
             }
           }
         }
@@ -555,6 +559,8 @@ export interface PressureReport {
   idleFloor?: number;
   /** The hook event that read it (#107: only some can show the daemon's notice). */
   event?: string;
+  /** The newest usage row was invalid: tokens are null because unknown, not because compacted (#109). */
+  unknown?: true;
 }
 
 /** The seat's idle-compaction floor, when its environment sets one. */
@@ -658,7 +664,7 @@ export function runPressure(argv: string[], io: PressureIo): number {
     if (
       ear &&
       io.onReading &&
-      (tokens !== undefined || reading.boundary !== null)
+      (tokens !== undefined || reading.boundary !== null || reading.unknown)
     ) {
       const reached = tokens !== undefined ? reachedBand(tokens, bands) : -1;
       const idleFloor = idleFloorFrom(io.env);
@@ -674,6 +680,7 @@ export function runPressure(argv: string[], io: PressureIo): number {
         at: reading.at ?? Date.now(),
         ...(idleFloor !== undefined ? { idleFloor } : {}),
         ...(input.event ? { event: input.event } : {}),
+        ...(reading.unknown ? { unknown: true as const } : {}),
       });
     }
     // Already continuing because of a Stop hook: never ask again, or a turn

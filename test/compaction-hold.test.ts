@@ -647,6 +647,11 @@ test("frond-ear precompact --hook exits 2 only for a held auto compaction under 
     `${turn(250_000)}\n${JSON.stringify({ type: "user", message: { content: "y".repeat(1_200_000) } })}\n`,
   );
   writeFileSync(compacted, `${turn(250_000)}\n${marker}\n`);
+  const zeroAfter = join(directory, "zero-after.jsonl");
+  writeFileSync(
+    zeroAfter,
+    `${turn(250_000)}\n${JSON.stringify({ type: "assistant", message: { role: "assistant", usage: { input_tokens: 0, output_tokens: 0 } } })}\n`,
+  );
   const h = harness();
   const server = await listenUnix(h.daemon, socketPath);
   try {
@@ -716,6 +721,11 @@ test("frond-ear precompact --hook exits 2 only for a held auto compaction under 
         hook({}),
       ],
       ["garbage stdin", env, "not json"],
+      [
+        "all-zero row after 250k (🌫 #110)",
+        env,
+        hook({ transcript_path: zeroAfter }),
+      ],
       ["oversized stdin", env, `{"x":"${"z".repeat(70 * 1024)}"}`],
     ];
     for (const [name, caseEnv, stdin] of cases) {
@@ -955,7 +965,7 @@ test("stopping the hook (SIGTERM, SIGINT) while its worker is blocked stops the 
   }
 });
 
-test("the gauge and the hold agree (#109): invalid newest usage is unknown for both; an all-zero synthetic row is passed by both", () => {
+test("the gauge and the hold agree on invalid (#109); an all-zero synthetic row is passed by the gauge but stays unknown for the hold (unchanged policy, 🌫 on #110)", () => {
   const row = (usage: string) =>
     `{"type":"assistant","message":{"role":"assistant","usage":${usage}}}`;
   const big = turn(700_000);
@@ -973,7 +983,8 @@ test("the gauge and the hold agree (#109): invalid newest usage is unknown for b
     assert.equal(usageVerdict(JSON.parse(usage)).kind, "invalid", usage);
   }
   // An all-zero row (Claude Code writes one after an API error) carries no reading:
-  // both readers pass it and keep the real one; the hold counts its bytes as pending.
+  // the gauge passes it and keeps the real one; the hold keeps #108's fail-open read
+  // (unknown, so it allows), since changing what blocks belongs in its own change.
   const zero = row(
     '{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0}',
   );
@@ -983,9 +994,7 @@ test("the gauge and the hold agree (#109): invalid newest usage is unknown for b
     "zero",
   );
   assert.equal(latestReading(t).tokens, 700_000);
-  const held = holdReading(t);
-  assert.equal(held.tokens, 700_000);
-  assert.ok(held.pendingBytes >= Buffer.byteLength(zero));
+  assert.equal(holdReading(t).tokens, undefined);
   assert.equal(
     strictUsageTokens({ input_tokens: 0, output_tokens: 0 }),
     undefined,
