@@ -74,6 +74,7 @@
         "bufferPerStream": 32,
         "maxPushesPerHour": 60
       }
-    }
+    },
+    "derivedPublication": false
   }
 }

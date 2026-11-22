@@ -42,6 +42,8 @@ export interface Song {
   key?: string;
   /** How old the record already was when the host receptor first heard it. */
   age?: number;
+  /** A non-text body (ctype 2), which no banner shows the text of. */
+  binary?: true;
   /** Merged over `times`; a field set to `undefined` is left out. */
   times?: R;
 }
@@ -153,12 +155,14 @@ export class Host {
       disposition: "surface",
       dedup: o.dedup ?? "first",
       versions: { manifest_sha256: "00", manifest_label: "test" },
-      body: {
-        ctype: 1,
-        text,
-        size: Buffer.byteLength(text),
-        ...(o.digest !== undefined ? { sha256: o.digest } : {}),
-      },
+      body: o.binary
+        ? { ctype: 2, size: 64 }
+        : {
+            ctype: 1,
+            text,
+            size: Buffer.byteLength(text),
+            ...(o.digest !== undefined ? { sha256: o.digest } : {}),
+          },
       ...(o.flags === null
         ? {}
         : {

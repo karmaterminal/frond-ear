@@ -2802,7 +2802,7 @@ export class Daemon {
     windowMs: number,
     stream?: string,
   ): { view: CustodyView; since: number; custodySince: number } {
-    const since = this.clock.now() - windowMs;
+    const since = Math.max(0, this.clock.now() - windowMs);
     const custodySince = this.store.canticleCustodySince();
     let rows = this.store.canticleCustody(ear, since);
     if (stream !== undefined) {
@@ -2866,6 +2866,7 @@ export class Daemon {
     );
     const holder = this.attached.get(ear);
     const boundary = this.boundary(ear);
+    const reading = this.pressure.get(ear);
     return JSON.stringify(
       {
         ear,
@@ -2875,6 +2876,9 @@ export class Daemon {
         now: {
           session: holder ? (holder.sessionId?.slice(0, 8) ?? null) : null,
           boundary: boundary === undefined ? "unknown" : boundary,
+          // Custody is only as current as this reading: a compaction since it is unseen.
+          boundaryReportedAt:
+            boundary === undefined ? null : (reading?.receivedAt ?? null),
         },
         counts: view.counts,
         records: newest.slice(0, limit).map(custodyEntry),

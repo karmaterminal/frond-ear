@@ -10,6 +10,7 @@ knowing which tier you are actually in before you start reinstalling things.
 | Thing                       | Where it lives                                                           | Survives a reboot?                                                               |
 | --------------------------- | ------------------------------------------------------------------------ | -------------------------------------------------------------------------------- |
 | Held and delivered messages | `$XDG_STATE_HOME/frond-ear/frond-ear.db`                                 | yes                                                                              |
+| Canticle custody            | the same database: what each session was shown and echoed (BC#161)       | yes; the compaction boundary is unknown until the pressure hook reports again    |
 | Messages sent while down    | Discord: replayed on a Gateway resume, or read back from channel history | yes, up to `limits.catchUpMessages` per chat when the outage outlasts the resume |
 | The daemon process          | systemd `--user` unit                                                    | yes, if installed and linger is on                                               |
 | Config                      | `~/.config/frond-ear/frond-ear.json`                                     | yes, but it is yours to back up                                                  |

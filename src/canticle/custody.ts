@@ -273,6 +273,10 @@ export function custodyEntry(record: CustodyRecord): object {
       exposure.offeredAt === null ? null : boundary(exposure.offerBoundary),
     echoedAt: exposure.echoedAt,
     echo: exposure.echoKind,
+    // Echoed by naming a later push of the same session, as a later Discord batch does.
+    ...(exposure.echoBatch !== null && exposure.echoBatch !== exposure.batchId
+      ? { echoedThrough: "a later push" }
+      : {}),
     echoBoundary:
       exposure.echoedAt === null ? null : boundary(exposure.echoBoundary),
   };

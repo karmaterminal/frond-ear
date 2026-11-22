@@ -96,8 +96,9 @@ const streamOf = (item: LiveItem) => `${item.station}:${item.stream}`;
 
 /**
  * One record as custody keeps an exposure of it (binary-canticle#161): its identity and
- * where it came from, and a digest of its payload (the text as shown, else the source's
- * body digest), never the text itself and never anything of the signer's.
+ * where it came from, and a digest of its payload (SHA-256 of its whole text, even when a
+ * push cut it; else the source's body digest), never the text itself and never anything
+ * of the signer's.
  */
 export function exposure(
   item: LiveItem,

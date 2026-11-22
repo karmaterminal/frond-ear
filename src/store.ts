@@ -498,12 +498,23 @@ export class EventStore {
         ON canticle_custody (ear, batch_id);
     `);
     // Custody is whole from the moment its table exists: a window that reaches back
-    // before that (or before the prune's cutoff) reads as unknown, never as empty.
+    // before that (or before the prune's cutoff) reads as unknown, never as empty. A
+    // store no session ever attached to, and that never settled a canticle record, has
+    // exposed nothing, so its custody is whole from the start.
+    const exposedBefore = this.database
+      .prepare(
+        `SELECT EXISTS (SELECT 1 FROM ears) OR EXISTS (SELECT 1 FROM canticle_settled)
+           AS used`,
+      )
+      .get() as { used: number };
     this.database
       .prepare(
         "INSERT INTO runtime_state (name, value) VALUES (?, ?) ON CONFLICT(name) DO NOTHING",
       )
-      .run(CUSTODY_SINCE, String(this.clock.now()));
+      .run(
+        CUSTODY_SINCE,
+        String(exposedBefore.used === 1 ? this.clock.now() : 0),
+      );
     // A push's tombstones name its batch (#161), so a push no session took can give its
     // claim back. Older tombstones name none and keep the claim they made.
     const settledColumns = new Set(
