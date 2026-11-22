@@ -96,12 +96,28 @@ import {
   attentionAt,
   dueStep,
   listSchedules,
+  parseNote,
   parseSchedule,
+  parseTtl,
   readSchedule,
   renderHeld,
   renderWake,
+  repushAt,
   shortSession,
+  type WakeFacts,
 } from "./wakes.ts";
+import {
+  GITHUB_LIMITS,
+  GithubClient,
+  baseline,
+  describeTarget,
+  htmlUrl,
+  parseTarget,
+  poll,
+  type GithubCursor,
+  type GithubTarget,
+  type PollOutcome,
+} from "./github.ts";
 import type { Schedule, Wake } from "./wake-store.ts";
 import type { CompactionBoundary, EventStore, ReplyPart } from "./store.ts";
 import type {
@@ -672,6 +688,8 @@ export class Daemon {
   /** The one timer for schedules, watches, orphans and re-pushes (#111). */
   private wakeTimer: unknown;
   private wakeTicking = false;
+  /** The one GitHub poll pass in flight, if any: polls never run concurrently (#111). */
+  private polling: Promise<void> | undefined;
 
   public constructor(options: DaemonOptions) {
     const { rest, ...kept } = options;
@@ -2459,14 +2477,358 @@ export class Daemon {
 
   /** What a watch targets, for its setter's eyes only. */
   private targetText(schedule: Schedule): string | undefined {
-    return schedule.target === null ? undefined : undefined;
+    const target = this.watchTarget(schedule);
+    return target ? describeTarget(target) : undefined;
+  }
+
+  private watchTarget(schedule: Schedule): GithubTarget | undefined {
+    if (schedule.target === null) {
+      return undefined;
+    }
+    try {
+      return JSON.parse(schedule.target) as GithubTarget;
+    } catch {
+      return undefined;
+    }
+  }
+
+  // ---- wake_on GitHub (#111) ---------------------------------------------------------
+
+  private githubClient(): GithubClient | undefined {
+    const github = this.config.github;
+    if (!github?.enabled) {
+      return undefined;
+    }
+    return new GithubClient({
+      apiBase: github.apiBase,
+      token: this.options.githubToken,
+      fetch: this.options.githubFetch ?? ((url, init) => fetch(url, init)),
+      now: () => this.clock.now(),
+    });
+  }
+
+  /** Until when GitHub asked every watch to wait (persisted: a restart still waits). */
+  private githubBackoffUntil(): number {
+    const value = Number(this.store.runtimeState("github.backoff_until") ?? 0);
+    return Number.isFinite(value) ? value : 0;
+  }
+
+  private githubWindow(
+    ear: string,
+    now: number,
+  ): { window: number; count: number } {
+    const window = Math.floor(now / 3_600_000) * 3_600_000;
+    try {
+      const kept = JSON.parse(
+        this.store.runtimeState(`github.requests.${ear}`) ?? "null",
+      ) as { window?: unknown; count?: unknown } | null;
+      if (kept && kept.window === window && typeof kept.count === "number") {
+        return { window, count: kept.count };
+      }
+    } catch {
+      // unreadable: a fresh window
+    }
+    return { window, count: 0 };
+  }
+
+  /** One HTTP attempt from this ear's hourly budget, or false when it is spent. */
+  private spendGithub(ear: string): boolean {
+    const limit = this.config.github?.maxRequestsPerHour ?? 0;
+    const { window, count } = this.githubWindow(ear, this.clock.now());
+    if (count >= limit) {
+      return false;
+    }
+    this.store.setRuntimeState(
+      `github.requests.${ear}`,
+      JSON.stringify({ window, count: count + 1 }),
+    );
+    return true;
+  }
+
+  private async wakeOnTool(
+    client: Client,
+    args: Record<string, unknown>,
+  ): Promise<string> {
+    const ear = this.requireHolder(client, "set a watch");
+    const setter = this.requireWakeSession(client, "set a watch");
+    const github = this.config.github;
+    const gh = this.githubClient();
+    if (!github?.enabled || !gh) {
+      throw new Error(
+        "wake_on is not enabled on this daemon (config github.enabled); nothing was set",
+      );
+    }
+    const now = this.clock.now();
+    const note = parseNote(args);
+    const target = parseTarget(args);
+    if (
+      !(github.repos[ear] ?? []).some(
+        (repo) => repo.toLowerCase() === target.repo.toLowerCase(),
+      )
+    ) {
+      throw new Error(
+        `repo ${target.repo} is not in this ear's github.repos (the daemon's config); nothing was set`,
+      );
+    }
+    const expiresAt = parseTtl(args, now);
+    this.checkWakeCaps(ear, setter);
+    const backoff = this.githubBackoffUntil();
+    if (backoff > now) {
+      throw new Error(
+        `GitHub asked frond-ear to wait until ${iso(backoff)} (a rate limit); nothing was set, try after it`,
+      );
+    }
+    const first = await baseline(gh, () => this.spendGithub(ear), target, now);
+    if (first.kind === "refused") {
+      if (first.rate) {
+        this.backOffGithub(this.clock.now(), first.retryAfterMs);
+      }
+      throw new Error(`nothing was set: ${first.reason}`);
+    }
+    // The ear may have changed hands while GitHub answered.
+    if (this.wakeSession(client) !== setter) {
+      throw new Error(
+        "this session no longer holds the ear (or frond-ear can no longer tell it is this session); nothing was set",
+      );
+    }
+    this.checkWakeCaps(ear, setter);
+    const at = this.clock.now();
+    const id = this.store.wakes.addSchedule({
+      ear,
+      setter,
+      kind: "github",
+      note,
+      periodMs: null,
+      firstDue: null,
+      nextDue: at + github.pollMs,
+      target: JSON.stringify(first.target),
+      cursor: JSON.stringify(first.cursor),
+      createdAt: at,
+      expiresAt,
+    });
+    this.logger.log("info", "wake.watch_set", { ear, scheduleId: id });
+    const what = describeTarget(first.target);
+    if (first.kind === "fire") {
+      const schedule = this.store.wakes.schedule(id)!;
+      this.store.wakes.recordWatch(
+        schedule,
+        "github",
+        JSON.stringify(first.facts),
+        null,
+        { end: "done", reason: "already held when set" },
+        at,
+      );
+      this.deliverWakes(ear, { all: false, held: false });
+      this.armWakes();
+      return `schedule ${id} set: ${what}; it already holds, so its wake was written at once and the watch retired. Ack the kind="wake" event's nonce to settle it.`;
+    }
+    this.armWakes();
+    return `schedule ${id} set: ${what}, polled every ${github.pollMs / 1_000} s with conditional requests until it fires once (then it retires) or expires ${iso(expiresAt)}. ${
+      first.target.on === "review" || first.target.on === "comment"
+        ? `Only ${first.target.on}s after now count: those already there are the baseline.`
+        : first.target.on === "ci_done" && first.target.kind === "pr"
+          ? `Bound to head ${first.target.head}: checks on any other commit never fire it.`
+          : first.target.kind === "run"
+            ? `Bound to attempt ${first.target.attempt}: a rerun is another attempt.`
+            : "A PR closed without merging fires it too."
+    } Its wake is owed to this session until you ack its nonce; a poll that keeps failing ends it with one wake saying so.`;
+  }
+
+  private backOffGithub(now: number, retryAfterMs: number | undefined): number {
+    const until = Math.max(
+      this.githubBackoffUntil(),
+      now + (retryAfterMs ?? GITHUB_LIMITS.defaultRateWaitMs),
+    );
+    this.store.setRuntimeState("github.backoff_until", String(until));
+    this.logger.log("warn", "wake.github_backoff", { until });
+    return until;
+  }
+
+  /** Starts a poll pass over the due watches, unless one is running or GitHub is off. */
+  private startPolls(): void {
+    if (this.polling || this.stopped || this.closing || !this.githubClient()) {
+      return;
+    }
+    const work = this.pollDue().catch((error: unknown) => {
+      this.logger.log("error", "wake.poll_pass_failed", {
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    });
+    const tracked = work.finally(() => {
+      this.polling = undefined;
+      this.inFlight.delete(tracked);
+      this.armWakes();
+    });
+    this.polling = tracked;
+    this.inFlight.add(tracked);
+  }
+
+  private dueWatches(now: number): Schedule[] {
+    return this.store.wakes
+      .active()
+      .filter(
+        (schedule) =>
+          schedule.kind === "github" &&
+          this.config.ears[schedule.ear] !== undefined &&
+          schedule.nextDue !== null &&
+          schedule.nextDue <= now &&
+          schedule.expiresAt > now,
+      );
+  }
+
+  /** One pass, one watch at a time: GitHub never sees concurrent polls from this daemon. */
+  private async pollDue(): Promise<void> {
+    const gh = this.githubClient();
+    if (!gh || this.githubBackoffUntil() > this.clock.now()) {
+      return;
+    }
+    for (const schedule of this.dueWatches(this.clock.now())) {
+      if (this.stopped || this.closing) {
+        return;
+      }
+      if (this.githubBackoffUntil() > this.clock.now()) {
+        return;
+      }
+      await this.pollOne(gh, schedule);
+    }
+  }
+
+  private async pollOne(gh: GithubClient, schedule: Schedule): Promise<void> {
+    const target = this.watchTarget(schedule);
+    let cursor: GithubCursor = { etags: {} };
+    try {
+      cursor = {
+        etags: {},
+        ...(JSON.parse(schedule.cursor ?? "{}") as object),
+      };
+    } catch {
+      // a fresh cursor: at worst one unconditional request
+    }
+    let outcome: PollOutcome;
+    if (!target) {
+      outcome = { kind: "terminal", reason: "its target is unreadable" };
+    } else {
+      try {
+        outcome = await poll(
+          gh,
+          () => this.spendGithub(schedule.ear),
+          target,
+          cursor,
+          this.clock.now(),
+        );
+      } catch (error) {
+        outcome = {
+          kind: "retry",
+          rate: false,
+          reason: error instanceof Error ? error.message : "poll failed",
+        };
+      }
+    }
+    if (this.stopped) {
+      return;
+    }
+    const now = this.clock.now();
+    // Cancelled or expired while GitHub answered: the outcome belongs to nobody.
+    const fresh = this.store.wakes.schedule(schedule.id);
+    if (!fresh || fresh.state !== "active") {
+      return;
+    }
+    const pollMs = this.config.github?.pollMs ?? 120_000;
+    this.logger.log("info", "wake.github_polled", {
+      ear: fresh.ear,
+      scheduleId: fresh.id,
+      outcome: outcome.kind,
+    });
+    const end = (reason: string): void => {
+      const facts: WakeFacts = {
+        lines: [
+          `${target ? describeTarget(target) : `watch ${fresh.id}`}: ${reason}. The watch retires and will not fire; set a new one once that is fixed.`,
+        ],
+        ...(target ? { url: htmlUrl(target) } : {}),
+      };
+      this.store.wakes.recordWatch(
+        fresh,
+        "ended",
+        JSON.stringify(facts),
+        null,
+        { end: "failed", reason },
+        now,
+      );
+      this.logger.log("warn", "wake.watch_failed", {
+        ear: fresh.ear,
+        scheduleId: fresh.id,
+      });
+    };
+    switch (outcome.kind) {
+      case "unchanged":
+        this.store.wakes.updateWatch(fresh.id, {
+          cursor: JSON.stringify(outcome.cursor),
+          nextDue: now + Math.max(pollMs, outcome.pollAfterMs ?? 0),
+          failures: 0,
+          failingSince: null,
+        });
+        break;
+      case "fire":
+        this.store.wakes.recordWatch(
+          fresh,
+          "github",
+          JSON.stringify(outcome.facts),
+          JSON.stringify(outcome.cursor),
+          { end: "done", reason: "fired" },
+          now,
+        );
+        this.logger.log("info", "wake.watch_fired", {
+          ear: fresh.ear,
+          scheduleId: fresh.id,
+        });
+        break;
+      case "deferred":
+        // The ear's hourly budget is spent: wait for the next window, failing nothing.
+        this.store.wakes.updateWatch(fresh.id, {
+          cursor: null,
+          nextDue: Math.floor(now / 3_600_000) * 3_600_000 + 3_600_000,
+          failures: fresh.failures,
+          failingSince: fresh.failingSince,
+        });
+        break;
+      case "retry": {
+        const failingSince = fresh.failingSince ?? now;
+        const failures = outcome.rate ? fresh.failures : fresh.failures + 1;
+        if (failures >= GITHUB_LIMITS.maxFailures) {
+          end(
+            `gave up after ${failures} failed polls in a row (the last: ${outcome.reason})`,
+          );
+          break;
+        }
+        if (now - failingSince >= GITHUB_LIMITS.maxFailingMs) {
+          end(
+            `gave up after failing for ${Math.round((now - failingSince) / 3_600_000)} hours (the last: ${outcome.reason})`,
+          );
+          break;
+        }
+        const nextDue = outcome.rate
+          ? this.backOffGithub(now, outcome.retryAfterMs)
+          : now + Math.min(pollMs * 2 ** failures, GITHUB_LIMITS.maxBackoffMs);
+        this.store.wakes.updateWatch(fresh.id, {
+          cursor: null,
+          nextDue,
+          failures,
+          failingSince,
+        });
+        break;
+      }
+      case "terminal":
+        end(outcome.reason);
+        break;
+    }
+    this.deliverWakes(fresh.ear, { all: false, held: false });
   }
 
   /**
    * Pushes the attached session what it is owed: one event per schedule, carrying every
    * owed occurrence of it under one fresh nonce. `all` replays everything (an attach or
-   * a session change); otherwise only schedules with an occurrence never pushed, or
-   * last pushed WAKE_LIMITS.repushMs ago. `held` also names, without their text, the
+   * a session change); otherwise only schedules with an occurrence never pushed, or due
+   * a re-push (repushAt: 1 h after the first push, doubling to a day). `held` also names, without their text, the
    * wakes owed to other sessions. Never to taps: a tap is another reader.
    */
   private deliverWakes(
@@ -2492,12 +2854,7 @@ export class Daemon {
       }
       for (const [scheduleId, wakes] of bySchedule) {
         const due =
-          options.all ||
-          wakes.some(
-            (wake) =>
-              wake.lastDeliveredAt === null ||
-              wake.lastDeliveredAt <= now - WAKE_LIMITS.repushMs,
-          );
+          options.all || wakes.some((wake) => (repushAt(wake) ?? now) <= now);
         const schedule = this.store.wakes.schedule(scheduleId);
         if (!due || !schedule) {
           continue;
@@ -2571,6 +2928,23 @@ export class Daemon {
           continue;
         }
         try {
+          if (schedule.kind === "github" && now >= schedule.expiresAt) {
+            const target = this.watchTarget(schedule);
+            this.store.wakes.recordWatch(
+              schedule,
+              "ended",
+              JSON.stringify({
+                lines: [
+                  `${target ? describeTarget(target) : `watch ${schedule.id}`}: expired at ${iso(schedule.expiresAt)} without firing; it reached its ttl and will not fire. Set a new one if you still want it.`,
+                ],
+                ...(target ? { url: htmlUrl(target) } : {}),
+              } satisfies WakeFacts),
+              null,
+              { end: "expired", reason: "reached its ttl" },
+              now,
+            );
+            continue;
+          }
           const step = dueStep(schedule, now);
           if (step) {
             this.store.wakes.recordTicks(
@@ -2616,6 +2990,9 @@ export class Daemon {
       for (const ear of this.attached.keys()) {
         this.deliverWakes(ear, { all: false, held: false });
       }
+      if (this.dueWatches(now).length > 0) {
+        this.startPolls();
+      }
     } catch (error) {
       failed = true;
       this.logger.log("error", "wake.tick_failed", {
@@ -2652,11 +3029,22 @@ export class Daemon {
         holders.set(ear, session);
       }
     }
+    const pollable = this.config.github?.enabled === true;
+    const backoff = this.githubBackoffUntil();
     for (const schedule of this.store.wakes.active()) {
       if (!this.config.ears[schedule.ear]) {
         continue;
       }
-      consider(attentionAt(schedule));
+      if (schedule.kind === "github") {
+        // Its expiry always; its next poll only while polling is on and none runs (a
+        // pass re-arms when it ends), and never inside GitHub's backoff.
+        consider(schedule.expiresAt);
+        if (pollable && !this.polling && schedule.nextDue !== null) {
+          consider(Math.max(schedule.nextDue, backoff));
+        }
+      } else {
+        consider(attentionAt(schedule));
+      }
       if (holders.get(schedule.ear) !== schedule.setter) {
         consider(schedule.setterSeenAt + WAKE_LIMITS.orphanAfterMs);
       }
@@ -2665,11 +3053,7 @@ export class Daemon {
       for (const [ear, session] of holders) {
         for (const wake of this.store.wakes.owed(ear)) {
           if (wake.setter === session) {
-            consider(
-              wake.lastDeliveredAt === null
-                ? now
-                : wake.lastDeliveredAt + WAKE_LIMITS.repushMs,
-            );
+            consider(repushAt(wake) ?? now);
           }
         }
       }
@@ -2856,6 +3240,19 @@ export class Daemon {
       droppedUnacked:
         this.store.counters()[`wakes_dropped_unacked.${ear}`] ?? 0,
       holderIdentity: this.holderIdentity(ear),
+      github: {
+        enabled: this.config.github?.enabled === true,
+        token: this.options.githubToken !== undefined,
+        watches: kind("github"),
+        repos: this.config.github?.repos[ear]?.length ?? 0,
+        pollSeconds: (this.config.github?.pollMs ?? 120_000) / 1_000,
+        requestsThisHour: this.githubWindow(ear, this.clock.now()).count,
+        maxRequestsPerHour: this.config.github?.maxRequestsPerHour ?? 0,
+        backoffUntil:
+          this.githubBackoffUntil() > this.clock.now()
+            ? this.githubBackoffUntil()
+            : null,
+      },
       caps: {
         maxPerEar: WAKE_LIMITS.maxPerEar,
         maxPerSession: WAKE_LIMITS.maxPerSession,
@@ -3347,6 +3744,8 @@ export class Daemon {
         return this.scheduleTool(client, args);
       case "schedules":
         return this.schedulesTool(client, args);
+      case "wake_on":
+        return this.wakeOnTool(client, args);
       case "ear_status":
         return JSON.stringify(
           this.status(client.ear ?? stringArg(args, "ear")),

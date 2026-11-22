@@ -38,8 +38,13 @@ export const WAKE_LIMITS = {
   /** How long a settled occurrence, or an ended schedule, stays listable. */
   keepSettledMs: 7 * DAY,
   keepEndedMs: 7 * DAY,
-  /** An owed wake is pushed again to its setter this long after its last push. */
+  /**
+   * An owed wake is pushed again to its setter, while it holds the ear, this long after
+   * its first push, then twice as long each time, up to maxRepushMs: at least once,
+   * never a drumbeat.
+   */
   repushMs: HOUR,
+  maxRepushMs: DAY,
   /** How far in the past `at` may be (it then fires at once). */
   pastSlackMs: MINUTE,
   /** After a step that failed (the store refused it), when to try again. */
@@ -223,6 +228,18 @@ function expiry(schedule: Schedule): Omit<DueStep, "ticks"> {
       } satisfies WakeFacts),
     },
   };
+}
+
+/** When an owed, delivered wake is pushed again to its setter. */
+export function repushAt(wake: Wake): number | null {
+  if (wake.lastDeliveredAt === null) {
+    return null;
+  }
+  const after = Math.min(
+    WAKE_LIMITS.repushMs * 2 ** Math.max(0, wake.deliveries - 1),
+    WAKE_LIMITS.maxRepushMs,
+  );
+  return wake.lastDeliveredAt + after;
 }
 
 /** The time a schedule next needs the daemon's attention, or null. */

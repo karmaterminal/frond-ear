@@ -642,16 +642,16 @@ test("schedule: at fires once and retires; ear_status shows counts and times, ne
     assert.equal(earStatus(h).schedules.active, 0);
     assert.equal(earStatus(h).schedules.lastDeliveredAt, h.clock.now());
     h.timers.advance(5 * HOUR);
-    // A one-shot fires once: what comes after is that occurrence pushed again, hourly,
-    // until it is acked.
+    // A one-shot fires once: what comes after is that occurrence pushed again, 1 h after
+    // the first push and 2 h after that, until it is acked: never a drumbeat.
     assert.equal(earStatus(h).schedules.owed, 1);
-    assert.equal(wakes(shim).length, 6);
-    assert.ok(
-      wakes(shim).every((item) => item.meta.wake_ids === event.meta.wake_ids),
+    assert.deepEqual(
+      wakes(shim).map((item) => item.meta.wake_ids),
+      [event.meta.wake_ids, event.meta.wake_ids, event.meta.wake_ids],
     );
     await h.call(shim, "ack", { nonce: lastWake(shim).meta.nonce });
     h.timers.advance(5 * HOUR);
-    assert.equal(wakes(shim).length, 6, "settled: never again");
+    assert.equal(wakes(shim).length, 3, "settled: never again");
     const read = await h.call(shim, "schedules", { read: 1 });
     assert.match(read.text, /check the 03:06Z burst/u);
   } finally {

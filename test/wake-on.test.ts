@@ -651,7 +651,13 @@ test("wake_on: retryable failures back off, and past the bound end in one notice
     assert.equal(notice.meta.ended, "failed");
     assert.match(notice.content, /gave up after 8 failed polls in a row/u);
     assert.match(notice.content, /HTTP 502/u);
-    assert.equal(wakes(shim).length, 1);
+    // Unacked, it is pushed again with a widening gap, and it is always that one notice.
+    const pushes = wakes(shim);
+    assert.ok(pushes.length < 10, `${pushes.length} pushes in two days`);
+    assert.ok(
+      pushes.every((event) => event.meta.wake_ids === notice.meta.wake_ids),
+    );
+    assert.equal(view(h).owed, 1);
   } finally {
     h.dispose();
   }
@@ -766,6 +772,47 @@ test("wake_on merged: a PR already merged when the watch is set fires at once an
     assert.match(event.content, /merged at 2026-11-20T10:00:00Z by figs/u);
     assert.match(event.content, /already so when the watch was set/u);
     assert.equal(view(h).active, 0);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("wake_on: a cancel that lands while a poll waits on GitHub wins: that poll's trigger is never written", async () => {
+  const fake = new FakeGithub();
+  let merged = false;
+  fake.routes.set(`${R}/pulls/11`, () => ({
+    body: { state: merged ? "closed" : "open", merged, head: { sha: S1 } },
+  }));
+  let release: (() => void) | undefined;
+  const slow = async (url: string, init: RequestInit): Promise<Response> => {
+    if (merged) {
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    }
+    return fake.fetch(url, init);
+  };
+  const h = harness(config(), { githubFetch: slow });
+  try {
+    const shim = h.attach("scribe", { sessionId: A });
+    const { id } = await watch(h, shim, {
+      target: "pr",
+      number: 11,
+      on: "merged",
+    });
+    merged = true;
+    await advance(h, POLL);
+    assert.ok(release, "the poll is waiting on GitHub");
+    const cancel = await call(h, shim, "schedules", { cancel: id });
+    assert.equal(cancel.ok, true, cancel.text);
+    release!();
+    await drain();
+    assert.equal(
+      wakes(shim).length,
+      0,
+      "the cancelled watch's answer belongs to nobody",
+    );
+    assert.equal(view(h).owed, 0);
   } finally {
     h.dispose();
   }

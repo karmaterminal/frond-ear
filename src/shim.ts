@@ -403,6 +403,49 @@ export const TOOLS = [
     },
   },
   {
+    name: "wake_on",
+    description:
+      "Ask frond-ear to wake you once when something happens on GitHub: a PR gets a review (review), merges or closes (merged), gets a comment (comment), or its CI ends (ci_done); an issue gets a comment; or a workflow run attempt ends (ci_done). Say exactly what number names (target pr, issue or run). ci_done on a PR binds the PR's current head (or head_sha, which must be it): checks on any other commit never fire it, and if the head moves first you are told so, which is not a CI result. ci_done on a run binds one attempt (attempt, default the current one): a rerun is another attempt. Reviews and comments already there when you set it are the baseline; merged or ci_done that already hold fire at once. The daemon polls with conditional requests within its own budget and backs off when GitHub asks; it fires once, then retires. The wake carries your note, frond-ear's facts (exact URL, head, attempt, ids, conclusions: completed is not success, a review is not an approval) and any GitHub text quoted as untrusted evidence. Owed to this session until acked, like schedule. A poll that keeps failing ends the watch with one wake saying so. Only repos the daemon's config allows this ear (github.repos); off unless its config turns it on (github.enabled). schedules lists, reads and cancels it.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        source: { type: "string", description: '"github"' },
+        repo: { type: "string", description: "owner/name" },
+        target: {
+          type: "string",
+          description:
+            'What number names: "pr", "issue" or "run" (a workflow run id)',
+        },
+        number: {
+          type: "number",
+          description: "PR or issue number, or run id",
+        },
+        on: {
+          type: "string",
+          description:
+            'pr: "review", "merged", "comment" or "ci_done"; issue: "comment"; run: "ci_done"',
+        },
+        head_sha: {
+          type: "string",
+          description:
+            "pr ci_done only: the head to bind (must be the PR's current head)",
+        },
+        attempt: {
+          type: "number",
+          description:
+            "run only: the attempt to watch (default: the current one)",
+        },
+        note: {
+          type: "string",
+          description:
+            "What the wake is for (at most 2000 bytes); shown only to this session",
+        },
+        ttl_days: { type: "number", description: "1 to 30; default 30" },
+      },
+      required: ["source", "repo", "target", "number", "on", "note"],
+    },
+  },
+  {
     name: "schedules",
     description:
       "List this ear's schedules (ids, kinds, states, next due times, owed wakes), read one (read: id: its note, target and occurrences, for the session that set it), or cancel one (cancel: id; only the session that set it). Another session's schedules show as metadata only: never their note or target. Cancel stops future wakes; a wake already owed stays owed until acked. Only the session holding the ear.",

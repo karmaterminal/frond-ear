@@ -16,6 +16,7 @@ import {
   defaultSocketPath,
   loadConfigFile,
   readBotToken,
+  readGithubToken,
   runtimeOptions,
 } from "./config.ts";
 import { watchConfigFile } from "./config-watch.ts";
@@ -68,8 +69,9 @@ usage:
   frond-ear tap --ear <name>          stream the batches pushed to an ear's attached session (read-only;\n                                      wakes a session without channel push; a shim must be attached)
   frond-ear release --ear <name> [--source <s>] [--session <id>] [--hook]
                                       release an ear's letters (#88) to its attached session; for a
-                                      SessionStart hook (matcher startup|compact): --hook reads the hook's
-                                      JSON on stdin (session_id, source) and always exits 0
+                                      SessionStart hook (matcher startup|compact|clear): --hook reads the
+                                      hook's JSON on stdin (session_id, source) and CLAUDE_PID, which ties
+                                      a /clear's new session to the shim (#111), and always exits 0
   frond-ear precompact --ear <name> [--session <id>] [--hook]
                                       print the session's unsettled letters (#102) as compaction-summary
                                       instructions; for a PreCompact hook: --hook reads session_id on
@@ -108,6 +110,8 @@ async function runDaemon(argv: string[]): Promise<void> {
   const runtime = runtimeOptions(env, { dryRun: values["dry-run"] === true });
   const config = loadConfigFile(runtime.configPath);
   const token = runtime.dryRun ? "" : readBotToken(env);
+  // wake_on's read-only token (#111): only in the daemon, never logged or passed on.
+  const githubToken = readGithubToken(env);
   const logger = new StructuredLogger(undefined, token ? [token] : []);
   const store = new EventStore(runtime.databasePath);
   const pruned = store.prune(config.limits.retentionMs);
@@ -168,7 +172,11 @@ async function runDaemon(argv: string[]): Promise<void> {
       `${runtime.databasePath}-shm`,
       ...(env.DISCORD_BOT_TOKEN_FILE ? [env.DISCORD_BOT_TOKEN_FILE] : []),
       ...(env.FROND_EAR_TOKEN_FILE ? [env.FROND_EAR_TOKEN_FILE] : []),
+      ...(env.FROND_EAR_GITHUB_TOKEN_FILE
+        ? [env.FROND_EAR_GITHUB_TOKEN_FILE]
+        : []),
     ],
+    ...(githubToken ? { githubToken } : {}),
     allowInject: runtime.allowInject,
     ...(sharedToken ? { token: sharedToken } : {}),
     gatewayStatus: () =>

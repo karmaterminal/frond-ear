@@ -77,5 +77,13 @@
     },
     "derivedPublication": false,
     "roomPolicy": "observe"
+  },
+  "github": {
+    "enabled": false,
+    "pollSeconds": 120,
+    "maxRequestsPerHour": 120,
+    "repos": {
+      "my-ear": ["owner/repo"]
+    }
   }
 }

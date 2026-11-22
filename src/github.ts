@@ -1,0 +1,905 @@
+/**
+ * `wake_on` GitHub (#111): the daemon polls one exact target with conditional requests
+ * and writes one wake when its trigger is observed, then retires the watch.
+ *
+ * Bounded and read-only: GET only, to the configured API origin only, never following a
+ * redirect (so the token never goes elsewhere), bodies capped, and only repositories the
+ * ear's config allows. Every attempt counts against the ear's own request budget, a 304
+ * included; a rate limit backs every watch off until GitHub says, and that backoff is
+ * persisted. External text (review and comment bodies, check names) is untrusted
+ * evidence: it is quoted in the wake, never part of the setter's note.
+ */
+import type { WakeFacts } from "./wakes.ts";
+
+export const GITHUB_LIMITS = {
+  maxBodyBytes: 1024 * 1024,
+  requestTimeoutMs: 15_000,
+  /** Pages one poll may read of a review or comment list (100 items each). */
+  maxPages: 5,
+  /** Consecutive retryable failures (network, 5xx) before the watch gives up. */
+  maxFailures: 8,
+  /** How long a watch may keep failing, rate limits included, before it gives up. */
+  maxFailingMs: 24 * 60 * 60_000,
+  /** Backoff ceiling for a failing watch. */
+  maxBackoffMs: 60 * 60_000,
+  /** A rate limit with no Retry-After or reset waits this long. */
+  defaultRateWaitMs: 60_000,
+  /** External text kept per quoted item. */
+  maxQuoteChars: 600,
+  /** Items named per wake (reviews, comments, checks). */
+  maxItems: 5,
+} as const;
+
+export type GithubTargetKind = "pr" | "issue" | "run";
+export type GithubTrigger = "review" | "merged" | "ci_done" | "comment";
+
+/** Which triggers each kind of target can watch. */
+export const TRIGGERS: Record<GithubTargetKind, GithubTrigger[]> = {
+  pr: ["review", "merged", "ci_done", "comment"],
+  issue: ["comment"],
+  run: ["ci_done"],
+};
+
+export interface GithubTarget {
+  repo: string;
+  kind: GithubTargetKind;
+  /** A PR or issue number, or a workflow run id. */
+  number: number;
+  on: GithubTrigger;
+  /** ci_done on a PR: the exact head SHA whose checks are watched. */
+  head?: string;
+  /** ci_done on a run: the exact attempt watched. */
+  attempt?: number;
+}
+
+export interface GithubCursor {
+  /** Review or comment ids up to this one existed at registration: never a trigger. */
+  baseline?: number;
+  /** The list page the newest items are on. */
+  page?: number;
+  /** ETags by request path, for If-None-Match. */
+  etags: Record<string, string>;
+  /** ci_done on a PR: the PR's head when last read (it may have moved off the bound one). */
+  currentHead?: string;
+}
+
+export type GithubFetch = (url: string, init: RequestInit) => Promise<Response>;
+
+export interface GithubResponse {
+  status: number;
+  etag?: string;
+  body?: unknown;
+  retryAfterMs?: number;
+  pollIntervalMs?: number;
+  rateLimited: boolean;
+  hasNext: boolean;
+  /** Network failure or an unreadable body: no HTTP answer to go by. */
+  error?: string;
+}
+
+const REPO = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/u;
+const SHA = /^[0-9a-f]{40}$/u;
+
+/** One GET to the API origin, counted by the caller before it is made. */
+export class GithubClient {
+  private readonly apiBase: string;
+  private readonly token: string | undefined;
+  private readonly fetch: GithubFetch;
+  private readonly now: () => number;
+
+  public constructor(options: {
+    apiBase: string;
+    token?: string | undefined;
+    fetch: GithubFetch;
+    now: () => number;
+  }) {
+    this.apiBase = options.apiBase.replace(/\/+$/u, "");
+    this.token = options.token;
+    this.fetch = options.fetch;
+    this.now = options.now;
+  }
+
+  public get hasToken(): boolean {
+    return this.token !== undefined;
+  }
+
+  public async get(path: string, etag?: string): Promise<GithubResponse> {
+    const headers: Record<string, string> = {
+      accept: "application/vnd.github+json",
+      "x-github-api-version": "2022-11-28",
+      "user-agent": "frond-ear",
+    };
+    if (this.token) {
+      headers.authorization = `Bearer ${this.token}`;
+    }
+    if (etag) {
+      headers["if-none-match"] = etag;
+    }
+    let response: Response;
+    try {
+      response = await this.fetch(`${this.apiBase}${path}`, {
+        method: "GET",
+        headers,
+        // Never follow: a redirect could carry the token to another origin.
+        redirect: "manual",
+        signal: AbortSignal.timeout(GITHUB_LIMITS.requestTimeoutMs),
+      });
+    } catch {
+      return {
+        status: 0,
+        rateLimited: false,
+        hasNext: false,
+        error: "network",
+      };
+    }
+    const header = (name: string): string | undefined =>
+      response.headers.get(name) ?? undefined;
+    const retryAfter = Number(header("retry-after"));
+    const reset = Number(header("x-ratelimit-reset"));
+    const remaining = header("x-ratelimit-remaining");
+    const pollInterval = Number(header("x-poll-interval"));
+    const rateLimited =
+      response.status === 429 ||
+      (response.status === 403 &&
+        (remaining === "0" || header("retry-after") !== undefined));
+    const retryAfterMs =
+      Number.isFinite(retryAfter) && retryAfter > 0
+        ? retryAfter * 1_000
+        : rateLimited && Number.isFinite(reset) && reset > 0
+          ? Math.max(0, reset * 1_000 - this.now())
+          : undefined;
+    const result: GithubResponse = {
+      status: response.status,
+      rateLimited,
+      hasNext: /<[^>]+>;\s*rel="next"/u.test(header("link") ?? ""),
+      ...(header("etag") ? { etag: header("etag")! } : {}),
+      ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
+      ...(Number.isFinite(pollInterval) && pollInterval > 0
+        ? { pollIntervalMs: pollInterval * 1_000 }
+        : {}),
+    };
+    if (response.status !== 200) {
+      await response.body?.cancel().catch(() => undefined);
+      return result;
+    }
+    try {
+      const text = await readCapped(response, GITHUB_LIMITS.maxBodyBytes);
+      return { ...result, body: JSON.parse(text) as unknown };
+    } catch (error) {
+      return {
+        ...result,
+        status: 0,
+        error: error instanceof Error ? error.message : "unreadable body",
+      };
+    }
+  }
+}
+
+async function readCapped(response: Response, cap: number): Promise<string> {
+  const reader = response.body?.getReader();
+  if (!reader) {
+    return "";
+  }
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    size += value.byteLength;
+    if (size > cap) {
+      await reader.cancel();
+      throw new Error(`response over ${cap} bytes`);
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+/** Validates the wake_on tool's target arguments (the note is the caller's). */
+export function parseTarget(args: Record<string, unknown>): GithubTarget {
+  if (args.source !== "github") {
+    throw new Error('source must be "github" (the only source wake_on has)');
+  }
+  const repo = typeof args.repo === "string" ? args.repo.trim() : "";
+  if (!REPO.test(repo)) {
+    throw new Error("repo must be owner/name");
+  }
+  const kind = args.target;
+  if (kind !== "pr" && kind !== "issue" && kind !== "run") {
+    throw new Error(
+      'target must be "pr", "issue" or "run": say which the number names',
+    );
+  }
+  const number = Number(args.number);
+  if (!Number.isSafeInteger(number) || number < 1) {
+    throw new Error(
+      kind === "run"
+        ? "number must be the workflow run id"
+        : `number must be the ${kind === "pr" ? "pull request" : "issue"} number`,
+    );
+  }
+  const on = args.on;
+  if (typeof on !== "string" || !TRIGGERS[kind].includes(on as GithubTrigger)) {
+    throw new Error(
+      `on must be one of ${TRIGGERS[kind].join(", ")} for target ${kind}`,
+    );
+  }
+  const target: GithubTarget = { repo, kind, number, on: on as GithubTrigger };
+  if (args.head_sha !== undefined && args.head_sha !== null) {
+    if (kind !== "pr" || on !== "ci_done") {
+      throw new Error("head_sha is only for target pr with on ci_done");
+    }
+    const head = String(args.head_sha).toLowerCase();
+    if (!SHA.test(head)) {
+      throw new Error("head_sha must be a full 40-character commit SHA");
+    }
+    target.head = head;
+  }
+  if (args.attempt !== undefined && args.attempt !== null) {
+    if (kind !== "run") {
+      throw new Error("attempt is only for target run");
+    }
+    const attempt = Number(args.attempt);
+    if (!Number.isSafeInteger(attempt) || attempt < 1) {
+      throw new Error("attempt must be a positive integer");
+    }
+    target.attempt = attempt;
+  }
+  return target;
+}
+
+/** The target as its setter reads it: exact, never shown to another session. */
+export function describeTarget(target: GithubTarget): string {
+  const what =
+    target.kind === "run"
+      ? `run ${target.number}${target.attempt !== undefined ? ` attempt ${target.attempt}` : ""}`
+      : `${target.kind === "pr" ? "PR" : "issue"} #${target.number}`;
+  const head = target.head ? ` at head ${target.head.slice(0, 12)}` : "";
+  return `github ${target.repo} ${what} on ${target.on}${head}`;
+}
+
+function segment(value: string | number): string {
+  return encodeURIComponent(String(value));
+}
+
+function repoPath(repo: string): string {
+  const [owner, name] = repo.split("/");
+  return `/repos/${segment(owner!)}/${segment(name!)}`;
+}
+
+export function htmlUrl(target: GithubTarget): string {
+  const base = `https://github.com/${target.repo}`;
+  return target.kind === "run"
+    ? `${base}/actions/runs/${target.number}${target.attempt !== undefined ? `/attempts/${target.attempt}` : ""}`
+    : `${base}/${target.kind === "pr" ? "pull" : "issues"}/${target.number}`;
+}
+
+/** What one poll (or the registration's first look) concluded. */
+export type PollOutcome =
+  | { kind: "unchanged"; cursor: GithubCursor; pollAfterMs?: number }
+  | { kind: "fire"; facts: WakeFacts; cursor: GithubCursor }
+  | { kind: "retry"; reason: string; rate: boolean; retryAfterMs?: number }
+  | { kind: "terminal"; reason: string }
+  | { kind: "deferred" };
+
+/** The registration's answer: a cursor to start from, or the trigger already holding. */
+export type Baseline =
+  | { kind: "ready"; target: GithubTarget; cursor: GithubCursor }
+  | {
+      kind: "fire";
+      target: GithubTarget;
+      cursor: GithubCursor;
+      facts: WakeFacts;
+    }
+  | { kind: "refused"; reason: string; retryAfterMs?: number; rate?: boolean };
+
+/**
+ * Asks before each request whether the ear's budget allows one; every attempt counts,
+ * 304s and failures included.
+ */
+export type Spend = () => boolean;
+
+class Stop extends Error {
+  public readonly outcome: PollOutcome;
+
+  public constructor(outcome: PollOutcome) {
+    super("stop");
+    this.outcome = outcome;
+  }
+}
+
+async function fetchOk(
+  client: GithubClient,
+  spend: Spend,
+  path: string,
+  etag?: string,
+): Promise<GithubResponse> {
+  if (!spend()) {
+    throw new Stop({ kind: "deferred" });
+  }
+  const response = await client.get(path, etag);
+  if (response.status === 200 || response.status === 304) {
+    return response;
+  }
+  throw new Stop(failure(response));
+}
+
+/** A non-200, non-304 answer: retryable, rate-limited, or the end of the watch. */
+export function failure(response: GithubResponse): PollOutcome {
+  if (response.rateLimited) {
+    return {
+      kind: "retry",
+      rate: true,
+      reason: `rate limited (HTTP ${response.status})`,
+      ...(response.retryAfterMs !== undefined
+        ? { retryAfterMs: response.retryAfterMs }
+        : {}),
+    };
+  }
+  if (response.status === 0 || response.status >= 500) {
+    return {
+      kind: "retry",
+      rate: false,
+      reason:
+        response.status === 0
+          ? `no answer (${response.error ?? "network"})`
+          : `HTTP ${response.status}`,
+    };
+  }
+  if (response.status >= 300 && response.status < 400) {
+    return {
+      kind: "terminal",
+      reason: `GitHub answered HTTP ${response.status}, a redirect (a renamed or transferred repository?); frond-ear never follows one, so the token never leaves the API origin`,
+    };
+  }
+  const why: Record<number, string> = {
+    401: "the daemon's GitHub token was refused (HTTP 401)",
+    403: "access forbidden (HTTP 403): the token cannot read this repository",
+    404: "not found (HTTP 404): no such target, or the token cannot see it",
+    410: "gone (HTTP 410)",
+    422: "GitHub refused the request (HTTP 422)",
+  };
+  return {
+    kind: "terminal",
+    reason: why[response.status] ?? `HTTP ${response.status}`,
+  };
+}
+
+interface ListItem {
+  id: number;
+  created_at?: string;
+  submitted_at?: string;
+  state?: string;
+  html_url?: string;
+  body?: string | null;
+  user?: { login?: string } | null;
+}
+
+/**
+ * The items of a review or comment list after `cursor.baseline`, read from the page the
+ * newest were on. A page that was full can grow onto the next, so only a page that was
+ * not full is asked conditionally: its 304 is proof nothing was added.
+ */
+async function newItems(
+  client: GithubClient,
+  spend: Spend,
+  listPath: string,
+  cursor: GithubCursor,
+): Promise<{ items: ListItem[]; cursor: GithubCursor; pollAfterMs?: number }> {
+  let page = cursor.page ?? 1;
+  const etags = { ...cursor.etags };
+  const found: ListItem[] = [];
+  let highest = cursor.baseline ?? 0;
+  let pollAfterMs: number | undefined;
+  for (let read = 0; read < GITHUB_LIMITS.maxPages; read += 1) {
+    const path = `${listPath}?per_page=100&page=${page}`;
+    const response = await fetchOk(client, spend, path, etags[path]);
+    pollAfterMs = response.pollIntervalMs ?? pollAfterMs;
+    if (response.status === 304) {
+      break;
+    }
+    const items = Array.isArray(response.body)
+      ? (response.body as ListItem[])
+      : [];
+    for (const item of items) {
+      if (typeof item.id === "number" && item.id > (cursor.baseline ?? 0)) {
+        found.push(item);
+      }
+      if (typeof item.id === "number" && item.id > highest) {
+        highest = item.id;
+      }
+    }
+    delete etags[path];
+    if (items.length >= 100 && response.hasNext) {
+      page += 1;
+      continue;
+    }
+    if (items.length < 100 && response.etag) {
+      etags[path] = response.etag;
+    }
+    break;
+  }
+  return {
+    items: found,
+    cursor: { ...cursor, page, etags, baseline: cursor.baseline ?? highest },
+    ...(pollAfterMs !== undefined ? { pollAfterMs } : {}),
+  };
+}
+
+interface Pull {
+  state?: string;
+  merged?: boolean;
+  merged_at?: string | null;
+  merge_commit_sha?: string | null;
+  merged_by?: { login?: string } | null;
+  html_url?: string;
+  head?: { sha?: string };
+  pull_request?: unknown;
+}
+
+interface CheckRuns {
+  total_count?: number;
+  check_runs?: Array<{
+    name?: string;
+    status?: string;
+    conclusion?: string | null;
+  }>;
+}
+
+interface RunAttempt {
+  id?: number;
+  name?: string;
+  status?: string;
+  conclusion?: string | null;
+  run_attempt?: number;
+  head_sha?: string;
+  html_url?: string;
+}
+
+function login(user: { login?: string } | null | undefined): string {
+  return typeof user?.login === "string" ? user.login.slice(0, 40) : "unknown";
+}
+
+function excerpt(text: string | null | undefined): string {
+  const body = typeof text === "string" ? text : "";
+  return body.length > GITHUB_LIMITS.maxQuoteChars
+    ? `${body.slice(0, GITHUB_LIMITS.maxQuoteChars)}… (cut at ${GITHUB_LIMITS.maxQuoteChars} characters)`
+    : body || "(empty)";
+}
+
+function word(value: unknown): string {
+  return typeof value === "string" && /^[A-Za-z_]{1,32}$/u.test(value)
+    ? value
+    : "unknown";
+}
+
+function stamp(now: number): string {
+  return new Date(now).toISOString().replace(/\.\d{3}Z$/u, "Z");
+}
+
+async function pullRequest(
+  client: GithubClient,
+  spend: Spend,
+  target: GithubTarget,
+  cursor: GithubCursor,
+): Promise<{
+  pull: Pull | undefined;
+  cursor: GithubCursor;
+  pollAfterMs?: number;
+}> {
+  const path = `${repoPath(target.repo)}/pulls/${segment(target.number)}`;
+  const response = await fetchOk(client, spend, path, cursor.etags[path]);
+  if (response.status === 304) {
+    return {
+      pull: undefined,
+      cursor,
+      ...(response.pollIntervalMs !== undefined
+        ? { pollAfterMs: response.pollIntervalMs }
+        : {}),
+    };
+  }
+  const etags = { ...cursor.etags };
+  if (response.etag) {
+    etags[path] = response.etag;
+  }
+  return {
+    pull: response.body as Pull,
+    cursor: { ...cursor, etags },
+    ...(response.pollIntervalMs !== undefined
+      ? { pollAfterMs: response.pollIntervalMs }
+      : {}),
+  };
+}
+
+/** Checks on one exact commit: complete only when there are some and all completed. */
+async function checksOn(
+  client: GithubClient,
+  spend: Spend,
+  target: GithubTarget,
+  sha: string,
+): Promise<{
+  complete: boolean;
+  total: number;
+  runs: NonNullable<CheckRuns["check_runs"]>;
+}> {
+  const runs: NonNullable<CheckRuns["check_runs"]> = [];
+  let total = 0;
+  for (let page = 1; page <= GITHUB_LIMITS.maxPages; page += 1) {
+    const response = await fetchOk(
+      client,
+      spend,
+      `${repoPath(target.repo)}/commits/${segment(sha)}/check-runs?per_page=100&page=${page}`,
+    );
+    const body = (response.body ?? {}) as CheckRuns;
+    total = typeof body.total_count === "number" ? body.total_count : 0;
+    runs.push(...(Array.isArray(body.check_runs) ? body.check_runs : []));
+    if (!response.hasNext || runs.length >= total) {
+      break;
+    }
+  }
+  const complete =
+    total > 0 &&
+    runs.length >= total &&
+    runs.every((run) => run.status === "completed");
+  return { complete, total, runs };
+}
+
+function checkFacts(
+  target: GithubTarget,
+  sha: string,
+  runs: NonNullable<CheckRuns["check_runs"]>,
+  now: number,
+  currentHead: string | undefined,
+  already: boolean,
+): WakeFacts {
+  const counts = new Map<string, number>();
+  for (const run of runs) {
+    const conclusion = word(run.conclusion);
+    counts.set(conclusion, (counts.get(conclusion) ?? 0) + 1);
+  }
+  const summary = [...counts.entries()]
+    .map(([conclusion, count]) => `${count} ${conclusion}`)
+    .join(", ");
+  const lines = [
+    `${describeTarget(target)}: all ${runs.length} check run${runs.length === 1 ? "" : "s"} on ${sha} completed (${summary}); observed ${stamp(now)}${already ? ", already complete when the watch was set" : ""}. Completed is not success: read each conclusion.`,
+  ];
+  if (currentHead !== undefined && currentHead !== sha) {
+    lines.push(
+      `the PR's head is now ${currentHead}, not ${sha}: this result is for ${sha} only, not for the current head.`,
+    );
+  }
+  return {
+    lines,
+    url: htmlUrl(target),
+    quoted: [
+      {
+        label: "check runs (names as GitHub gave them)",
+        text: runs
+          .slice(0, 20)
+          .map(
+            (run) =>
+              `${String(run.name ?? "unnamed").slice(0, 100)}: ${word(run.conclusion)}`,
+          )
+          .join("\n"),
+      },
+    ],
+  };
+}
+
+function itemFacts(
+  target: GithubTarget,
+  items: ListItem[],
+  now: number,
+): WakeFacts {
+  const noun = target.on === "review" ? "review" : "comment";
+  const shown = items.slice(0, GITHUB_LIMITS.maxItems);
+  const lines = [
+    `${describeTarget(target)}: ${items.length} new ${noun}${items.length === 1 ? "" : "s"} since the watch was set; observed ${stamp(now)}.`,
+    ...shown.map(
+      (item) =>
+        `${noun} ${item.id} by ${login(item.user)}${target.on === "review" ? `, state ${word(item.state)}` : ""} at ${String(item.submitted_at ?? item.created_at ?? "unknown").slice(0, 25)}`,
+    ),
+  ];
+  if (target.on === "review") {
+    lines.push(
+      "a review is not an approval: only state APPROVED is one, and it says nothing about CI.",
+    );
+  }
+  if (items.length > shown.length) {
+    lines.push(`and ${items.length - shown.length} more not shown here.`);
+  }
+  return {
+    lines,
+    url: shown[0]?.html_url ?? htmlUrl(target),
+    quoted: shown.map((item) => ({
+      label: `${noun} ${item.id} by ${login(item.user)}`,
+      text: excerpt(item.body),
+    })),
+  };
+}
+
+function runFacts(
+  target: GithubTarget,
+  attempt: RunAttempt,
+  now: number,
+  already: boolean,
+): WakeFacts {
+  return {
+    lines: [
+      `${describeTarget(target)}: completed with conclusion ${word(attempt.conclusion)} (completed is not success); head ${String(attempt.head_sha ?? "unknown").slice(0, 40)}; observed ${stamp(now)}${already ? ", already complete when the watch was set" : ""}.`,
+    ],
+    url:
+      typeof attempt.html_url === "string" ? attempt.html_url : htmlUrl(target),
+    quoted: [
+      {
+        label: "workflow name (as GitHub gave it)",
+        text: String(attempt.name ?? "unnamed").slice(0, 200),
+      },
+    ],
+  };
+}
+
+function mergedFacts(
+  target: GithubTarget,
+  pull: Pull,
+  now: number,
+  already: boolean,
+): WakeFacts {
+  const suffix = already ? ", already so when the watch was set" : "";
+  return {
+    lines: pull.merged
+      ? [
+          `${describeTarget(target)}: merged at ${String(pull.merged_at ?? "unknown").slice(0, 25)} by ${login(pull.merged_by)}, merge commit ${String(pull.merge_commit_sha ?? "unknown").slice(0, 40)}; observed ${stamp(now)}${suffix}.`,
+        ]
+      : [
+          `${describeTarget(target)}: closed without merging; observed ${stamp(now)}${suffix}. The watch retires: it can no longer merge as watched.`,
+        ],
+    url: typeof pull.html_url === "string" ? pull.html_url : htmlUrl(target),
+  };
+}
+
+/**
+ * The registration's first look: exact target, baseline, and whether a state trigger
+ * (merged, ci_done) already holds, which fires at once. Event triggers (review,
+ * comment) only fire for what comes after.
+ */
+export async function baseline(
+  client: GithubClient,
+  spend: Spend,
+  target: GithubTarget,
+  now: number,
+): Promise<Baseline> {
+  const cursor: GithubCursor = { etags: {} };
+  try {
+    if (target.kind === "run") {
+      const run = await fetchOk(
+        client,
+        spend,
+        `${repoPath(target.repo)}/actions/runs/${segment(target.number)}`,
+      );
+      const current = (run.body as RunAttempt | undefined)?.run_attempt;
+      const attempt =
+        target.attempt ?? (typeof current === "number" ? current : 1);
+      if (typeof current === "number" && attempt > current) {
+        return {
+          kind: "refused",
+          reason: `run ${target.number} is on attempt ${current}; attempt ${attempt} doesn't exist yet`,
+        };
+      }
+      const bound = { ...target, attempt };
+      const state = await fetchOk(
+        client,
+        spend,
+        `${repoPath(target.repo)}/actions/runs/${segment(target.number)}/attempts/${segment(attempt)}`,
+      );
+      const body = state.body as RunAttempt;
+      if (body.status === "completed") {
+        return {
+          kind: "fire",
+          target: bound,
+          cursor,
+          facts: runFacts(bound, body, now, true),
+        };
+      }
+      return { kind: "ready", target: bound, cursor };
+    }
+    if (target.kind === "issue") {
+      const issue = await fetchOk(
+        client,
+        spend,
+        `${repoPath(target.repo)}/issues/${segment(target.number)}`,
+      );
+      if ((issue.body as Pull | undefined)?.pull_request !== undefined) {
+        return {
+          kind: "refused",
+          reason: `#${target.number} in ${target.repo} is a pull request: use target "pr"`,
+        };
+      }
+    }
+    if (target.kind === "pr") {
+      const read = await pullRequest(client, spend, target, cursor);
+      const pull = read.pull;
+      const head = pull?.head?.sha;
+      if (target.on === "merged") {
+        if (pull && (pull.merged || pull.state === "closed")) {
+          return {
+            kind: "fire",
+            target,
+            cursor,
+            facts: mergedFacts(target, pull, now, true),
+          };
+        }
+        return { kind: "ready", target, cursor: read.cursor };
+      }
+      if (target.on === "ci_done") {
+        if (typeof head !== "string") {
+          return {
+            kind: "refused",
+            reason: "GitHub gave no head SHA for that PR",
+          };
+        }
+        if (target.head !== undefined && target.head !== head) {
+          return {
+            kind: "refused",
+            reason: `the PR's head is ${head}, not ${target.head}: a ci_done watch binds the head it is set on`,
+          };
+        }
+        const bound = { ...target, head };
+        const checks = await checksOn(client, spend, bound, head);
+        const watching = { ...read.cursor, currentHead: head };
+        if (checks.complete) {
+          return {
+            kind: "fire",
+            target: bound,
+            cursor,
+            facts: checkFacts(bound, head, checks.runs, now, head, true),
+          };
+        }
+        return { kind: "ready", target: bound, cursor: watching };
+      }
+    }
+    if (target.on === "review" || target.on === "comment") {
+      const listed = await newItems(client, spend, listPath(target), {
+        etags: {},
+      });
+      return { kind: "ready", target, cursor: listed.cursor };
+    }
+    return { kind: "ready", target, cursor };
+  } catch (error) {
+    if (error instanceof Stop) {
+      const outcome = error.outcome;
+      return {
+        kind: "refused",
+        ...(outcome.kind === "retry" && outcome.rate
+          ? {
+              rate: true,
+              ...(outcome.retryAfterMs !== undefined
+                ? { retryAfterMs: outcome.retryAfterMs }
+                : {}),
+            }
+          : {}),
+        reason:
+          outcome.kind === "deferred"
+            ? "this ear's GitHub request budget for the hour is spent"
+            : outcome.kind === "retry" || outcome.kind === "terminal"
+              ? outcome.reason
+              : "GitHub could not be read",
+      };
+    }
+    throw error;
+  }
+}
+
+function listPath(target: GithubTarget): string {
+  return target.on === "review"
+    ? `${repoPath(target.repo)}/pulls/${segment(target.number)}/reviews`
+    : `${repoPath(target.repo)}/issues/${segment(target.number)}/comments`;
+}
+
+/** One poll of a registered watch. */
+export async function poll(
+  client: GithubClient,
+  spend: Spend,
+  target: GithubTarget,
+  cursor: GithubCursor,
+  now: number,
+): Promise<PollOutcome> {
+  try {
+    if (target.kind === "run") {
+      const response = await fetchOk(
+        client,
+        spend,
+        `${repoPath(target.repo)}/actions/runs/${segment(target.number)}/attempts/${segment(target.attempt ?? 1)}`,
+        cursor.etags.attempt,
+      );
+      if (response.status === 304) {
+        return unchanged(cursor, response.pollIntervalMs);
+      }
+      const body = response.body as RunAttempt;
+      const etags = { ...cursor.etags };
+      if (response.etag) {
+        etags.attempt = response.etag;
+      }
+      // Only the bound attempt: a rerun is another attempt, never this one finishing.
+      if (
+        body.status === "completed" &&
+        (body.run_attempt ?? target.attempt) === target.attempt
+      ) {
+        return {
+          kind: "fire",
+          facts: runFacts(target, body, now, false),
+          cursor: { ...cursor, etags },
+        };
+      }
+      return unchanged({ ...cursor, etags }, response.pollIntervalMs);
+    }
+    if (target.on === "review" || target.on === "comment") {
+      const listed = await newItems(client, spend, listPath(target), cursor);
+      const items = listed.items.filter(
+        (item) => target.on !== "review" || word(item.state) !== "PENDING",
+      );
+      if (items.length > 0) {
+        return {
+          kind: "fire",
+          facts: itemFacts(target, items, now),
+          cursor: listed.cursor,
+        };
+      }
+      return unchanged(listed.cursor, listed.pollAfterMs);
+    }
+    const read = await pullRequest(client, spend, target, cursor);
+    if (target.on === "merged") {
+      if (read.pull && (read.pull.merged || read.pull.state === "closed")) {
+        return {
+          kind: "fire",
+          facts: mergedFacts(target, read.pull, now, false),
+          cursor: read.cursor,
+        };
+      }
+      return unchanged(read.cursor, read.pollAfterMs);
+    }
+    // ci_done on a PR: the bound head's checks, whatever the PR's head is now.
+    const head = target.head!;
+    const current =
+      typeof read.pull?.head?.sha === "string"
+        ? read.pull.head.sha
+        : (cursor.currentHead ?? head);
+    const next: GithubCursor = { ...read.cursor, currentHead: current };
+    const checks = await checksOn(client, spend, target, head);
+    if (checks.complete) {
+      return {
+        kind: "fire",
+        facts: checkFacts(target, head, checks.runs, now, current, false),
+        cursor: next,
+      };
+    }
+    if (current !== head) {
+      return {
+        kind: "fire",
+        facts: {
+          lines: [
+            `${describeTarget(target)}: the PR's head moved to ${current} before the checks on ${head} completed (${checks.total === 0 ? "no check runs on it" : `${checks.runs.filter((run) => run.status === "completed").length} of ${checks.total} completed`}); observed ${stamp(now)}. This is not a CI result: the watch retires, set a new one on the new head if you still want it.`,
+          ],
+          url: htmlUrl(target),
+        },
+        cursor: next,
+      };
+    }
+    return unchanged(next, read.pollAfterMs);
+  } catch (error) {
+    if (error instanceof Stop) {
+      return error.outcome;
+    }
+    throw error;
+  }
+}
+
+function unchanged(cursor: GithubCursor, pollAfterMs?: number): PollOutcome {
+  return {
+    kind: "unchanged",
+    cursor,
+    ...(pollAfterMs !== undefined ? { pollAfterMs } : {}),
+  };
+}
