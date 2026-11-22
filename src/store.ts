@@ -496,6 +496,8 @@ export class EventStore {
         ON canticle_custody (ear, claimed_at);
       CREATE INDEX IF NOT EXISTS canticle_custody_batch
         ON canticle_custody (ear, batch_id);
+      CREATE INDEX IF NOT EXISTS canticle_custody_claimed
+        ON canticle_custody (claimed_at);
     `);
     // Custody is whole from the moment its table exists: a window that reaches back
     // before that (or before the prune's cutoff) reads as unknown, never as empty. A
