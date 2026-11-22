@@ -1486,12 +1486,16 @@ export class Daemon {
   private detach(client: Client): void {
     const ear = client.ear;
     if (ear && this.attached.get(ear) === client) {
+      // It held the ear until now: its schedules' orphan clock starts here, and their
+      // orphan deadline is armed below (#111).
+      this.touchHolder(ear, client);
       this.attached.delete(ear);
       // Socket close events can arrive after shutdown has handed the store
       // back to be closed; shutdown already reverted unconfirmed batches.
       if (!this.stopped) {
         const reverted = this.revertUnconfirmed(ear);
         this.logger.log("info", "ear.detached", { ear, reverted });
+        this.armWakes();
       }
     }
     client.ear = undefined;
@@ -1824,6 +1828,7 @@ export class Daemon {
     }
     // Every wake owed to this session comes back, one event per schedule; another
     // session's are only named (#111).
+    this.touchHolder(ear, client);
     this.deliverWakes(ear, { all: true, held: true });
     this.releaseArmed(ear);
     this.tick();
@@ -1849,9 +1854,12 @@ export class Daemon {
       }
     }
     const changed = client.sessionId !== sessionId;
+    // The session leaving held the ear until now, and the one arriving holds it from now.
+    this.touchHolder(ear, client);
     client.sessionId = sessionId;
     delete client.wakeDoubt;
     this.store.updateEarSession(ear, sessionId);
+    this.touchHolder(ear, client);
     if (this.attached.get(ear) === client && changed) {
       this.logger.log("info", "ear.session_changed", {
         ear,
@@ -2566,6 +2574,21 @@ export class Daemon {
     throw new Error(
       `frond-ear does not know this session's id (its shim had no CLAUDE_CODE_SESSION_ID), so it cannot ${what} for it; nothing was changed`,
     );
+  }
+
+  /**
+   * Refreshes the orphan clock of the schedules `client`'s session set, while it is the
+   * ear's holder: at attach, at a session change (both sides) and at detach, not only on
+   * a wake tick (🍃 on #114).
+   */
+  private touchHolder(ear: string, client: Client): void {
+    if (
+      this.attached.get(ear) === client &&
+      client.sessionId &&
+      !this.stopped
+    ) {
+      this.store.wakes.touchSetter(ear, client.sessionId, this.clock.now());
+    }
   }
 
   private holderIdentity(ear: string): string {
