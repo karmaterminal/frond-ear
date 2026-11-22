@@ -150,6 +150,13 @@ export interface DaemonOptions {
    * capsules and a station's control socket. Absent (the CLI wires none): closed.
    */
   derivedRoute?: DerivedRoute;
+  /**
+   * `wake_on` GitHub's HTTP (#111): the global fetch by default; tests pass a fake. It is
+   * only ever called with GET to config.github.apiBase, redirects never followed.
+   */
+  githubFetch?: (url: string, init: RequestInit) => Promise<Response>;
+  /** The daemon's read-only GitHub token, from FROND_EAR_GITHUB_TOKEN_FILE. Never logged. */
+  githubToken?: string;
 }
 
 interface Client {
