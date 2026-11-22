@@ -319,6 +319,54 @@ export function status(h: Harness): DeliveryStatus {
   return delivery;
 }
 
+/** The session id scribe's shim gives in the tests that judge custody against one. */
+export const SESSION = "11111111-aaaa-4aaa-8aaa-000000000001";
+
+let reports = 0;
+
+/**
+ * The seat's pressure hook (#98), as a CLI client: the session's context reading with its
+ * latest compaction marker (null: none yet). Evidence time is the harness clock.
+ */
+export async function pressure(
+  h: Harness,
+  boundary: string | null,
+  options: { sessionId?: string; tokens?: number | null } = {},
+): Promise<void> {
+  const cli = h.attach(undefined, { role: "cli" });
+  reports += 1;
+  await cli.send({
+    type: "pressure",
+    id: reports,
+    ear: "scribe",
+    sessionId: options.sessionId ?? SESSION,
+    tokens: options.tokens === undefined ? 1_000 : options.tokens,
+    band: null,
+    boundary,
+    at: h.clock.now(),
+  });
+  const result = cli.connection.results().at(-1)!;
+  assert.equal(result.ok, true, result.text);
+  cli.close();
+}
+
+/** Sings `seq`, lets immediate push it, and has the shim confirm it: the push. */
+export async function offered(
+  h: Harness,
+  host: Host,
+  shim: ReturnType<Harness["attach"]>,
+  seq: number,
+  song: Song = {},
+) {
+  const before = pushes(shim).length;
+  host.sing(seq, song);
+  h.timers.advance(6_000);
+  assert.equal(pushes(shim).length, before + 1, `record ${seq} was pushed`);
+  const push = pushes(shim).at(-1)!;
+  await shim.send({ type: "offered", batchId: push.batchId! });
+  return push;
+}
+
 /** `station:stream/seq` of each record a push carries, in the order it carries them. */
 export const order = (content: string) =>
   [
