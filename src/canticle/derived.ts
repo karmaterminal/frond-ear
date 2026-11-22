@@ -18,8 +18,9 @@
 //
 // #162 has no capability advertisement. The one answer that names the derived op without
 // any effect is `derived_query`'s, so frond-ear asks it about an election no authority
-// issues and reads `station_claim_missing` (the op is configured, this uid admitted, no
-// such claim) as the capability. Any other answer is its absence, in the station's words.
+// issues and reads exactly `{"ok": false, "error": "station_claim_missing"}` (the op is
+// configured, this uid admitted, no such claim) as the capability. Any other answer is its
+// absence, quoted: `ok` for that election is an anomaly, never support.
 //
 // A lost answer is never retried. #162: the host queries the same election and never makes
 // a new one to retry an uncertain effect, so an unanswered publish stays `unknown` until a
@@ -159,8 +160,24 @@ export type DerivedCapability =
   | { derived: false; reason: string };
 
 /**
+ * #162's answer to a `derived_query` for an election it holds no claim for, exactly: its
+ * bridge refuses `station_claim_missing`, and its runner writes a refusal as these two
+ * fields and no other.
+ */
+const CLAIM_MISSING = { ok: false, error: "station_claim_missing" } as const;
+
+/** An answer as a reason quotes it: its JSON, at most 200 characters. */
+const quoted = (answer: Record<string, unknown>) => {
+  const json = JSON.stringify(answer);
+  return json.length > 200 ? `${json.slice(0, 200)}…` : json;
+};
+
+/**
  * Whether the station's control socket offers the derived op: a `derived_query` for an
- * election no authority issues, answered `station_claim_missing`. No effect either way.
+ * election no authority issues, answered exactly `CLAIM_MISSING` (the op is configured,
+ * this uid admitted, no such claim). No effect either way. Any other answer is its
+ * absence: a refusal in the station's own words; `ok` for that election, an anomaly (no
+ * authority issued it, so no station can hold it); or any other shape, quoted.
  */
 export async function derivedCapability(
   control: StationControl,
@@ -171,9 +188,29 @@ export async function derivedCapability(
   } catch (error) {
     return { derived: false, reason: noAnswer(error) };
   }
-  return answer.ok === true || answer.error === "station_claim_missing"
-    ? { derived: true }
-    : { derived: false, reason: stationWords(answer) };
+  const keys = Object.keys(answer);
+  if (
+    keys.length === 2 &&
+    answer.ok === CLAIM_MISSING.ok &&
+    answer.error === CLAIM_MISSING.error
+  ) {
+    return { derived: true };
+  }
+  if (
+    answer.ok === false &&
+    typeof answer.error === "string" &&
+    answer.error !== "" &&
+    answer.error !== CLAIM_MISSING.error
+  ) {
+    return { derived: false, reason: stationWords(answer) };
+  }
+  return {
+    derived: false,
+    reason:
+      answer.ok === true
+        ? `an anomaly: it answered ok for the all-zero election, which no authority issues: ${quoted(answer)}`
+        : `its answer is not #162's ${JSON.stringify(CLAIM_MISSING)}: ${quoted(answer)}`,
+  };
 }
 
 /** One source of a derived publication: which record, its digest, and its lineage. */

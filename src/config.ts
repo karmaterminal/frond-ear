@@ -108,10 +108,10 @@ export interface CanticleConfig {
   delivery: Record<string, CanticleEarDelivery>;
   /**
    * Whether derived publication may ever open (binary-canticle#161). Off by default, and
-   * off, frond-ear never calls a station's derived op. Even on, it stays closed unless
-   * every source record was heard whole and echoed within the session's current
-   * compaction boundary, and the owner's route and the station's capability hold
-   * (canticle/derived.ts).
+   * off, frond-ear never calls a station's derived op: no publish, no capability probe,
+   * no `derivedQuery`. Even on, it stays closed unless every source record was heard
+   * whole and echoed within the session's current compaction boundary, and the owner's
+   * route and the station's capability hold (canticle/derived.ts).
    */
   derivedPublication: boolean;
   /**
@@ -119,6 +119,11 @@ export interface CanticleConfig {
    * (default) records the speaker's custody and refuses nothing; `strict-fresh` refuses
    * unless every source the session was exposed to is echoed within its current
    * compaction boundary and its history is complete.
+   *
+   * `strict-fresh` is a freshness-of-attention gate, not an output-content check. It
+   * never reads the output; one un-acked push mutes the room for about an hour;
+   * `frond-ear send` (seat-pulse's alerts) is always refused; verbatim reuse passes. No
+   * seat should select strict-fresh until the frond's source-use rule is settled.
    */
   roomPolicy: RoomPolicy;
 }

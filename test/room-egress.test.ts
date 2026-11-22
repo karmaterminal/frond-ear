@@ -6,13 +6,19 @@
 // tool error and sends nothing. Bash, gh, files and other MCP servers are outside it.
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { readdirSync, readFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { connect } from "node:net";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import { PassThrough } from "node:stream";
 import test from "node:test";
 
 import { ROOM_OUTPUT_TOOLS } from "../src/egress.ts";
 import { RestError } from "../src/rest.ts";
-import { TOOLS } from "../src/shim.ts";
+import { runSend } from "../src/send.ts";
+import { listenUnix } from "../src/server.ts";
+import { ChannelShim, TOOLS } from "../src/shim.ts";
 import { EventStore } from "../src/store.ts";
 import {
   canticleConfig,
@@ -402,11 +408,14 @@ test("replay: a retry re-checks at the gate and never reuses an earlier allow; a
     assert.equal(result.ok, false);
     assert.match(result.text, /did not confirm part 2 of 2/u);
     const part1 = writes(h)[0]!.messageId!;
-    let row = rows(h).at(-1)!;
+    const first = rows(h).at(-1)!;
+    let row = first;
     assert.deepEqual(
       [row.decision, row.outcome, row.messageIds],
-      ["allow", "error", [part1]],
+      ["allow", "unconfirmed", [part1]],
+      "part 2 went unanswered: it may have posted",
     );
+    assert.match(row.nonce!, /^[0-9a-f]{20}$/u, "tied to part 2's nonce");
 
     // A compaction, then the identical retry: refused, nothing posted.
     h.clock.advance(1_000);
@@ -419,7 +428,9 @@ test("replay: a retry re-checks at the gate and never reuses an earlier allow; a
     row = rows(h).at(-1)!;
     assert.deepEqual([row.decision, row.outcome], ["refuse", "refused"]);
 
-    // Fresh again: the retry resumes, posting only part 2.
+    // Fresh again: the retry resumes, posting only part 2, under the first try's nonce. Discord
+    // makes them one message, so frond-ear can't tell which try posted it: it is the first
+    // row's write, and the retry's row names it as re-sent for that row.
     await h.call(shim, "hear", {});
     result = await h.call(shim, "reply", { chat_id: CHANNEL, text });
     assert.equal(result.ok, true, result.text);
@@ -428,8 +439,13 @@ test("replay: a retry re-checks at the gate and never reuses an earlier allow; a
     const part2 = writes(h)[1]!.messageId!;
     row = rows(h).at(-1)!;
     assert.deepEqual(
-      [row.decision, row.outcome, row.messageIds],
-      ["allow", "sent", [part2]],
+      [row.decision, row.outcome, row.messageIds, row.resent],
+      ["allow", "sent", [], [{ egressId: first.id, messageId: part2 }]],
+    );
+    row = rows(h).find((item) => item.id === first.id)!;
+    assert.deepEqual(
+      [row.outcome, row.messageIds, row.nonce],
+      ["sent", [part1, part2], first.nonce],
     );
 
     // An allowed reply, repeated after a compaction, is checked again too.
@@ -518,6 +534,551 @@ test("outcome: a definitive Discord refusal (4xx) settles the row as error with 
     );
   } finally {
     h.dispose();
+  }
+});
+
+async function waitFor<T>(
+  probe: () => T | undefined,
+  what: string,
+): Promise<T> {
+  for (let i = 0; i < 400; i++) {
+    const value = probe();
+    if (value !== undefined) return value;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`timed out waiting for ${what}`);
+}
+
+/**
+ * The real channel shim, as Claude Code runs it for ear scribe, on a real Unix socket to
+ * the daemon; `call` is an MCP tools/call over its stdio.
+ */
+async function realShim(socketPath: string, sessionId: string) {
+  const input = new PassThrough();
+  const output = new PassThrough();
+  const answers = new Map<number, { text: string; isError: boolean }>();
+  let buffer = "";
+  output.setEncoding("utf8");
+  output.on("data", (chunk: string) => {
+    buffer += chunk;
+    for (let at = buffer.indexOf("\n"); at !== -1; at = buffer.indexOf("\n")) {
+      const message = JSON.parse(buffer.slice(0, at)) as {
+        id?: number;
+        result?: { content?: Array<{ text: string }>; isError?: boolean };
+      };
+      buffer = buffer.slice(at + 1);
+      if (typeof message.id === "number" && message.result) {
+        answers.set(message.id, {
+          text: message.result.content?.[0]?.text ?? "",
+          isError: message.result.isError === true,
+        });
+      }
+    }
+  });
+  const shim = new ChannelShim({
+    input,
+    output,
+    connect: () => connect(socketPath),
+    ear: "scribe",
+    sessionId,
+    log: () => undefined,
+  });
+  shim.start();
+  let id = 0;
+  const request = (method: string, params: object) => {
+    const n = ++id;
+    input.write(
+      `${JSON.stringify({ jsonrpc: "2.0", id: n, method, params })}\n`,
+    );
+    return waitFor(() => answers.get(n), method);
+  };
+  // initialize answers once the daemon has welcomed the shim.
+  await request("initialize", {
+    protocolVersion: "2025-06-18",
+    capabilities: {},
+    clientInfo: { name: "test", version: "0" },
+  });
+  input.write(
+    `${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`,
+  );
+  return {
+    call: (tool: string, args: Record<string, unknown>) =>
+      request("tools/call", { name: tool, arguments: args }),
+    stop: () => shim.stop(),
+  };
+}
+
+/** `frond-ear send`, as seat-pulse runs it, against the daemon's socket. */
+async function cliSend(socketPath: string, text: string) {
+  let stdout = "";
+  let stderr = "";
+  const out = new PassThrough();
+  out.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
+  const err = new PassThrough();
+  err.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
+  const code = await runSend(["--chat", CHANNEL, text], {
+    stdout: out,
+    stderr: err,
+    env: { FROND_EAR_SOCKET: socketPath },
+  });
+  return { code, stdout, stderr };
+}
+
+/**
+ * Discord takes every send, as enforce_nonce does (a repeated nonce returns the original),
+ * but the answer to the first `lose[text]` tries at a text is lost. Returns each try's nonce.
+ */
+function losingAnswers(h: Harness, lose: Record<string, number>): string[] {
+  const nonces: string[] = [];
+  const discordSend = h.rest.sendMessage.bind(h.rest);
+  h.rest.sendMessage = async (chatId, content, replyTo, nonce, files) => {
+    nonces.push(nonce!);
+    const sent = await discordSend(chatId, content, replyTo, nonce, files);
+    if ((lose[content] ?? 0) > 0) {
+      lose[content]! -= 1;
+      throw new TypeError("fetch failed");
+    }
+    return sent;
+  };
+  return nonces;
+}
+
+test("unconfirmed, through the real shim and `frond-ear send` on a real socket: a reply Discord posted but never answered keeps its own row, unconfirmed and tied to its nonce; the identical retry gets the original back, credits it to that row, and claims nothing", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "frond-ear-egress-"));
+  const socketPath = join(directory, "daemon.sock");
+  const h = harness(testConfig());
+  const server = await listenUnix(h.daemon, socketPath);
+  const session = await realShim(socketPath, SESSION);
+  try {
+    const nonces = losingAnswers(h, { "deploy done": 1, "seat gone": 1 });
+
+    // The session's reply: Discord posts it, and its answer is lost.
+    let answer = await session.call("reply", {
+      chat_id: CHANNEL,
+      text: "deploy done",
+    });
+    assert.equal(answer.isError, true);
+    assert.match(answer.text, /^Discord did not confirm this send/u);
+    assert.equal(writes(h).length, 1, "Discord did post it");
+    const posted = writes(h)[0]!.messageId!;
+    const first = rows(h)[0]!;
+    assert.deepEqual(
+      [
+        first.speaker,
+        first.decision,
+        first.outcome,
+        first.messageIds,
+        first.nonce,
+        first.resent,
+      ],
+      ["holder", "allow", "unconfirmed", [], nonces[0], []],
+      "never error: the send may have posted, and its nonce says which",
+    );
+
+    // The identical retry: Discord hands back the message it already has.
+    answer = await session.call("reply", {
+      chat_id: CHANNEL,
+      text: "deploy done",
+    });
+    assert.equal(answer.isError, false, answer.text);
+    assert.match(answer.text, new RegExp(`\\(id ${posted}\\)`, "u"));
+    assert.equal(nonces[1], nonces[0], "the retry reused the nonce");
+    assert.equal(writes(h).length, 1, "one message in the room");
+    let [one, two] = rows(h);
+    assert.deepEqual(
+      [one!.outcome, one!.messageIds, one!.nonce],
+      ["sent", [posted], nonces[0]],
+      "the post is the first row's, under its decision and custody",
+    );
+    assert.deepEqual(
+      [two!.decision, two!.outcome, two!.messageIds, two!.resent],
+      ["allow", "sent", [], [{ egressId: one!.id, messageId: posted }]],
+      "the retry's row names it as re-sent for the first row; it posted nothing of its own",
+    );
+
+    // seat-pulse's path: `frond-ear send`, a CLI with no ear's session.
+    const lost = await cliSend(socketPath, "seat gone");
+    assert.equal(lost.code, 1);
+    assert.match(lost.stderr, /Discord did not confirm this send/u);
+    const alert = writes(h)[1]!.messageId!;
+    const third = rows(h)[2]!;
+    assert.deepEqual(
+      [third.speaker, third.outcome, third.messageIds, third.nonce],
+      ["other", "unconfirmed", [], nonces[2]],
+    );
+    const retried = await cliSend(socketPath, "seat gone");
+    assert.equal(retried.code, 0, retried.stderr);
+    assert.equal(writes(h).length, 2);
+    [one, two] = rows(h).slice(2);
+    assert.deepEqual([one!.outcome, one!.messageIds], ["sent", [alert]]);
+    assert.deepEqual(
+      [two!.outcome, two!.messageIds, two!.resent],
+      ["sent", [], [{ egressId: third.id, messageId: alert }]],
+    );
+    assert.equal(rows(h).length, 4);
+  } finally {
+    session.stop();
+    server.close();
+    h.dispose();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("unconfirmed: a retry whose answer is lost too stays tied to the same nonce; when a later retry confirms it, every row waiting on it is reconciled, and the post stays the first row's", async () => {
+  const h = harness(testConfig());
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    const nonces = losingAnswers(h, { "deploy done": 2 });
+    const reply = () =>
+      h.call(shim, "reply", { chat_id: CHANNEL, text: "deploy done" });
+    assert.equal((await reply()).ok, false);
+    assert.equal((await reply()).ok, false);
+    assert.deepEqual(
+      rows(h).map((row) => [row.outcome, row.nonce]),
+      [
+        ["unconfirmed", nonces[0]],
+        ["unconfirmed", nonces[0]],
+      ],
+    );
+    const result = await reply();
+    assert.equal(result.ok, true, result.text);
+    assert.equal(writes(h).length, 1);
+    const posted = writes(h)[0]!.messageId!;
+    const [one, two, three] = rows(h);
+    assert.deepEqual(
+      rows(h).map((row) => [row.outcome, row.messageIds, row.resent]),
+      [
+        ["sent", [posted], []],
+        ["sent", [], [{ egressId: one!.id, messageId: posted }]],
+        ["sent", [], [{ egressId: one!.id, messageId: posted }]],
+      ],
+    );
+    assert.equal(two!.settledAt, h.clock.now());
+    assert.equal(three!.nonce, null, "the last try was answered");
+  } finally {
+    h.dispose();
+  }
+});
+
+test("unconfirmed: a concurrent identical reply that Discord answers first resolves the nonce; the first try's answer, lost after that, settles its row sent, not unconfirmed", async () => {
+  const h = harness(testConfig());
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    const discordSend = h.rest.sendMessage.bind(h.rest);
+    let release: (() => void) | undefined;
+    let tries = 0;
+    h.rest.sendMessage = async (...args) => {
+      tries += 1;
+      const sent = await discordSend(...args);
+      if (tries === 1) {
+        await new Promise<void>((resolve) => (release = resolve));
+        throw new TypeError("fetch failed");
+      }
+      return sent;
+    };
+    await shim.send({
+      type: "call",
+      id: 910,
+      tool: "reply",
+      args: { chat_id: CHANNEL, text: "deploy done" },
+    });
+    assert.ok(release, "the first try is waiting on Discord");
+    const second = await h.call(shim, "reply", {
+      chat_id: CHANNEL,
+      text: "deploy done",
+    });
+    assert.equal(second.ok, true, second.text);
+    const posted = writes(h)[0]!.messageId!;
+    release!();
+    const first = await waitFor(
+      () => shim.connection.results().find((item) => item.id === 910),
+      "the first try's result",
+    );
+    assert.equal(first.ok, false);
+    assert.equal(writes(h).length, 1);
+    const [one, two] = rows(h);
+    assert.deepEqual(
+      [one!.outcome, one!.messageIds],
+      ["sent", [posted]],
+      "its nonce was already confirmed when its own answer was lost",
+    );
+    assert.deepEqual(
+      [two!.outcome, two!.messageIds, two!.resent],
+      ["sent", [], [{ egressId: one!.id, messageId: posted }]],
+    );
+  } finally {
+    h.dispose();
+  }
+});
+
+test("unconfirmed across a restart: a reply a crash caught mid-send is released unconfirmed, with its nonce, when frond-ear starts; the identical retry credits that row", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "frond-ear-egress-"));
+  const path = join(directory, "ear.db");
+  try {
+    let nonce = "";
+    let posted = "";
+    {
+      const h = harness(testConfig(), { path });
+      const shim = h.attach("scribe", { sessionId: SESSION });
+      const discordSend = h.rest.sendMessage.bind(h.rest);
+      h.rest.sendMessage = async (...args) => {
+        nonce = args[3]!;
+        posted = (await discordSend(...args)).id;
+        return new Promise<never>(() => undefined); // the process dies first
+      };
+      await shim.send({
+        type: "call",
+        id: 920,
+        tool: "reply",
+        args: { chat_id: CHANNEL, text: "deploy done" },
+      });
+      assert.equal(rows(h)[0]!.outcome, "pending");
+      // The crash: the store goes away under the call.
+      h.store.close();
+      rmSync(h.directory, { recursive: true, force: true });
+    }
+
+    const h = harness(testConfig(), { path });
+    try {
+      const released = rows(h)[0]!;
+      assert.deepEqual(
+        [released.outcome, released.messageIds, released.nonce],
+        ["unconfirmed", [], nonce],
+        "a row a previous process left pending may have posted",
+      );
+      // Discord still has the message under that nonce.
+      const discordSend = h.rest.sendMessage.bind(h.rest);
+      h.rest.sendMessage = async (...args) =>
+        args[3] === nonce ? { id: posted } : discordSend(...args);
+      const shim = h.attach("scribe", { sessionId: SESSION });
+      const result = await h.call(shim, "reply", {
+        chat_id: CHANNEL,
+        text: "deploy done",
+      });
+      assert.equal(result.ok, true, result.text);
+      const [one, two] = rows(h);
+      assert.deepEqual([one!.outcome, one!.messageIds], ["sent", [posted]]);
+      assert.deepEqual(
+        [two!.outcome, two!.messageIds, two!.resent],
+        ["sent", [], [{ egressId: one!.id, messageId: posted }]],
+      );
+    } finally {
+      h.dispose();
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("unconfirmed: a reaction or an edit whose answer is lost may have applied, so its row is unconfirmed (no nonce: a retry is a write of its own); a definitive refusal is error", async () => {
+  const h = harness(testConfig());
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    const sent = await h.call(shim, "reply", { chat_id: CHANNEL, text: "x" });
+    assert.equal(sent.ok, true, sent.text);
+    const id = writes(h)[0]!.messageId!;
+    h.rest.addReaction = async () => {
+      throw new TypeError("fetch failed");
+    };
+    h.rest.editMessage = async () => {
+      throw new RestError(503, undefined, "Service Unavailable");
+    };
+    assert.equal(
+      (
+        await h.call(shim, "react", {
+          chat_id: CHANNEL,
+          message_id: id,
+          emoji: "👍",
+        })
+      ).ok,
+      false,
+    );
+    assert.equal(
+      (
+        await h.call(shim, "edit_message", {
+          chat_id: CHANNEL,
+          message_id: id,
+          text: "y",
+        })
+      ).ok,
+      false,
+    );
+    h.rest.addReaction = async () => {
+      throw new RestError(403, 50013, "Missing Permissions");
+    };
+    assert.equal(
+      (
+        await h.call(shim, "react", {
+          chat_id: CHANNEL,
+          message_id: id,
+          emoji: "👍",
+        })
+      ).ok,
+      false,
+    );
+    assert.deepEqual(
+      rows(h)
+        .slice(1)
+        .map((row) => [row.tool, row.outcome, row.messageIds, row.nonce]),
+      [
+        ["react", "unconfirmed", [], null],
+        ["edit_message", "unconfirmed", [], null],
+        ["react", "error", [], null],
+      ],
+    );
+  } finally {
+    h.dispose();
+  }
+});
+
+test("unconfirmed: a store from an earlier build of the egress gate (no unconfirmed outcome, no nonce or resent; intents with no egress row) opens with its rows kept, and records unconfirmed", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "frond-ear-egress-"));
+  const path = join(directory, "ear.db");
+  try {
+    const before = new EventStore(path);
+    before.close();
+    const database = new DatabaseSync(path);
+    database.exec(`
+      DROP TABLE room_egress;
+      CREATE TABLE room_egress (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ear TEXT NOT NULL,
+        tool TEXT NOT NULL CHECK (tool IN ('reply', 'react', 'edit_message')),
+        chat_id TEXT NOT NULL,
+        target TEXT,
+        digest TEXT NOT NULL,
+        session_id TEXT,
+        speaker TEXT NOT NULL CHECK (speaker IN ('holder', 'superseded', 'other')),
+        policy TEXT NOT NULL,
+        decision TEXT NOT NULL CHECK (decision IN ('allow', 'refuse')),
+        reason TEXT NOT NULL,
+        history TEXT NOT NULL CHECK (history IN ('complete', 'incomplete', 'unknown')),
+        reasons TEXT NOT NULL,
+        boundary TEXT,
+        boundary_known INTEGER NOT NULL,
+        sources TEXT NOT NULL,
+        since INTEGER NOT NULL,
+        decided_at INTEGER NOT NULL,
+        outcome TEXT NOT NULL CHECK (outcome IN ('refused', 'pending', 'sent', 'error')),
+        message_ids TEXT NOT NULL DEFAULT '[]',
+        settled_at INTEGER
+      );
+      CREATE INDEX room_egress_ear ON room_egress (ear, decided_at);
+      INSERT INTO room_egress (ear, tool, chat_id, digest, speaker, policy, decision,
+          reason, history, reasons, boundary_known, sources, since, decided_at, outcome,
+          message_ids, settled_at)
+        VALUES ('scribe', 'reply', '${CHANNEL}', 'ab', 'holder', 'observe', 'allow',
+          'observed, not enforced', 'unknown', '[]', 0, '[]', 0, 5, 'sent',
+          '["900000000000000001"]', 6),
+        -- Left pending by that build's process: its intents name no egress row.
+          ('scribe', 'reply', '${CHANNEL}', 'cd', 'holder', 'observe', 'allow',
+          'observed, not enforced', 'unknown', '[]', 0, '[]', 0, 7, 'pending',
+          '[]', NULL);
+    `);
+    const intentColumns = (
+      database.prepare("PRAGMA table_info(outbound_intents)").all() as Array<{
+        name: string;
+      }>
+    ).map((column) => column.name);
+    if (intentColumns.includes("egress_id")) {
+      database.exec("ALTER TABLE outbound_intents DROP COLUMN egress_id");
+    }
+    database.close();
+
+    const h = harness(testConfig(), { path });
+    try {
+      const [old, cutOff] = rows(h);
+      assert.deepEqual(
+        [old!.outcome, old!.messageIds, old!.nonce, old!.resent],
+        ["sent", ["900000000000000001"], null, []],
+      );
+      assert.deepEqual(
+        [cutOff!.outcome, cutOff!.nonce, cutOff!.settledAt],
+        ["unconfirmed", null, h.clock.now()],
+        "no intent of that build names it, so whether it posted is unknown: never error",
+      );
+      const shim = h.attach("scribe", { sessionId: SESSION });
+      losingAnswers(h, { "deploy done": 1 });
+      await h.call(shim, "reply", { chat_id: CHANNEL, text: "deploy done" });
+      const row = rows(h).at(-1)!;
+      assert.equal(row.id, cutOff!.id + 1, "ids go on from the old rows");
+      assert.equal(row.outcome, "unconfirmed");
+    } finally {
+      h.dispose();
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("unconfirmed at startup: of the rows a previous process left pending, a reply with a part still unanswered and a reaction are unconfirmed; a reply whose every part was answered is error, keeping the message credited when Discord confirmed it", () => {
+  const directory = mkdtempSync(join(tmpdir(), "frond-ear-egress-"));
+  const path = join(directory, "ear.db");
+  try {
+    const store = new EventStore(path);
+    const open = (tool: "reply" | "react") =>
+      store.openEgress({
+        ear: "scribe",
+        tool,
+        chatId: CHANNEL,
+        target: null,
+        digest: "ab",
+        sessionId: SESSION,
+        speaker: "holder",
+        policy: "observe",
+        decision: "allow",
+        reason: "observed, not enforced",
+        history: "unknown",
+        reasons: [],
+        boundary: undefined,
+        sources: [],
+        since: 0,
+        decidedAt: 5,
+      });
+    const part = (key: string) => ({ key, id: key, part: 0, parts: 1 });
+    const cutMidSend = open("reply");
+    store.beginSend(
+      "k1",
+      CHANNEL,
+      "a",
+      "n1",
+      300_000,
+      "scribe",
+      part("k1"),
+      cutMidSend,
+    );
+    const cutAfterConfirm = open("reply");
+    store.beginSend(
+      "k2",
+      CHANNEL,
+      "b",
+      "n2",
+      300_000,
+      "scribe",
+      part("k2"),
+      cutAfterConfirm,
+    );
+    store.completeSend("n2", "900000000000000002", CHANNEL);
+    const reaction = open("react");
+    store.close();
+
+    const h = harness(testConfig(), { path });
+    try {
+      assert.deepEqual(
+        rows(h).map((row) => [row.id, row.outcome, row.nonce, row.messageIds]),
+        [
+          [cutMidSend, "unconfirmed", "n1", []],
+          [cutAfterConfirm, "error", null, ["900000000000000002"]],
+          [reaction, "unconfirmed", null, []],
+        ],
+      );
+      assert.ok(rows(h).every((row) => row.settledAt === h.clock.now()));
+      assert.ok(h.logs.some((line) => line.includes('"room.egress_released"')));
+    } finally {
+      h.dispose();
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
   }
 });
 
