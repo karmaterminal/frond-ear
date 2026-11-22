@@ -52,6 +52,7 @@ import type { Notification } from "../render.ts";
 import type {
   CanticleChoice,
   CanticleExposure,
+  CanticleReverted,
   CanticleSettled,
   CanticleShown,
   EventStore,
@@ -369,8 +370,14 @@ export class CanticleDelivery {
   readonly #settled = new Map<string, Map<string, number>>();
   /** Per ear, `refreshKey + "\n" + digest` → when the latest such tombstone lapses. */
   readonly #refreshes = new Map<string, Map<string, number>>();
-  /** Per ear, batch id → the records of a push the host hasn't confirmed yet. */
-  readonly #unconfirmed = new Map<string, Map<number, Waiting[]>>();
+  /**
+   * Per ear, batch id → a push the host hasn't confirmed yet: its records, and the
+   * records it told the session were missed (its footer and stream lines).
+   */
+  readonly #unconfirmed = new Map<
+    string,
+    Map<number, { records: Waiting[]; missed: Map<string, Missed> }>
+  >();
   #timer: unknown;
   #stopped = false;
   #sweptAt: number;
@@ -776,7 +783,7 @@ export class CanticleDelivery {
     }
     state.cursor = cursor;
     for (const waiting of rendered.pushed) this.#unwait(state, waiting);
-    this.#keepUnconfirmed(ear, claimed.batchId, rendered.pushed);
+    this.#keepUnconfirmed(ear, claimed.batchId, rendered.pushed, state.missed);
     state.missed.clear();
     state.lastPushAt = now;
     this.#count(state, cadence === "digest" ? "reports" : "pushes");
@@ -867,11 +874,21 @@ export class CanticleDelivery {
     };
   }
 
-  /** A push a connection took: its records, until the host confirms it or it is reverted. */
-  #keepUnconfirmed(ear: string, batchId: number, records: Waiting[]): void {
-    const kept = this.#unconfirmed.get(ear) ?? new Map<number, Waiting[]>();
+  /** A push a connection took: kept until the host confirms it or it is reverted. */
+  #keepUnconfirmed(
+    ear: string,
+    batchId: number,
+    records: Waiting[],
+    missed: ReadonlyMap<string, Missed>,
+  ): void {
+    const kept =
+      this.#unconfirmed.get(ear) ??
+      new Map<number, { records: Waiting[]; missed: Map<string, Missed> }>();
     this.#unconfirmed.set(ear, kept);
-    kept.set(batchId, [...records]);
+    kept.set(batchId, {
+      records: [...records],
+      missed: new Map([...missed].map(([stream, m]) => [stream, { ...m }])),
+    });
     const oldest = kept.keys().next().value;
     if (oldest !== undefined && kept.size > MAX_UNCONFIRMED) {
       kept.delete(oldest);
@@ -885,16 +902,16 @@ export class CanticleDelivery {
 
   /**
    * The daemon reverted pushes the host never confirmed, and the store gave back their
-   * claims and the cursor from before them (`revertUnconfirmed`). Both are read again from
-   * the store, and the records wait for the next push, as a push no connection took
-   * leaves them; one already off air is counted so, never pushed late. The records of a
-   * push this process didn't make (a crash left it) or no longer keeps are read from the
-   * view on the next pass instead, if they are still on air.
+   * claims, the cursor from before them, and the tombstones of refreshes that collapsed
+   * into them (`revertUnconfirmed`). Cursor and tombstones are read again from the store,
+   * and the records wait for the next push, as a push no connection took leaves them,
+   * along with what that push said was missed; one already off air is counted so, never
+   * pushed late. The records of a push this process didn't make (a crash left it) or no
+   * longer keeps are read from the view on the next pass instead, if they are on air. A
+   * refresh that collapsed into a record that waits again stays collapsed; one whose
+   * record is gone is read again on the next pass, and is news.
    */
-  reverted(
-    ear: string,
-    released: ReadonlyArray<{ batchId: number; identities: readonly string[] }>,
-  ): void {
+  reverted(ear: string, released: readonly CanticleReverted[]): void {
     if (released.length === 0) return;
     const now = this.#deps.clock.now();
     const state = this.#state(ear);
@@ -905,23 +922,42 @@ export class CanticleDelivery {
       ? config.canticle!.delivery[ear]!
       : undefined;
     const kept = this.#unconfirmed.get(ear);
+    let live: Set<string> | undefined;
+    const onAir = () =>
+      (live ??= new Set(liveNow(this.#deps.hear(ear)).map(identity)));
+    /** Records that wait again, or that the next pass reads again from the view. */
+    const again = new Set<string>();
     let records = 0;
     for (const { batchId, identities } of released) {
-      const pushed = kept?.get(batchId);
+      const push = kept?.get(batchId);
       kept?.delete(batchId);
       records += identities.length;
+      for (const [stream, missed] of push?.missed ?? []) {
+        const merged = state.missed.get(stream) ?? { offAir: 0, dropped: 0 };
+        merged.offAir += missed.offAir;
+        merged.dropped += missed.dropped;
+        state.missed.set(stream, merged);
+      }
       for (const id of identities) {
-        const waiting = pushed?.find((record) => record.id === id);
+        const waiting = push?.records.find((record) => record.id === id);
         if (waiting === undefined || delivery === undefined) {
           state.seen.delete(id);
+          if (onAir().has(id)) again.add(id);
           continue;
         }
+        again.add(id);
         if (state.waiting.has(id)) continue;
         if (waiting.expiresAt <= now) {
+          again.delete(id);
           this.#miss(state, waiting.stream, "offAir");
           continue;
         }
         this.#wait(state, waiting, delivery.bufferPerStream);
+      }
+    }
+    for (const { collapsed } of released) {
+      for (const { identity: id, into } of collapsed) {
+        if (!into.some((record) => again.has(record))) state.seen.delete(id);
       }
     }
     this.#count(state, "reverted", released.length);

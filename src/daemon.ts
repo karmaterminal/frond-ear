@@ -306,6 +306,16 @@ const CANTICLE_TUNE =
 /** The window ear_status's canticle custody summary covers; canticle_custody's default. */
 const CUSTODY_WINDOW_MS = 60 * 60 * 1_000;
 
+/** Why naming a canticle push's batch_id echoed nothing, beyond the push's own state (#161). */
+const CANTICLE_REFUSED = {
+  forged:
+    "a canticle push is heard only by the batch_id its event carried, delivery token and all; this one's token is missing or wrong (pass the kind=\"canticle\" event's batch_id as it is)",
+  restarted:
+    "that push went out before frond-ear last restarted, so its delivery token can't be checked any more; hear shows its records again while they are live",
+  reverted:
+    "that push was given back unconfirmed when its connection went, and its records go out again under a new batch_id; name that one",
+} as const;
+
 const ATTACHMENT_RETENTION_MS = 24 * 60 * 60 * 1_000;
 /** How often the daemon sweeps every ear's saved attachments, fetching or not. */
 const ATTACHMENT_SWEEP_MS = 60 * 60 * 1_000;
@@ -545,6 +555,11 @@ export class Daemon {
    * to a tap, so only the push itself carries a token.
    */
   private readonly pushSecret = randomBytes(16);
+  /**
+   * The highest batch id when this process started: a push up to it was named by another
+   * process's `pushSecret`, so its token can't be checked here.
+   */
+  private readonly batchesBefore: number;
   private botLimiter: WakeLimiter;
   private ambientLimiter: WakeLimiter;
   private timer: unknown;
@@ -579,6 +594,7 @@ export class Daemon {
     this.timers = options.timers ?? systemTimers;
     this.botLimiter = new WakeLimiter(options.config.botLoop);
     this.ambientLimiter = new WakeLimiter(options.config.ambientWake);
+    this.batchesBefore = this.store.batchHighWater();
     const repaired = this.store.repairUnscheduled(this.clock.now());
     if (repaired > 0) {
       this.logger.log("warn", "ear.repaired_unscheduled", { repaired });
@@ -1350,7 +1366,16 @@ export class Daemon {
    */
   private revertUnconfirmed(ear: string): number {
     const { batches, canticle } = this.store.revertUnconfirmed(ear);
-    this.canticle?.reverted(ear, canticle);
+    try {
+      this.canticle?.reverted(ear, canticle);
+    } catch (error) {
+      // The store gave the claims back; until a restart reads it again, the delivery's
+      // own copy may hold those records as pushed.
+      this.logger.log("error", "canticle.revert_failed", {
+        ear,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    }
     return batches;
   }
 
@@ -2262,9 +2287,11 @@ export class Daemon {
    * the batch_id the model passed (clamped to what was confirmed), else the
    * latest confirmed batch at call start. Anything offered later stays unseen.
    * A named canticle push is echoed here, at the call (#161): `canticle` says the
-   * id was one, `echoed` how many of its records it echoed, and `forged` that the id
-   * lacked the push's own delivery token, so it echoed nothing. A canticle id names the
-   * canticle stream, never a chat, so it acknowledges no Discord batch in any tool.
+   * id was one, `echoed` how many of its records it echoed, and `refused` why it echoed
+   * nothing when that isn't the push's state: the id lacks the push's own delivery token,
+   * the push went out before this process started, or a revert gave it back. A canticle
+   * id names the canticle stream, never a chat, so it acknowledges no Discord batch in any
+   * tool, a reverted push's id included.
    */
   private seenHorizon(
     client: Client,
@@ -2276,7 +2303,7 @@ export class Daemon {
     horizon: number | undefined;
     canticle: boolean;
     echoed: number;
-    forged?: true;
+    refused?: "forged" | "restarted" | "reverted";
   } {
     if (!this.isAttachedSession(client, ear)) {
       return { horizon: undefined, canticle: false, echoed: 0 };
@@ -2292,20 +2319,34 @@ export class Daemon {
       throw new Error("batch_id must be the batch_id from the event");
     }
     this.provenByUse(client, ear, batch, match[2]);
-    const generation = this.store.canticleBatchGeneration(ear, batch);
-    if (generation !== undefined) {
+    const push = this.store.canticlePush(ear, batch);
+    if (push === "reverted") {
+      return {
+        horizon: undefined,
+        canticle: true,
+        echoed: 0,
+        refused: "reverted",
+      };
+    }
+    if (push !== undefined) {
       // The echo is the session's word that it heard the push, so only the id the push
       // carried counts (🍃 on #112): the bare id is in taps, logs and the store, and is
       // sequential. The token is keyed by the push's own attach generation, so the same
       // session behind a reconnected shim still holds it, and by this process's secret,
-      // so one from before a restart can't be told from a forgery and echoes nothing.
-      return match[2] === this.pushToken(ear, generation, batch)
-        ? {
-            horizon: undefined,
-            canticle: true,
-            echoed: this.echoCanticle(client, ear, batch, tool),
-          }
-        : { horizon: undefined, canticle: true, echoed: 0, forged: true };
+      // so one from before a restart can't be checked and echoes nothing.
+      if (match[2] === this.pushToken(ear, push.generation, batch)) {
+        return {
+          horizon: undefined,
+          canticle: true,
+          echoed: this.echoCanticle(client, ear, batch, tool),
+        };
+      }
+      return {
+        horizon: undefined,
+        canticle: true,
+        echoed: 0,
+        refused: batch <= this.batchesBefore ? "restarted" : "forged",
+      };
     }
     return { horizon: Math.min(batch, latest), canticle: false, echoed: 0 };
   }
@@ -2565,8 +2606,8 @@ export class Daemon {
         if (seen.canticle) {
           // A canticle push's batch_id echoes the push and marks no Discord event
           // seen, with or without chat_id (#161).
-          return seen.forged
-            ? "0 canticle records echoed: a canticle push is heard only by the batch_id its event carried, delivery token and all; this one's token is missing or wrong (pass the kind=\"canticle\" event's batch_id as it is)"
+          return seen.refused !== undefined
+            ? `0 canticle records echoed: ${CANTICLE_REFUSED[seen.refused]}`
             : seen.echoed > 0
               ? `${seen.echoed} canticle record${seen.echoed === 1 ? "" : "s"} echoed as heard`
               : "0 canticle records echoed: already echoed, or the push was never confirmed delivered to this session";

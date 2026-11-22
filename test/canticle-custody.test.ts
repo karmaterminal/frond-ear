@@ -1650,8 +1650,8 @@ test("store: a revert gives back every canticle claim the host never confirmed: 
       assert.deepEqual(released, {
         batches: 2,
         canticle: [
-          { batchId: b, identities: ["k:7:s:2"] },
-          { batchId: c, identities: ["k:7:s:3"] },
+          { batchId: b, identities: ["k:7:s:2"], collapsed: [] },
+          { batchId: c, identities: ["k:7:s:3"], collapsed: [] },
         ],
       });
       assert.equal(store.runtimeState("canticle.cursor.other"), "after 9");
@@ -1680,6 +1680,43 @@ test("store: a revert gives back every canticle claim the host never confirmed: 
       assert.equal(cursor(), "after 6");
       assert.deepEqual(kept(), ["k:7:s:1", "k:7:s:6"]);
       assert.equal(store.isCanticleBatch("scribe", e), false);
+      assert.equal(store.canticlePush("scribe", e), "reverted");
+
+      // A refresh that collapses into an unconfirmed push goes back with it; one that a
+      // confirmed push stands behind stays.
+      const keyed = (seq: number, outcome: "pushed" | "collapsed") => ({
+        ...row(seq),
+        outcome,
+        refreshKey: '["k","s","x"]',
+        digest: "d".repeat(64),
+      });
+      const f = store.claimCanticlePush(
+        "scribe",
+        session,
+        [keyed(7, "pushed")],
+        { name: "canticle.cursor.scribe", value: "after 7", before: "after 6" },
+        [exposure(7)],
+      );
+      store.settleCanticle("scribe", [keyed(8, "collapsed")]);
+      assert.deepEqual(store.revertUnconfirmed("scribe").canticle, [
+        {
+          batchId: f,
+          identities: ["k:7:s:7"],
+          collapsed: [{ identity: "k:7:s:8", into: ["k:7:s:7"] }],
+        },
+      ]);
+      assert.equal(settled().includes("k:7:s:8"), false);
+      const g = store.claimCanticlePush(
+        "scribe",
+        session,
+        [keyed(9, "pushed")],
+        { name: "canticle.cursor.scribe", value: "after 9", before: "after 7" },
+        [exposure(9)],
+      );
+      confirm(g);
+      store.settleCanticle("scribe", [keyed(10, "collapsed")]);
+      store.revertUnconfirmed("scribe");
+      assert.equal(settled().includes("k:7:s:10"), true);
     } finally {
       store.close();
     }

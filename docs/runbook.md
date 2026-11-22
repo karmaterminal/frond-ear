@@ -628,7 +628,8 @@ not delivery: it is written with the push's batch before the push goes out. A pu
 gives its claim back, and its records wait for the next. So does a push the host never confirmed (no `offered` from the
 shim), once frond-ear reverts it: when the session's connection goes, when another shim attaches, when frond-ear stops,
 or, after a crash, at the next attach. Its records then go out once more while they are on air, as a Discord batch's
-events are queued again. What was offered is never pushed again. The price is a rare duplicate: a shim that wrote the event
+events are queued again, and a refresh that collapsed into one of them goes back with it: it stays collapsed if its
+record goes out again, and is news if that record is off air. What was offered is never pushed again. The price is a rare duplicate: a shim that wrote the event
 and died before it said so. A record heard again with a later
 local expiry (a restarted receptor's new δ̂, §14.6.3) keeps its tombstone until then. Once a tombstone has
 lapsed, though, a receptor that hears the record again as new (after a restart, with a later local expiry) can
@@ -694,8 +695,10 @@ report, a non-text payload).
   shim wrote the event, so each push is heard only by its own id. A push the host never confirmed echoes nothing. Only
   the id the push carried counts, delivery token and all: the bare id a tap prints, a forged or another push's token
   echoes nothing, and `ack` says why. The token is keyed by the push's attach, so the same session behind a reconnected
-  shim still holds it, and by the daemon process, so after a frond-ear restart an id from before it echoes nothing:
-  `hear` shows the record again while it is live. The session is the one the host confirmed the push to, by id; only a
+  shim still holds it, and by the daemon process, so after a frond-ear restart an id from before it echoes nothing
+  (`ack` says so): `hear` shows the record again while it is live. A push a revert gave back still names the canticle
+  stream: its id echoes nothing and marks no Discord event seen, and `ack` says to name the push its records went out
+  in again. The session is the one the host confirmed the push to, by id; only a
   push confirmed while no id was known falls back to the attach. A session never echoes what another was shown, even one
   it replaced within the same attach (a `/clear`). The token form also registers the ear by use, as a Discord batch's
   does.
