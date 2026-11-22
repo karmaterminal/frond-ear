@@ -1237,3 +1237,100 @@ test("wake_on comment: 501 baseline comments that still match since fill pages 1
     h.dispose();
   }
 });
+
+/** A commit's combined status as GitHub pages it: per_page defaults to 30, at most 100. */
+function combinedStatus(
+  state: string,
+  statuses: Array<{ context: string; state: string }>,
+) {
+  return (path: string): Route => {
+    const url = new URL(`${API}${path}`);
+    const perPage = Math.min(
+      100,
+      Number(url.searchParams.get("per_page") ?? 30),
+    );
+    const page = Number(url.searchParams.get("page") ?? 1);
+    const last = Math.max(1, Math.ceil(statuses.length / perPage));
+    const base = `${API}${url.pathname}?per_page=${perPage}`;
+    return {
+      body: {
+        state,
+        total_count: statuses.length,
+        statuses: statuses.slice((page - 1) * perPage, page * perPage),
+      },
+      headers:
+        page < last
+          ? {
+              link: `<${base}&page=${page + 1}>; rel="next", <${base}&page=${last}>; rel="last"`,
+            }
+          : {},
+    };
+  };
+}
+
+test("wake_on ci_done reads every commit status, and never certifies done past an incomplete page or a pending aggregate (🌫 N2)", async () => {
+  const contexts = (n: number, state: string) =>
+    Array.from({ length: n }, (_, index) => ({
+      context: `ctx-${index + 1}`,
+      state,
+    }));
+  const cases = [
+    {
+      name: "a pending context beyond the first page",
+      state: "pending",
+      statuses: [
+        ...contexts(30, "success"),
+        { context: "ctx-31", state: "pending" },
+      ],
+      fires: false,
+    },
+    {
+      name: "a failure aggregate with an off-page pending context",
+      state: "failure",
+      statuses: [
+        ...contexts(29, "success"),
+        { context: "ctx-30", state: "failure" },
+        { context: "ctx-31", state: "pending" },
+      ],
+      fires: false,
+    },
+    {
+      name: "every context terminal, beyond the first page",
+      state: "success",
+      statuses: contexts(31, "success"),
+      fires: true,
+    },
+  ];
+  for (const item of cases) {
+    const fake = new FakeGithub();
+    fake.routes.set(`${R}/pulls/27`, {
+      body: { state: "open", head: { sha: S1 } },
+    });
+    fake.routes.set(`${R}/commits/${S1}/check-runs`, {
+      body: { total_count: 0, check_runs: [] },
+    });
+    fake.routes.set(
+      `${R}/commits/${S1}/status`,
+      combinedStatus(item.state, item.statuses),
+    );
+    const h = harness(config(), { githubFetch: fake.fetch });
+    try {
+      const shim = h.attach("scribe", { sessionId: A });
+      await watch(h, shim, { target: "pr", number: 27, on: "ci_done" });
+      await advance(h, 3 * POLL);
+      const events = wakes(shim);
+      if (!item.fires) {
+        assert.equal(events.length, 0, item.name);
+        continue;
+      }
+      assert.equal(events.length, 1, item.name);
+      assert.match(
+        events[0]!.content,
+        /all 0 check runs and 31 commit statuses on 1{40} completed \(31 success\)/u,
+        item.name,
+      );
+    } finally {
+      h.dispose();
+    }
+  }
+});
