@@ -193,9 +193,29 @@ export interface HearOptions {
  * left out and counted. If even that listing can't fit, a short bounded notice.
  */
 export function renderHear(view: HearView, options: HearOptions): string {
+  return hearResult(view, options).text;
+}
+
+/** An item whose payload text a `hear` result shows: `whole`, or `cut` to fit. */
+export interface HeardItem {
+  item: LiveItem;
+  shown: "whole" | "cut";
+}
+
+/**
+ * `renderHear`, and the items whose payload text the result shows, at least in part
+ * (custody of a `hear`, binary-canticle#161). An item left out, shown without its text
+ * (non-text, or cut to nothing) or not rendered at all is not among them.
+ */
+export function hearResult(
+  view: HearView,
+  options: HearOptions,
+): { text: string; heard: HeardItem[] } {
   const max = options.maxChars;
-  const bounded = (text: string) =>
-    text.length <= max ? text : `${text.slice(0, Math.max(0, max - 1))}…`;
+  const bounded = (text: string) => ({
+    text: text.length <= max ? text : `${text.slice(0, Math.max(0, max - 1))}…`,
+    heard: [],
+  });
   if (!view.tuned) {
     return bounded(
       "canticle: this ear tunes no station:stream (config canticle.tune).",
@@ -257,18 +277,25 @@ export function renderHear(view: HearView, options: HearOptions): string {
   };
   const fits = (shown: string[]) => assemble(shown).length <= max;
   const shown: string[] = [];
+  const heard: HeardItem[] = [];
   for (const item of items.slice(0, options.limit)) {
+    let rendered = true;
     // One malformed item must not empty the whole call.
     const render = (textChars?: number) => {
       try {
+        rendered = true;
         return renderItem(item, view.now, textChars);
       } catch {
+        rendered = false;
         return `[canticle:heard] item from "${quotedName(String(item.station))}" could not be rendered; not shown`;
       }
     };
     const full = render();
     if (fits([...shown, full])) {
       shown.push(full);
+      if (rendered && item.text !== undefined) {
+        heard.push({ item, shown: "whole" });
+      }
       continue;
     }
     // Too big whole: show as much payload as fits, the frame intact.
@@ -282,11 +309,12 @@ export function renderHear(view: HearView, options: HearOptions): string {
         else hi = mid - 1;
       }
       shown.push(render(lo));
+      if (rendered && lo > 0) heard.push({ item, shown: "cut" });
     }
     break;
   }
   const out = assemble(shown);
-  if (out.length <= max) return out;
+  if (out.length <= max) return { text: out, heard };
   return bounded(
     `canticle: ${total} live item${total === 1 ? "" : "s"}; the listing doesn't fit limits.maxNotificationChars (${max}). Narrow with stream or raise it.`,
   );

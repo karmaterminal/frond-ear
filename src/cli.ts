@@ -724,9 +724,13 @@ function runTap(argv: string[]): void {
           return;
         }
         if (message.type === "event" && message.batchId !== null) {
-          const chat = message.meta.chat_id ?? "?";
+          // A canticle push is a batch too (binary-canticle#161), with no chat.
+          const where =
+            message.meta.chat_id !== undefined
+              ? `chat_id=${message.meta.chat_id}`
+              : `kind=${message.meta.kind ?? "?"}`;
           process.stdout.write(
-            `[frond-ear] ear=${ear} batch_id=${message.batchId} chat_id=${chat}\n${message.content}\n`,
+            `[frond-ear] ear=${ear} batch_id=${message.batchId} ${where}\n${message.content}\n`,
           );
         }
       },

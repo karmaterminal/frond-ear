@@ -14,7 +14,15 @@ import {
 import { join } from "node:path";
 
 import { DELIVERY_PROOF, targetAdvice } from "./advice.ts";
-import { CanticleDelivery } from "./canticle/delivery.ts";
+import {
+  custodyEntry,
+  custodyView,
+  derivedPublication,
+  type CustodyNow,
+  type CustodyView,
+  type PublicationDecision,
+} from "./canticle/custody.ts";
+import { CanticleDelivery, exposure } from "./canticle/delivery.ts";
 import { messageText } from "./components.ts";
 import { CANTICLE_KEY_ID, CANTICLE_STATION, type Config } from "./config.ts";
 import type { StructuredLogger } from "./logger.ts";
@@ -37,6 +45,7 @@ import {
   renderDigest,
   renderEvent,
   type CatchUpChat,
+  type Notification,
 } from "./render.ts";
 import type { DiscordRest } from "./rest.ts";
 import {
@@ -45,7 +54,7 @@ import {
   type OutboundFile,
 } from "./outbound-files.ts";
 import { chunkMessage, RestError } from "./rest.ts";
-import { renderHear } from "./canticle/hear.ts";
+import { hearResult, iso, type HeardItem } from "./canticle/hear.ts";
 import {
   LETTER_LIMITS,
   leaveLetter,
@@ -57,7 +66,7 @@ import {
   summaryLetters,
 } from "./letters.ts";
 import type { HearView } from "./canticle/receptor.ts";
-import type { EventStore, ReplyPart } from "./store.ts";
+import type { CompactionBoundary, EventStore, ReplyPart } from "./store.ts";
 import type {
   BatchKind,
   Clock,
@@ -156,6 +165,14 @@ export const IDLE_COMPACT = {
   defaultFloor: 200_000,
   afterMs: 54 * 60 * 1_000,
 } as const;
+
+/** When a reading forecasts an idle compaction, or null. A forecast: any request moves it. */
+function idleCompactDue(report: PressureReport): number | null {
+  const floor = report.idleFloor ?? IDLE_COMPACT.defaultFloor;
+  return report.tokens !== null && report.tokens >= floor
+    ? report.at + IDLE_COMPACT.afterMs
+    : null;
+}
 
 /**
  * A session's hold on its own compaction (#107): while it stands, the PreCompact
@@ -285,6 +302,19 @@ function stringArg(
 const SNOWFLAKE = /^\d{1,25}$/u;
 const CANTICLE_TUNE =
   /^(\*|[a-z][a-z0-9-]{0,30}):[a-z][a-z0-9-]{0,30}(\.[a-z][a-z0-9-]{0,30}){0,3}$/u;
+
+/** The window ear_status's canticle custody summary covers; canticle_custody's default. */
+const CUSTODY_WINDOW_MS = 60 * 60 * 1_000;
+
+/** Why naming a canticle push's batch_id echoed nothing, beyond the push's own state (#161). */
+const CANTICLE_REFUSED = {
+  forged:
+    "a canticle push is heard only by the batch_id its event carried, delivery token and all; this one's token is missing or wrong (pass the kind=\"canticle\" event's batch_id as it is)",
+  restarted:
+    "that push went out before frond-ear last restarted, so its delivery token can't be checked any more; hear shows its records again while they are live",
+  reverted:
+    "that push was given back unconfirmed when its connection went, and its records go out again under a new batch_id; name that one",
+} as const;
 
 const ATTACHMENT_RETENTION_MS = 24 * 60 * 60 * 1_000;
 /** How often the daemon sweeps every ear's saved attachments, fetching or not. */
@@ -525,6 +555,11 @@ export class Daemon {
    * to a tap, so only the push itself carries a token.
    */
   private readonly pushSecret = randomBytes(16);
+  /**
+   * The highest batch id when this process started: a push up to it was named by another
+   * process's `pushSecret`, so its token can't be checked here.
+   */
+  private readonly batchesBefore: number;
   private botLimiter: WakeLimiter;
   private ambientLimiter: WakeLimiter;
   private timer: unknown;
@@ -559,6 +594,7 @@ export class Daemon {
     this.timers = options.timers ?? systemTimers;
     this.botLimiter = new WakeLimiter(options.config.botLoop);
     this.ambientLimiter = new WakeLimiter(options.config.ambientWake);
+    this.batchesBefore = this.store.batchHighWater();
     const repaired = this.store.repairUnscheduled(this.clock.now());
     if (repaired > 0) {
       this.logger.log("warn", "ear.repaired_unscheduled", { repaired });
@@ -577,8 +613,17 @@ export class Daemon {
           clock: this.clock,
           timers: this.timers,
           logger: this.logger,
-          attached: (ear) => this.attached.has(ear),
-          push: (ear, notification) => this.pushNotice(ear, notification),
+          session: (ear) => {
+            const client = this.attached.get(ear);
+            return client
+              ? {
+                  generation: client.attachGeneration,
+                  sessionId: client.sessionId ?? null,
+                }
+              : undefined;
+          },
+          push: (ear, batchId, notification) =>
+            this.pushCanticle(ear, batchId, notification),
           silenced: (ear) =>
             this.store
               .attentionOverrides(ear, this.clock.now())
@@ -601,6 +646,50 @@ export class Daemon {
     for (const tap of this.taps.get(ear) ?? []) {
       tap.connection.send(event);
     }
+  }
+
+  /**
+   * A canticle push, named as a Discord batch is (binary-canticle#161): the session's copy
+   * carries `<id>-<token>` as its batch_id and a tap's the bare id. The shim answers
+   * `offered` once it has handed the event to the session; only that makes its records
+   * offered, and only the session naming the whole id makes them echoed. Returns whether
+   * the session's connection took it: a socket already gone takes nothing, and one that
+   * goes after taking it reverts the push when its close is handled.
+   */
+  private pushCanticle(
+    ear: string,
+    batchId: number,
+    notification: Notification,
+  ): boolean {
+    const client = this.attached.get(ear);
+    if (!client) {
+      return false;
+    }
+    const token = this.pushToken(ear, client.attachGeneration, batchId);
+    if (
+      !client.connection.send({
+        type: "event",
+        batchId,
+        content: notification.content,
+        meta: { ...notification.meta, batch_id: `${batchId}-${token}` },
+      })
+    ) {
+      return false;
+    }
+    const tapped = {
+      type: "event",
+      batchId,
+      content: notification.content,
+      meta: { ...notification.meta, batch_id: String(batchId) },
+    } as const;
+    for (const tap of this.taps.get(ear) ?? []) {
+      try {
+        tap.connection.send(tapped);
+      } catch {
+        // A tap's failure never changes what the session was sent.
+      }
+    }
+    return true;
   }
 
   /**
@@ -1263,11 +1352,31 @@ export class Daemon {
       // Socket close events can arrive after shutdown has handed the store
       // back to be closed; shutdown already reverted unconfirmed batches.
       if (!this.stopped) {
-        const reverted = this.store.revertUnconfirmed(ear);
+        const reverted = this.revertUnconfirmed(ear);
         this.logger.log("info", "ear.detached", { ear, reverted });
       }
     }
     client.ear = undefined;
+  }
+
+  /**
+   * Gives back every batch the host never confirmed to this ear: Discord events queue
+   * again, and a canticle push's claim goes back so its records wait again while they
+   * are on air (#161). Returns how many batches.
+   */
+  private revertUnconfirmed(ear: string): number {
+    const { batches, canticle } = this.store.revertUnconfirmed(ear);
+    try {
+      this.canticle?.reverted(ear, canticle);
+    } catch (error) {
+      // The store gave the claims back; until a restart reads it again, the delivery's
+      // own copy may hold those records as pushed.
+      this.logger.log("error", "canticle.revert_failed", {
+        ear,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    }
+    return batches;
   }
 
   private async handleMessage(client: Client, raw: unknown): Promise<void> {
@@ -1290,13 +1399,26 @@ export class Daemon {
         return;
       case "offered":
         // Only the currently attached session may confirm, and only a batch
-        // offered to its own ear and attach generation.
+        // offered to its own ear and attach generation. A canticle push's records
+        // are offered from here, under the session's boundary now (#161).
         if (client.ear && this.isAttachedSession(client, client.ear)) {
-          this.store.confirmBatch(
-            message.batchId,
-            client.ear,
-            client.attachGeneration,
+          const ear = client.ear;
+          const canticle = this.store.atomically(
+            () =>
+              this.store.confirmBatch(
+                message.batchId,
+                ear,
+                client.attachGeneration,
+              ) &&
+              this.store.offerCanticleCustody(ear, message.batchId, {
+                at: this.clock.now(),
+                sessionId: client.sessionId ?? null,
+                boundary: this.boundary(ear),
+              }) > 0,
           );
+          if (canticle) {
+            this.canticle?.confirmed(ear, message.batchId);
+          }
         }
         return;
       case "release":
@@ -1507,7 +1629,7 @@ export class Daemon {
       previous.connection.send({ type: "detached", reason: "superseded" });
       this.detach(previous);
     }
-    this.store.revertUnconfirmed(ear);
+    this.revertUnconfirmed(ear);
     const nonce = this.config.ears[ear]?.attachCanary
       ? (this.options.nonce ?? (() => randomBytes(6).toString("hex")))()
       : null;
@@ -1801,7 +1923,6 @@ export class Daemon {
     if (!report || !client || client.sessionId !== report.sessionId) {
       return null;
     }
-    const floor = report.idleFloor ?? IDLE_COMPACT.defaultFloor;
     return {
       tokens: report.tokens,
       band: report.band,
@@ -1809,11 +1930,34 @@ export class Daemon {
       at: report.at,
       ageMs: Math.max(0, this.clock.now() - report.at),
       receivedAt: report.receivedAt,
-      // A forecast, not a fact: any request before then moves it.
+      idleCompactDueAt: idleCompactDue(report),
+    };
+  }
+
+  /**
+   * The compaction boundary of the session holding the ear, as its pressure hook last
+   * reported it (#98): the marker's id, null when it read none yet, undefined when no
+   * reading from that session is kept. Custody stamps it on every step (#161).
+   */
+  private boundary(ear: string): CompactionBoundary {
+    const client = this.attached.get(ear);
+    const report = this.pressure.get(ear);
+    return client && report && client.sessionId === report.sessionId
+      ? report.boundary
+      : undefined;
+  }
+
+  /** What canticle custody is judged against now: the holder, its boundary, its forecast. */
+  private custodyNow(ear: string): CustodyNow {
+    const client = this.attached.get(ear);
+    const report = this.pressure.get(ear);
+    const boundary = this.boundary(ear);
+    return {
+      session: client ? { id: client.sessionId ?? null } : undefined,
+      boundary,
       idleCompactDueAt:
-        report.tokens !== null && report.tokens >= floor
-          ? report.at + IDLE_COMPACT.afterMs
-          : null,
+        boundary !== undefined && report ? idleCompactDue(report) : null,
+      now: this.clock.now(),
     };
   }
 
@@ -2142,20 +2286,32 @@ export class Daemon {
    * The batch an action acknowledges, fixed *before* any awaited Discord call:
    * the batch_id the model passed (clamped to what was confirmed), else the
    * latest confirmed batch at call start. Anything offered later stays unseen.
+   * A named canticle push is echoed here, at the call (#161): `canticle` says the
+   * id was one, `echoed` how many of its records it echoed, and `refused` why it echoed
+   * nothing when that isn't the push's state: the id lacks the push's own delivery token,
+   * the push went out before this process started, or a revert gave it back. A canticle
+   * id names the canticle stream, never a chat, so it acknowledges no Discord batch in any
+   * tool, a reverted push's id included.
    */
   private seenHorizon(
     client: Client,
     ear: string,
     chatId: string | undefined,
     args: Record<string, unknown>,
-  ): number | undefined {
+    tool: string,
+  ): {
+    horizon: number | undefined;
+    canticle: boolean;
+    echoed: number;
+    refused?: "forged" | "restarted" | "reverted";
+  } {
     if (!this.isAttachedSession(client, ear)) {
-      return undefined;
+      return { horizon: undefined, canticle: false, echoed: 0 };
     }
     const latest = this.store.latestConfirmedBatch(ear, chatId);
     const requested = args.batch_id;
     if (requested === undefined || requested === null || requested === "") {
-      return latest;
+      return { horizon: latest, canticle: false, echoed: 0 };
     }
     const match = /^(\d+)(?:-([0-9a-f]+))?$/u.exec(String(requested));
     const batch = Number(match?.[1]);
@@ -2163,7 +2319,66 @@ export class Daemon {
       throw new Error("batch_id must be the batch_id from the event");
     }
     this.provenByUse(client, ear, batch, match[2]);
-    return Math.min(batch, latest);
+    const push = this.store.canticlePush(ear, batch);
+    if (push === "reverted") {
+      return {
+        horizon: undefined,
+        canticle: true,
+        echoed: 0,
+        refused: "reverted",
+      };
+    }
+    if (push !== undefined) {
+      // The echo is the session's word that it heard the push, so only the id the push
+      // carried counts (🍃 on #112): the bare id is in taps, logs and the store, and is
+      // sequential. The token is keyed by the push's own attach generation, so the same
+      // session behind a reconnected shim still holds it, and by this process's secret,
+      // so one from before a restart can't be checked and echoes nothing.
+      if (match[2] === this.pushToken(ear, push.generation, batch)) {
+        return {
+          horizon: undefined,
+          canticle: true,
+          echoed: this.echoCanticle(client, ear, batch, tool),
+        };
+      }
+      return {
+        horizon: undefined,
+        canticle: true,
+        echoed: 0,
+        refused: batch <= this.batchesBefore ? "restarted" : "forged",
+      };
+    }
+    return { horizon: Math.min(batch, latest), canticle: false, echoed: 0 };
+  }
+
+  /**
+   * The session named a canticle push's whole batch_id in a tool call (#161): that
+   * push's records, and no other push's, are echoed now, under the session's boundary
+   * now. The id is the session's word that it heard them; a push, or a call that names
+   * no id, never is. Returns how many records it echoed.
+   */
+  private echoCanticle(
+    client: Client,
+    ear: string,
+    batch: number,
+    tool: string,
+  ): number {
+    const echoed = this.store.echoCanticleCustody(ear, batch, {
+      at: this.clock.now(),
+      kind: tool,
+      sessionId: client.sessionId ?? null,
+      generation: client.attachGeneration,
+      boundary: this.boundary(ear),
+    });
+    if (echoed > 0) {
+      this.logger.log("info", "canticle.echoed", {
+        ear,
+        batchId: batch,
+        records: echoed,
+        by: tool,
+      });
+    }
+    return echoed;
   }
 
   private markSeenThrough(
@@ -2220,7 +2435,13 @@ export class Daemon {
             ? stringArg(args, "text", true)
             : (stringArg(args, "text") ?? "");
         const replyTo = snowflakeArg(args, "reply_to");
-        const horizon = this.seenHorizon(client, ear, chatId, args);
+        const { horizon } = this.seenHorizon(
+          client,
+          ear,
+          chatId,
+          args,
+          "reply",
+        );
         // Read and checked before anything is posted: a refused file posts nothing.
         const files = await loadOutboundFiles(paths, {
           ear,
@@ -2256,7 +2477,13 @@ export class Daemon {
         const { chatId, ear } = this.requireChat(args);
         const messageId = snowflakeArg(args, "message_id", true);
         const emoji = stringArg(args, "emoji", true);
-        const horizon = this.seenHorizon(client, ear, chatId, args);
+        const { horizon } = this.seenHorizon(
+          client,
+          ear,
+          chatId,
+          args,
+          "react",
+        );
         await this.rest.addReaction(chatId, messageId, emoji);
         this.markSeenThrough(client, ear, chatId, horizon);
         return "reacted";
@@ -2273,7 +2500,13 @@ export class Daemon {
             `message ${messageId} was not sent by frond-ear in chat ${chatId}; only those can be edited`,
           );
         }
-        const horizon = this.seenHorizon(client, ear, chatId, args);
+        const { horizon } = this.seenHorizon(
+          client,
+          ear,
+          chatId,
+          args,
+          "edit_message",
+        );
         await this.rest.editMessage(chatId, messageId, text);
         this.markSeenThrough(client, ear, chatId, horizon);
         return "edited";
@@ -2282,7 +2515,13 @@ export class Daemon {
         const { chatId, ear } = this.requireChat(args);
         const limit = numberArg(args, "limit", 20, 100);
         const before = snowflakeArg(args, "before");
-        const horizon = this.seenHorizon(client, ear, chatId, args);
+        const { horizon } = this.seenHorizon(
+          client,
+          ear,
+          chatId,
+          args,
+          "fetch_messages",
+        );
         const messages = await this.rest.fetchMessages(
           chatId,
           before ? { limit, before } : { limit },
@@ -2363,12 +2602,17 @@ export class Daemon {
         const ear = chatId
           ? this.requireChat(args).ear
           : this.readableEar(client, args);
-        const marked = this.markSeenThrough(
-          client,
-          ear,
-          chatId,
-          this.seenHorizon(client, ear, chatId, args),
-        );
+        const seen = this.seenHorizon(client, ear, chatId, args, "ack");
+        if (seen.canticle) {
+          // A canticle push's batch_id echoes the push and marks no Discord event
+          // seen, with or without chat_id (#161).
+          return seen.refused !== undefined
+            ? `0 canticle records echoed: ${CANTICLE_REFUSED[seen.refused]}`
+            : seen.echoed > 0
+              ? `${seen.echoed} canticle record${seen.echoed === 1 ? "" : "s"} echoed as heard`
+              : "0 canticle records echoed: already echoed, or the push was never confirmed delivered to this session";
+        }
+        const marked = this.markSeenThrough(client, ear, chatId, seen.horizon);
         return `${marked} event${marked === 1 ? "" : "s"} marked seen`;
       }
       case "set_attention":
@@ -2384,13 +2628,20 @@ export class Daemon {
         if (stream !== undefined && !CANTICLE_TUNE.test(stream)) {
           throw new Error("stream must be station:stream (station may be *)");
         }
-        // A read, not a wake: it marks nothing seen and touches no ledger.
-        return renderHear(this.options.canticleHear(ear), {
+        // A read, not a wake: it marks no Discord event seen. What it shows this ear's
+        // own session is custody, an exposure echoed at its return (#161).
+        const { text, heard } = hearResult(this.options.canticleHear(ear), {
           stream,
           limit: numberArg(args, "limit", 10, 50),
           maxChars: this.config.limits.maxNotificationChars,
         });
+        if (heard.length > 0 && this.isAttachedSession(client, ear)) {
+          this.recordHear(client, ear, heard);
+        }
+        return text;
       }
+      case "canticle_custody":
+        return this.canticleCustody(client, args);
       case "fetch_attachment":
         return this.fetchAttachment(args);
       case "hold_compaction":
@@ -2587,6 +2838,174 @@ export class Daemon {
       },
       null,
       2,
+    );
+  }
+
+  /** `hear` showed these payloads to the ear's own session: custody, echoed at the return. */
+  private recordHear(
+    client: Client,
+    ear: string,
+    heard: readonly HeardItem[],
+  ): void {
+    this.store.recordCanticleHear(
+      ear,
+      {
+        generation: client.attachGeneration,
+        sessionId: client.sessionId ?? null,
+      },
+      heard.map(({ item, shown }) =>
+        exposure(
+          item,
+          "hear",
+          this.canticle?.modeOf(ear, item) ?? "off",
+          shown,
+        ),
+      ),
+      this.clock.now(),
+      this.boundary(ear),
+    );
+    this.logger.log("info", "canticle.heard", { ear, records: heard.length });
+  }
+
+  /**
+   * Custody over the ear's exposures claimed in the last `windowMs`, optionally for one
+   * `station:stream` (station may be *). A window reaching back before custody was kept
+   * (a new store, or the prune's cutoff) reads as unknown.
+   */
+  private custodyOver(
+    ear: string,
+    windowMs: number,
+    stream?: string,
+  ): { view: CustodyView; since: number; custodySince: number } {
+    const since = Math.max(0, this.clock.now() - windowMs);
+    const custodySince = this.store.canticleCustodySince();
+    let rows = this.store.canticleCustody(ear, since);
+    if (stream !== undefined) {
+      const at = stream.indexOf(":");
+      const [station, name] = [stream.slice(0, at), stream.slice(at + 1)];
+      rows = rows.filter(
+        (row) =>
+          (station === "*" || row.station === station) && row.stream === name,
+      );
+    }
+    const missing =
+      since < custodySince
+        ? [
+            `custody is kept only from ${iso(custodySince)}, after the window starts`,
+          ]
+        : [];
+    return {
+      view: custodyView(rows, this.custodyNow(ear), missing),
+      since,
+      custodySince,
+    };
+  }
+
+  /**
+   * The canticle_custody tool (#161): per record exposed to the ear's session, whether it
+   * was claimed, offered or echoed, and whether its echo is within the session's current
+   * compaction boundary; the `history` flag; and what the derived-publication seam would
+   * answer for the window. Read-only, and never a payload: identities and digests only.
+   */
+  private canticleCustody(
+    client: Client,
+    args: Record<string, unknown>,
+  ): string {
+    const ear = this.readableEar(client, args);
+    if (!this.options.canticleHear) {
+      return "canticle is not enabled on this daemon (config canticle.enabled).";
+    }
+    const stream = stringArg(args, "stream");
+    if (stream !== undefined && !CANTICLE_TUNE.test(stream)) {
+      throw new Error("stream must be station:stream (station may be *)");
+    }
+    const windowS = numberArg(
+      args,
+      "since_seconds",
+      CUSTODY_WINDOW_MS / 1_000,
+      366 * 24 * 60 * 60,
+    );
+    const limit = numberArg(args, "limit", 20, 100);
+    const { view, since, custodySince } = this.custodyOver(
+      ear,
+      windowS * 1_000,
+      stream,
+    );
+    const newest = [...view.records].sort(
+      (a, b) => b.exposure.claimedAt - a.exposure.claimedAt,
+    );
+    const gate = derivedPublication(
+      this.config.canticle?.derivedPublication === true,
+      view.records.map((record) => record.exposure.identity),
+      view,
+    );
+    const holder = this.attached.get(ear);
+    const boundary = this.boundary(ear);
+    const reading = this.pressure.get(ear);
+    return JSON.stringify(
+      {
+        ear,
+        history: view.history,
+        reasons: view.reasons,
+        window: { since, custodySince, ...(stream ? { stream } : {}) },
+        now: {
+          session: holder ? (holder.sessionId?.slice(0, 8) ?? null) : null,
+          boundary: boundary === undefined ? "unknown" : boundary,
+          // Custody is only as current as this reading: a compaction since it is unseen.
+          boundaryReportedAt:
+            boundary === undefined ? null : (reading?.receivedAt ?? null),
+        },
+        counts: view.counts,
+        records: newest.slice(0, limit).map(custodyEntry),
+        ...(newest.length > limit ? { omitted: newest.length - limit } : {}),
+        publication: gate.open
+          ? `open: the derived op may publish from these ${gate.sources.length} records`
+          : gate.reason,
+      },
+      null,
+      2,
+    );
+  }
+
+  /** ear_status's custody summary: the last CUSTODY_WINDOW_MS, counts and history only. */
+  private custodySummary(ear: string): object {
+    const { view } = this.custodyOver(ear, CUSTODY_WINDOW_MS);
+    return {
+      windowMs: CUSTODY_WINDOW_MS,
+      history: view.history,
+      reasons: view.reasons,
+      counts: view.counts,
+    };
+  }
+
+  /**
+   * The derived-publication seam (binary-canticle#161), for a path that would publish
+   * something derived from these heard records (`key:epoch:stream:seq` each). Closed
+   * unless config canticle.derivedPublication is on and every one was heard whole and
+   * echoed within the current compaction boundary of the session holding the ear; a
+   * record custody doesn't hold reads as unknown. It decides only: no station call, and
+   * never the `sing` route. Nothing in frond-ear calls it yet (binary-canticle#162).
+   */
+  public derivedPublicationGate(
+    ear: string,
+    sources: readonly string[],
+  ): PublicationDecision {
+    const rows = this.store.canticleCustodyOf(ear, sources);
+    const held = new Set(rows.map((row) => row.identity));
+    const absent = [...new Set(sources)].filter((id) => !held.has(id));
+    const view = custodyView(
+      rows,
+      this.custodyNow(ear),
+      absent.length > 0
+        ? [
+            `no custody for ${absent.length} source record${absent.length === 1 ? "" : "s"}`,
+          ]
+        : [],
+    );
+    return derivedPublication(
+      this.config.canticle?.derivedPublication === true,
+      sources,
+      view,
     );
   }
 
@@ -2994,6 +3413,9 @@ export class Daemon {
         const record = this.store.ear(name);
         const client = this.attached.get(name);
         const canticleDelivery = this.canticle?.status(name);
+        const canticleCustody = this.options.canticleHear
+          ? this.custodySummary(name)
+          : undefined;
         return {
           name,
           target: ear.target,
@@ -3019,6 +3441,7 @@ export class Daemon {
           pressure: this.pressureView(name),
           hold: this.holdView(name),
           ...(canticleDelivery ? { canticleDelivery } : {}),
+          ...(canticleCustody ? { canticleCustody } : {}),
         };
       });
     return {
@@ -3090,7 +3513,7 @@ export class Daemon {
     // then stop all further ledger writes before closing connections (their
     // close events arrive asynchronously, after the store may be closed).
     for (const ear of this.attached.keys()) {
-      this.store.revertUnconfirmed(ear);
+      this.revertUnconfirmed(ear);
     }
     this.stopped = true;
     for (const client of this.clients) {

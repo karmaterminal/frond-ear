@@ -141,6 +141,7 @@ const config = (over: Partial<CanticleConfig> = {}): CanticleConfig => ({
   wakeKeys: [],
   muted: false,
   delivery: {},
+  derivedPublication: false,
   ...over,
 });
 
@@ -279,6 +280,7 @@ test("config: canticle defaults and validation", () => {
     wakeKeys: [],
     muted: false,
     delivery: {},
+    derivedPublication: false,
   });
   const bad = (canticle: unknown) => () => parseConfig({ ...base, canticle });
   assert.throws(bad({ enabled: true }), /manifestPath is required/);
