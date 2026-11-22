@@ -465,8 +465,7 @@ names are external text, quoted under a label that says so (at most 600 characte
   faster than GitHub's `x-poll-interval`. Cursors, ETags and baselines are stored, so after a
   restart nothing old is found again.
   - A comment watch's baseline is the highest comment id at registration, read from page 1 and
-    the last page, whatever the list's length. Its polls list comments updated since just before
-    registration and count only higher ids. Deletions or edits can't hide a new one.
+    the last page, whatever the list's length. Its polls list comments updated since just before registration and count only higher ids, reading page 1 and then the list's tail (the last page, walking back while it is all new), so baseline comments that still match can't hide one. Deletions or edits can't hide a new one.
   - A review watch keeps the set of submitted reviews it has seen. Every poll walks the list from
     page 1, each page asked with its ETag. A review begun before the watch and submitted after it
     fires. A PR with more than 1,000 reviews is refused.

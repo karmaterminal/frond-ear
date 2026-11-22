@@ -480,8 +480,13 @@ async function commentBaseline(
 }
 
 /**
- * Comments above the baseline among those updated since `cursor.since`. Page 1 is asked
- * with its ETag while it was not full; later pages, rare, unconditionally.
+ * Comments above the baseline among those updated since `cursor.since`. The list is in
+ * ascending id order, so anything new is at its end: each poll reads page 1, then the
+ * last page Link names, walking back while a page is all above the baseline (or came back
+ * empty because the list shrank between reads). However many baseline comments still
+ * match `since`, every poll reads the newest ones (🌫 on #114); `since` never moves and
+ * no page cursor is kept, so neither can skip a comment. Page 1 is asked with its ETag
+ * only while it was the whole list.
  */
 async function newComments(
   client: GithubClient,
@@ -490,43 +495,69 @@ async function newComments(
   cursor: GithubCursor,
 ): Promise<{ items: ListItem[]; cursor: GithubCursor; pollAfterMs?: number }> {
   const since = cursor.since ?? new Date(0).toISOString();
+  const baseline = cursor.baseline ?? 0;
+  const pagePath = (page: number): string =>
+    `${listPath}?since=${encodeURIComponent(since)}&per_page=100&page=${page}`;
   const etags: Record<string, string> = {};
-  const found: ListItem[] = [];
+  const found = new Map<number, ListItem>();
   let pollAfterMs: number | undefined;
-  for (let page = 1; page <= GITHUB_LIMITS.maxPages; page += 1) {
-    const path = `${listPath}?since=${encodeURIComponent(since)}&per_page=100&page=${page}`;
-    const response = await fetchOk(
-      client,
-      admit,
-      path,
-      page === 1 ? cursor.etags[path] : undefined,
-    );
+  const take = (response: GithubResponse): ListItem[] => {
     pollAfterMs = response.pollIntervalMs ?? pollAfterMs;
-    if (response.status === 304) {
-      etags[path] = cursor.etags[path]!;
-      break;
-    }
     const items = Array.isArray(response.body)
       ? (response.body as ListItem[])
       : [];
     for (const item of items) {
       const id = itemId(item.id);
-      if (id !== undefined && id > (cursor.baseline ?? 0)) {
-        found.push(item);
+      if (id !== undefined && id > baseline) {
+        found.set(id, item);
       }
     }
-    if (page === 1 && items.length < 100 && response.etag) {
-      etags[path] = response.etag;
-    }
-    if (items.length < 100 || !response.hasNext) {
-      break;
-    }
-  }
-  return {
-    items: found,
+    return items;
+  };
+  const done = () => ({
+    items: [...found.values()].sort((a, b) => a.id - b.id),
     cursor: { ...cursor, since, etags },
     ...(pollAfterMs !== undefined ? { pollAfterMs } : {}),
-  };
+  });
+  const firstPath = pagePath(1);
+  const first = await fetchOk(
+    client,
+    admit,
+    firstPath,
+    cursor.etags[firstPath],
+  );
+  if (first.status === 304) {
+    pollAfterMs = first.pollIntervalMs;
+    etags[firstPath] = cursor.etags[firstPath]!;
+    return done();
+  }
+  const firstItems = take(first);
+  if (firstItems.length < 100 || !first.hasNext) {
+    if (first.etag && firstItems.length < 100) {
+      etags[firstPath] = first.etag;
+    }
+    return done();
+  }
+  if (first.lastPage === undefined) {
+    // No rel="last" (GitHub gives one): walk forward, bounded.
+    for (let page = 2; page <= GITHUB_LIMITS.maxPages; page += 1) {
+      const response = await fetchOk(client, admit, pagePath(page));
+      if (take(response).length < 100 || !response.hasNext) {
+        break;
+      }
+    }
+    return done();
+  }
+  let page = first.lastPage;
+  for (let read = 1; read < GITHUB_LIMITS.maxPages && page > 1; read += 1) {
+    const items = take(await fetchOk(client, admit, pagePath(page)));
+    const lowest = items.length > 0 ? itemId(items[0]!.id) : undefined;
+    if (items.length > 0 && (lowest === undefined || lowest <= baseline)) {
+      break;
+    }
+    page -= 1;
+  }
+  return done();
 }
 
 /**
