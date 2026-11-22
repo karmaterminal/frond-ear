@@ -867,7 +867,9 @@ export class EventStore {
       );
     }
     // An earlier build of the egress gate had no `unconfirmed` outcome, nonce or resent:
-    // rebuild its table into this shape, keeping every row and id.
+    // rebuild its table into this shape, keeping every row and id. A row its process left
+    // pending can't be tied to a nonce (that build's intents name no egress row), so
+    // whether it went out is unknown: unconfirmed.
     const egress = this.database
       .prepare(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'room_egress'",
@@ -884,6 +886,12 @@ export class EventStore {
           CREATE INDEX IF NOT EXISTS room_egress_ear
             ON room_egress (ear, decided_at);
         `);
+        this.database
+          .prepare(
+            `UPDATE room_egress SET outcome = 'unconfirmed', settled_at = ?
+             WHERE outcome = 'pending'`,
+          )
+          .run(this.clock.now());
       });
     }
     this.database.exec(`

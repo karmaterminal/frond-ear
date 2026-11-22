@@ -969,7 +969,11 @@ test("unconfirmed: a store from an earlier build of the egress gate (no unconfir
           message_ids, settled_at)
         VALUES ('scribe', 'reply', '${CHANNEL}', 'ab', 'holder', 'observe', 'allow',
           'observed, not enforced', 'unknown', '[]', 0, '[]', 0, 5, 'sent',
-          '["900000000000000001"]', 6);
+          '["900000000000000001"]', 6),
+        -- Left pending by that build's process: its intents name no egress row.
+          ('scribe', 'reply', '${CHANNEL}', 'cd', 'holder', 'observe', 'allow',
+          'observed, not enforced', 'unknown', '[]', 0, '[]', 0, 7, 'pending',
+          '[]', NULL);
     `);
     const intentColumns = (
       database.prepare("PRAGMA table_info(outbound_intents)").all() as Array<{
@@ -983,16 +987,21 @@ test("unconfirmed: a store from an earlier build of the egress gate (no unconfir
 
     const h = harness(testConfig(), { path });
     try {
-      const [old] = rows(h);
+      const [old, cutOff] = rows(h);
       assert.deepEqual(
         [old!.outcome, old!.messageIds, old!.nonce, old!.resent],
         ["sent", ["900000000000000001"], null, []],
+      );
+      assert.deepEqual(
+        [cutOff!.outcome, cutOff!.nonce, cutOff!.settledAt],
+        ["unconfirmed", null, h.clock.now()],
+        "no intent of that build names it, so whether it posted is unknown: never error",
       );
       const shim = h.attach("scribe", { sessionId: SESSION });
       losingAnswers(h, { "deploy done": 1 });
       await h.call(shim, "reply", { chat_id: CHANNEL, text: "deploy done" });
       const row = rows(h).at(-1)!;
-      assert.equal(row.id, old!.id + 1, "ids go on from the old rows");
+      assert.equal(row.id, cutOff!.id + 1, "ids go on from the old rows");
       assert.equal(row.outcome, "unconfirmed");
     } finally {
       h.dispose();
