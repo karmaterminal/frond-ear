@@ -76,6 +76,12 @@ export interface GithubCursor {
    * and count only ids above `baseline`, so no page cursor can go stale (🍃 on #114).
    */
   since?: string;
+  /**
+   * ci_done on a PR: what the last poll read when it found everything complete. Done is
+   * that reading again on the next poll, so a second wave of checks between them holds
+   * it open (🍃 on #114).
+   */
+  settled?: string;
 }
 
 export type GithubFetch = (url: string, init: RequestInit) => Promise<Response>;
@@ -674,16 +680,31 @@ async function pullRequest(
 }
 
 /** Checks on one exact commit: complete only when there are some and all completed. */
+interface CombinedStatus {
+  state?: string;
+  total_count?: number;
+  statuses?: Array<{ context?: string; state?: string }>;
+}
+
+interface Checks {
+  complete: boolean;
+  total: number;
+  runs: NonNullable<CheckRuns["check_runs"]>;
+  statuses: NonNullable<CombinedStatus["statuses"]>;
+  /** What was read, for the two-poll rule. */
+  signature: string;
+}
+
+/**
+ * Check runs and commit statuses on one exact commit. Complete only when there are some,
+ * every check run has completed and no commit status is pending.
+ */
 async function checksOn(
   client: GithubClient,
   spend: Spend,
   target: GithubTarget,
   sha: string,
-): Promise<{
-  complete: boolean;
-  total: number;
-  runs: NonNullable<CheckRuns["check_runs"]>;
-}> {
+): Promise<Checks> {
   const runs: NonNullable<CheckRuns["check_runs"]> = [];
   let total = 0;
   for (let page = 1; page <= GITHUB_LIMITS.maxPages; page += 1) {
@@ -699,53 +720,91 @@ async function checksOn(
       break;
     }
   }
+  const combined = (
+    await fetchOk(
+      client,
+      spend,
+      `${repoPath(target.repo)}/commits/${segment(sha)}/status`,
+    )
+  ).body as CombinedStatus | undefined;
+  // With no statuses GitHub's combined state reads "pending": only real ones count.
+  const statuses = Array.isArray(combined?.statuses) ? combined.statuses : [];
   const complete =
-    total > 0 &&
+    total + statuses.length > 0 &&
     runs.length >= total &&
-    runs.every((run) => run.status === "completed");
-  return { complete, total, runs };
+    runs.every((run) => run.status === "completed") &&
+    statuses.every((status) => word(status.state) !== "pending");
+  const signature = [
+    ...runs.map(
+      (run) =>
+        `run:${String(run.name ?? "")}:${word(run.status)}:${word(run.conclusion)}`,
+    ),
+    ...statuses.map(
+      (status) =>
+        `status:${String(status.context ?? "")}:${word(status.state)}`,
+    ),
+  ]
+    .sort()
+    .join("|");
+  return { complete, total, runs, statuses, signature };
 }
 
 function checkFacts(
   target: GithubTarget,
   sha: string,
-  runs: NonNullable<CheckRuns["check_runs"]>,
+  checks: Checks,
   now: number,
   currentHead: string | undefined,
-  already: boolean,
 ): WakeFacts {
+  const { runs, statuses } = checks;
   const counts = new Map<string, number>();
-  for (const run of runs) {
-    const conclusion = word(run.conclusion);
-    counts.set(conclusion, (counts.get(conclusion) ?? 0) + 1);
+  for (const outcome of [
+    ...runs.map((run) => word(run.conclusion)),
+    ...statuses.map((status) => word(status.state)),
+  ]) {
+    counts.set(outcome, (counts.get(outcome) ?? 0) + 1);
   }
   const summary = [...counts.entries()]
-    .map(([conclusion, count]) => `${count} ${conclusion}`)
+    .map(([outcome, count]) => `${count} ${outcome}`)
     .join(", ");
+  const what = `${runs.length} check run${runs.length === 1 ? "" : "s"}${
+    statuses.length > 0
+      ? ` and ${statuses.length} commit status${statuses.length === 1 ? "" : "es"}`
+      : ""
+  }`;
   const lines = [
-    `${describeTarget(target)}: all ${runs.length} check run${runs.length === 1 ? "" : "s"} on ${sha} completed (${summary}); observed ${stamp(now)}${already ? ", already complete when the watch was set" : ""}. Completed is not success: read each conclusion.`,
+    `${describeTarget(target)}: all ${what} on ${sha} completed (${summary}), the same on two polls in a row; observed ${stamp(now)}. Completed is not success: read each conclusion.`,
   ];
   if (currentHead !== undefined && currentHead !== sha) {
     lines.push(
       `the PR's head is now ${currentHead}, not ${sha}: this result is for ${sha} only, not for the current head.`,
     );
   }
-  return {
-    lines,
-    url: htmlUrl(target),
-    quoted: [
-      {
-        label: "check runs (names as GitHub gave them)",
-        text: runs
-          .slice(0, 20)
-          .map(
-            (run) =>
-              `${String(run.name ?? "unnamed").slice(0, 100)}: ${word(run.conclusion)}`,
-          )
-          .join("\n"),
-      },
-    ],
-  };
+  const quoted = [
+    {
+      label: "check runs (names as GitHub gave them)",
+      text: runs
+        .slice(0, 20)
+        .map(
+          (run) =>
+            `${String(run.name ?? "unnamed").slice(0, 100)}: ${word(run.conclusion)}`,
+        )
+        .join("\n"),
+    },
+  ];
+  if (statuses.length > 0) {
+    quoted.push({
+      label: "commit statuses (contexts as GitHub gave them)",
+      text: statuses
+        .slice(0, 20)
+        .map(
+          (status) =>
+            `${String(status.context ?? "unnamed").slice(0, 100)}: ${word(status.state)}`,
+        )
+        .join("\n"),
+    });
+  }
+  return { lines, url: htmlUrl(target), quoted };
 }
 
 function itemFacts(
@@ -911,15 +970,12 @@ export async function baseline(
         }
         const bound = { ...target, head };
         const checks = await checksOn(client, spend, bound, head);
-        const watching = { ...read.cursor, currentHead: head };
-        if (checks.complete) {
-          return {
-            kind: "fire",
-            target: bound,
-            cursor,
-            facts: checkFacts(bound, head, checks.runs, now, head, true),
-          };
-        }
+        // Complete already: the first poll confirms it, as any other done.
+        const watching: GithubCursor = {
+          ...read.cursor,
+          currentHead: head,
+          ...(checks.complete ? { settled: checks.signature } : {}),
+        };
         return { kind: "ready", target: bound, cursor: watching };
       }
     }
@@ -1043,12 +1099,16 @@ export async function poll(
         : (cursor.currentHead ?? head);
     const next: GithubCursor = { ...read.cursor, currentHead: current };
     const checks = await checksOn(client, spend, target, head);
-    if (checks.complete) {
+    delete next.settled;
+    if (checks.complete && cursor.settled === checks.signature) {
       return {
         kind: "fire",
-        facts: checkFacts(target, head, checks.runs, now, current, false),
+        facts: checkFacts(target, head, checks, now, current),
         cursor: next,
       };
+    }
+    if (checks.complete) {
+      next.settled = checks.signature;
     }
     if (current !== head) {
       return {
