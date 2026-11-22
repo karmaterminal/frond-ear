@@ -30,14 +30,14 @@
 //
 // A tombstone is a dedupe claim, not delivery (binary-canticle#161). Each push is a batch:
 // its claim (batch, tombstones, cursor, a custody row per record) is written in one
-// transaction before the push, so a crash never repeats one. A push no session's
-// connection takes gives its claim back, and its records wait. So does a push the host
-// never confirmed, when the daemon reverts its unconfirmed batches (the session's
-// connection went, a new one attached, or frond-ear stopped): at most once holds for what
-// was offered, not for what was only claimed (🍃 on #112), so its records wait again and
-// go out once more while they are on air. Only the host's word makes a record offered,
-// and only the session naming that push's batch_id makes it echoed (custody.ts); a push
-// alone never counts as heard.
+// transaction before the push. A push no session's connection takes gives its claim
+// back, and its records wait. So does a push the host never confirmed, when the daemon
+// reverts its unconfirmed batches (the session's connection went, a new one attached,
+// frond-ear stopped, or the first attach after a crash): at most once holds for what was
+// offered, not for what was only claimed (🍃 on #112), so its records wait again and go
+// out once more while they are on air. Only the host's word makes a record offered, and
+// only the session naming that push's whole batch_id makes it echoed (custody.ts); a
+// push alone never counts as heard.
 
 import { createHash } from "node:crypto";
 
@@ -873,8 +873,9 @@ export class CanticleDelivery {
     this.#unconfirmed.set(ear, kept);
     kept.set(batchId, [...records]);
     const oldest = kept.keys().next().value;
-    if (kept.size > MAX_UNCONFIRMED && oldest !== undefined)
+    if (oldest !== undefined && kept.size > MAX_UNCONFIRMED) {
       kept.delete(oldest);
+    }
   }
 
   /** The host confirmed canticle push `batchId` (its `offered`): no revert can take it back. */

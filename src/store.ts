@@ -968,10 +968,9 @@ export class EventStore {
    * Opens a canticle push, in one transaction, before anything is pushed: its batch, the
    * tombstones that claim its records for dedupe, the delivery cursor (`value`; `before`
    * is kept until the host confirms the push, for a revert to give back), and one custody
-   * row per record, claimed. A crash after this repeats nothing: the push stays claimed
-   * until the next attach reverts it. Nothing here says the session got it: that is
-   * `offerCanticleCustody`, on the host's word. Returns the batch id, which the push
-   * carries as its batch_id.
+   * row per record, claimed. After a crash the push stays claimed until the next attach
+   * reverts it. Nothing here says the session got it: that is `offerCanticleCustody`, on
+   * the host's word. Returns the batch id, which the push carries as its batch_id.
    */
   public claimCanticlePush(
     ear: string,

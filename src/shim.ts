@@ -152,7 +152,7 @@ export const TOOLS = [
   {
     name: "ack",
     description:
-      'Mark events seen without replying, when you read them and chose not to answer. Pass chat_id and the event\'s batch_id: without chat_id it covers every chat of this ear, and without batch_id everything delivered so far. A kind="canticle" event\'s batch_id tells frond-ear you heard that push, and earlier ones, and marks no Discord event seen; a push you never name counts as offered, never heard. With nonce instead (from the kind="attach" event), it confirms that events reach you and marks nothing. "unknown or already-used nonce" means the ear is already confirmed, the nonce is from an earlier attach, or this session no longer holds the ear: check ear_status instead of retrying.',
+      'Mark events seen without replying, when you read them and chose not to answer. Pass chat_id and the event\'s batch_id: without chat_id it covers every chat of this ear, and without batch_id everything delivered so far. A kind="canticle" event\'s batch_id, passed whole as the event shows it, tells frond-ear you heard that push (that one only) and marks no Discord event seen; a push you never name counts as offered, never heard. With nonce instead (from the kind="attach" event), it confirms that events reach you and marks nothing. "unknown or already-used nonce" means the ear is already confirmed, the nonce is from an earlier attach, or this session no longer holds the ear: check ear_status instead of retrying.',
     inputSchema: {
       type: "object",
       properties: {
@@ -472,7 +472,8 @@ export class ChannelShim {
         }
         this.calls.clear();
         // Held events were never written, so their batches are unoffered: the daemon queues
-        // them again and pushes them anew when this shim re-attaches.
+        // them again (a canticle push's records, while they are on air) and pushes them anew
+        // when this shim re-attaches.
         this.pendingEvents.length = 0;
         if (wasConnected) {
           this.log("daemon connection lost; reconnecting");

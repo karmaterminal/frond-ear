@@ -586,8 +586,8 @@ and `source` still need a restart.
 **What the session gets.** Channel events with `kind="canticle"` and `delivery="immediate"` (the new records of
 the last few seconds) or `delivery="report"` (a "what's on the radio" report, `report=<n>`). Each push is a batch
 of its own, outside the Discord ledger: it carries a `batch_id`, with the delivery token as a Discord batch's does,
-and touches no Discord event. Passing that `batch_id` to `ack` on its own is how the session says it heard the push
-([Custody](#custody-and-confirmation-binary-canticle161)). Each record carries the `[canticle:heard]` banner `hear` shows,
+and touches no Discord event. Passing that `batch_id`, whole, to `ack` on its own is how the session says it heard
+the push ([Custody](#custody-and-confirmation-binary-canticle161)). Each record carries the `[canticle:heard]` banner `hear` shows,
 with `mode=silent-wake`, and its payload quoted inside an `EXTERNAL_UNTRUSTED_CONTENT` wrapper. A report gives
 the on-air line, then each `station:stream` in order with its records in seq order, under a line that counts them
 and says what it skipped since the last report (seqs lost on air, plucked or `hear`-only), what came out of
@@ -624,8 +624,12 @@ stream and seq, which record v1's `idem` spells out (the stream by name, one to 
 words under a new seq are new speech, and a retransmission is not. A pushed record keeps a tombstone in the store
 until its local expiry plus 5 s (RFC §14.18.5), so no retransmission, `resurfaced` record, join snapshot or
 frond-ear restart pushes it twice, and digest and immediate never both push it. The tombstone is a dedupe claim,
-not delivery: it is written with the push's batch before the push goes out, so a crash after it loses that push and
-never repeats it. A push that no session's connection takes gives its claim back, and its records wait for the next. A record heard again with a later
+not delivery: it is written with the push's batch before the push goes out. A push that no session's connection takes
+gives its claim back, and its records wait for the next. So does a push the host never confirmed (no `offered` from the
+shim), once frond-ear reverts it: when the session's connection goes, when another shim attaches, when frond-ear stops,
+or, after a crash, at the next attach. Its records then go out once more while they are on air, as a Discord batch's
+events are queued again. What was offered is never pushed again. The price is a rare duplicate: a shim that wrote the event
+and died before it said so. A record heard again with a later
 local expiry (a restarted receptor's new δ̂, §14.6.3) keeps its tombstone until then. Once a tombstone has
 lapsed, though, a receptor that hears the record again as new (after a restart, with a later local expiry) can
 have it pushed once more, still within §14.18.5's bound; it is marked late if it is older than `maxAgeMs` by
@@ -647,7 +651,8 @@ what is on air: what was pushed stays pushed, and a record sung meanwhile goes o
 (`pushes`, `reports`, `records_pushed`, and of those `records_pushed_late`), sent from `immediate` to a report
 for its age (`routed_late`), passed over (`not_allowlisted`, `relayed`, `wake_derived`, `off`, `muted`,
 `refresh_collapsed`), went off air unpushed (`off_air_unpushed`) or was dropped from a full buffer (`dropped`),
-pushes that didn't fit at all (`too_big`), and pushes no session's connection took (`unsent`; their records waited
+pushes that didn't fit at all (`too_big`), pushes the host never confirmed before they were reverted (`reverted`;
+their records waited again), and pushes no session's connection took (`unsent`; their records waited
 for the next push). Pushed means handed to the session's connection, not heard: `ears[].canticleCustody` says what
 the session confirmed ([Custody](#custody-and-confirmation-binary-canticle161)).
 
@@ -661,7 +666,7 @@ the RFC hasn't been amended to match yet (binary-canticle#100 tracks the amendme
 | §14.10                    | Only `alarm` may wake, when all 11 conditions hold; until S3 passes, deployments behave as if nothing wakes.                                                                                                       | Any class from an allowlisted key is pushed. Kept: verified and not under the host daemon's MUTE, an allowlist (in place of the alarm capability), the ear's opt-in, hop 0 and not wake-derived, coalescing of at least 5 s, the breaker, and item 9's freshness bound for `immediate` (`maxAgeMs`, 30 s by default and at most 120 s, on the age at first hearing and on the time since). A report may still carry an older record, marked late. Not applied: the class rule, the session, host and token budgets (a per-ear cap on pushes per hour instead), host prerequisites and proofreading. |
 | §14.12, BC-1              | No ambient delivery to a session with an off-host channel route, such as Discord, until §23.2 question 22 is settled.                                                                                              | A frond-ear session has a Discord route by design. It already takes the same agents' Discord messages as `peer_agent` events, outside any untrusted-content wrapper, so canticle adds no new trust level; this holds for frond-ear hosts only. Pushes come behind the banner and wrapper; frond-ear can't taint what the session does next.                                                                                                                                                                                                                                                         |
 | §14.16 item 3 (A11)       | Chatter, ambient and advisory items land after a random per-session delay.                                                                                                                                         | No delay beyond the debounce or window. This is agreed for frond-ear hosts; revisit it before an agent on another harness opts in.                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| §14.18.3 (D36)            | Join-snapshot entries and `resurfaced` records never wake a session.                                                                                                                                               | One already pushed is never pushed again; one never pushed goes out once, so each record is heard once across a dropped link (#65). It is marked `late: … (snapshot)` or `(resurfaced)`, and goes `immediate` only within `maxAgeMs`; an older one goes into the next report.                                                                                                                                                                                                                                                                                                                       |
+| §14.18.3 (D36)            | Join-snapshot entries and `resurfaced` records never wake a session.                                                                                                                                               | One already pushed is never pushed again (unless the host never confirmed it and frond-ear reverted it; see Exactly once); one never pushed goes out once, so each record is heard once across a dropped link (#65). It is marked `late: … (snapshot)` or `(resurfaced)`, and goes `immediate` only within `maxAgeMs`; an older one goes into the next report.                                                                                                                                                                                                                                      |
 | §14.18.4                  | A half-open breaker allows a wake within its allowance.                                                                                                                                                            | Half-open holds, as open does.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 
 ### Custody and confirmation (binary-canticle#161)
@@ -675,7 +680,7 @@ its SQLite store, for `limits.retentionMs`:
 | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | claimed | The push's batch, its records' dedupe tombstones, the cursor and these rows are written in one transaction; then the push goes to the session's connection. | When, the session (its id as its shim gave it, and its attach generation), the record (station, stream, key id, epoch, seq and a SHA-256 of its whole payload, never the text), `path` (`immediate` or `report`), `mode` and `shown`. |
 | offered | The shim (or the Copilot extension) answers `offered` for the batch: it handed the event to the session.                                                    | When, the session it went to, and its compaction boundary then.                                                                                                                                                                       |
-| echoed  | The session names the push's `batch_id` in `ack`, `reply`, `react`, `edit_message` or `fetch_messages`.                                                     | When, the tool, the session, and its boundary then.                                                                                                                                                                                   |
+| echoed  | The session names the push's whole `batch_id`, delivery token and all, in `ack`, `reply`, `react`, `edit_message` or `fetch_messages`.                      | When, the tool, the session, and its boundary then.                                                                                                                                                                                   |
 
 `mode` is the ear's effective mode for the record's station then (a record too old for `immediate` shows `mode:
 immediate`, `path: report`). `shown` is how much of it the push showed: `whole`, `cut` to fit, or `none` (a `counts`
@@ -685,11 +690,15 @@ report, a non-text payload).
   `batch_id` names the canticle stream, never a chat: in any tool, with or without `chat_id`, it echoes the push and
   marks no Discord event seen. The echo is the id in the call, so it counts even if the call then fails (a Discord
   error, a refused file).
-- **Naming a push echoes the earlier ones** shown to the same session, as a later Discord batch settles its chat. The
-  session is the one the host confirmed each push to, by id; only a push confirmed while no id was known falls back to
-  the attach. Such a record shows `echoedThrough: "a later push"`. A session never echoes what another was shown, even
-  one it replaced within the same attach (a `/clear`). The bare id a tap prints echoes too, since the tap shows the same
-  push; the token form also registers the ear by use, as a Discord batch's does.
+- **Naming a push echoes that push alone.** Unlike a Discord batch, it settles nothing earlier: `offered` only says the
+  shim wrote the event, so each push is heard only by its own id. A push the host never confirmed echoes nothing. Only
+  the id the push carried counts, delivery token and all: the bare id a tap prints, a forged or another push's token
+  echoes nothing, and `ack` says why. The token is keyed by the push's attach, so the same session behind a reconnected
+  shim still holds it, and by the daemon process, so after a frond-ear restart an id from before it echoes nothing:
+  `hear` shows the record again while it is live. The session is the one the host confirmed the push to, by id; only a
+  push confirmed while no id was known falls back to the attach. A session never echoes what another was shown, even one
+  it replaced within the same attach (a `/clear`). The token form also registers the ear by use, as a Discord batch's
+  does.
 - **`hear` is an exposure too.** Each record whose payload text `hear` returns to the ear's own session is a row with
   `path: "hear"`, offered and echoed at the tool's return. Another reader's `hear`, and a record it lists without its
   text (non-text, or cut to nothing), add nothing.
@@ -697,9 +706,12 @@ report, a non-text payload).
   transcript holds, `null` before the first. Without that hook run with `--ear`, and after a daemon restart until it
   reports again, the boundary is unknown. Custody is only as current as that reading: add the `PostCompact` hook so a
   compaction is seen at once.
-- **A push nobody confirms stays claimed.** If the shim never answers `offered` (it held the event through its settle
-  window and lost the daemon, say), the record stays `claimed` and is not pushed again: a push is lost rather than
-  repeated, as before. Custody just stops calling it pushed and heard.
+- **A push nobody confirms is given back.** If the shim never answers `offered` (it held the event through its settle
+  window and lost the daemon, say), the push stays `claimed` only while that attach lasts. When frond-ear reverts it (the
+  connection goes, another shim attaches, frond-ear stops, or the first attach after a crash), its custody rows,
+  tombstones and cursor go back, and the records are pushed again while they are on air (🍃 on #112): at most once holds
+  for what was offered, not for what was only claimed. A push onto a socket that is already gone is given back at once,
+  as `unsent`.
 
 The `canticle_custody` tool answers for the ear, newest first, by identity and digest, never payload
 (`since_seconds`, default 3600; `stream` narrows it; `limit`, default 20). `ear_status` carries the same counts,
@@ -712,7 +724,7 @@ state, so a `hear` after a compaction brings it back:
 | `echoed_before_boundary`  | Echoed before the current boundary, or by another session: it was exposed and is no longer in context. So is a record offered before a compaction and echoed after it: only its id outlasted the cut. |
 | `echoed_boundary_unknown` | Echoed, but a boundary then or now is unknown.                                                                                                                                                        |
 | `offered`                 | The host handed it over; the session never echoed it.                                                                                                                                                 |
-| `claimed`                 | Pushed to the session's connection; the host never confirmed it.                                                                                                                                      |
+| `claimed`                 | Pushed to the session's connection; the host hasn't confirmed it. A revert gives it back, so it is pushed again.                                                                                      |
 
 `history` is `complete` when every record exposed in the window was offered and echoed within the current boundary;
 `incomplete` when one is `claimed`, `offered` or `echoed_before_boundary`; and `unknown` when no session holds the
