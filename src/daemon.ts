@@ -23,8 +23,33 @@ import {
   type PublicationDecision,
 } from "./canticle/custody.ts";
 import { CanticleDelivery, exposure } from "./canticle/delivery.ts";
+import {
+  DERIVED_TEXT_MAX_BYTES,
+  ELECTION_ID,
+  derivedCapability,
+  derivedLineage,
+  derivedTextFits,
+  noAnswer,
+  payloadDigest,
+  publishRequest,
+  queryRequest,
+  receiptFor,
+  stationWords,
+  type DerivedLineage,
+  type DerivedOutcome,
+  type DerivedRoute,
+} from "./canticle/derived.ts";
 import { messageText } from "./components.ts";
 import { CANTICLE_KEY_ID, CANTICLE_STATION, type Config } from "./config.ts";
+import {
+  RoomEgress,
+  RoomRefused,
+  unplaced,
+  type DiscordReads,
+  type RoomOutput,
+  type RoomPermit,
+  type SpeakerCustody,
+} from "./egress.ts";
 import type { StructuredLogger } from "./logger.ts";
 import {
   WakeLimiter,
@@ -53,7 +78,7 @@ import {
   loadOutboundFiles,
   type OutboundFile,
 } from "./outbound-files.ts";
-import { chunkMessage, RestError } from "./rest.ts";
+import { chunkMessage, definitive, RestError } from "./rest.ts";
 import { hearResult, iso, type HeardItem } from "./canticle/hear.ts";
 import {
   LETTER_LIMITS,
@@ -108,6 +133,11 @@ export interface DaemonOptions {
    * reinstall must reach this daemon's socket). Default: process.env.
    */
   env?: NodeJS.ProcessEnv;
+  /**
+   * The owner's route for derived publication (binary-canticle#161 item 4): the issuer of
+   * capsules and a station's control socket. Absent (the CLI wires none): closed.
+   */
+  derivedRoute?: DerivedRoute;
 }
 
 interface Client {
@@ -445,6 +475,18 @@ function fileIdentity(files: readonly OutboundFile[]): string {
   return files.map((file) => `\nfile ${file.sha256} ${file.name}`).join("");
 }
 
+/** A reply's identity (#55): its chat, reply_to, whole text and files, hashed. */
+function replyKey(
+  chatId: string,
+  replyTo: string | undefined,
+  text: string,
+  files: readonly OutboundFile[],
+): string {
+  return createHash("sha256")
+    .update(`${chatId}\n${replyTo ?? ""}\n${text}${fileIdentity(files)}`)
+    .digest("hex");
+}
+
 /** Whole minutes and seconds, rounded down: "4 minutes 59 seconds". */
 function duration(ms: number): string {
   const seconds = Math.floor(ms / 1_000);
@@ -520,11 +562,14 @@ function replyFailure(
 export class Daemon {
   private config: Config;
   private readonly store: EventStore;
-  private readonly rest: DiscordRest;
+  /** Discord reads. Every write goes through `egress`, the room-output gate (#161). */
+  private readonly rest: DiscordReads;
+  private readonly egress: RoomEgress;
   private readonly logger: StructuredLogger;
   private readonly clock: Clock;
   private readonly timers: Timers;
-  private readonly options: DaemonOptions;
+  /** Without `rest`: the egress gate holds Discord's writes, and nothing else here. */
+  private readonly options: Omit<DaemonOptions, "rest">;
   private readonly clients = new Set<Client>();
   private readonly attached = new Map<string, Client>();
   /**
@@ -583,21 +628,35 @@ export class Daemon {
   private lastCatchUp: CatchUpRun | undefined;
   /** Canticle's push to sessions (frond-ear#65); present whenever a receptor runs. */
   private readonly canticle: CanticleDelivery | undefined;
+  /** Derived publications this process is still working on, by row id (#161). */
+  private readonly derivedInFlight = new Set<number>();
 
   public constructor(options: DaemonOptions) {
-    this.options = options;
+    const { rest, ...kept } = options;
+    this.options = kept;
     this.config = options.config;
     this.store = options.store;
-    this.rest = options.rest;
+    this.rest = rest;
     this.logger = options.logger;
     this.clock = options.clock ?? systemClock;
     this.timers = options.timers ?? systemTimers;
+    this.egress = new RoomEgress(rest, this.store, this.clock);
     this.botLimiter = new WakeLimiter(options.config.botLoop);
     this.ambientLimiter = new WakeLimiter(options.config.ambientWake);
     this.batchesBefore = this.store.batchHighWater();
     const repaired = this.store.repairUnscheduled(this.clock.now());
     if (repaired > 0) {
       this.logger.log("warn", "ear.repaired_unscheduled", { repaired });
+    }
+    // No publish of this process owns a row yet: one left issuing never reached the station.
+    const released = this.store.releaseIssuingDerived(this.clock.now());
+    if (released > 0) {
+      this.logger.log("warn", "canticle.derived_released", { released });
+    }
+    // Nor does any call own an egress row: one left pending was cut off mid-call.
+    const cutOff = this.store.releasePendingEgress(this.clock.now());
+    if (cutOff > 0) {
+      this.logger.log("warn", "room.egress_released", { rows: cutOff });
     }
     // The config may have changed while the daemon was down: re-check every
     // persisted queue against current routing and modes before any session
@@ -2451,12 +2510,17 @@ export class Daemon {
         });
         // Superseded sessions included; null for a script or a tools-only shim.
         const sessionEar = client.attachedAs ?? null;
-        const { ids, earlier } = await this.sendReply(
-          chatId,
-          text,
-          replyTo,
-          sessionEar,
-          files,
+        const { ids, earlier } = await this.roomOutput(
+          client,
+          ear,
+          {
+            tool: "reply",
+            chatId,
+            replyTo,
+            identity: replyKey(chatId, replyTo, text, files),
+          },
+          (permit) =>
+            this.sendReply(permit, chatId, text, replyTo, sessionEar, files),
         );
         this.markSeenThrough(client, ear, chatId, horizon);
         this.store.increment("replies_sent");
@@ -2484,7 +2548,12 @@ export class Daemon {
           args,
           "react",
         );
-        await this.rest.addReaction(chatId, messageId, emoji);
+        await this.roomOutput(
+          client,
+          ear,
+          { tool: "react", chatId, messageId, emoji },
+          (permit) => permit.apply(),
+        );
         this.markSeenThrough(client, ear, chatId, horizon);
         return "reacted";
       }
@@ -2507,7 +2576,12 @@ export class Daemon {
           args,
           "edit_message",
         );
-        await this.rest.editMessage(chatId, messageId, text);
+        await this.roomOutput(
+          client,
+          ear,
+          { tool: "edit_message", chatId, messageId, text },
+          (permit) => permit.apply(),
+        );
         this.markSeenThrough(client, ear, chatId, horizon);
         return "edited";
       }
@@ -2967,6 +3041,113 @@ export class Daemon {
     );
   }
 
+  /**
+   * The one way a tool writes to a Discord room (binary-canticle#161 item 3). The egress
+   * gate reads the speaking session's custody now, asks config canticle.roomPolicy, and
+   * records the row before anything is sent; a refusal throws, and nothing is sent.
+   * `write` gets the permit, the only thing that can make the Discord call, for this
+   * output alone, and how it went is recorded on the row. A retry or replay comes back
+   * through here, so it is checked again; an earlier allow is never reused.
+   */
+  private async roomOutput<T>(
+    client: Client,
+    chatEar: string,
+    output: RoomOutput,
+    write: (permit: RoomPermit) => Promise<T>,
+  ): Promise<T> {
+    const policy = this.config.canticle?.roomPolicy ?? "observe";
+    let permit: RoomPermit;
+    try {
+      permit = this.egress.open(
+        output,
+        policy,
+        this.speakerCustody(client, chatEar),
+      );
+    } catch (error) {
+      if (error instanceof RoomRefused) {
+        this.logger.log("warn", "room.refused", {
+          tool: output.tool,
+          chatId: output.chatId,
+          policy,
+          egressId: error.egressId,
+          reason: error.reason,
+        });
+      }
+      throw error;
+    }
+    try {
+      const result = await write(permit);
+      if (!this.stopped) permit.settle("sent");
+      return result;
+    } catch (error) {
+      // After shutdown the store may be closed: the row stays pending, settled when
+      // frond-ear next starts.
+      if (!this.stopped) permit.settle("failed");
+      throw error;
+    }
+  }
+
+  /**
+   * The custody a room output is judged by: the speaker's own. The session holding an ear
+   * is judged as canticle_custody and ear_status judge it, over the last CUSTODY_WINDOW_MS.
+   * A session it superseded, or whose ear was removed, keeps the exposures of its own
+   * attach, but frond-ear can't place them against a boundary; a CLI or tools-only
+   * connection has none. Both read as unknown.
+   */
+  private speakerCustody(client: Client, chatEar: string): SpeakerCustody {
+    const sessionId = client.sessionId ?? null;
+    if (
+      client.ear !== undefined &&
+      this.isAttachedSession(client, client.ear)
+    ) {
+      const { view, since } = this.custodyOver(client.ear, CUSTODY_WINDOW_MS);
+      return {
+        ear: client.ear,
+        speaker: "holder",
+        sessionId,
+        view,
+        boundary: this.boundary(client.ear),
+        since,
+      };
+    }
+    const now = this.clock.now();
+    const since = Math.max(0, now - CUSTODY_WINDOW_MS);
+    const unplacedNow: CustodyNow = {
+      session: { id: sessionId },
+      boundary: undefined,
+      idleCompactDueAt: null,
+      now,
+    };
+    if (client.attachedAs === undefined) {
+      return {
+        ear: chatEar,
+        speaker: "other",
+        sessionId,
+        view: unplaced(
+          custodyView([], unplacedNow),
+          "no ear's session is speaking (a CLI or tools-only connection): frond-ear holds no custody of its own for it",
+        ),
+        boundary: undefined,
+        since,
+      };
+    }
+    const ear = client.attachedAs;
+    const own = this.store
+      .canticleCustody(ear, since)
+      .filter((row) => row.generation === client.attachGeneration);
+    return {
+      ear,
+      speaker: "superseded",
+      sessionId,
+      view: unplaced(
+        custodyView(own, unplacedNow),
+        `this session no longer holds ear ${ear}, so frond-ear can't place what it was shown against its compaction boundary`,
+      ),
+      boundary: undefined,
+      since,
+    };
+  }
+
   /** ear_status's custody summary: the last CUSTODY_WINDOW_MS, counts and history only. */
   private custodySummary(ear: string): object {
     const { view } = this.custodyOver(ear, CUSTODY_WINDOW_MS);
@@ -2984,16 +3165,25 @@ export class Daemon {
    * unless config canticle.derivedPublication is on and every one was heard whole and
    * echoed within the current compaction boundary of the session holding the ear; a
    * record custody doesn't hold reads as unknown. It decides only: no station call, and
-   * never the `sing` route. Nothing in frond-ear calls it yet (binary-canticle#162).
+   * never the `sing` route. `derivedPublish` asks it before anything else.
    */
   public derivedPublicationGate(
     ear: string,
     sources: readonly string[],
   ): PublicationDecision {
+    return derivedPublication(
+      this.config.canticle?.derivedPublication === true,
+      sources,
+      this.sourceCustody(ear, sources),
+    );
+  }
+
+  /** Custody of these source records, judged now; one custody doesn't hold reads as unknown. */
+  private sourceCustody(ear: string, sources: readonly string[]): CustodyView {
     const rows = this.store.canticleCustodyOf(ear, sources);
     const held = new Set(rows.map((row) => row.identity));
     const absent = [...new Set(sources)].filter((id) => !held.has(id));
-    const view = custodyView(
+    return custodyView(
       rows,
       this.custodyNow(ear),
       absent.length > 0
@@ -3002,11 +3192,298 @@ export class Daemon {
           ]
         : [],
     );
-    return derivedPublication(
-      this.config.canticle?.derivedPublication === true,
-      sources,
-      view,
-    );
+  }
+
+  /**
+   * Publishes `text`, derived from these heard records, by a station's derived op
+   * (binary-canticle#161 item 4; the op is #159, assembled in #162). Closed unless the
+   * seam is open (`derivedPublicationGate`), the owner's route is wired, the text is
+   * within #162's bound, custody kept each source's lineage, and the station's control
+   * socket offers the op; that is judged again after every wait, so custody that moved
+   * meanwhile (a compaction, a new session) stops it before anything is published. Then
+   * the owner's issuer gets the lineage and returns the capsule, and the station gets
+   * exactly `derived_publish`, never `sing`. An unanswered publish stays unknown: only
+   * `derivedQuery` for the same election settles it, and no publication of the same text
+   * from the same sources is made while one is in flight, unknown or accepted (#162:
+   * never a new election to retry an uncertain effect). Each issued attempt is recorded by
+   * ids and digests, never the text. No model tool calls this (#162 adds none, and the
+   * capsule stays out of any model's sight): it is the owner's integration's call. Like a
+   * tool call, shutdown drains it, and nothing starts or reaches the station once
+   * frond-ear is shutting down.
+   */
+  public derivedPublish(
+    ear: string,
+    sources: readonly string[],
+    text: string,
+  ): Promise<DerivedOutcome> {
+    const work = this.publishDerived(ear, sources, text);
+    this.inFlight.add(work);
+    const settled = () => this.inFlight.delete(work);
+    work.then(settled, settled);
+    return work;
+  }
+
+  private async publishDerived(
+    ear: string,
+    sources: readonly string[],
+    text: string,
+  ): Promise<DerivedOutcome> {
+    const route = this.options.derivedRoute;
+    const judge = (): { lineage: DerivedLineage } | { reason: string } => {
+      if (this.closing) {
+        return { reason: "closed: frond-ear is shutting down" };
+      }
+      const view = this.sourceCustody(ear, sources);
+      const gate = derivedPublication(
+        this.config.canticle?.derivedPublication === true,
+        sources,
+        view,
+      );
+      if (!gate.open) return { reason: gate.reason };
+      if (!route) {
+        return {
+          reason:
+            "closed: no derived-publication route: the owner's issuer and station control socket aren't wired into this daemon",
+        };
+      }
+      if (!derivedTextFits(text)) {
+        return {
+          reason: `closed: the derived text must be 1 to ${DERIVED_TEXT_MAX_BYTES} UTF-8 bytes (binary-canticle#162)`,
+        };
+      }
+      // An open seam means the session holding the ear echoed every source under its id.
+      const sessionId = this.attached.get(ear)?.sessionId;
+      if (!sessionId) {
+        return { reason: "closed: the session holding the ear has no id" };
+      }
+      const traced = derivedLineage(
+        ear,
+        sessionId,
+        sources,
+        view.records.map((record) => record.exposure),
+        text,
+      );
+      return "blocked" in traced
+        ? { reason: `closed: ${traced.blocked}` }
+        : traced;
+    };
+    const closed = (reason: string): DerivedOutcome => {
+      this.logger.log("info", "canticle.derived_closed", { ear, reason });
+      return { state: "closed", reason };
+    };
+    // A publication in flight, unknown or accepted is never published again (#162: never
+    // a new election to retry an uncertain effect); only derivedQuery goes on from it.
+    const payloadSha256 = payloadDigest(text);
+    const standing = (): string | undefined => {
+      const prior = this.store.standingDerived(ear, sources, payloadSha256);
+      return prior
+        ? `closed: a publication of this text from these sources is already ${prior.state}${prior.electionId ? ` (election ${prior.electionId})` : ""}; derivedQuery it rather than publish again`
+        : undefined;
+    };
+
+    const before = standing();
+    if (before !== undefined) return closed(before);
+    let judged = judge();
+    if ("reason" in judged) return closed(judged.reason);
+    const capability = await derivedCapability(route!.control);
+    if (!capability.derived) {
+      return closed(
+        `closed: the station's control socket doesn't offer derived publication: ${capability.reason}`,
+      );
+    }
+    const meanwhile = standing();
+    if (meanwhile !== undefined) return closed(meanwhile);
+    judged = judge();
+    if ("reason" in judged) return closed(judged.reason);
+    const { lineage } = judged;
+    const id = this.store.openDerived({
+      ear,
+      sessionId: lineage.author.sessionId,
+      sources: lineage.sources.map(({ identity, digest }) => ({
+        identity,
+        digest,
+      })),
+      audience: lineage.audience.scope,
+      payloadSha256: lineage.payloadSha256,
+      createdAt: this.clock.now(),
+    });
+    this.derivedInFlight.add(id);
+    try {
+      return await this.issueAndPublish(ear, id, lineage, text, route!, judge);
+    } finally {
+      this.derivedInFlight.delete(id);
+    }
+  }
+
+  /** The issued part of `publishDerived`: the row `id` exists, `issuing`, and this owns it. */
+  private async issueAndPublish(
+    ear: string,
+    id: number,
+    lineage: DerivedLineage,
+    text: string,
+    route: DerivedRoute,
+    judge: () => { lineage: DerivedLineage } | { reason: string },
+  ): Promise<DerivedOutcome> {
+    const settle = (outcome: DerivedOutcome): DerivedOutcome => {
+      if (!this.stopped) {
+        this.store.updateDerived(id, {
+          state: outcome.state === "closed" ? "refused" : outcome.state,
+          ...("electionId" in outcome && outcome.electionId !== null
+            ? { electionId: outcome.electionId }
+            : {}),
+          reason: "reason" in outcome ? outcome.reason : null,
+          ...(outcome.state === "accepted"
+            ? { acceptance: outcome.acceptance }
+            : {}),
+          ...(outcome.state === "unknown"
+            ? {}
+            : { settledAt: this.clock.now() }),
+          from: ["issuing", "claimed"],
+        });
+      }
+      this.logger.log("info", "canticle.derived", {
+        ear,
+        state: outcome.state,
+        electionId: "electionId" in outcome ? outcome.electionId : null,
+      });
+      return outcome;
+    };
+
+    let issued: { capsule: Uint8Array; electionId: string };
+    try {
+      issued = await route.issuer.issue(lineage, text);
+    } catch (error) {
+      return settle({
+        state: "refused",
+        electionId: null,
+        reason: `the issuer refused: ${error instanceof Error ? error.message : String(error)}`,
+      });
+    }
+    if (!ELECTION_ID.test(issued.electionId)) {
+      return settle({
+        state: "refused",
+        electionId: null,
+        reason:
+          "the issuer returned no election id (32 lowercase hex digits) to query; nothing was published",
+      });
+    }
+    const electionId = issued.electionId;
+    if (!this.stopped) {
+      this.store.updateDerived(id, {
+        state: "claimed",
+        electionId,
+        from: ["issuing"],
+      });
+    }
+    const again = judge();
+    if ("reason" in again) {
+      return settle({
+        state: "refused",
+        electionId,
+        reason: `stopped after the capsule was issued (${again.reason}); election ${electionId} is left unpublished`,
+      });
+    }
+    let answer: Record<string, unknown>;
+    try {
+      answer = await route.control.request(
+        publishRequest(issued.capsule, text),
+      );
+    } catch (error) {
+      return settle({
+        state: "unknown",
+        electionId,
+        reason: `${noAnswer(error)}; query election ${electionId}, never publish it again`,
+      });
+    }
+    if (answer.ok === true) {
+      const taken = receiptFor(
+        answer.acceptance,
+        electionId,
+        lineage.payloadSha256,
+      );
+      return settle(
+        "receipt" in taken
+          ? { state: "accepted", electionId, acceptance: taken.receipt }
+          : {
+              state: "unknown",
+              electionId,
+              reason: `${taken.why}; query election ${electionId}, never publish it again`,
+            },
+      );
+    }
+    return settle({
+      state: "refused",
+      electionId,
+      reason: `the station refused: ${stationWords(answer)}`,
+    });
+  }
+
+  /**
+   * #162's `derived_query` for an election frond-ear asked about: the station's answer,
+   * with no send, refresh or retry. An unknown attempt, or a claimed one no publish in
+   * this process still owns (a crash left it), that the station reports accepted with a
+   * receipt naming this election and payload is settled from it. It is the station's
+   * derived op too, so it makes no station call with config canticle.derivedPublication
+   * off, or once frond-ear is shutting down; shutdown drains one in flight, as it drains
+   * a publish.
+   */
+  public derivedQuery(
+    ear: string,
+    electionId: string,
+  ): Promise<Record<string, unknown>> {
+    const work = this.queryDerived(ear, electionId);
+    this.inFlight.add(work);
+    const settled = () => this.inFlight.delete(work);
+    work.then(settled, settled);
+    return work;
+  }
+
+  private async queryDerived(
+    ear: string,
+    electionId: string,
+  ): Promise<Record<string, unknown>> {
+    if (!ELECTION_ID.test(electionId)) {
+      throw new Error("election_id is 32 lowercase hex digits");
+    }
+    if (this.closing) {
+      throw new Error("closed: frond-ear is shutting down; no station call");
+    }
+    if (this.config.canticle?.derivedPublication !== true) {
+      throw new Error(
+        "closed: derived publication is off (config canticle.derivedPublication); no station call",
+      );
+    }
+    const route = this.options.derivedRoute;
+    if (!route) {
+      throw new Error(
+        "no derived-publication route: the owner's issuer and station control socket aren't wired into this daemon",
+      );
+    }
+    const answer = await route.control.request(queryRequest(electionId));
+    const row = this.store.derivedByElection(ear, electionId);
+    if (
+      row &&
+      (row.state === "unknown" ||
+        (row.state === "claimed" && !this.derivedInFlight.has(row.id))) &&
+      answer.ok === true &&
+      answer.state === "accepted"
+    ) {
+      const taken = receiptFor(
+        answer.acceptance,
+        electionId,
+        row.payloadSha256,
+      );
+      if ("receipt" in taken && !this.stopped) {
+        this.store.updateDerived(row.id, {
+          state: "accepted",
+          acceptance: taken.receipt,
+          reason: null,
+          settledAt: this.clock.now(),
+          from: ["claimed", "unknown"],
+        });
+      }
+    }
+    return answer;
   }
 
   /**
@@ -3139,9 +3616,11 @@ export class Daemon {
    * and an unconfirmed part reuses its nonce. When a part fails, the error says
    * which parts went out. `files` ride on the last part, so they follow the text;
    * their digests are part of the reply's identity, so the same text with other
-   * files is a new reply, not a retry.
+   * files is a new reply, not a retry. Each part goes out through `permit`, the egress
+   * gate's for this reply alone.
    */
   private async sendReply(
+    permit: RoomPermit,
     chatId: string,
     text: string,
     replyTo: string | undefined,
@@ -3149,9 +3628,7 @@ export class Daemon {
     files: readonly OutboundFile[] = [],
   ): Promise<{ ids: string[]; earlier: number[] }> {
     const chunks = chunkMessage(text);
-    const key = createHash("sha256")
-      .update(`${chatId}\n${replyTo ?? ""}\n${text}${fileIdentity(files)}`)
-      .digest("hex");
+    const key = replyKey(chatId, replyTo, text, files);
     const id = this.store.resumeReply(
       key,
       chunks.length,
@@ -3171,6 +3648,7 @@ export class Daemon {
       try {
         ids.push(
           await this.sendOnce(
+            permit,
             chatId,
             chunk,
             index === 0 ? replyTo : undefined,
@@ -3204,6 +3682,7 @@ export class Daemon {
    * is told if the send stays ambiguous.
    */
   private async sendOnce(
+    permit: RoomPermit,
     chatId: string,
     content: string,
     replyTo: string | undefined,
@@ -3224,15 +3703,16 @@ export class Daemon {
       SEND_DEDUPE_WINDOW_MS,
       sessionEar,
       reply,
+      permit.egressId,
     );
     this.sendsInFlight.add(intent.nonce);
     try {
-      const sent = await this.rest.sendMessage(
-        chatId,
+      const sent = await permit.send(
         content,
         replyTo,
         intent.nonce,
         files,
+        intent.owner,
       );
       if (!this.stopped) {
         this.store.completeSend(intent.nonce, sent.id, chatId);
@@ -3242,12 +3722,7 @@ export class Daemon {
       }
       return sent.id;
     } catch (error) {
-      if (
-        error instanceof RestError &&
-        error.status >= 400 &&
-        error.status < 500 &&
-        error.status !== 429
-      ) {
+      if (definitive(error)) {
         if (!this.stopped) {
           this.store.failSend(intent.nonce);
         }
@@ -3442,6 +3917,14 @@ export class Daemon {
           hold: this.holdView(name),
           ...(canticleDelivery ? { canticleDelivery } : {}),
           ...(canticleCustody ? { canticleCustody } : {}),
+          roomEgress: {
+            policy: this.config.canticle?.roomPolicy ?? "observe",
+            windowMs: CUSTODY_WINDOW_MS,
+            ...this.store.roomEgressSummary(
+              name,
+              Math.max(0, this.clock.now() - CUSTODY_WINDOW_MS),
+            ),
+          },
         };
       });
     return {

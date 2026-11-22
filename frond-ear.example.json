@@ -75,6 +75,7 @@
         "maxPushesPerHour": 60
       }
     },
-    "derivedPublication": false
+    "derivedPublication": false,
+    "roomPolicy": "observe"
   }
 }

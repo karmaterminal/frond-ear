@@ -142,6 +142,7 @@ const config = (over: Partial<CanticleConfig> = {}): CanticleConfig => ({
   muted: false,
   delivery: {},
   derivedPublication: false,
+  roomPolicy: "observe",
   ...over,
 });
 
@@ -281,6 +282,7 @@ test("config: canticle defaults and validation", () => {
     muted: false,
     delivery: {},
     derivedPublication: false,
+    roomPolicy: "observe",
   });
   const bad = (canticle: unknown) => () => parseConfig({ ...base, canticle });
   assert.throws(bad({ enabled: true }), /manifestPath is required/);

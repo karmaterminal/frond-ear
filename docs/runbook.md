@@ -567,21 +567,22 @@ and `source` still need a restart.
 }
 ```
 
-| Field                | Default        | Meaning                                                                                                                                                                                                                                                                                              |
-| -------------------- | -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `wakeKeys`           | `[]`           | Station key ids (16 hex digits, the `key=` of a `hear` banner) whose records may be pushed. Empty: nothing is pushed, and `ear_status` warns. Leave out the host's own station key, or it hears itself.                                                                                              |
-| `muted`              | `false`        | `true` mutes every push to every ear.                                                                                                                                                                                                                                                                |
-| `delivery.<ear>`     | absent (`off`) | The ear's ceiling. A bare string (`"digest"`) sets `mode` alone.                                                                                                                                                                                                                                     |
-| `….mode`             | `off`          | `immediate`, `digest` or `off`, for every station.                                                                                                                                                                                                                                                   |
-| `….stations`         | `{}`           | `station → mode`, overriding `mode` for that station. A station can be named by its key id (16 hex digits, the `key=` of a `hear` banner), which outlasts a manifest rename; where its key id and its name both have an entry, the narrower holds.                                                   |
-| `….windowMs`         | `60000`        | `digest`: at most one report per window, 5 s to 1 h. The window opens when a record starts waiting.                                                                                                                                                                                                  |
-| `….debounceMs`       | `5000`         | `immediate`: a burst is coalesced over this long, 5 s (RFC §14.10) to 1 min, and less than `maxAgeMs`.                                                                                                                                                                                               |
-| `….maxAgeMs`         | `30000`        | `immediate` pushes only a record heard at most this long ago and at most this old when first heard (RFC §14.10 item 9). Any other goes into the next report instead, marked late. 10 s to 2 min (item 9's 120 s).                                                                                    |
-| `….style`            | `records`      | `digest`: `records` (each record behind its banner) or `counts` (per stream: how many, seqs skipped, repeats caught; no payloads).                                                                                                                                                                   |
-| `….maxItems`         | `5`            | Records per push, 1 to 10 (RFC §14.6.5's dose is 5). The rest wait for the next push.                                                                                                                                                                                                                |
-| `….bufferPerStream`  | `32`           | Records waiting per `station:stream`, 1 to 256. When it is full the oldest is dropped, and the next push says so.                                                                                                                                                                                    |
-| `derivedPublication` | `false`        | Whether the derived-publication seam may open at all ([Custody](#custody-and-confirmation-binary-canticle161)). frond-ear makes no station call either way.                                                                                                                                          |
-| `….maxPushesPerHour` | `60` or more   | Pushes to the ear per hour, from `immediate` and reports together, 1 to 360: 60 by default, or one per window when `windowMs` is under a minute, so a busy band's reports fit the hour. `ear_status` warns when it is less than one per window. Past it, records wait. The count survives a restart. |
+| Field                | Default        | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| -------------------- | -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `wakeKeys`           | `[]`           | Station key ids (16 hex digits, the `key=` of a `hear` banner) whose records may be pushed. Empty: nothing is pushed, and `ear_status` warns. Leave out the host's own station key, or it hears itself.                                                                                                                                                                                                                             |
+| `muted`              | `false`        | `true` mutes every push to every ear.                                                                                                                                                                                                                                                                                                                                                                                               |
+| `delivery.<ear>`     | absent (`off`) | The ear's ceiling. A bare string (`"digest"`) sets `mode` alone.                                                                                                                                                                                                                                                                                                                                                                    |
+| `….mode`             | `off`          | `immediate`, `digest` or `off`, for every station.                                                                                                                                                                                                                                                                                                                                                                                  |
+| `….stations`         | `{}`           | `station → mode`, overriding `mode` for that station. A station can be named by its key id (16 hex digits, the `key=` of a `hear` banner), which outlasts a manifest rename; where its key id and its name both have an entry, the narrower holds.                                                                                                                                                                                  |
+| `….windowMs`         | `60000`        | `digest`: at most one report per window, 5 s to 1 h. The window opens when a record starts waiting.                                                                                                                                                                                                                                                                                                                                 |
+| `….debounceMs`       | `5000`         | `immediate`: a burst is coalesced over this long, 5 s (RFC §14.10) to 1 min, and less than `maxAgeMs`.                                                                                                                                                                                                                                                                                                                              |
+| `….maxAgeMs`         | `30000`        | `immediate` pushes only a record heard at most this long ago and at most this old when first heard (RFC §14.10 item 9). Any other goes into the next report instead, marked late. 10 s to 2 min (item 9's 120 s).                                                                                                                                                                                                                   |
+| `….style`            | `records`      | `digest`: `records` (each record behind its banner) or `counts` (per stream: how many, seqs skipped, repeats caught; no payloads).                                                                                                                                                                                                                                                                                                  |
+| `….maxItems`         | `5`            | Records per push, 1 to 10 (RFC §14.6.5's dose is 5). The rest wait for the next push.                                                                                                                                                                                                                                                                                                                                               |
+| `….bufferPerStream`  | `32`           | Records waiting per `station:stream`, 1 to 256. When it is full the oldest is dropped, and the next push says so.                                                                                                                                                                                                                                                                                                                   |
+| `….maxPushesPerHour` | `60` or more   | Pushes to the ear per hour, from `immediate` and reports together, 1 to 360: 60 by default, or one per window when `windowMs` is under a minute, so a busy band's reports fit the hour. `ear_status` warns when it is less than one per window. Past it, records wait. The count survives a restart.                                                                                                                                |
+| `derivedPublication` | `false`        | Whether derived publication may open at all ([Derived publication](#derived-publication-binary-canticle161-item-4)). Off: no station call, `derivedQuery` and the capability probe included.                                                                                                                                                                                                                                        |
+| `roomPolicy`         | `observe`      | What the egress gate does at every room output ([Room output](#room-output-and-source-use-frond-ear-scope)): `observe` records and refuses nothing; `strict-fresh` refuses unless the speaker's canticle history is complete. It is a freshness-of-attention gate, not an output-content check; no seat should select it until the frond's source-use rule is settled. Anything else fails config load. It reloads with the config. |
 
 **What the session gets.** Channel events with `kind="canticle"` and `delivery="immediate"` (the new records of
 the last few seconds) or `delivery="report"` (a "what's on the radio" report, `report=<n>`). Each push is a batch
@@ -736,13 +737,153 @@ ear, no boundary reading from it is kept, an idle compaction was forecast (`pres
 since, the window reaches back before custody was kept (the upgrade that added it, or the prune's cutoff), or a record
 was echoed under an unknown boundary. `reasons` says which.
 
-**Derived publication: the seam, closed.** A path that would publish something derived from heard records asks the
-daemon's `derivedPublicationGate(ear, sources)`, naming each source by identity (`key:epoch:stream:seq`). It is closed
-unless `canticle.derivedPublication` is `true` (default `false`; it reloads with the config) **and** every source was
-heard whole (not cut, not counts-only) and echoed within the current boundary of the session holding the ear. A source
-custody doesn't hold reads as unknown. An open answer names the derived op, never `sing`: heard content is never sung
-back as heard. Nothing calls the seam yet, and it makes no station call (binary-canticle#162's derived op isn't on
-seats). `canticle_custody` shows under `publication` what it would answer for its window.
+### Room output and source use (frond-ear scope)
+
+frond-ear holds both ends for a Claude seat: canticle comes in through it (`hear`, the push) and room output goes
+out through it (`reply`, `react`, `edit_message`). So the source-use check of
+[binary-canticle#161](https://github.com/karmaterminal/binary-canticle/issues/161) (item 3) sits in one process, at
+every room output, and what it proves is **room output via frond-ear**, nothing wider.
+
+**One egress gate.** Every Discord write frond-ear makes goes through it: `reply` (all of its parts), `react`,
+`edit_message`, and any retry or replay of one of them, including `frond-ear send`, which is a client of `reply`.
+Before anything is sent, the gate:
+
+1. reads the speaking session's canticle custody: phase 1's records and `history` flag over the last hour, as
+   `ear_status` shows them under `canticleCustody`. A `batch_id` the call names is echoed first, so naming the push
+   being answered counts;
+2. asks `canticle.roomPolicy` to allow or refuse, with a reason;
+3. writes an egress row to the store (`room_egress`), kept for `limits.retentionMs`.
+
+A refusal is the tool's error (`refused by canticle.roomPolicy strict-fresh: <reason>; nothing was sent …`). It sends
+nothing and marks no Discord event seen; a canticle `batch_id` in the call is still echoed, since the echo is the id
+in the call. Only the gate can call Discord's writes: the daemon's own REST handle is typed for reads, and a test
+fails if any other source file names `sendMessage`, `addReaction` or `editMessage`. One decision covers one output: a
+reply's parts, and the REST client's own waits on a Discord rate limit, go out under the decision its call got (a
+session doesn't compact inside its own tool call). A retry of the call goes through the gate again and never reuses
+an earlier allow, so an unfinished reply retried after a compaction posts nothing more until the policy allows it;
+then it resumes as #55 says.
+
+| Policy              | What it does                                                                                                                                                                                                                                                                                                                                                                                                               |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `observe` (default) | Records every row and refuses nothing: no behaviour change.                                                                                                                                                                                                                                                                                                                                                                |
+| `strict-fresh`      | Refuses unless the speaker's `history` is `complete`: every record it was exposed to in the window offered and echoed within its current compaction boundary. So it refuses when an echoed source predates the boundary, when a push was offered and never echoed, and when history is `unknown`: no reading from the session's pressure hook with `--ear`, an idle compaction due unseen, a superseded session, or a CLI. |
+
+The source-use rule itself is not adopted: "all history must be fresh" is a candidate. `strict-fresh` is that
+candidate, for tests and for adoption, not a default.
+
+**What `strict-fresh` is: a freshness-of-attention gate, not an output-content check.** It never reads the output.
+Its only signal is the speaking session's `history` over the last hour: `complete`, with nothing echoed before the
+current boundary. So, as built:
+
+- **One un-acked push mutes the room for about an hour.** The record stays `offered`, never echoed, so every reply,
+  reaction and edit is refused until the session echoes it (its `batch_id` in `ack` or in the call, or `hear` while
+  the record is still on air) or it leaves the one-hour window. A record that left the air after a compaction can't be
+  shown again, so the seat waits out the window.
+- **`frond-ear send` is always refused**, seat-pulse's outage alerts included: a CLI connection holds no custody, so
+  it reads `unknown` (and it can read `hear` without leaving any). So is every room output of a seat whose pressure
+  hook doesn't run with `--ear`.
+- **Verbatim reuse passes.** With complete history, re-singing a heard record word for word is allowed; so is a
+  compaction summary carrying a record once that record is more than an hour old.
+
+**No seat should select `strict-fresh` until the frond's source-use rule is settled.** The default stays `observe`.
+
+**Who is judged.** The session holding the ear, over the same window `ear_status` uses. A session it superseded (or
+whose ear was removed) keeps its own attach's exposures in the row, but frond-ear can't place them against a boundary;
+a CLI or tools-only connection has none. Both read as `unknown`.
+
+**The egress row.** By identity and digest, never text or payload:
+
+| Field                            | Kept                                                                                                                                                                                                                                                                                                                            |
+| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tool`, `chat_id`, `target`      | `reply`, `react` or `edit_message`; the chat; the message replied to, reacted to or edited.                                                                                                                                                                                                                                     |
+| `digest`                         | SHA-256 of what went out: a reply's identity (chat, `reply_to`, text and files), an edit's text, an emoji.                                                                                                                                                                                                                      |
+| `speaker`, `session_id`          | `holder`, `superseded` or `other` (a CLI or tools-only connection), and its session id.                                                                                                                                                                                                                                         |
+| `policy`, `decision`, `reason`   | The policy, `allow` or `refuse`, and why.                                                                                                                                                                                                                                                                                       |
+| `sources`                        | Each record the speaker had echoed in the window: identity (`key:epoch:stream:seq`), payload digest, and its custody state then.                                                                                                                                                                                                |
+| `history`, `reasons`, `boundary` | Phase 1's flag and why, and the compaction boundary the speaker's hook last reported (unknown when none).                                                                                                                                                                                                                       |
+| `outcome`                        | `refused`; `pending` (allowed, its call still running: the row is written before Discord is called); `sent` (every write it made was confirmed); `error` (the call failed, and nothing it wrote is unknown); or `unconfirmed` (a write it made was never answered: a timeout, a lost response, a 5xx, so it may have gone out). |
+| `message_ids`                    | What the output posted, by the nonces its own call first sent, or edited, as Discord confirmed it.                                                                                                                                                                                                                              |
+| `nonce`                          | For an `unconfirmed` reply, the nonce of the part Discord never answered.                                                                                                                                                                                                                                                       |
+| `resent`                         | Parts this output re-sent under an earlier row's nonce (an identical retry), each with that row's id and the message Discord confirmed. They are that row's, never this one's.                                                                                                                                                  |
+
+**A send that may have posted keeps its own row.** Discord can post a message and lose its answer. That row is
+`unconfirmed`, tied to the part's nonce (each send's write-ahead intent names the egress row that first sent it), and
+the tool says the message may already have been posted. An identical retry within 5 minutes reuses the nonce (#55),
+so Discord hands back the original instead of posting it twice. frond-ear can't tell which try posted it, so the
+message is the first row's: in the same transaction that records Discord's answer, it joins that row's `message_ids`,
+and every row the nonce left `unconfirmed` becomes `sent`. The retry's row lists it under `resent` and claims nothing.
+A reaction or an edit with a lost answer is `unconfirmed` too, with no nonce: a retry of it is a write of its own. A
+row a previous process left `pending` was cut off mid-call; when frond-ear starts it becomes `unconfirmed` (tied to
+its unanswered part's nonce, if it had one) or, for a reply with nothing unanswered, `error`.
+
+`ear_status` shows each ear's `roomEgress`: the policy, the last hour's `allowed` and `refused`, and the latest
+refusal's reason.
+
+**Outside enforcement.** The gate covers only what frond-ear sends. These reach a room without frond-ear, and nothing
+here checks them or vouches for them:
+
+- **Bash**: any command the session runs (`curl` to Discord's API or a webhook, a bot script, `canticle sing`).
+- **`gh`**: issues, pull requests, comments, and whatever a repository relays to a room.
+- **Files**: anything written where another process publishes it (an outbox, a log another bot posts).
+- **Other MCP servers**: another Discord, Slack or chat server, or any tool holding its own credentials.
+
+frond-ear's own claude.ai connector (`src/connector/`) has no Discord access, so it has no room output to check.
+
+### Derived publication (binary-canticle#161 item 4)
+
+A path that publishes something derived from heard records goes through the daemon's
+`derivedPublish(ear, sources, text)`, naming each source by identity (`key:epoch:stream:seq`). It calls a station's
+derived op ([binary-canticle#159](https://github.com/karmaterminal/binary-canticle/pull/159), assembled in
+[#162](https://github.com/karmaterminal/binary-canticle/pull/162) at `452c5433`) and never `sing`: heard content is
+never sung back as heard. It is not a model tool (#162 adds none, and the capsule stays out of any model's sight); the
+owner's integration calls it. It stays closed, and says why, unless every one of these holds:
+
+1. `canticle.derivedPublication` is `true` (default `false`; it reloads with the config) **and** every source was
+   heard whole (not cut, not counts-only) and echoed within the current boundary of the session holding the ear. This
+   is `derivedPublicationGate(ear, sources)`, phase 1's seam; a source custody doesn't hold reads as unknown.
+   `canticle_custody` shows under `publication` what it would answer for its window.
+2. The owner's route is wired: an issuer and the station's control socket (`DaemonOptions.derivedRoute`). The CLI
+   wires none yet, so on a seat derived publication stays closed.
+3. The text is 1 to 800 UTF-8 bytes (#162's bound, before any grant narrows it).
+4. Custody kept each source's lineage. Every custody row now keeps what the verified record said of itself: scope,
+   class, hop, lineage root, station principal, expiry and `wake_derived`. Rows from before this read as none.
+5. The station's control socket offers the derived op. #162 has no capability advertisement, so frond-ear asks
+   `derived_query` about an election no authority issues (all zeros). Only #162's exact answer,
+   `{"ok": false, "error": "station_claim_missing"}`, means the op is configured and this uid is admitted. A refusal
+   closes it in the station's words; `ok` for that election is an anomaly (no authority issued it), and any other
+   answer is absence: both close it with the answer quoted. No answer closes it too. The probe can't
+   see one thing: #162 refuses `derived_publish` (not `derived_query`) on a control socket not granted class
+   `chatter`. On such a socket the probe passes and the station refuses the publish, after the issuer has spent an
+   election: closed, but wasteful. Grant the socket `chatter`.
+6. No publication of the same text from the same sources is in flight, `unknown` or `accepted`. #162: the host never
+   makes a new election to retry an uncertain effect. So a later or concurrent call is closed and points at
+   `derivedQuery`; this is kept in the store, so it holds across a restart.
+
+Custody is judged again after each wait (the probe, the issuer), so a compaction or a new session meanwhile stops it
+before the station gets anything. Shutdown drains a publication or a `derivedQuery` in flight as it drains a tool call,
+and once frond-ear is shutting down none starts or reaches the station. With `derivedPublication` off, `derivedQuery`
+makes no station call either: it throws, and a row it would settle waits until the flag is on again.
+
+#162's transport takes only `derived_publish` with exactly `op`, `capsule_b64` and `text`, and `derived_query` with
+exactly `op` and `election_id`, one JSON line per connection. Lineage, audience and signer are not request fields:
+they are bound inside the capsule, which the owner's authority issues from its own ledger and the station checks
+against that same ledger. So frond-ear never mints a capsule. It hands the owner's issuer the lineage (each source's
+identity, payload digest and the lineage above; the author, the session holding the ear; the audience, no wider than
+the narrowest source scope) and the text, then sends the station exactly `derived_publish`.
+
+Each issued attempt is a `derived_publications` row by source ids and digests, never the text: `issuing`, `claimed`
+(the election issued), then `accepted` with the station's receipt, `refused` (the issuer or the station said no, or it
+was stopped after the capsule was issued: custody moved, or frond-ear began shutting down), or `unknown` when no answer
+came, or an answer without a receipt naming this election and this payload. An unknown one is never published again:
+`derivedQuery(ear, election_id)` asks the station about the same election and settles the row if the station reports
+it accepted with such a receipt (a row a publish in this process still owns is left to that publish). The prune keeps a
+row still `claimed` or `unknown` past `limits.retentionMs`: it is the record that its election may have published. A row
+a previous process left `issuing` never reached the station (the request goes out only once a row is `claimed`), so
+frond-ear releases it as `refused` when it starts. A `claimed` or `unknown` row the station keeps answering
+`station_claim_missing` or `claimed_unknown` for blocks that text from those sources for good: #162 says absence never
+proves an item wasn't emitted. Publish other text, or, once you have checked the station's air yourself, release it in
+the store:
+`sqlite3 "$XDG_STATE_HOME/frond-ear/frond-ear.db" "UPDATE derived_publications SET state='refused', reason='released by the operator' WHERE election_id='<id>'"`.
 
 ## Troubleshooting
 

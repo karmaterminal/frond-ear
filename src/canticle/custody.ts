@@ -14,7 +14,8 @@
 // longer in context.
 //
 // This module only reads custody: what each record's state is now, the `history` flag
-// over a window, and the closed-by-default seam a derived-publication path would ask.
+// over a window (the room-output gate, egress.ts, judges by it), and the closed-by-default
+// seam the derived-publication adapter (derived.ts) asks first.
 
 import type { CanticleCustody, CompactionBoundary } from "../store.ts";
 import { iso } from "./hear.ts";

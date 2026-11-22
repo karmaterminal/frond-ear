@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { ROOM_POLICIES, type RoomPolicy } from "./egress.ts";
 import type { Mode } from "./types.ts";
 
 export interface ChannelConfig {
@@ -106,12 +107,25 @@ export interface CanticleConfig {
   /** Per ear, what reaches its session unasked. An ear left out is `off`. */
   delivery: Record<string, CanticleEarDelivery>;
   /**
-   * Whether the derived-publication seam may ever open (binary-canticle#161). Off by
-   * default; even on, it stays closed unless every source record was heard whole and
-   * echoed within the session's current compaction boundary. frond-ear makes no station
-   * call either way.
+   * Whether derived publication may ever open (binary-canticle#161). Off by default, and
+   * off, frond-ear never calls a station's derived op: no publish, no capability probe,
+   * no `derivedQuery`. Even on, it stays closed unless every source record was heard
+   * whole and echoed within the session's current compaction boundary, and the owner's
+   * route and the station's capability hold (canticle/derived.ts).
    */
   derivedPublication: boolean;
+  /**
+   * What the egress gate does at every room output (binary-canticle#161 item 3): `observe`
+   * (default) records the speaker's custody and refuses nothing; `strict-fresh` refuses
+   * unless every source the session was exposed to is echoed within its current
+   * compaction boundary and its history is complete.
+   *
+   * `strict-fresh` is a freshness-of-attention gate, not an output-content check. It
+   * never reads the output; one un-acked push mutes the room for about an hour;
+   * `frond-ear send` (seat-pulse's alerts) is always refused; verbatim reuse passes. No
+   * seat should select strict-fresh until the frond's source-use rule is settled.
+   */
+  roomPolicy: RoomPolicy;
 }
 
 /** `off`: `hear` only. `digest`: a radio report per window. `immediate`: each new record. */
@@ -321,6 +335,13 @@ function parseCanticle(
   ) {
     throw new Error("canticle.derivedPublication must be true or false");
   }
+  const roomPolicy =
+    value.roomPolicy === undefined ? "observe" : value.roomPolicy;
+  if (!(ROOM_POLICIES as readonly unknown[]).includes(roomPolicy)) {
+    throw new Error(
+      `canticle.roomPolicy must be ${ROOM_POLICIES.join(" or ")}`,
+    );
+  }
   const deliveryInput = value.delivery ?? {};
   if (!isObject(deliveryInput)) {
     throw new Error("canticle.delivery must be an object of ear -> delivery");
@@ -346,6 +367,7 @@ function parseCanticle(
     muted: value.muted === true,
     delivery,
     derivedPublication: value.derivedPublication === true,
+    roomPolicy: roomPolicy as RoomPolicy,
   };
 }
 

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -135,6 +136,25 @@ export interface CanticleExposure {
   digest: string | null;
   /** `whole` payload, `cut` to fit, or `none` (a counts report, a non-text payload). */
   shown: CanticleShown;
+  /** What the verified record said of itself; absent when the caller had no record. */
+  lineage?: ExposureLineage;
+}
+
+/**
+ * What a verified record said of itself when it was exposed (binary-canticle#161 items 2
+ * and 4): its permission (scope), class, hop and lineage root, its station's principal, its
+ * expiry and whether it was sung in a canticle-woken turn. A derived publication carries it
+ * as each source's lineage, bound at exposure rather than read back later.
+ */
+export interface ExposureLineage {
+  scope: string;
+  class: string;
+  hop: number;
+  principal: string | null;
+  /** `key:epoch:stream:seq` of the record's lineage root, when it named one. */
+  root: string | null;
+  expiresAt: number;
+  wakeDerived: boolean | null;
 }
 
 /**
@@ -143,7 +163,7 @@ export interface CanticleExposure {
  * offered (the host handed it to the session), echoed (the session named its batch_id, or
  * `hear` returned it). Each step carries the session and its compaction boundary then.
  */
-export interface CanticleCustody extends CanticleExposure {
+export interface CanticleCustody extends Omit<CanticleExposure, "lineage"> {
   id: number;
   ear: string;
   /** The push's batch; null for `hear`. */
@@ -166,6 +186,8 @@ export interface CanticleCustody extends CanticleExposure {
   echoBatch: number | null;
   echoSession: string | null;
   echoBoundary: CompactionBoundary;
+  /** Null for custody kept before frond-ear kept lineage. */
+  lineage: ExposureLineage | null;
 }
 
 interface CustodyRow {
@@ -195,6 +217,7 @@ interface CustodyRow {
   echo_session: string | null;
   echo_boundary: string | null;
   echo_boundary_known: number;
+  lineage: string | null;
 }
 
 const boundaryOf = (value: string | null, known: number): CompactionBoundary =>
@@ -226,8 +249,15 @@ function mapCustody(row: CustodyRow): CanticleCustody {
     echoBatch: row.echo_batch,
     echoSession: row.echo_session,
     echoBoundary: boundaryOf(row.echo_boundary, row.echo_boundary_known),
+    lineage:
+      row.lineage === null
+        ? null
+        : (JSON.parse(row.lineage) as ExposureLineage),
   };
 }
+
+const lineageOf = (exposure: CanticleExposure): string | null =>
+  exposure.lineage === undefined ? null : JSON.stringify(exposure.lineage);
 
 /**
  * A canticle push a revert gave back (#161): its records, and the refreshes that had
@@ -272,6 +302,244 @@ export interface Letter {
   ackedAt: number | null;
   /** The ear's release count when it was left: releases since = compactions or starts since. */
   releasesAtLeave: number;
+}
+
+/**
+ * One room output as the egress gate recorded it (binary-canticle#161 item 3): what it
+ * was and where it went (never its text), who spoke, what the policy decided, the
+ * speaker's custody then (the records it had echoed, by id and digest, never payload; the
+ * history flag; the compaction boundary) and how the write went.
+ */
+export interface EgressRecord {
+  id: number;
+  /** The ear whose custody was read: the speaker's, else the chat's. */
+  ear: string;
+  tool: "reply" | "react" | "edit_message";
+  chatId: string;
+  /** The message replied to, reacted to or edited; null for a plain reply. */
+  target: string | null;
+  /** SHA-256 of what went out (a reply's identity, an edit's text, an emoji). */
+  digest: string;
+  sessionId: string | null;
+  /** The session holding the ear, one it superseded, or no ear's session (a CLI). */
+  speaker: "holder" | "superseded" | "other";
+  policy: string;
+  decision: "allow" | "refuse";
+  reason: string;
+  history: "complete" | "incomplete" | "unknown";
+  reasons: string[];
+  boundary: CompactionBoundary;
+  /** The records the speaker had echoed in the window, with their state then. */
+  sources: Array<{ identity: string; digest: string | null; state: string }>;
+  /** Where the custody window began. */
+  since: number;
+  decidedAt: number;
+  /**
+   * `refused`: nothing sent. `pending`: allowed, its call still running (a row a previous
+   * process left pending is settled when frond-ear starts). `sent`: every write it made
+   * was confirmed. `error`: the call ended in an error, and nothing it wrote is unknown.
+   * `unconfirmed`: a write it made was never answered, so it may have gone out; for a reply
+   * part, `nonce` names it, and the row becomes `sent` when Discord confirms that nonce.
+   */
+  outcome: "refused" | "pending" | "sent" | "error" | "unconfirmed";
+  /**
+   * The messages this output posted (a reply's parts, by the nonces its own call first
+   * sent) or edited, as Discord confirmed them. A part an earlier row first sent is that
+   * row's, even when this row's retry got Discord's answer for it.
+   */
+  messageIds: string[];
+  /** The nonce of the reply part this output's call left unanswered; null when none. */
+  nonce: string | null;
+  /**
+   * Parts this output re-sent under an earlier row's nonce (an identical retry), and the
+   * message Discord confirmed for each: credited to that row (`egressId`, null for a send
+   * from before egress rows were kept), never to this one.
+   */
+  resent: EgressResend[];
+  settledAt: number | null;
+}
+
+/** A reply part one egress row re-sent under another's nonce, as Discord confirmed it. */
+export interface EgressResend {
+  egressId: number | null;
+  messageId: string;
+}
+
+/** How an allowed room output's call ended, as its permit saw it. */
+export interface EgressSettlement {
+  outcome: "sent" | "error" | "unconfirmed";
+  /** What it wrote under its own nonces (or edited), as Discord confirmed it. */
+  messageIds: readonly string[];
+  resent: readonly EgressResend[];
+  /** For `unconfirmed`: the nonce of the reply part left unanswered, if it was one. */
+  nonce: string | null;
+}
+
+interface EgressRow {
+  id: number;
+  ear: string;
+  tool: EgressRecord["tool"];
+  chat_id: string;
+  target: string | null;
+  digest: string;
+  session_id: string | null;
+  speaker: EgressRecord["speaker"];
+  policy: string;
+  decision: EgressRecord["decision"];
+  reason: string;
+  history: EgressRecord["history"];
+  reasons: string;
+  boundary: string | null;
+  boundary_known: number;
+  sources: string;
+  since: number;
+  decided_at: number;
+  outcome: EgressRecord["outcome"];
+  message_ids: string;
+  nonce: string | null;
+  resent: string;
+  settled_at: number | null;
+}
+
+function mapEgress(row: EgressRow): EgressRecord {
+  return {
+    id: row.id,
+    ear: row.ear,
+    tool: row.tool,
+    chatId: row.chat_id,
+    target: row.target,
+    digest: row.digest,
+    sessionId: row.session_id,
+    speaker: row.speaker,
+    policy: row.policy,
+    decision: row.decision,
+    reason: row.reason,
+    history: row.history,
+    reasons: JSON.parse(row.reasons) as string[],
+    boundary: boundaryOf(row.boundary, row.boundary_known),
+    sources: JSON.parse(row.sources) as EgressRecord["sources"],
+    since: row.since,
+    decidedAt: row.decided_at,
+    outcome: row.outcome,
+    messageIds: JSON.parse(row.message_ids) as string[],
+    nonce: row.nonce,
+    resent: JSON.parse(row.resent) as EgressResend[],
+    settledAt: row.settled_at,
+  };
+}
+
+/**
+ * The room_egress table (binary-canticle#161 item 3) under `name`, so a store from an
+ * earlier build can be rebuilt into the same shape.
+ */
+const egressTable = (name: string) => `
+  CREATE TABLE IF NOT EXISTS ${name} (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ear TEXT NOT NULL,
+    tool TEXT NOT NULL CHECK (tool IN ('reply', 'react', 'edit_message')),
+    chat_id TEXT NOT NULL,
+    target TEXT,
+    digest TEXT NOT NULL,
+    session_id TEXT,
+    speaker TEXT NOT NULL CHECK (speaker IN ('holder', 'superseded', 'other')),
+    policy TEXT NOT NULL,
+    decision TEXT NOT NULL CHECK (decision IN ('allow', 'refuse')),
+    reason TEXT NOT NULL,
+    history TEXT NOT NULL CHECK (history IN ('complete', 'incomplete', 'unknown')),
+    reasons TEXT NOT NULL,
+    boundary TEXT,
+    boundary_known INTEGER NOT NULL,
+    sources TEXT NOT NULL,
+    since INTEGER NOT NULL,
+    decided_at INTEGER NOT NULL,
+    outcome TEXT NOT NULL CHECK (outcome IN
+      ('refused', 'pending', 'sent', 'error', 'unconfirmed')),
+    message_ids TEXT NOT NULL DEFAULT '[]',
+    nonce TEXT,
+    resent TEXT NOT NULL DEFAULT '[]',
+    settled_at INTEGER
+  );
+`;
+
+/** The columns an earlier build's room_egress already had, which a rebuild copies. */
+const EGRESS_V1_COLUMNS =
+  "id, ear, tool, chat_id, target, digest, session_id, speaker, policy, decision, reason, " +
+  "history, reasons, boundary, boundary_known, sources, since, decided_at, outcome, " +
+  "message_ids, settled_at";
+
+/**
+ * One derived publication frond-ear asked a station for (binary-canticle#161 item 4), by
+ * the ids and digests of its sources, never the text. `issuing`: the owner's issuer was
+ * asked for a capsule (after a crash, unknown whether it issued one). `claimed`: issued,
+ * the station not yet answered (after a crash, unknown). `accepted`: the station's receipt
+ * is kept. `refused`: the issuer or the station said no. `unknown`: no answer came; only
+ * `derived_query` for the same election may settle it, never a second publish.
+ */
+export interface DerivedPublication {
+  id: number;
+  ear: string;
+  /** The session holding the ear: the author. */
+  sessionId: string | null;
+  electionId: string | null;
+  sources: Array<{ identity: string; digest: string }>;
+  /** The narrowest scope among the sources: the widest the publication may reach. */
+  audience: string;
+  payloadSha256: string;
+  state: "issuing" | "claimed" | "accepted" | "refused" | "unknown";
+  reason: string | null;
+  /** The station's acceptance receipt (ids and digests, no payload). */
+  acceptance: Record<string, unknown> | null;
+  createdAt: number;
+  settledAt: number | null;
+}
+
+interface DerivedRow {
+  id: number;
+  ear: string;
+  session_id: string | null;
+  election_id: string | null;
+  sources: string;
+  audience: string;
+  payload_sha256: string;
+  state: DerivedPublication["state"];
+  reason: string | null;
+  acceptance: string | null;
+  created_at: number;
+  settled_at: number | null;
+}
+
+/** One publication's identity: the ear, its sources as a set, and its text's digest. */
+function publicationKey(
+  ear: string,
+  sources: readonly string[],
+  payloadSha256: string,
+): string {
+  return createHash("sha256")
+    .update(
+      JSON.stringify([ear, [...new Set(sources)].sort(), payloadSha256]),
+      "utf8",
+    )
+    .digest("hex");
+}
+
+function mapDerived(row: DerivedRow): DerivedPublication {
+  return {
+    id: row.id,
+    ear: row.ear,
+    sessionId: row.session_id,
+    electionId: row.election_id,
+    sources: JSON.parse(row.sources) as DerivedPublication["sources"],
+    audience: row.audience,
+    payloadSha256: row.payload_sha256,
+    state: row.state,
+    reason: row.reason,
+    acceptance:
+      row.acceptance === null
+        ? null
+        : (JSON.parse(row.acceptance) as Record<string, unknown>),
+    createdAt: row.created_at,
+    settledAt: row.settled_at,
+  };
 }
 
 /** Where one Discord message sits in the reply it is part of (#55). */
@@ -411,7 +679,8 @@ export class EventStore {
         reply_key TEXT,
         reply_id TEXT,
         part INTEGER,
-        parts INTEGER
+        parts INTEGER,
+        egress_id INTEGER
       );
       CREATE INDEX IF NOT EXISTS outbound_intents_key
         ON outbound_intents (intent_key, state, created_at);
@@ -508,7 +777,8 @@ export class EventStore {
         echo_batch INTEGER,
         echo_session TEXT,
         echo_boundary TEXT,
-        echo_boundary_known INTEGER NOT NULL DEFAULT 0
+        echo_boundary_known INTEGER NOT NULL DEFAULT 0,
+        lineage TEXT
       );
       CREATE INDEX IF NOT EXISTS canticle_custody_ear
         ON canticle_custody (ear, claimed_at);
@@ -529,6 +799,27 @@ export class EventStore {
         ear TEXT NOT NULL,
         reverted_at INTEGER NOT NULL
       );
+      ${egressTable("room_egress")}
+      CREATE INDEX IF NOT EXISTS room_egress_ear
+        ON room_egress (ear, decided_at);
+      CREATE TABLE IF NOT EXISTS derived_publications (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ear TEXT NOT NULL,
+        session_id TEXT,
+        election_id TEXT,
+        sources TEXT NOT NULL,
+        audience TEXT NOT NULL,
+        payload_sha256 TEXT NOT NULL,
+        publication_key TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN
+          ('issuing', 'claimed', 'accepted', 'refused', 'unknown')),
+        reason TEXT,
+        acceptance TEXT,
+        created_at INTEGER NOT NULL,
+        settled_at INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS derived_publications_election
+        ON derived_publications (ear, election_id);
     `);
     // Custody is whole from the moment its table exists: a window that reaches back
     // before that (or before the prune's cutoff) reads as unknown, never as empty. A
@@ -562,9 +853,54 @@ export class EventStore {
         "ALTER TABLE canticle_settled ADD COLUMN batch_id INTEGER",
       );
     }
+    // Custody keeps each exposure's lineage (#161 item 4); older rows read as none.
+    const custodyColumns = new Set(
+      (
+        this.database
+          .prepare("PRAGMA table_info(canticle_custody)")
+          .all() as Array<{ name: string }>
+      ).map((column) => column.name),
+    );
+    if (!custodyColumns.has("lineage")) {
+      this.database.exec(
+        "ALTER TABLE canticle_custody ADD COLUMN lineage TEXT",
+      );
+    }
+    // An earlier build of the egress gate had no `unconfirmed` outcome, nonce or resent:
+    // rebuild its table into this shape, keeping every row and id. A row its process left
+    // pending can't be tied to a nonce (that build's intents name no egress row), so
+    // whether it went out is unknown: unconfirmed.
+    const egress = this.database
+      .prepare(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'room_egress'",
+      )
+      .get() as { sql: string };
+    if (!egress.sql.includes("'unconfirmed'")) {
+      this.transaction(() => {
+        this.database.exec(`
+          ${egressTable("room_egress_rebuilt")}
+          INSERT INTO room_egress_rebuilt (${EGRESS_V1_COLUMNS})
+            SELECT ${EGRESS_V1_COLUMNS} FROM room_egress;
+          DROP TABLE room_egress;
+          ALTER TABLE room_egress_rebuilt RENAME TO room_egress;
+          CREATE INDEX IF NOT EXISTS room_egress_ear
+            ON room_egress (ear, decided_at);
+        `);
+        this.database
+          .prepare(
+            `UPDATE room_egress SET outcome = 'unconfirmed', settled_at = ?
+             WHERE outcome = 'pending'`,
+          )
+          .run(this.clock.now());
+      });
+    }
+    this.database.exec(`
+      CREATE INDEX IF NOT EXISTS room_egress_nonce
+        ON room_egress (nonce) WHERE nonce IS NOT NULL;
+    `);
     // outbound_intents shipped without these columns; a database created before
-    // one of them gains it here. Its older rows read as no session's (#49) and
-    // no reply's (#55).
+    // one of them gains it here. Its older rows read as no session's (#49), no
+    // reply's (#55) and no egress row's (#161).
     const intentColumns = new Set(
       (
         this.database
@@ -578,6 +914,7 @@ export class EventStore {
       ["reply_id", "TEXT"],
       ["part", "INTEGER"],
       ["parts", "INTEGER"],
+      ["egress_id", "INTEGER"],
     ] as const) {
       if (!intentColumns.has(column)) {
         this.database.exec(
@@ -588,6 +925,51 @@ export class EventStore {
     this.database.exec(`
       CREATE INDEX IF NOT EXISTS outbound_intents_reply
         ON outbound_intents (reply_key, reply_id, part);
+    `);
+    // An earlier build of derived publication kept no publication key: key its rows in
+    // place, so a standing publication still blocks the same one again.
+    const derivedColumns = new Set(
+      (
+        this.database
+          .prepare("PRAGMA table_info(derived_publications)")
+          .all() as Array<{ name: string }>
+      ).map((column) => column.name),
+    );
+    if (!derivedColumns.has("publication_key")) {
+      this.transaction(() => {
+        this.database.exec(
+          "ALTER TABLE derived_publications ADD COLUMN publication_key TEXT",
+        );
+        const keyed = this.database.prepare(
+          "UPDATE derived_publications SET publication_key = ? WHERE id = ?",
+        );
+        for (const row of this.database
+          .prepare(
+            "SELECT id, ear, sources, payload_sha256 FROM derived_publications",
+          )
+          .all() as Array<{
+          id: number;
+          ear: string;
+          sources: string;
+          payload_sha256: string;
+        }>) {
+          const sources = JSON.parse(row.sources) as Array<{
+            identity: string;
+          }>;
+          keyed.run(
+            publicationKey(
+              row.ear,
+              sources.map((source) => source.identity),
+              row.payload_sha256,
+            ),
+            row.id,
+          );
+        }
+      });
+    }
+    this.database.exec(`
+      CREATE INDEX IF NOT EXISTS derived_publications_key
+        ON derived_publications (publication_key, state);
     `);
   }
 
@@ -1053,8 +1435,8 @@ export class EventStore {
         .run(batchId, ear, cursor.name, cursor.before);
       const insert = this.database.prepare(
         `INSERT INTO canticle_custody (ear, path, mode, batch_id, session_id, generation,
-           identity, station, stream, key_id, epoch, seq, digest, shown, claimed_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           identity, station, stream, key_id, epoch, seq, digest, shown, claimed_at, lineage)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       );
       for (const exposure of exposures) {
         insert.run(
@@ -1073,6 +1455,7 @@ export class EventStore {
           exposure.digest,
           exposure.shown,
           now,
+          lineageOf(exposure),
         );
       }
       return batchId;
@@ -1241,8 +1624,8 @@ export class EventStore {
       `INSERT INTO canticle_custody (ear, path, mode, batch_id, session_id, generation,
          identity, station, stream, key_id, epoch, seq, digest, shown, claimed_at,
          offered_at, offer_session, offer_boundary, offer_boundary_known, echoed_at,
-         echo_kind, echo_session, echo_boundary, echo_boundary_known)
-       VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'hear', ?, ?, ?)`,
+         echo_kind, echo_session, echo_boundary, echo_boundary_known, lineage)
+       VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'hear', ?, ?, ?, ?)`,
     );
     const known = boundary === undefined ? 0 : 1;
     this.atomically(() => {
@@ -1270,6 +1653,7 @@ export class EventStore {
           session.sessionId,
           boundary ?? null,
           known,
+          lineageOf(exposure),
         );
       }
     });
@@ -1370,6 +1754,384 @@ export class EventStore {
            WHERE ear = ? ORDER BY scope`,
       )
       .all(ear) as unknown as CanticleChoice[];
+  }
+
+  // ---- room egress (binary-canticle#161 item 3) ---------------------------------------
+
+  /**
+   * The egress gate's row for one room output, written before anything is sent: `pending`
+   * for an allowed one (a crash leaves it so), `refused`, settled at once, for one the
+   * policy refused. Returns its id.
+   */
+  public openEgress(
+    row: Omit<
+      EgressRecord,
+      "id" | "outcome" | "messageIds" | "nonce" | "resent" | "settledAt"
+    >,
+  ): number {
+    const refused = row.decision === "refuse";
+    return Number(
+      this.database
+        .prepare(
+          `INSERT INTO room_egress (ear, tool, chat_id, target, digest, session_id, speaker,
+             policy, decision, reason, history, reasons, boundary, boundary_known, sources,
+             since, decided_at, outcome, settled_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          row.ear,
+          row.tool,
+          row.chatId,
+          row.target,
+          row.digest,
+          row.sessionId,
+          row.speaker,
+          row.policy,
+          row.decision,
+          row.reason,
+          row.history,
+          JSON.stringify(row.reasons),
+          row.boundary ?? null,
+          row.boundary === undefined ? 0 : 1,
+          JSON.stringify(row.sources),
+          row.since,
+          row.decidedAt,
+          refused ? "refused" : "pending",
+          refused ? row.decidedAt : null,
+        ).lastInsertRowid,
+    );
+  }
+
+  /**
+   * How an allowed room output went: once, from `pending`. Its message ids join those
+   * `completeSend` already credited to it. An `unconfirmed` part whose nonce Discord has
+   * meanwhile confirmed (a concurrent identical retry got the answer) settles it `sent`.
+   */
+  public settleEgress(id: number, settled: EgressSettlement, at: number): void {
+    this.transaction(() => {
+      const row = this.database
+        .prepare(
+          "SELECT outcome, message_ids, resent FROM room_egress WHERE id = ?",
+        )
+        .get(id) as
+        | { outcome: string; message_ids: string; resent: string }
+        | undefined;
+      if (row?.outcome !== "pending") return;
+      let outcome = settled.outcome;
+      const resent = [
+        ...(JSON.parse(row.resent) as EgressResend[]),
+        ...settled.resent,
+      ];
+      if (outcome === "unconfirmed" && settled.nonce !== null) {
+        const intent = this.sentIntent(settled.nonce);
+        if (intent !== undefined) {
+          outcome = "sent";
+          if (intent.owner !== id) {
+            resent.push({
+              egressId: intent.owner,
+              messageId: intent.messageId,
+            });
+          }
+        }
+      }
+      const messageIds = [
+        ...new Set([
+          ...(JSON.parse(row.message_ids) as string[]),
+          ...settled.messageIds,
+        ]),
+      ];
+      this.database
+        .prepare(
+          `UPDATE room_egress SET outcome = ?, message_ids = ?, nonce = ?, resent = ?,
+             settled_at = ?
+           WHERE id = ?`,
+        )
+        .run(
+          outcome,
+          JSON.stringify(messageIds),
+          settled.nonce,
+          JSON.stringify(resent),
+          at,
+          id,
+        );
+    });
+  }
+
+  /** A send Discord confirmed: its message, and the egress row that first sent its nonce. */
+  private sentIntent(
+    nonce: string,
+  ): { messageId: string; owner: number | null } | undefined {
+    const intent = this.database
+      .prepare(
+        `SELECT message_id AS messageId, egress_id AS owner FROM outbound_intents
+         WHERE nonce = ? AND state = 'sent'`,
+      )
+      .get(nonce) as { messageId: string; owner: number | null } | undefined;
+    return intent;
+  }
+
+  /**
+   * Inside `completeSend`: Discord confirmed `nonce` as `messageId`. The message is the
+   * egress row's that first sent the nonce, and each row whose call left it unanswered
+   * is `sent` now; one that only re-sent it names it as re-sent for that row.
+   */
+  private reconcileEgress(nonce: string, messageId: string): void {
+    const owner = this.sentIntent(nonce)?.owner ?? null;
+    if (owner !== null) {
+      const row = this.database
+        .prepare("SELECT message_ids FROM room_egress WHERE id = ?")
+        .get(owner) as { message_ids: string } | undefined;
+      const ids = row ? (JSON.parse(row.message_ids) as string[]) : [];
+      if (row && !ids.includes(messageId)) {
+        this.database
+          .prepare("UPDATE room_egress SET message_ids = ? WHERE id = ?")
+          .run(JSON.stringify([...ids, messageId]), owner);
+      }
+    }
+    const waiting = this.database
+      .prepare(
+        "SELECT id, resent FROM room_egress WHERE nonce = ? AND outcome = 'unconfirmed'",
+      )
+      .all(nonce) as Array<{ id: number; resent: string }>;
+    for (const row of waiting) {
+      const resent = JSON.parse(row.resent) as EgressResend[];
+      if (row.id !== owner) resent.push({ egressId: owner, messageId });
+      this.database
+        .prepare(
+          `UPDATE room_egress SET outcome = 'sent', resent = ?, settled_at = ?
+           WHERE id = ?`,
+        )
+        .run(JSON.stringify(resent), this.clock.now(), row.id);
+    }
+  }
+
+  /**
+   * At startup: a row a previous process left `pending` had its call cut off. A reply
+   * whose part was still unanswered (an intent it first sent, still pending) is
+   * `unconfirmed`, tied to that nonce; a reaction or an edit may have applied, so it is
+   * `unconfirmed` too. A reply with nothing unanswered wrote only what its message ids
+   * say: `error`. Returns how many.
+   */
+  public releasePendingEgress(at: number): number {
+    return this.transaction(() => {
+      this.database
+        .prepare(
+          `UPDATE room_egress SET nonce = (
+             SELECT nonce FROM outbound_intents
+              WHERE egress_id = room_egress.id AND state = 'pending'
+              ORDER BY created_at DESC LIMIT 1)
+           WHERE outcome = 'pending'`,
+        )
+        .run();
+      return Number(
+        this.database
+          .prepare(
+            `UPDATE room_egress SET settled_at = ?, outcome =
+               CASE WHEN tool <> 'reply' OR nonce IS NOT NULL THEN 'unconfirmed' ELSE 'error' END
+             WHERE outcome = 'pending'`,
+          )
+          .run(at).changes,
+      );
+    });
+  }
+
+  /** The ear's egress rows decided at or after `since`, oldest first. */
+  public roomEgress(ear: string, since: number): EgressRecord[] {
+    return (
+      this.database
+        .prepare(
+          "SELECT * FROM room_egress WHERE ear = ? AND decided_at >= ? ORDER BY id",
+        )
+        .all(ear, since) as unknown as EgressRow[]
+    ).map(mapEgress);
+  }
+
+  /** ear_status's view of the ear's egress since `since`: decisions, and the latest refusal. */
+  public roomEgressSummary(
+    ear: string,
+    since: number,
+  ): {
+    allowed: number;
+    refused: number;
+    lastRefusal: {
+      at: number;
+      tool: string;
+      chatId: string;
+      reason: string;
+    } | null;
+  } {
+    const counts = this.database
+      .prepare(
+        `SELECT COALESCE(SUM(decision = 'allow'), 0) AS allowed,
+                COALESCE(SUM(decision = 'refuse'), 0) AS refused
+           FROM room_egress WHERE ear = ? AND decided_at >= ?`,
+      )
+      .get(ear, since) as { allowed: number; refused: number };
+    const last = this.database
+      .prepare(
+        `SELECT decided_at, tool, chat_id, reason FROM room_egress
+          WHERE ear = ? AND decided_at >= ? AND decision = 'refuse'
+          ORDER BY id DESC LIMIT 1`,
+      )
+      .get(ear, since) as
+      | { decided_at: number; tool: string; chat_id: string; reason: string }
+      | undefined;
+    return {
+      allowed: counts.allowed,
+      refused: counts.refused,
+      lastRefusal: last
+        ? {
+            at: last.decided_at,
+            tool: last.tool,
+            chatId: last.chat_id,
+            reason: last.reason,
+          }
+        : null,
+    };
+  }
+
+  // ---- derived publication (binary-canticle#161 item 4) ---------------------------------
+
+  /** A derived publication about to ask the owner's issuer: `issuing`. Returns its id. */
+  public openDerived(row: {
+    ear: string;
+    sessionId: string | null;
+    sources: DerivedPublication["sources"];
+    audience: string;
+    payloadSha256: string;
+    createdAt: number;
+  }): number {
+    return Number(
+      this.database
+        .prepare(
+          `INSERT INTO derived_publications (ear, session_id, sources, audience,
+             payload_sha256, publication_key, state, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, 'issuing', ?)`,
+        )
+        .run(
+          row.ear,
+          row.sessionId,
+          JSON.stringify(row.sources),
+          row.audience,
+          row.payloadSha256,
+          publicationKey(
+            row.ear,
+            row.sources.map((source) => source.identity),
+            row.payloadSha256,
+          ),
+          row.createdAt,
+        ).lastInsertRowid,
+    );
+  }
+
+  /**
+   * Moves a derived publication on: its election once issued, its outcome once known.
+   * Only from one of `from` (any state when absent), so a settle that lost a race moves
+   * nothing. `reason: null` clears it; a field left out keeps its value.
+   */
+  public updateDerived(
+    id: number,
+    change: {
+      state: DerivedPublication["state"];
+      electionId?: string;
+      reason?: string | null;
+      acceptance?: Record<string, unknown>;
+      settledAt?: number;
+      from?: readonly DerivedPublication["state"][];
+    },
+  ): boolean {
+    const sets = ["state = ?"];
+    const values: Array<string | number | null> = [change.state];
+    if (change.electionId !== undefined) {
+      sets.push("election_id = ?");
+      values.push(change.electionId);
+    }
+    if (change.reason !== undefined) {
+      sets.push("reason = ?");
+      values.push(change.reason);
+    }
+    if (change.acceptance !== undefined) {
+      sets.push("acceptance = ?");
+      values.push(JSON.stringify(change.acceptance));
+    }
+    if (change.settledAt !== undefined) {
+      sets.push("settled_at = ?");
+      values.push(change.settledAt);
+    }
+    const from = change.from ?? [];
+    return (
+      Number(
+        this.database
+          .prepare(
+            `UPDATE derived_publications SET ${sets.join(", ")} WHERE id = ?${
+              from.length > 0
+                ? ` AND state IN (${from.map(() => "?").join(", ")})`
+                : ""
+            }`,
+          )
+          .run(...values, id, ...from).changes,
+      ) > 0
+    );
+  }
+
+  /**
+   * At startup: a publication a previous process left `issuing` had no derived_publish
+   * sent for it (the request goes out only once it is `claimed`), so it is released,
+   * refused, and blocks nothing. Returns how many.
+   */
+  public releaseIssuingDerived(at: number): number {
+    return Number(
+      this.database
+        .prepare(
+          `UPDATE derived_publications SET state = 'refused', settled_at = ?,
+             reason = 'released at startup: frond-ear stopped while the issuer was asked, before any derived_publish was sent'
+           WHERE state = 'issuing'`,
+        )
+        .run(at).changes,
+    );
+  }
+
+  /**
+   * The ear's publication of this text from these sources (in any order) that still
+   * stands: in flight, unknown or accepted. A refused one doesn't.
+   */
+  public standingDerived(
+    ear: string,
+    sources: readonly string[],
+    payloadSha256: string,
+  ): DerivedPublication | undefined {
+    const row = this.database
+      .prepare(
+        `SELECT * FROM derived_publications WHERE publication_key = ?
+           AND state IN ('issuing', 'claimed', 'unknown', 'accepted')
+         ORDER BY id DESC LIMIT 1`,
+      )
+      .get(publicationKey(ear, sources, payloadSha256)) as
+      | DerivedRow
+      | undefined;
+    return row ? mapDerived(row) : undefined;
+  }
+
+  /** The ear's derived publications, oldest first. */
+  public derivedPublications(ear: string): DerivedPublication[] {
+    return (
+      this.database
+        .prepare("SELECT * FROM derived_publications WHERE ear = ? ORDER BY id")
+        .all(ear) as unknown as DerivedRow[]
+    ).map(mapDerived);
+  }
+
+  /** The ear's derived publication for this election, if frond-ear asked for it. */
+  public derivedByElection(
+    ear: string,
+    electionId: string,
+  ): DerivedPublication | undefined {
+    const row = this.database
+      .prepare(
+        "SELECT * FROM derived_publications WHERE ear = ? AND election_id = ? ORDER BY id DESC LIMIT 1",
+      )
+      .get(ear, electionId) as DerivedRow | undefined;
+    return row ? mapDerived(row) : undefined;
   }
 
   // ---- letters (#88) ---------------------------------------------------------------
@@ -1527,7 +2289,9 @@ export class EventStore {
    * whose session is sending, or null for any other client (a `frond-ear send`
    * script): an unconfirmed send is put to that ear's sessions alone. A session
    * retrying a script's pending send makes it the session's; a script's retry
-   * changes nothing.
+   * changes nothing. `egressId` is the egress row (#161) of the call sending it: a
+   * new intent is that row's, and a reused one stays the row's that first sent it
+   * (`owner`; null for an intent from before egress rows were kept).
    */
   public beginSend(
     key: string,
@@ -1537,15 +2301,18 @@ export class EventStore {
     reuseWindowMs: number,
     sessionEar: string | null,
     reply: ReplyPart,
-  ): { nonce: string; reused: boolean } {
+    egressId: number,
+  ): { nonce: string; reused: boolean; owner: number | null } {
     const now = this.clock.now();
     const pending = this.database
       .prepare(
-        `SELECT nonce FROM outbound_intents
+        `SELECT nonce, egress_id AS owner FROM outbound_intents
          WHERE intent_key = ? AND reply_id = ? AND state = 'pending' AND created_at >= ?
          ORDER BY created_at DESC LIMIT 1`,
       )
-      .get(key, reply.id, now - reuseWindowMs) as { nonce: string } | undefined;
+      .get(key, reply.id, now - reuseWindowMs) as
+      | { nonce: string; owner: number | null }
+      | undefined;
     if (pending) {
       this.database
         .prepare(
@@ -1553,14 +2320,14 @@ export class EventStore {
            WHERE nonce = ?`,
         )
         .run(now, sessionEar, pending.nonce);
-      return { nonce: pending.nonce, reused: true };
+      return { nonce: pending.nonce, reused: true, owner: pending.owner };
     }
     this.database
       .prepare(
         `INSERT INTO outbound_intents
            (nonce, intent_key, chat_id, preview, state, created_at, updated_at, session_ear,
-            reply_key, reply_id, part, parts)
-         VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)`,
+            reply_key, reply_id, part, parts, egress_id)
+         VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         nonce,
@@ -1574,11 +2341,15 @@ export class EventStore {
         reply.id,
         reply.part,
         reply.parts,
+        egressId,
       );
-    return { nonce, reused: false };
+    return { nonce, reused: false, owner: egressId };
   }
 
-  /** Discord confirmed the post: mark the intent sent and keep the receipt. */
+  /**
+   * Discord confirmed the post: mark the intent sent, keep the receipt, and credit the
+   * message to the egress row that first sent the nonce (#161), in one transaction.
+   */
   public completeSend(nonce: string, messageId: string, chatId: string): void {
     this.transaction(() => {
       this.database
@@ -1588,6 +2359,7 @@ export class EventStore {
         )
         .run(messageId, this.clock.now(), nonce);
       this.recordSent(messageId, chatId);
+      this.reconcileEgress(nonce, messageId);
     });
   }
 
@@ -2198,6 +2970,18 @@ export class EventStore {
       // A reverted push's id stays a canticle id as long as its custody would have.
       this.database
         .prepare("DELETE FROM canticle_reverted WHERE reverted_at < ?")
+        .run(cutoff);
+      // Egress and derived-publication rows are kept as long as the custody they recorded.
+      this.database
+        .prepare("DELETE FROM room_egress WHERE decided_at < ?")
+        .run(cutoff);
+      // An unsettled derived publication is kept until it settles: it is the record that
+      // its election may have published and must never be published again.
+      this.database
+        .prepare(
+          `DELETE FROM derived_publications WHERE created_at < ?
+           AND state IN ('accepted', 'refused')`,
+        )
         .run(cutoff);
       return events;
     });

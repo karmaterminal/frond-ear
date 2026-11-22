@@ -3,6 +3,7 @@
 // RecordConsumer, on the harness clock; what comes out is what the attached session is sent.
 import assert from "node:assert/strict";
 
+import type { DerivedRoute } from "../src/canticle/derived.ts";
 import { RECORD_V, RecordConsumer } from "../src/canticle/records.ts";
 import type { Config } from "../src/config.ts";
 import {
@@ -44,6 +45,8 @@ export interface Song {
   age?: number;
   /** A non-text body (ctype 2), which no banner shows the text of. */
   binary?: true;
+  /** The record's scope (§4.3); `lan` by default. */
+  scope?: string;
   /** Merged over `times`; a field set to `undefined` is left out. */
   times?: R;
 }
@@ -138,7 +141,7 @@ export class Host {
       station: { name: station, principal: null },
       stream,
       class: "advisory",
-      scope: "lan",
+      scope: o.scope ?? "lan",
       hop: o.hop ?? 0,
       ...(o.stateKey !== undefined ? { state_key: o.stateKey } : {}),
       times: Object.fromEntries(
@@ -261,7 +264,7 @@ export function setup(
   delivery: unknown,
   canticle: R = {},
   top: R = {},
-  options: { path?: string } = {},
+  options: { path?: string; derivedRoute?: DerivedRoute } = {},
 ): { h: Harness; host: Host } {
   let host: Host | undefined;
   const h = harness(canticleConfig(delivery, canticle, top), {
@@ -317,6 +320,54 @@ export function status(h: Harness): DeliveryStatus {
   const delivery = ears.find((ear) => ear.name === "scribe")?.canticleDelivery;
   assert.ok(delivery, "ear_status shows scribe's canticle delivery");
   return delivery;
+}
+
+/** The session id scribe's shim gives in the tests that judge custody against one. */
+export const SESSION = "11111111-aaaa-4aaa-8aaa-000000000001";
+
+let reports = 0;
+
+/**
+ * The seat's pressure hook (#98), as a CLI client: the session's context reading with its
+ * latest compaction marker (null: none yet). Evidence time is the harness clock.
+ */
+export async function pressure(
+  h: Harness,
+  boundary: string | null,
+  options: { sessionId?: string; tokens?: number | null } = {},
+): Promise<void> {
+  const cli = h.attach(undefined, { role: "cli" });
+  reports += 1;
+  await cli.send({
+    type: "pressure",
+    id: reports,
+    ear: "scribe",
+    sessionId: options.sessionId ?? SESSION,
+    tokens: options.tokens === undefined ? 1_000 : options.tokens,
+    band: null,
+    boundary,
+    at: h.clock.now(),
+  });
+  const result = cli.connection.results().at(-1)!;
+  assert.equal(result.ok, true, result.text);
+  cli.close();
+}
+
+/** Sings `seq`, lets immediate push it, and has the shim confirm it: the push. */
+export async function offered(
+  h: Harness,
+  host: Host,
+  shim: ReturnType<Harness["attach"]>,
+  seq: number,
+  song: Song = {},
+) {
+  const before = pushes(shim).length;
+  host.sing(seq, song);
+  h.timers.advance(6_000);
+  assert.equal(pushes(shim).length, before + 1, `record ${seq} was pushed`);
+  const push = pushes(shim).at(-1)!;
+  await shim.send({ type: "offered", batchId: push.batchId! });
+  return push;
 }
 
 /** `station:stream/seq` of each record a push carries, in the order it carries them. */
