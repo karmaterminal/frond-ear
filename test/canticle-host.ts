@@ -276,6 +276,17 @@ export function setup(
 export const pushes = (client: { connection: MemoryConnection }) =>
   client.connection.events().filter((event) => event.meta.kind === "canticle");
 
+/**
+ * Answers `offered` for each canticle push the client was sent, as a shim does once it
+ * has written it: a push left unconfirmed is given back when the daemon reverts it (a
+ * detach, an attach, a shutdown), and its records go out again (#161).
+ */
+export async function confirm(client: ReturnType<Harness["attach"]>) {
+  for (const push of pushes(client)) {
+    await client.send({ type: "offered", batchId: push.batchId! });
+  }
+}
+
 export interface DeliveryStatus {
   ceiling: string;
   mode: string;

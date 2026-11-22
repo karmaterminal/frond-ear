@@ -139,8 +139,10 @@ export class MemoryConnection implements Connection {
   public readonly received: DaemonMessage[] = [];
   public closed = false;
 
-  public send(message: DaemonMessage | ClientMessage): void {
+  /** Takes every message, as a live socket would; a dead one is tested on a real socket. */
+  public send(message: DaemonMessage | ClientMessage): boolean {
     this.received.push(message as DaemonMessage);
+    return true;
   }
 
   public close(): void {

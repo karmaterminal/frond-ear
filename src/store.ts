@@ -229,6 +229,16 @@ function mapCustody(row: CustodyRow): CanticleCustody {
   };
 }
 
+/**
+ * A canticle push a revert gave back (#161): its records, and the refreshes that had
+ * collapsed into it (§7.9), whose tombstones went back with it.
+ */
+export interface CanticleReverted {
+  batchId: number;
+  identities: string[];
+  collapsed: string[];
+}
+
 /** Since when custody is whole: set when the table is first made, moved by the prune. */
 const CUSTODY_SINCE = "canticle.custody.since";
 
@@ -508,6 +518,17 @@ export class EventStore {
         ON canticle_custody (claimed_at);
       CREATE INDEX IF NOT EXISTS canticle_custody_identity
         ON canticle_custody (ear, identity);
+      CREATE TABLE IF NOT EXISTS canticle_claims (
+        batch_id INTEGER PRIMARY KEY,
+        ear TEXT NOT NULL,
+        cursor_name TEXT NOT NULL,
+        cursor_before TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS canticle_reverted (
+        batch_id INTEGER PRIMARY KEY,
+        ear TEXT NOT NULL,
+        reverted_at INTEGER NOT NULL
+      );
     `);
     // Custody is whole from the moment its table exists: a window that reaches back
     // before that (or before the prune's cutoff) reads as unknown, never as empty. A
@@ -915,11 +936,50 @@ export class EventStore {
     cursor?: { name: string; value: string },
   ): void {
     this.transaction(() => {
-      this.insertSettled(ear, rows, null);
+      for (const row of rows) {
+        this.insertSettled(ear, [row], this.collapsedInto(ear, row));
+      }
       if (cursor) {
         this.setRuntimeState(cursor.name, cursor.value);
       }
     });
+  }
+
+  /**
+   * The push a refresh collapses into (§7.9), when it rides only on pushes the host hasn't
+   * confirmed yet: the latest of them, so a revert that gives that push back gives the
+   * refresh's tombstone back too (#161). Null for any other row, and when a confirmed push
+   * (or a tombstone from before #161) stands behind the collapse.
+   */
+  private collapsedInto(
+    ear: string,
+    row: Omit<CanticleSettled, "ear">,
+  ): number | null {
+    if (
+      row.outcome !== "collapsed" ||
+      row.refreshKey === null ||
+      row.digest === null
+    ) {
+      return null;
+    }
+    const seeds = this.database
+      .prepare(
+        `SELECT s.batch_id AS batchId,
+           EXISTS (SELECT 1 FROM canticle_claims c WHERE c.batch_id = s.batch_id) AS held
+         FROM canticle_settled s
+         WHERE s.ear = ? AND s.refresh_key = ? AND s.digest = ? AND s.expires_at > ?`,
+      )
+      .all(ear, row.refreshKey, row.digest, this.clock.now()) as Array<{
+      batchId: number | null;
+      held: number;
+    }>;
+    if (
+      seeds.length === 0 ||
+      seeds.some((seed) => seed.batchId === null || seed.held !== 1)
+    ) {
+      return null;
+    }
+    return Math.max(...seeds.map((seed) => seed.batchId!));
   }
 
   private insertSettled(
@@ -960,16 +1020,17 @@ export class EventStore {
 
   /**
    * Opens a canticle push, in one transaction, before anything is pushed: its batch, the
-   * tombstones that claim its records for dedupe, the delivery cursor, and one custody row
-   * per record, claimed. A crash after this loses the push, never repeats it. Nothing here
-   * says the session got it: that is `offerCanticleCustody`, on the host's word. Returns
-   * the batch id, which the push carries as its batch_id.
+   * tombstones that claim its records for dedupe, the delivery cursor (`value`; `before`
+   * is kept until the host confirms the push, for a revert to give back), and one custody
+   * row per record, claimed. After a crash the push stays claimed until the next attach
+   * reverts it. Nothing here says the session got it: that is `offerCanticleCustody`, on
+   * the host's word. Returns the batch id, which the push carries as its batch_id.
    */
   public claimCanticlePush(
     ear: string,
     session: { generation: number; sessionId: string | null },
     rows: ReadonlyArray<Omit<CanticleSettled, "ear">>,
-    cursor: { name: string; value: string },
+    cursor: { name: string; value: string; before: string },
     exposures: readonly CanticleExposure[],
   ): number {
     return this.transaction(() => {
@@ -984,6 +1045,12 @@ export class EventStore {
       );
       this.insertSettled(ear, rows, batchId);
       this.setRuntimeState(cursor.name, cursor.value);
+      this.database
+        .prepare(
+          `INSERT INTO canticle_claims (batch_id, ear, cursor_name, cursor_before)
+           VALUES (?, ?, ?, ?)`,
+        )
+        .run(batchId, ear, cursor.name, cursor.before);
       const insert = this.database.prepare(
         `INSERT INTO canticle_custody (ear, path, mode, batch_id, session_id, generation,
            identity, station, stream, key_id, epoch, seq, digest, shown, claimed_at)
@@ -1023,25 +1090,33 @@ export class EventStore {
     cursor: { name: string; value: string },
   ): void {
     this.transaction(() => {
-      this.database
-        .prepare("DELETE FROM canticle_custody WHERE ear = ? AND batch_id = ?")
-        .run(ear, batchId);
-      this.database
-        .prepare("DELETE FROM canticle_settled WHERE ear = ? AND batch_id = ?")
-        .run(ear, batchId);
-      this.database
-        .prepare(
-          "DELETE FROM batches WHERE id = ? AND ear = ? AND kind = 'canticle'",
-        )
-        .run(batchId, ear);
+      this.dropCanticleClaim(ear, batchId);
       this.setRuntimeState(cursor.name, cursor.value);
     });
   }
 
+  /** A canticle push's claim gone whole: custody rows, tombstones, saved cursor, batch. */
+  private dropCanticleClaim(ear: string, batchId: number): void {
+    this.database
+      .prepare("DELETE FROM canticle_custody WHERE ear = ? AND batch_id = ?")
+      .run(ear, batchId);
+    this.database
+      .prepare("DELETE FROM canticle_settled WHERE ear = ? AND batch_id = ?")
+      .run(ear, batchId);
+    this.database
+      .prepare("DELETE FROM canticle_claims WHERE ear = ? AND batch_id = ?")
+      .run(ear, batchId);
+    this.database
+      .prepare(
+        "DELETE FROM batches WHERE id = ? AND ear = ? AND kind = 'canticle'",
+      )
+      .run(batchId, ear);
+  }
+
   /**
    * The host handed canticle batch `batchId` to the session (the shim's `offered`): its
-   * records are offered now, to the session holding the ear now, under its boundary now.
-   * Returns how many.
+   * records are offered now, to the session holding the ear now, under its boundary now,
+   * and no revert can give the push back. Returns how many.
    */
   public offerCanticleCustody(
     ear: string,
@@ -1052,6 +1127,9 @@ export class EventStore {
       boundary: CompactionBoundary;
     },
   ): number {
+    this.database
+      .prepare("DELETE FROM canticle_claims WHERE ear = ? AND batch_id = ?")
+      .run(ear, batchId);
     return Number(
       this.database
         .prepare(
@@ -1072,23 +1150,46 @@ export class EventStore {
 
   /** Whether `batchId` is one of this ear's canticle pushes that custody still holds. */
   public isCanticleBatch(ear: string, batchId: number): boolean {
-    return (
-      this.database
-        .prepare(
-          "SELECT 1 AS hit FROM canticle_custody WHERE ear = ? AND batch_id = ? LIMIT 1",
-        )
-        .get(ear, batchId) !== undefined
-    );
+    const push = this.canticlePush(ear, batchId);
+    return push !== undefined && push !== "reverted";
   }
 
   /**
-   * The session named canticle batch `batchId` in a tool call. As a named Discord batch
-   * does in its chat, it echoes that batch and the earlier ones: every record of this ear
-   * offered in a canticle batch up to it, not echoed yet, that was offered to this same
-   * session. That is the session id the offer went to; only an offer made while no id was
-   * known falls back to the attach. A session that changed within one attach (a /clear)
-   * never echoes what the one before it was shown. A batch the host never confirmed
-   * echoes nothing of its own. Returns how many records were echoed.
+   * Canticle push `batchId` of this ear as custody holds it, with the attach generation it
+   * went out under (its delivery token is keyed by it); `reverted` when a revert gave it
+   * back (its records went out again under new ids); undefined when it is no canticle push
+   * of this ear that frond-ear still knows.
+   */
+  public canticlePush(
+    ear: string,
+    batchId: number,
+  ): { generation: number } | "reverted" | undefined {
+    const row = this.database
+      .prepare(
+        "SELECT generation FROM canticle_custody WHERE ear = ? AND batch_id = ? LIMIT 1",
+      )
+      .get(ear, batchId) as { generation: number } | undefined;
+    if (row !== undefined) {
+      return { generation: row.generation };
+    }
+    return this.database
+      .prepare(
+        "SELECT 1 AS hit FROM canticle_reverted WHERE ear = ? AND batch_id = ?",
+      )
+      .get(ear, batchId) !== undefined
+      ? "reverted"
+      : undefined;
+  }
+
+  /**
+   * The session named canticle batch `batchId` in a tool call: that batch's records, and
+   * no other's, are echoed, if the host confirmed it to this same session and they aren't
+   * echoed yet. Unlike a Discord batch, it settles nothing earlier: the session can only
+   * vouch for the push it names (🍃 on #112). The same session is the one the offer went
+   * to, by id; only an offer made while no id was known falls back to the attach. A
+   * session that changed within one attach (a /clear) never echoes what the one before it
+   * was shown, and a push the host never confirmed echoes nothing. Returns how many
+   * records were echoed.
    */
   public echoCanticleCustody(
     ear: string,
@@ -1101,15 +1202,12 @@ export class EventStore {
       boundary: CompactionBoundary;
     },
   ): number {
-    if (!this.isCanticleBatch(ear, batchId)) {
-      return 0;
-    }
     return Number(
       this.database
         .prepare(
           `UPDATE canticle_custody SET echoed_at = ?, echo_kind = ?, echo_batch = ?,
              echo_session = ?, echo_boundary = ?, echo_boundary_known = ?
-           WHERE ear = ? AND batch_id IS NOT NULL AND batch_id <= ?
+           WHERE ear = ? AND batch_id = ?
              AND offered_at IS NOT NULL AND echoed_at IS NULL
              AND (offer_session = ? OR (offer_session IS NULL AND generation = ?))`,
         )
@@ -1792,6 +1890,14 @@ export class EventStore {
     });
   }
 
+  /** The highest batch id ever handed out, deleted batches included (0 for none yet). */
+  public batchHighWater(): number {
+    const row = this.database
+      .prepare("SELECT seq FROM sqlite_sequence WHERE name = 'batches'")
+      .get() as { seq: number } | undefined;
+    return row?.seq ?? 0;
+  }
+
   public confirmBatch(
     batchId: number,
     ear: string,
@@ -1806,13 +1912,75 @@ export class EventStore {
     return result.changes === 1;
   }
 
-  public revertUnconfirmed(ear: string): number {
+  /**
+   * Gives back every batch of the ear the host never confirmed, in one transaction. A
+   * Discord batch's events are queued again. A canticle push's claim goes whole, as a
+   * push no connection took gives it back (#161): its custody rows and tombstones go, the
+   * tombstones of refreshes that collapsed into it too, so its records can be pushed
+   * again while they are on air; the delivery cursor goes back to before the first such
+   * push, unless a later push was confirmed since; and its id stays known as a canticle
+   * push's, which names no chat. Returns how many batches it gave back and, for each
+   * canticle push, its record identities and those of the refreshes collapsed into it.
+   */
+  public revertUnconfirmed(ear: string): {
+    batches: number;
+    canticle: CanticleReverted[];
+  } {
     return this.transaction(() => {
       const batches = this.database
-        .prepare("SELECT id FROM batches WHERE ear = ? AND offered_at IS NULL")
-        .all(ear) as Array<{ id: number }>;
+        .prepare(
+          "SELECT id, kind FROM batches WHERE ear = ? AND offered_at IS NULL ORDER BY id",
+        )
+        .all(ear) as Array<{ id: number; kind: string }>;
       const now = this.clock.now();
+      const canticle: CanticleReverted[] = [];
+      const pushes = batches.filter((batch) => batch.kind === "canticle");
+      const first = pushes[0];
+      if (first !== undefined) {
+        const claim = this.database
+          .prepare(
+            "SELECT cursor_name, cursor_before FROM canticle_claims WHERE ear = ? AND batch_id = ?",
+          )
+          .get(ear, first.id) as
+          | { cursor_name: string; cursor_before: string }
+          | undefined;
+        const later = this.database
+          .prepare(
+            `SELECT 1 AS hit FROM batches WHERE ear = ? AND kind = 'canticle' AND id > ?
+               AND offered_at IS NOT NULL LIMIT 1`,
+          )
+          .get(ear, first.id);
+        if (claim !== undefined && later === undefined) {
+          this.setRuntimeState(claim.cursor_name, claim.cursor_before);
+        }
+      }
       for (const batch of batches) {
+        if (batch.kind === "canticle") {
+          const identities = (
+            this.database
+              .prepare(
+                "SELECT identity FROM canticle_custody WHERE ear = ? AND batch_id = ? ORDER BY id",
+              )
+              .all(ear, batch.id) as Array<{ identity: string }>
+          ).map((row) => row.identity);
+          const collapsed = (
+            this.database
+              .prepare(
+                `SELECT identity FROM canticle_settled
+                 WHERE ear = ? AND batch_id = ? AND outcome = 'collapsed' ORDER BY identity`,
+              )
+              .all(ear, batch.id) as Array<{ identity: string }>
+          ).map((row) => row.identity);
+          this.dropCanticleClaim(ear, batch.id);
+          this.database
+            .prepare(
+              `INSERT INTO canticle_reverted (batch_id, ear, reverted_at) VALUES (?, ?, ?)
+               ON CONFLICT(batch_id) DO NOTHING`,
+            )
+            .run(batch.id, ear, now);
+          canticle.push({ batchId: batch.id, identities, collapsed });
+          continue;
+        }
         this.database
           .prepare(
             `UPDATE events SET state = CASE WHEN wake = 1 THEN 'queued' ELSE 'context' END,
@@ -1822,7 +1990,7 @@ export class EventStore {
           .run(now, now, batch.id);
         this.database.prepare("DELETE FROM batches WHERE id = ?").run(batch.id);
       }
-      return batches.length;
+      return { batches: batches.length, canticle };
     });
   }
 
@@ -2020,6 +2188,17 @@ export class EventStore {
       if (custody > 0 && this.canticleCustodySince() < cutoff) {
         this.setRuntimeState(CUSTODY_SINCE, String(cutoff));
       }
+      // A push's saved cursor goes with its confirmation, release or revert; one whose
+      // batch is gone otherwise has nothing left to give back to.
+      this.database
+        .prepare(
+          "DELETE FROM canticle_claims WHERE batch_id NOT IN (SELECT id FROM batches)",
+        )
+        .run();
+      // A reverted push's id stays a canticle id as long as its custody would have.
+      this.database
+        .prepare("DELETE FROM canticle_reverted WHERE reverted_at < ?")
+        .run(cutoff);
       return events;
     });
   }

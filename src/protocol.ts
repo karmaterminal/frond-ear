@@ -96,7 +96,11 @@ export type DaemonMessage =
   | { type: "detached"; reason: string };
 
 export interface Connection {
-  send(message: DaemonMessage | ClientMessage): void;
+  /**
+   * Whether the connection took the message: false when it can no longer carry one. True
+   * is no delivery receipt; only the peer's answer (a shim's `offered`) is.
+   */
+  send(message: DaemonMessage | ClientMessage): boolean;
   close(): void;
 }
 
@@ -148,10 +152,24 @@ export class LineConnection implements Connection {
     });
   }
 
-  public send(message: DaemonMessage | ClientMessage): void {
-    if (!this.closed) {
-      this.socket.write(`${JSON.stringify(message)}\n`);
+  /**
+   * False, writing nothing, once the socket can't carry a write: closed, destroyed (its
+   * close event may still be to come), or ended by the peer. No peer half-closes this
+   * protocol, so an end read means the peer is gone, though the socket would still
+   * take the write. A write that fails after this returns surfaces as the close.
+   */
+  public send(message: DaemonMessage | ClientMessage): boolean {
+    const socket = this.socket;
+    if (
+      this.closed ||
+      socket.destroyed ||
+      !socket.writable ||
+      socket.readableEnded
+    ) {
+      return false;
     }
+    socket.write(`${JSON.stringify(message)}\n`);
+    return true;
   }
 
   public close(): void {

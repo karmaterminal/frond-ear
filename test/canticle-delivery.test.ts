@@ -24,6 +24,7 @@ import { channelInstructions } from "../src/render.ts";
 import {
   ALPHA,
   canticleConfig,
+  confirm,
   OPS,
   order,
   pushes,
@@ -478,6 +479,7 @@ test("dedupe: tombstones, a standing mute and the report cursor survive a frond-
         mode: "mute",
         station: "alpha",
       }); // no TTL: it stands
+      await confirm(shim); // the shim wrote the report, and said so
     } finally {
       first.h.dispose();
     }
@@ -673,6 +675,44 @@ test("dedupe: a refresh re-issue with an equal body digest is the pushed record 
     assert.match(push, /item=7\/4 hop=0 root=unavailable state_key=silas\n/u);
     assert.match(push, / expires_in=\d+s refresh\n/u);
     assert.equal(status(h).counts.refresh_collapsed, 2);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("dedupe: a refresh heard while the record it re-issues still waits is held back, and collapses once that record is pushed (§7.9)", async () => {
+  const A = "a".repeat(64);
+  const { h, host } = setup({ mode: "immediate" });
+  try {
+    const shim = h.attach("scribe");
+    const keyed = { stateKey: "silas", text: "silas: deploying", digest: A };
+    host.sing(1, keyed);
+    h.timers.advance(2_000); // record 1 waits out its debounce
+    host.sing(2, { ...keyed, flags: { refresh: true } });
+    h.timers.advance(4_000);
+    assert.equal(pushes(shim).length, 1);
+    assert.deepEqual(order(pushes(shim)[0]!.content), ["ops:ops.fleet/1"]);
+    h.timers.advance(60_000);
+    assert.equal(pushes(shim).length, 1, "2 is 1 again");
+    assert.equal(status(h).counts.refresh_collapsed, 1);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("dedupe: a refresh whose record has left the view (superseded, as the embedded receptor does) is not held behind it: it goes out", async () => {
+  const A = "a".repeat(64);
+  const { h, host } = setup({ mode: "immediate" });
+  try {
+    const shim = h.attach("scribe");
+    const keyed = { stateKey: "silas", text: "silas: deploying", digest: A };
+    host.sing(1, { ...keyed, ttlMs: 600_000 });
+    h.timers.advance(2_000); // record 1 waits out its debounce
+    host.sing(2, { ...keyed, ttlMs: 600_000, flags: { refresh: true } });
+    host.pluck(1, keyed); // the refresh supersedes it: it leaves the view
+    h.timers.advance(10_000);
+    assert.equal(pushes(shim).length, 1);
+    assert.deepEqual(order(pushes(shim)[0]!.content), ["ops:ops.fleet/2"]);
   } finally {
     h.dispose();
   }
@@ -990,6 +1030,7 @@ test("dedupe: a record heard again with a later local expiry keeps its tombstone
       first.host.sing(1, { ttlMs: 60_000, dedup: "resurfaced" });
       first.h.timers.advance(30_000); // past the first tombstone, while the copy is fresh
       assert.equal(pushes(shim).length, 1);
+      await confirm(shim);
     } finally {
       first.h.dispose();
     }
@@ -1225,6 +1266,7 @@ test("holds: the hourly push budget holds records until the hour has room, throu
       first.host.sing(1, { ttlMs: 7_200_000 });
       first.h.timers.advance(6_000);
       assert.equal(pushes(shim).length, 1);
+      await confirm(shim);
     } finally {
       first.h.dispose();
     }
