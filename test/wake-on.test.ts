@@ -1174,3 +1174,25 @@ test("wake_on: a 429 holds every watch back even when the watch that got it reti
     h2.dispose();
   }
 });
+
+test("wake_on: an x-poll-interval GitHub gives at registration sets the first poll's time", async () => {
+  const fake = new FakeGithub();
+  fake.routes.set(`${R}/pulls/25`, {
+    body: { state: "open", merged: false, head: { sha: S1 } },
+    headers: { "x-poll-interval": "900" },
+  });
+  const h = harness(config(), { githubFetch: fake.fetch });
+  try {
+    const shim = h.attach("scribe", { sessionId: A });
+    await watch(h, shim, { target: "pr", number: 25, on: "merged" });
+    assert.equal(fake.requests.length, 1);
+    await advance(h, POLL);
+    assert.equal(fake.requests.length, 1, "not at the configured 120 s");
+    await advance(h, 900_000 - POLL - 30_000);
+    assert.equal(fake.requests.length, 1, "not before GitHub's 900 s");
+    await advance(h, 30_000);
+    assert.equal(fake.requests.length, 2, "at 900 s");
+  } finally {
+    h.dispose();
+  }
+});
