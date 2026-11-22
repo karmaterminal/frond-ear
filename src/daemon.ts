@@ -1370,12 +1370,11 @@ export class Daemon {
                 client.attachGeneration,
               )
             ) {
-              this.store.offerCanticleCustody(
-                ear,
-                message.batchId,
-                this.clock.now(),
-                this.boundary(ear),
-              );
+              this.store.offerCanticleCustody(ear, message.batchId, {
+                at: this.clock.now(),
+                sessionId: client.sessionId ?? null,
+                boundary: this.boundary(ear),
+              });
             }
           });
         }
@@ -2246,7 +2245,8 @@ export class Daemon {
    * the batch_id the model passed (clamped to what was confirmed), else the
    * latest confirmed batch at call start. Anything offered later stays unseen.
    * A named canticle push is echoed here, at the call (#161): `canticle` says the
-   * id was one, `echoed` how many of its records it echoed.
+   * id was one, `echoed` how many of its records it echoed. A canticle id names the
+   * canticle stream, never a chat, so it acknowledges no Discord batch in any tool.
    */
   private seenHorizon(
     client: Client,
@@ -2269,12 +2269,14 @@ export class Daemon {
       throw new Error("batch_id must be the batch_id from the event");
     }
     this.provenByUse(client, ear, batch, match[2]);
-    const canticle = this.store.isCanticleBatch(ear, batch);
-    return {
-      horizon: Math.min(batch, latest),
-      canticle,
-      echoed: canticle ? this.echoCanticle(client, ear, batch, tool) : 0,
-    };
+    if (this.store.isCanticleBatch(ear, batch)) {
+      return {
+        horizon: undefined,
+        canticle: true,
+        echoed: this.echoCanticle(client, ear, batch, tool),
+      };
+    }
+    return { horizon: Math.min(batch, latest), canticle: false, echoed: 0 };
   }
 
   /**
@@ -2529,16 +2531,15 @@ export class Daemon {
           ? this.requireChat(args).ear
           : this.readableEar(client, args);
         const seen = this.seenHorizon(client, ear, chatId, args, "ack");
-        const heard = `${seen.echoed} canticle record${seen.echoed === 1 ? "" : "s"} echoed as heard`;
-        if (seen.canticle && chatId === undefined) {
-          // A canticle push's batch_id names the canticle stream, not a chat: alone,
-          // it echoes the push and marks no Discord event seen (#161).
+        if (seen.canticle) {
+          // A canticle push's batch_id echoes the push and marks no Discord event
+          // seen, with or without chat_id (#161).
           return seen.echoed > 0
-            ? heard
-            : "0 canticle records echoed: already echoed, or the push never confirmed delivered to this session";
+            ? `${seen.echoed} canticle record${seen.echoed === 1 ? "" : "s"} echoed as heard`
+            : "0 canticle records echoed: already echoed, or the push was never confirmed delivered to this session";
         }
         const marked = this.markSeenThrough(client, ear, chatId, seen.horizon);
-        return `${marked} event${marked === 1 ? "" : "s"} marked seen${seen.echoed > 0 ? `; ${heard}` : ""}`;
+        return `${marked} event${marked === 1 ? "" : "s"} marked seen`;
       }
       case "set_attention":
         return this.setAttention(client, args);

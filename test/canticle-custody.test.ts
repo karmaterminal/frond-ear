@@ -340,6 +340,17 @@ test("settlement: a canticle batch_id echoes through ack, reply, react, edit_mes
       emoji: "👀",
       batch_id: c.meta.batch_id,
     });
+    // A canticle id names the canticle stream, never a chat: in any tool, it marks no
+    // Discord event seen, though the chat's own batch came before it.
+    assert.equal(
+      (
+        h.daemon.status("scribe") as {
+          ears: Array<{ events: Record<string, number> }>;
+        }
+      ).ears[0]!.events.offered,
+      1,
+      "the Discord batch is still unseen",
+    );
     const sent = (
       await h.call(shim, "reply", { chat_id: CHANNEL, text: "progress" })
     ).text.match(/ids? (\d+)/u)![1]!;
@@ -887,5 +898,69 @@ test("shown: custody keeps how much of each record a push showed: whole, cut to 
     );
   } finally {
     h.dispose();
+  }
+});
+
+test("sessions: a session switch inside one attach never lets the new session's echo vouch for what the old one was shown", async () => {
+  const { h, host } = setup({ mode: "immediate" });
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    await pressure(h, null);
+    await offered(h, host, shim, 1);
+    // The same shim now speaks for another session (a /clear in the same process).
+    await shim.send({ type: "session", sessionId: OTHER_SESSION });
+    h.clock.advance(1_000);
+    await pressure(h, null, { sessionId: OTHER_SESSION });
+    const second = await offered(h, host, shim, 2);
+    await h.call(shim, "ack", { batch_id: second.meta.batch_id });
+    const view = await custody(h, shim);
+    assert.equal(
+      recordOf(view, 1).state,
+      "offered",
+      "shown to the session before the switch, never echoed by it",
+    );
+    assert.equal(recordOf(view, 2).state, "echoed");
+    assert.equal(view.history, "incomplete");
+  } finally {
+    h.dispose();
+  }
+});
+
+test("store: claiming a record over a lapsed tombstone row and giving the claim back leaves no tombstone for it", () => {
+  const directory = mkdtempSync(join(tmpdir(), "frond-ear-custody-lapse-"));
+  try {
+    const clock = new FakeClock(5_000_000);
+    const store = new EventStore(join(directory, "ear.db"), clock);
+    try {
+      const row = {
+        identity: "k:7:s:1",
+        outcome: "pushed" as const,
+        refreshKey: null,
+        digest: null,
+      };
+      store.settleCanticle("scribe", [{ ...row, expiresAt: 5_010_000 }]);
+      // The tombstone lapses; no prune has run, so its row is still there.
+      clock.advance(60_000);
+      const batch = store.claimCanticlePush(
+        "scribe",
+        { generation: 1, sessionId: SESSION },
+        [{ ...row, expiresAt: 5_500_000 }],
+        { name: "canticle.cursor.scribe", value: "{}" },
+        [],
+      );
+      store.releaseCanticlePush("scribe", batch, {
+        name: "canticle.cursor.scribe",
+        value: "{}",
+      });
+      assert.deepEqual(
+        store.canticleSettled(clock.now()).map((item) => item.identity),
+        [],
+        "a restart would not take the record as pushed",
+      );
+    } finally {
+      store.close();
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
   }
 });

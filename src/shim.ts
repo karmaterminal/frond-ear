@@ -152,7 +152,7 @@ export const TOOLS = [
   {
     name: "ack",
     description:
-      'Mark events seen without replying, when you read them and chose not to answer. Pass chat_id and the event\'s batch_id: without chat_id it covers every chat of this ear, and without batch_id everything delivered so far. A kind="canticle" event\'s batch_id on its own (no chat_id) tells frond-ear you heard that push, and earlier ones, and marks no Discord event seen; a push you never name counts as offered, never heard. With nonce instead (from the kind="attach" event), it confirms that events reach you and marks nothing. "unknown or already-used nonce" means the ear is already confirmed, the nonce is from an earlier attach, or this session no longer holds the ear: check ear_status instead of retrying.',
+      'Mark events seen without replying, when you read them and chose not to answer. Pass chat_id and the event\'s batch_id: without chat_id it covers every chat of this ear, and without batch_id everything delivered so far. A kind="canticle" event\'s batch_id tells frond-ear you heard that push, and earlier ones, and marks no Discord event seen; a push you never name counts as offered, never heard. With nonce instead (from the kind="attach" event), it confirms that events reach you and marks nothing. "unknown or already-used nonce" means the ear is already confirmed, the nonce is from an earlier attach, or this session no longer holds the ear: check ear_status instead of retrying.',
     inputSchema: {
       type: "object",
       properties: {

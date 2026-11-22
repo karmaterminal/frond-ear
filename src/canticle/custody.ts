@@ -92,11 +92,20 @@ export function placeExposure(
     return exposure.offeredAt === null ? "claimed" : "offered";
   }
   const session = current.session?.id ?? null;
-  if (session === null || exposure.echoSession === null) {
-    // Without both ids frond-ear can't tell this session's echo from another's.
+  const { offerSession, echoSession } = exposure;
+  if (
+    offerSession !== null &&
+    echoSession !== null &&
+    offerSession !== echoSession
+  ) {
+    // Shown to one session, echoed by another: the echo vouches for nothing.
+    return "echoed_before_boundary";
+  }
+  if (session === null || offerSession === null || echoSession === null) {
+    // Without every id frond-ear can't tell this session's echo from another's.
     return "echoed_boundary_unknown";
   }
-  if (exposure.echoSession !== session) {
+  if (echoSession !== session) {
     return "echoed_before_boundary";
   }
   const { offerBoundary, echoBoundary } = exposure;
@@ -266,7 +275,8 @@ export function custodyEntry(record: CustodyRecord): object {
     shown: exposure.shown,
     digest: exposure.digest,
     exposures: record.exposures,
-    session: exposure.sessionId?.slice(0, 8) ?? null,
+    // The session it was shown to (or, before the host confirmed it, pushed to).
+    session: (exposure.offerSession ?? exposure.sessionId)?.slice(0, 8) ?? null,
     claimedAt: exposure.claimedAt,
     offeredAt: exposure.offeredAt,
     offerBoundary:

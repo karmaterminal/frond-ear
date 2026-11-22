@@ -674,21 +674,22 @@ its SQLite store, for `limits.retentionMs`:
 | Step    | When                                                                                                                                                        | Kept                                                                                                                                                                                                                                  |
 | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | claimed | The push's batch, its records' dedupe tombstones, the cursor and these rows are written in one transaction; then the push goes to the session's connection. | When, the session (its id as its shim gave it, and its attach generation), the record (station, stream, key id, epoch, seq and a SHA-256 of its whole payload, never the text), `path` (`immediate` or `report`), `mode` and `shown`. |
-| offered | The shim (or the Copilot extension) answers `offered` for the batch: it handed the event to the session.                                                    | When, and the session's compaction boundary then.                                                                                                                                                                                     |
+| offered | The shim (or the Copilot extension) answers `offered` for the batch: it handed the event to the session.                                                    | When, the session it went to, and its compaction boundary then.                                                                                                                                                                       |
 | echoed  | The session names the push's `batch_id` in `ack`, `reply`, `react`, `edit_message` or `fetch_messages`.                                                     | When, the tool, the session, and its boundary then.                                                                                                                                                                                   |
 
 `mode` is the ear's effective mode for the record's station then (a record too old for `immediate` shows `mode:
 immediate`, `path: report`). `shown` is how much of it the push showed: `whole`, `cut` to fit, or `none` (a `counts`
 report, a non-text payload).
 
-- **A push alone is never heard.** A call that names no id, or a Discord batch's id, echoes nothing. `ack` with a
-  canticle push's `batch_id` and no `chat_id` echoes it and marks no Discord event seen. With a `chat_id`, or from
-  `reply`, `react`, `edit_message` or `fetch_messages`, the id settles that chat too, as any batch id does. The echo is
-  the id in the call, so it counts even if the call then fails (a Discord error, a refused file).
-- **Naming a push echoes the earlier ones** made to the same session (by its session id, or by its attach when the
-  shim gave no id), as a later Discord batch settles its chat. Such a record shows `echoedThrough: "a later push"`. A
-  push made to another session is never echoed by this one. The bare id a tap prints echoes too, since the tap shows
-  the same push; the token form also registers the ear by use, as a Discord batch's does.
+- **A push alone is never heard.** A call that names no id, or a Discord batch's id, echoes nothing. A canticle push's
+  `batch_id` names the canticle stream, never a chat: in any tool, with or without `chat_id`, it echoes the push and
+  marks no Discord event seen. The echo is the id in the call, so it counts even if the call then fails (a Discord
+  error, a refused file).
+- **Naming a push echoes the earlier ones** shown to the same session, as a later Discord batch settles its chat. The
+  session is the one the host confirmed each push to, by id; only a push confirmed while no id was known falls back to
+  the attach. Such a record shows `echoedThrough: "a later push"`. A session never echoes what another was shown, even
+  one it replaced within the same attach (a `/clear`). The bare id a tap prints echoes too, since the tap shows the same
+  push; the token form also registers the ear by use, as a Discord batch's does.
 - **`hear` is an exposure too.** Each record whose payload text `hear` returns to the ear's own session is a row with
   `path: "hear"`, offered and echoed at the tool's return. Another reader's `hear`, and a record it lists without its
   text (non-text, or cut to nothing), add nothing.

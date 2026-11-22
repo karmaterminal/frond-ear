@@ -153,6 +153,11 @@ export interface CanticleCustody extends CanticleExposure {
   generation: number;
   claimedAt: number;
   offeredAt: number | null;
+  /**
+   * The session holding the ear when the host confirmed it: the one it was shown to. It
+   * can differ from `sessionId` when a session changed within one attach (a /clear).
+   */
+  offerSession: string | null;
   offerBoundary: CompactionBoundary;
   echoedAt: number | null;
   /** The tool whose call named the batch, or `hear`. */
@@ -181,6 +186,7 @@ interface CustodyRow {
   shown: CanticleShown;
   claimed_at: number;
   offered_at: number | null;
+  offer_session: string | null;
   offer_boundary: string | null;
   offer_boundary_known: number;
   echoed_at: number | null;
@@ -213,6 +219,7 @@ function mapCustody(row: CustodyRow): CanticleCustody {
     shown: row.shown,
     claimedAt: row.claimed_at,
     offeredAt: row.offered_at,
+    offerSession: row.offer_session,
     offerBoundary: boundaryOf(row.offer_boundary, row.offer_boundary_known),
     echoedAt: row.echoed_at,
     echoKind: row.echo_kind,
@@ -483,6 +490,7 @@ export class EventStore {
         shown TEXT NOT NULL CHECK (shown IN ('whole', 'cut', 'none')),
         claimed_at INTEGER NOT NULL,
         offered_at INTEGER,
+        offer_session TEXT,
         offer_boundary TEXT,
         offer_boundary_known INTEGER NOT NULL DEFAULT 0,
         echoed_at INTEGER,
@@ -498,6 +506,8 @@ export class EventStore {
         ON canticle_custody (ear, batch_id);
       CREATE INDEX IF NOT EXISTS canticle_custody_claimed
         ON canticle_custody (claimed_at);
+      CREATE INDEX IF NOT EXISTS canticle_custody_identity
+        ON canticle_custody (ear, identity);
     `);
     // Custody is whole from the moment its table exists: a window that reaches back
     // before that (or before the prune's cutoff) reads as unknown, never as empty. A
@@ -917,6 +927,14 @@ export class EventStore {
     rows: ReadonlyArray<Omit<CanticleSettled, "ear">>,
     batchId: number | null,
   ): void {
+    // A lapsed tombstone that no prune has removed yet decides nothing: a new claim
+    // replaces it whole, so its batch is this one and a release takes it back (#161).
+    const lapsed = this.database.prepare(
+      "DELETE FROM canticle_settled WHERE ear = ? AND identity = ? AND expires_at <= ?",
+    );
+    for (const row of rows) {
+      lapsed.run(ear, row.identity, this.clock.now());
+    }
     const insert = this.database.prepare(
       `INSERT INTO canticle_settled
          (ear, identity, outcome, refresh_key, digest, settled_at, expires_at, batch_id)
@@ -1022,22 +1040,33 @@ export class EventStore {
 
   /**
    * The host handed canticle batch `batchId` to the session (the shim's `offered`): its
-   * records are offered now, under the session's boundary now. Returns how many.
+   * records are offered now, to the session holding the ear now, under its boundary now.
+   * Returns how many.
    */
   public offerCanticleCustody(
     ear: string,
     batchId: number,
-    at: number,
-    boundary: CompactionBoundary,
+    offer: {
+      at: number;
+      sessionId: string | null;
+      boundary: CompactionBoundary;
+    },
   ): number {
     return Number(
       this.database
         .prepare(
-          `UPDATE canticle_custody SET offered_at = ?, offer_boundary = ?, offer_boundary_known = ?
+          `UPDATE canticle_custody SET offered_at = ?, offer_session = ?, offer_boundary = ?,
+             offer_boundary_known = ?
            WHERE ear = ? AND batch_id = ? AND offered_at IS NULL`,
         )
-        .run(at, boundary ?? null, boundary === undefined ? 0 : 1, ear, batchId)
-        .changes,
+        .run(
+          offer.at,
+          offer.sessionId,
+          offer.boundary ?? null,
+          offer.boundary === undefined ? 0 : 1,
+          ear,
+          batchId,
+        ).changes,
     );
   }
 
@@ -1055,8 +1084,10 @@ export class EventStore {
   /**
    * The session named canticle batch `batchId` in a tool call. As a named Discord batch
    * does in its chat, it echoes that batch and the earlier ones: every record of this ear
-   * offered in a canticle batch up to it, to that same session (its session id, or its
-   * attach when the id is unknown), not echoed yet. A batch the host never confirmed
+   * offered in a canticle batch up to it, not echoed yet, that was offered to this same
+   * session. That is the session id the offer went to; only an offer made while no id was
+   * known falls back to the attach. A session that changed within one attach (a /clear)
+   * never echoes what the one before it was shown. A batch the host never confirmed
    * echoes nothing of its own. Returns how many records were echoed.
    */
   public echoCanticleCustody(
@@ -1080,7 +1111,7 @@ export class EventStore {
              echo_session = ?, echo_boundary = ?, echo_boundary_known = ?
            WHERE ear = ? AND batch_id IS NOT NULL AND batch_id <= ?
              AND offered_at IS NOT NULL AND echoed_at IS NULL
-             AND (generation = ? OR (session_id IS NOT NULL AND session_id = ?))`,
+             AND (offer_session = ? OR (offer_session IS NULL AND generation = ?))`,
         )
         .run(
           echo.at,
@@ -1091,8 +1122,8 @@ export class EventStore {
           echo.boundary === undefined ? 0 : 1,
           ear,
           batchId,
-          echo.generation,
           echo.sessionId,
+          echo.generation,
         ).changes,
     );
   }
@@ -1111,9 +1142,9 @@ export class EventStore {
     const insert = this.database.prepare(
       `INSERT INTO canticle_custody (ear, path, mode, batch_id, session_id, generation,
          identity, station, stream, key_id, epoch, seq, digest, shown, claimed_at,
-         offered_at, offer_boundary, offer_boundary_known, echoed_at, echo_kind,
-         echo_session, echo_boundary, echo_boundary_known)
-       VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'hear', ?, ?, ?)`,
+         offered_at, offer_session, offer_boundary, offer_boundary_known, echoed_at,
+         echo_kind, echo_session, echo_boundary, echo_boundary_known)
+       VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'hear', ?, ?, ?)`,
     );
     const known = boundary === undefined ? 0 : 1;
     this.atomically(() => {
@@ -1134,6 +1165,7 @@ export class EventStore {
           exposure.shown,
           at,
           at,
+          session.sessionId,
           boundary ?? null,
           known,
           at,
