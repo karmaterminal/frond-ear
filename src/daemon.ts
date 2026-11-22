@@ -23,6 +23,20 @@ import {
   type PublicationDecision,
 } from "./canticle/custody.ts";
 import { CanticleDelivery, exposure } from "./canticle/delivery.ts";
+import {
+  DERIVED_TEXT_MAX_BYTES,
+  ELECTION_ID,
+  derivedCapability,
+  derivedLineage,
+  derivedTextFits,
+  noAnswer,
+  publishRequest,
+  queryRequest,
+  stationWords,
+  type DerivedLineage,
+  type DerivedOutcome,
+  type DerivedRoute,
+} from "./canticle/derived.ts";
 import { messageText } from "./components.ts";
 import { CANTICLE_KEY_ID, CANTICLE_STATION, type Config } from "./config.ts";
 import {
@@ -117,6 +131,11 @@ export interface DaemonOptions {
    * reinstall must reach this daemon's socket). Default: process.env.
    */
   env?: NodeJS.ProcessEnv;
+  /**
+   * The owner's route for derived publication (binary-canticle#161 item 4): the issuer of
+   * capsules and a station's control socket. Absent (the CLI wires none): closed.
+   */
+  derivedRoute?: DerivedRoute;
 }
 
 interface Client {
@@ -3129,16 +3148,25 @@ export class Daemon {
    * unless config canticle.derivedPublication is on and every one was heard whole and
    * echoed within the current compaction boundary of the session holding the ear; a
    * record custody doesn't hold reads as unknown. It decides only: no station call, and
-   * never the `sing` route. Nothing in frond-ear calls it yet (binary-canticle#162).
+   * never the `sing` route. `derivedPublish` asks it before anything else.
    */
   public derivedPublicationGate(
     ear: string,
     sources: readonly string[],
   ): PublicationDecision {
+    return derivedPublication(
+      this.config.canticle?.derivedPublication === true,
+      sources,
+      this.sourceCustody(ear, sources),
+    );
+  }
+
+  /** Custody of these source records, judged now; one custody doesn't hold reads as unknown. */
+  private sourceCustody(ear: string, sources: readonly string[]): CustodyView {
     const rows = this.store.canticleCustodyOf(ear, sources);
     const held = new Set(rows.map((row) => row.identity));
     const absent = [...new Set(sources)].filter((id) => !held.has(id));
-    const view = custodyView(
+    return custodyView(
       rows,
       this.custodyNow(ear),
       absent.length > 0
@@ -3147,11 +3175,215 @@ export class Daemon {
           ]
         : [],
     );
-    return derivedPublication(
-      this.config.canticle?.derivedPublication === true,
-      sources,
-      view,
-    );
+  }
+
+  /**
+   * Publishes `text`, derived from these heard records, by a station's derived op
+   * (binary-canticle#161 item 4; the op is #159, assembled in #162). Closed unless the
+   * seam is open (`derivedPublicationGate`), the owner's route is wired, the text is
+   * within #162's bound, custody kept each source's lineage, and the station's control
+   * socket offers the op; that is judged again after every wait, so custody that moved
+   * meanwhile (a compaction, a new session) stops it before anything is published. Then
+   * the owner's issuer gets the lineage and returns the capsule, and the station gets
+   * exactly `derived_publish`, never `sing`. An unanswered publish stays unknown: only
+   * `derivedQuery` for the same election settles it. Each issued attempt is recorded by
+   * ids and digests, never the text. No model tool calls this (#162 adds none, and the
+   * capsule stays out of any model's sight): it is the owner's integration's call.
+   */
+  public async derivedPublish(
+    ear: string,
+    sources: readonly string[],
+    text: string,
+  ): Promise<DerivedOutcome> {
+    const route = this.options.derivedRoute;
+    const judge = (): { lineage: DerivedLineage } | { reason: string } => {
+      const view = this.sourceCustody(ear, sources);
+      const gate = derivedPublication(
+        this.config.canticle?.derivedPublication === true,
+        sources,
+        view,
+      );
+      if (!gate.open) return { reason: gate.reason };
+      if (!route) {
+        return {
+          reason:
+            "closed: no derived-publication route: the owner's issuer and station control socket aren't wired into this daemon",
+        };
+      }
+      if (!derivedTextFits(text)) {
+        return {
+          reason: `closed: the derived text must be 1 to ${DERIVED_TEXT_MAX_BYTES} UTF-8 bytes (binary-canticle#162)`,
+        };
+      }
+      // An open seam means the session holding the ear echoed every source under its id.
+      const sessionId = this.attached.get(ear)?.sessionId;
+      if (!sessionId) {
+        return { reason: "closed: the session holding the ear has no id" };
+      }
+      const traced = derivedLineage(
+        ear,
+        sessionId,
+        sources,
+        view.records.map((record) => record.exposure),
+        text,
+      );
+      return "blocked" in traced
+        ? { reason: `closed: ${traced.blocked}` }
+        : traced;
+    };
+    const closed = (reason: string): DerivedOutcome => {
+      this.logger.log("info", "canticle.derived_closed", { ear, reason });
+      return { state: "closed", reason };
+    };
+
+    let judged = judge();
+    if ("reason" in judged) return closed(judged.reason);
+    const capability = await derivedCapability(route!.control);
+    if (!capability.derived) {
+      return closed(
+        `closed: the station's control socket doesn't offer derived publication: ${capability.reason}`,
+      );
+    }
+    judged = judge();
+    if ("reason" in judged) return closed(judged.reason);
+    const { lineage } = judged;
+    const id = this.store.openDerived({
+      ear,
+      sessionId: lineage.author.sessionId,
+      sources: lineage.sources.map(({ identity, digest }) => ({
+        identity,
+        digest,
+      })),
+      audience: lineage.audience.scope,
+      payloadSha256: lineage.payloadSha256,
+      createdAt: this.clock.now(),
+    });
+    const settle = (outcome: DerivedOutcome): DerivedOutcome => {
+      if (!this.stopped) {
+        this.store.updateDerived(id, {
+          state: outcome.state === "closed" ? "refused" : outcome.state,
+          ...("electionId" in outcome && outcome.electionId !== null
+            ? { electionId: outcome.electionId }
+            : {}),
+          ...("reason" in outcome ? { reason: outcome.reason } : {}),
+          ...(outcome.state === "accepted"
+            ? { acceptance: outcome.acceptance }
+            : {}),
+          ...(outcome.state === "unknown"
+            ? {}
+            : { settledAt: this.clock.now() }),
+        });
+      }
+      this.logger.log("info", "canticle.derived", {
+        ear,
+        state: outcome.state,
+        electionId: "electionId" in outcome ? outcome.electionId : null,
+      });
+      return outcome;
+    };
+
+    let issued: { capsule: Uint8Array; electionId: string };
+    try {
+      issued = await route!.issuer.issue(lineage, text);
+    } catch (error) {
+      return settle({
+        state: "refused",
+        electionId: null,
+        reason: `the issuer refused: ${error instanceof Error ? error.message : String(error)}`,
+      });
+    }
+    if (!ELECTION_ID.test(issued.electionId)) {
+      return settle({
+        state: "refused",
+        electionId: null,
+        reason:
+          "the issuer returned no election id (32 lowercase hex digits) to query; nothing was published",
+      });
+    }
+    const electionId = issued.electionId;
+    this.store.updateDerived(id, { state: "claimed", electionId });
+    const again = judge();
+    if ("reason" in again) {
+      return settle({
+        state: "refused",
+        electionId,
+        reason: `custody moved while the capsule was issued (${again.reason}); election ${electionId} is left unpublished`,
+      });
+    }
+    let answer: Record<string, unknown>;
+    try {
+      answer = await route!.control.request(
+        publishRequest(issued.capsule, text),
+      );
+    } catch (error) {
+      return settle({
+        state: "unknown",
+        electionId,
+        reason: `${noAnswer(error)}; query election ${electionId}, never publish it again`,
+      });
+    }
+    if (answer.ok === true) {
+      const acceptance = answer.acceptance;
+      return settle(
+        typeof acceptance === "object" &&
+          acceptance !== null &&
+          !Array.isArray(acceptance)
+          ? {
+              state: "accepted",
+              electionId,
+              acceptance: acceptance as Record<string, unknown>,
+            }
+          : {
+              state: "unknown",
+              electionId,
+              reason: `the station said ok without its receipt; query election ${electionId}, never publish it again`,
+            },
+      );
+    }
+    return settle({
+      state: "refused",
+      electionId,
+      reason: `the station refused: ${stationWords(answer)}`,
+    });
+  }
+
+  /**
+   * #162's `derived_query` for an election frond-ear asked about: the station's answer,
+   * with no send, refresh or retry. An unknown or claimed attempt it finds accepted is
+   * settled from the receipt.
+   */
+  public async derivedQuery(
+    ear: string,
+    electionId: string,
+  ): Promise<Record<string, unknown>> {
+    if (!ELECTION_ID.test(electionId)) {
+      throw new Error("election_id is 32 lowercase hex digits");
+    }
+    const route = this.options.derivedRoute;
+    if (!route) {
+      throw new Error(
+        "no derived-publication route: the owner's issuer and station control socket aren't wired into this daemon",
+      );
+    }
+    const answer = await route.control.request(queryRequest(electionId));
+    const row = this.store.derivedByElection(ear, electionId);
+    const acceptance = answer.acceptance;
+    if (
+      row &&
+      (row.state === "claimed" || row.state === "unknown") &&
+      answer.ok === true &&
+      answer.state === "accepted" &&
+      typeof acceptance === "object" &&
+      acceptance !== null &&
+      !Array.isArray(acceptance)
+    ) {
+      this.store.updateDerived(row.id, {
+        state: "accepted",
+        acceptance: acceptance as Record<string, unknown>,
+        settledAt: this.clock.now(),
+      });
+    }
+    return answer;
   }
 
   /**

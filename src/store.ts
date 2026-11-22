@@ -135,6 +135,25 @@ export interface CanticleExposure {
   digest: string | null;
   /** `whole` payload, `cut` to fit, or `none` (a counts report, a non-text payload). */
   shown: CanticleShown;
+  /** What the verified record said of itself; absent when the caller had no record. */
+  lineage?: ExposureLineage;
+}
+
+/**
+ * What a verified record said of itself when it was exposed (binary-canticle#161 items 2
+ * and 4): its permission (scope), class, hop and lineage root, its station's principal, its
+ * expiry and whether it was sung in a canticle-woken turn. A derived publication carries it
+ * as each source's lineage, bound at exposure rather than read back later.
+ */
+export interface ExposureLineage {
+  scope: string;
+  class: string;
+  hop: number;
+  principal: string | null;
+  /** `key:epoch:stream:seq` of the record's lineage root, when it named one. */
+  root: string | null;
+  expiresAt: number;
+  wakeDerived: boolean | null;
 }
 
 /**
@@ -143,7 +162,7 @@ export interface CanticleExposure {
  * offered (the host handed it to the session), echoed (the session named its batch_id, or
  * `hear` returned it). Each step carries the session and its compaction boundary then.
  */
-export interface CanticleCustody extends CanticleExposure {
+export interface CanticleCustody extends Omit<CanticleExposure, "lineage"> {
   id: number;
   ear: string;
   /** The push's batch; null for `hear`. */
@@ -166,6 +185,8 @@ export interface CanticleCustody extends CanticleExposure {
   echoBatch: number | null;
   echoSession: string | null;
   echoBoundary: CompactionBoundary;
+  /** Null for custody kept before frond-ear kept lineage. */
+  lineage: ExposureLineage | null;
 }
 
 interface CustodyRow {
@@ -195,6 +216,7 @@ interface CustodyRow {
   echo_session: string | null;
   echo_boundary: string | null;
   echo_boundary_known: number;
+  lineage: string | null;
 }
 
 const boundaryOf = (value: string | null, known: number): CompactionBoundary =>
@@ -226,8 +248,15 @@ function mapCustody(row: CustodyRow): CanticleCustody {
     echoBatch: row.echo_batch,
     echoSession: row.echo_session,
     echoBoundary: boundaryOf(row.echo_boundary, row.echo_boundary_known),
+    lineage:
+      row.lineage === null
+        ? null
+        : (JSON.parse(row.lineage) as ExposureLineage),
   };
 }
+
+const lineageOf = (exposure: CanticleExposure): string | null =>
+  exposure.lineage === undefined ? null : JSON.stringify(exposure.lineage);
 
 /**
  * A canticle push a revert gave back (#161): its records, and the refreshes that had
@@ -359,6 +388,67 @@ function mapEgress(row: EgressRow): EgressRecord {
     decidedAt: row.decided_at,
     outcome: row.outcome,
     messageIds: JSON.parse(row.message_ids) as string[],
+    settledAt: row.settled_at,
+  };
+}
+
+/**
+ * One derived publication frond-ear asked a station for (binary-canticle#161 item 4), by
+ * the ids and digests of its sources, never the text. `issuing`: the owner's issuer was
+ * asked for a capsule (after a crash, unknown whether it issued one). `claimed`: issued,
+ * the station not yet answered (after a crash, unknown). `accepted`: the station's receipt
+ * is kept. `refused`: the issuer or the station said no. `unknown`: no answer came; only
+ * `derived_query` for the same election may settle it, never a second publish.
+ */
+export interface DerivedPublication {
+  id: number;
+  ear: string;
+  /** The session holding the ear: the author. */
+  sessionId: string | null;
+  electionId: string | null;
+  sources: Array<{ identity: string; digest: string }>;
+  /** The narrowest scope among the sources: the widest the publication may reach. */
+  audience: string;
+  payloadSha256: string;
+  state: "issuing" | "claimed" | "accepted" | "refused" | "unknown";
+  reason: string | null;
+  /** The station's acceptance receipt (ids and digests, no payload). */
+  acceptance: Record<string, unknown> | null;
+  createdAt: number;
+  settledAt: number | null;
+}
+
+interface DerivedRow {
+  id: number;
+  ear: string;
+  session_id: string | null;
+  election_id: string | null;
+  sources: string;
+  audience: string;
+  payload_sha256: string;
+  state: DerivedPublication["state"];
+  reason: string | null;
+  acceptance: string | null;
+  created_at: number;
+  settled_at: number | null;
+}
+
+function mapDerived(row: DerivedRow): DerivedPublication {
+  return {
+    id: row.id,
+    ear: row.ear,
+    sessionId: row.session_id,
+    electionId: row.election_id,
+    sources: JSON.parse(row.sources) as DerivedPublication["sources"],
+    audience: row.audience,
+    payloadSha256: row.payload_sha256,
+    state: row.state,
+    reason: row.reason,
+    acceptance:
+      row.acceptance === null
+        ? null
+        : (JSON.parse(row.acceptance) as Record<string, unknown>),
+    createdAt: row.created_at,
     settledAt: row.settled_at,
   };
 }
@@ -597,7 +687,8 @@ export class EventStore {
         echo_batch INTEGER,
         echo_session TEXT,
         echo_boundary TEXT,
-        echo_boundary_known INTEGER NOT NULL DEFAULT 0
+        echo_boundary_known INTEGER NOT NULL DEFAULT 0,
+        lineage TEXT
       );
       CREATE INDEX IF NOT EXISTS canticle_custody_ear
         ON canticle_custody (ear, claimed_at);
@@ -643,6 +734,23 @@ export class EventStore {
       );
       CREATE INDEX IF NOT EXISTS room_egress_ear
         ON room_egress (ear, decided_at);
+      CREATE TABLE IF NOT EXISTS derived_publications (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ear TEXT NOT NULL,
+        session_id TEXT,
+        election_id TEXT,
+        sources TEXT NOT NULL,
+        audience TEXT NOT NULL,
+        payload_sha256 TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN
+          ('issuing', 'claimed', 'accepted', 'refused', 'unknown')),
+        reason TEXT,
+        acceptance TEXT,
+        created_at INTEGER NOT NULL,
+        settled_at INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS derived_publications_election
+        ON derived_publications (ear, election_id);
     `);
     // Custody is whole from the moment its table exists: a window that reaches back
     // before that (or before the prune's cutoff) reads as unknown, never as empty. A
@@ -674,6 +782,19 @@ export class EventStore {
     if (!settledColumns.has("batch_id")) {
       this.database.exec(
         "ALTER TABLE canticle_settled ADD COLUMN batch_id INTEGER",
+      );
+    }
+    // Custody keeps each exposure's lineage (#161 item 4); older rows read as none.
+    const custodyColumns = new Set(
+      (
+        this.database
+          .prepare("PRAGMA table_info(canticle_custody)")
+          .all() as Array<{ name: string }>
+      ).map((column) => column.name),
+    );
+    if (!custodyColumns.has("lineage")) {
+      this.database.exec(
+        "ALTER TABLE canticle_custody ADD COLUMN lineage TEXT",
       );
     }
     // outbound_intents shipped without these columns; a database created before
@@ -1167,8 +1288,8 @@ export class EventStore {
         .run(batchId, ear, cursor.name, cursor.before);
       const insert = this.database.prepare(
         `INSERT INTO canticle_custody (ear, path, mode, batch_id, session_id, generation,
-           identity, station, stream, key_id, epoch, seq, digest, shown, claimed_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           identity, station, stream, key_id, epoch, seq, digest, shown, claimed_at, lineage)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       );
       for (const exposure of exposures) {
         insert.run(
@@ -1187,6 +1308,7 @@ export class EventStore {
           exposure.digest,
           exposure.shown,
           now,
+          lineageOf(exposure),
         );
       }
       return batchId;
@@ -1355,8 +1477,8 @@ export class EventStore {
       `INSERT INTO canticle_custody (ear, path, mode, batch_id, session_id, generation,
          identity, station, stream, key_id, epoch, seq, digest, shown, claimed_at,
          offered_at, offer_session, offer_boundary, offer_boundary_known, echoed_at,
-         echo_kind, echo_session, echo_boundary, echo_boundary_known)
-       VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'hear', ?, ?, ?)`,
+         echo_kind, echo_session, echo_boundary, echo_boundary_known, lineage)
+       VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'hear', ?, ?, ?, ?)`,
     );
     const known = boundary === undefined ? 0 : 1;
     this.atomically(() => {
@@ -1384,6 +1506,7 @@ export class EventStore {
           session.sessionId,
           boundary ?? null,
           known,
+          lineageOf(exposure),
         );
       }
     });
@@ -1597,6 +1720,87 @@ export class EventStore {
           }
         : null,
     };
+  }
+
+  // ---- derived publication (binary-canticle#161 item 4) ---------------------------------
+
+  /** A derived publication about to ask the owner's issuer: `issuing`. Returns its id. */
+  public openDerived(row: {
+    ear: string;
+    sessionId: string | null;
+    sources: DerivedPublication["sources"];
+    audience: string;
+    payloadSha256: string;
+    createdAt: number;
+  }): number {
+    return Number(
+      this.database
+        .prepare(
+          `INSERT INTO derived_publications (ear, session_id, sources, audience,
+             payload_sha256, state, created_at)
+           VALUES (?, ?, ?, ?, ?, 'issuing', ?)`,
+        )
+        .run(
+          row.ear,
+          row.sessionId,
+          JSON.stringify(row.sources),
+          row.audience,
+          row.payloadSha256,
+          row.createdAt,
+        ).lastInsertRowid,
+    );
+  }
+
+  /** Moves a derived publication on: its election once issued, its outcome once known. */
+  public updateDerived(
+    id: number,
+    change: {
+      state: DerivedPublication["state"];
+      electionId?: string;
+      reason?: string;
+      acceptance?: Record<string, unknown>;
+      settledAt?: number;
+    },
+  ): void {
+    this.database
+      .prepare(
+        `UPDATE derived_publications SET state = ?,
+           election_id = COALESCE(?, election_id), reason = COALESCE(?, reason),
+           acceptance = COALESCE(?, acceptance), settled_at = COALESCE(?, settled_at)
+         WHERE id = ?`,
+      )
+      .run(
+        change.state,
+        change.electionId ?? null,
+        change.reason ?? null,
+        change.acceptance === undefined
+          ? null
+          : JSON.stringify(change.acceptance),
+        change.settledAt ?? null,
+        id,
+      );
+  }
+
+  /** The ear's derived publications, oldest first. */
+  public derivedPublications(ear: string): DerivedPublication[] {
+    return (
+      this.database
+        .prepare("SELECT * FROM derived_publications WHERE ear = ? ORDER BY id")
+        .all(ear) as unknown as DerivedRow[]
+    ).map(mapDerived);
+  }
+
+  /** The ear's derived publication for this election, if frond-ear asked for it. */
+  public derivedByElection(
+    ear: string,
+    electionId: string,
+  ): DerivedPublication | undefined {
+    const row = this.database
+      .prepare(
+        "SELECT * FROM derived_publications WHERE ear = ? AND election_id = ? ORDER BY id DESC LIMIT 1",
+      )
+      .get(ear, electionId) as DerivedRow | undefined;
+    return row ? mapDerived(row) : undefined;
   }
 
   // ---- letters (#88) ---------------------------------------------------------------
@@ -2426,9 +2630,12 @@ export class EventStore {
       this.database
         .prepare("DELETE FROM canticle_reverted WHERE reverted_at < ?")
         .run(cutoff);
-      // Egress rows are kept as long as the custody they recorded.
+      // Egress and derived-publication rows are kept as long as the custody they recorded.
       this.database
         .prepare("DELETE FROM room_egress WHERE decided_at < ?")
+        .run(cutoff);
+      this.database
+        .prepare("DELETE FROM derived_publications WHERE created_at < ?")
         .run(cutoff);
       return events;
     });

@@ -24,6 +24,7 @@ import {
 } from "../src/canticle/derived.ts";
 import { EventStore } from "../src/store.ts";
 import { offered, OPS, pressure, SESSION, setup } from "./canticle-host.ts";
+import type { Harness } from "./helpers.ts";
 
 type R = Record<string, unknown>;
 
@@ -105,8 +106,14 @@ function capable(publish: Answer = { ok: true, acceptance: ACCEPTANCE }) {
   };
 }
 
-/** The owner's issuer, faked: keeps what it was asked and returns a capsule naming it. */
-function fakeIssuer(refuse?: string): DerivedIssuer & {
+/**
+ * The owner's issuer, faked: keeps what it was asked and returns a capsule naming it.
+ * `during` runs while it is issuing, before it answers.
+ */
+function fakeIssuer(
+  refuse?: string,
+  during?: () => Promise<void>,
+): DerivedIssuer & {
   calls: Array<{ lineage: DerivedLineage; text: string }>;
   capsule: Uint8Array | undefined;
 } {
@@ -115,6 +122,7 @@ function fakeIssuer(refuse?: string): DerivedIssuer & {
     capsule: undefined as Uint8Array | undefined,
     async issue(lineage: DerivedLineage, text: string) {
       issuer.calls.push({ lineage, text });
+      await during?.();
       if (refuse !== undefined) throw new Error(refuse);
       issuer.capsule = new TextEncoder().encode(
         JSON.stringify({
@@ -134,7 +142,12 @@ function fakeIssuer(refuse?: string): DerivedIssuer & {
  */
 async function heard(
   answer: (request: R) => Answer,
-  options: { derivedPublication?: boolean; issuer?: DerivedIssuer } = {},
+  options: {
+    derivedPublication?: boolean;
+    issuer?: ReturnType<typeof fakeIssuer>;
+    /** Runs before each request goes to the station. */
+    beforeRequest?: () => Promise<void>;
+  } = {},
 ) {
   const issuer = options.issuer ?? fakeIssuer();
   let station: Awaited<ReturnType<typeof fakeStation>> | undefined;
@@ -145,8 +158,10 @@ async function heard(
     {
       derivedRoute: {
         control: {
-          request: (message) =>
-            unixStationControl(station!.path).request(message),
+          request: async (message) => {
+            await options.beforeRequest?.();
+            return unixStationControl(station!.path).request(message);
+          },
         },
         issuer,
       },
@@ -376,6 +391,58 @@ test("derived: when every condition holds, the issuer gets the exact lineage and
   } finally {
     await station.close();
     h.dispose();
+  }
+});
+
+test("derived: custody is judged again after every wait: a compaction while the station is probed, or while the capsule is issued, stops the publish before the station gets it", async () => {
+  const compaction =
+    "closed: history incomplete: 1 record echoed before the current compaction boundary or by another session";
+  {
+    let during: (() => Promise<void>) | undefined;
+    const { h, station, issuer } = await heard(capable(), {
+      beforeRequest: async () => during?.(),
+    });
+    try {
+      during = async () => {
+        during = undefined;
+        h.clock.advance(1_000);
+        await pressure(h, "compact-1", { tokens: null });
+      };
+      assert.deepEqual(
+        await h.daemon.derivedPublish("scribe", [identity(1)], TEXT),
+        { state: "closed", reason: compaction },
+      );
+      assert.deepEqual(station.requests, [PROBE]);
+      assert.deepEqual(issuer.calls, []);
+    } finally {
+      await station.close();
+      h.dispose();
+    }
+  }
+  {
+    let harnessed: Harness | undefined;
+    const issuer = fakeIssuer(undefined, async () => {
+      harnessed!.clock.advance(1_000);
+      await pressure(harnessed!, "compact-1", { tokens: null });
+    });
+    const { h, station } = await heard(capable(), { issuer });
+    harnessed = h;
+    try {
+      assert.deepEqual(
+        await h.daemon.derivedPublish("scribe", [identity(1)], TEXT),
+        {
+          state: "refused",
+          electionId: ELECTION,
+          reason: `custody moved while the capsule was issued (${compaction}); election ${ELECTION} is left unpublished`,
+        },
+      );
+      assert.deepEqual(station.requests, [PROBE], "no derived_publish");
+      const [row] = h.store.derivedPublications("scribe");
+      assert.deepEqual([row!.state, row!.electionId], ["refused", ELECTION]);
+    } finally {
+      await station.close();
+      h.dispose();
+    }
   }
 });
 

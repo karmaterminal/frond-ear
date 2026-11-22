@@ -106,9 +106,10 @@ const streamOf = (item: LiveItem) => `${item.station}:${item.stream}`;
 
 /**
  * One record as custody keeps an exposure of it (binary-canticle#161): its identity and
- * where it came from, and a digest of its payload (SHA-256 of its whole text, even when a
- * push cut it; else the source's body digest), never the text itself and never anything
- * of the signer's.
+ * where it came from, a digest of its payload (SHA-256 of its whole text, even when a push
+ * cut it; else the source's body digest), and what the verified record said of itself
+ * (scope, class, hop, root, principal, expiry: the lineage a derived publication carries),
+ * never the text itself and never anything of the signer's.
  */
 export function exposure(
   item: LiveItem,
@@ -130,6 +131,15 @@ export function exposure(
         ? createHash("sha256").update(item.text, "utf8").digest("hex")
         : (item.bodyDigest ?? null),
     shown,
+    lineage: {
+      scope: item.scope,
+      class: item.class,
+      hop: item.hop,
+      principal: item.principal ?? null,
+      root: item.root ?? null,
+      expiresAt: item.expiresAt,
+      wakeDerived: item.wakeDerived ?? null,
+    },
   };
 }
 
