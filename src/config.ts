@@ -105,6 +105,13 @@ export interface CanticleConfig {
   muted: boolean;
   /** Per ear, what reaches its session unasked. An ear left out is `off`. */
   delivery: Record<string, CanticleEarDelivery>;
+  /**
+   * Whether the derived-publication seam may ever open (binary-canticle#161). Off by
+   * default; even on, it stays closed unless every source record was heard whole and
+   * echoed within the session's current compaction boundary. frond-ear makes no station
+   * call either way.
+   */
+  derivedPublication: boolean;
 }
 
 /** `off`: `hear` only. `digest`: a radio report per window. `immediate`: each new record. */
@@ -308,6 +315,12 @@ function parseCanticle(
   if (value.muted !== undefined && typeof value.muted !== "boolean") {
     throw new Error("canticle.muted must be true or false");
   }
+  if (
+    value.derivedPublication !== undefined &&
+    typeof value.derivedPublication !== "boolean"
+  ) {
+    throw new Error("canticle.derivedPublication must be true or false");
+  }
   const deliveryInput = value.delivery ?? {};
   if (!isObject(deliveryInput)) {
     throw new Error("canticle.delivery must be an object of ear -> delivery");
@@ -332,6 +345,7 @@ function parseCanticle(
     wakeKeys,
     muted: value.muted === true,
     delivery,
+    derivedPublication: value.derivedPublication === true,
   };
 }
 

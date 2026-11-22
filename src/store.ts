@@ -108,6 +108,123 @@ export interface CanticleSettled {
   expiresAt: number;
 }
 
+/**
+ * A session's compaction boundary as frond-ear knew it (#98): the latest compaction marker
+ * its pressure hook read, `null` when the hook read none yet, and `undefined` when no
+ * reading from that session had reached the daemon (unknown).
+ */
+export type CompactionBoundary = string | null | undefined;
+
+/** How much of a record an exposure showed the session. */
+export type CanticleShown = "whole" | "cut" | "none";
+
+/** What a canticle exposure shows the session, before frond-ear knows how it went. */
+export interface CanticleExposure {
+  /** `immediate` or `report`: a push; `hear`: the tool's own return. */
+  path: "immediate" | "report" | "hear";
+  /** The ear's effective delivery mode for the record's station then. */
+  mode: string;
+  /** `key:epoch:stream:seq`, as dedupe has it. */
+  identity: string;
+  station: string;
+  stream: string;
+  keyId: string;
+  epoch: number;
+  seq: string;
+  /** SHA-256 of the payload text, else the source's body digest; null when neither is known. */
+  digest: string | null;
+  /** `whole` payload, `cut` to fit, or `none` (a counts report, a non-text payload). */
+  shown: CanticleShown;
+}
+
+/**
+ * One exposure of a canticle record to an ear's session, as custody keeps it
+ * (binary-canticle#161): claimed (deduplicated and handed to the session's connection),
+ * offered (the host handed it to the session), echoed (the session named its batch_id, or
+ * `hear` returned it). Each step carries the session and its compaction boundary then.
+ */
+export interface CanticleCustody extends CanticleExposure {
+  id: number;
+  ear: string;
+  /** The push's batch; null for `hear`. */
+  batchId: number | null;
+  /** The session holding the ear, as frond-ear knows it; null when its shim gave none. */
+  sessionId: string | null;
+  generation: number;
+  claimedAt: number;
+  offeredAt: number | null;
+  offerBoundary: CompactionBoundary;
+  echoedAt: number | null;
+  /** The tool whose call named the batch, or `hear`. */
+  echoKind: string | null;
+  /** The batch the echo named: this one, or a later one of the same session. */
+  echoBatch: number | null;
+  echoSession: string | null;
+  echoBoundary: CompactionBoundary;
+}
+
+interface CustodyRow {
+  id: number;
+  ear: string;
+  path: CanticleExposure["path"];
+  mode: string;
+  batch_id: number | null;
+  session_id: string | null;
+  generation: number;
+  identity: string;
+  station: string;
+  stream: string;
+  key_id: string;
+  epoch: number;
+  seq: string;
+  digest: string | null;
+  shown: CanticleShown;
+  claimed_at: number;
+  offered_at: number | null;
+  offer_boundary: string | null;
+  offer_boundary_known: number;
+  echoed_at: number | null;
+  echo_kind: string | null;
+  echo_batch: number | null;
+  echo_session: string | null;
+  echo_boundary: string | null;
+  echo_boundary_known: number;
+}
+
+const boundaryOf = (value: string | null, known: number): CompactionBoundary =>
+  known === 1 ? value : undefined;
+
+function mapCustody(row: CustodyRow): CanticleCustody {
+  return {
+    id: row.id,
+    ear: row.ear,
+    path: row.path,
+    mode: row.mode,
+    batchId: row.batch_id,
+    sessionId: row.session_id,
+    generation: row.generation,
+    identity: row.identity,
+    station: row.station,
+    stream: row.stream,
+    keyId: row.key_id,
+    epoch: row.epoch,
+    seq: row.seq,
+    digest: row.digest,
+    shown: row.shown,
+    claimedAt: row.claimed_at,
+    offeredAt: row.offered_at,
+    offerBoundary: boundaryOf(row.offer_boundary, row.offer_boundary_known),
+    echoedAt: row.echoed_at,
+    echoKind: row.echo_kind,
+    echoBatch: row.echo_batch,
+    echoSession: row.echo_session,
+    echoBoundary: boundaryOf(row.echo_boundary, row.echo_boundary_known),
+  };
+}
+
+/** Since when custody is whole: set when the table is first made, moved by the prune. */
+const CUSTODY_SINCE = "canticle.custody.since";
+
 /** A session's own canticle delivery choice for a station, or "*" for all of them. */
 export interface CanticleChoice {
   scope: string;
@@ -348,7 +465,59 @@ export class EventStore {
         releases_at_leave INTEGER NOT NULL DEFAULT 0
       );
       CREATE INDEX IF NOT EXISTS letters_ear ON letters (ear, id);
+      CREATE TABLE IF NOT EXISTS canticle_custody (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ear TEXT NOT NULL,
+        path TEXT NOT NULL CHECK (path IN ('immediate', 'report', 'hear')),
+        mode TEXT NOT NULL,
+        batch_id INTEGER,
+        session_id TEXT,
+        generation INTEGER NOT NULL,
+        identity TEXT NOT NULL,
+        station TEXT NOT NULL,
+        stream TEXT NOT NULL,
+        key_id TEXT NOT NULL,
+        epoch INTEGER NOT NULL,
+        seq TEXT NOT NULL,
+        digest TEXT,
+        shown TEXT NOT NULL CHECK (shown IN ('whole', 'cut', 'none')),
+        claimed_at INTEGER NOT NULL,
+        offered_at INTEGER,
+        offer_boundary TEXT,
+        offer_boundary_known INTEGER NOT NULL DEFAULT 0,
+        echoed_at INTEGER,
+        echo_kind TEXT,
+        echo_batch INTEGER,
+        echo_session TEXT,
+        echo_boundary TEXT,
+        echo_boundary_known INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE INDEX IF NOT EXISTS canticle_custody_ear
+        ON canticle_custody (ear, claimed_at);
+      CREATE INDEX IF NOT EXISTS canticle_custody_batch
+        ON canticle_custody (ear, batch_id);
     `);
+    // Custody is whole from the moment its table exists: a window that reaches back
+    // before that (or before the prune's cutoff) reads as unknown, never as empty.
+    this.database
+      .prepare(
+        "INSERT INTO runtime_state (name, value) VALUES (?, ?) ON CONFLICT(name) DO NOTHING",
+      )
+      .run(CUSTODY_SINCE, String(this.clock.now()));
+    // A push's tombstones name its batch (#161), so a push no session took can give its
+    // claim back. Older tombstones name none and keep the claim they made.
+    const settledColumns = new Set(
+      (
+        this.database
+          .prepare("PRAGMA table_info(canticle_settled)")
+          .all() as Array<{ name: string }>
+      ).map((column) => column.name),
+    );
+    if (!settledColumns.has("batch_id")) {
+      this.database.exec(
+        "ALTER TABLE canticle_settled ADD COLUMN batch_id INTEGER",
+      );
+    }
     // outbound_intents shipped without these columns; a database created before
     // one of them gains it here. Its older rows read as no session's (#49) and
     // no reply's (#55).
@@ -723,28 +892,276 @@ export class EventStore {
     cursor?: { name: string; value: string },
   ): void {
     this.transaction(() => {
-      const insert = this.database.prepare(
-        `INSERT INTO canticle_settled
-           (ear, identity, outcome, refresh_key, digest, settled_at, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(ear, identity) DO UPDATE SET
-           expires_at = MAX(canticle_settled.expires_at, excluded.expires_at)`,
-      );
-      for (const row of rows) {
-        insert.run(
-          ear,
-          row.identity,
-          row.outcome,
-          row.refreshKey,
-          row.digest,
-          this.clock.now(),
-          row.expiresAt,
-        );
-      }
+      this.insertSettled(ear, rows, null);
       if (cursor) {
         this.setRuntimeState(cursor.name, cursor.value);
       }
     });
+  }
+
+  private insertSettled(
+    ear: string,
+    rows: ReadonlyArray<Omit<CanticleSettled, "ear">>,
+    batchId: number | null,
+  ): void {
+    const insert = this.database.prepare(
+      `INSERT INTO canticle_settled
+         (ear, identity, outcome, refresh_key, digest, settled_at, expires_at, batch_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(ear, identity) DO UPDATE SET
+         expires_at = MAX(canticle_settled.expires_at, excluded.expires_at)`,
+    );
+    for (const row of rows) {
+      insert.run(
+        ear,
+        row.identity,
+        row.outcome,
+        row.refreshKey,
+        row.digest,
+        this.clock.now(),
+        row.expiresAt,
+        batchId,
+      );
+    }
+  }
+
+  // ---- canticle custody (binary-canticle#161) ------------------------------------
+
+  /**
+   * Opens a canticle push, in one transaction, before anything is pushed: its batch, the
+   * tombstones that claim its records for dedupe, the delivery cursor, and one custody row
+   * per record, claimed. A crash after this loses the push, never repeats it. Nothing here
+   * says the session got it: that is `offerCanticleCustody`, on the host's word. Returns
+   * the batch id, which the push carries as its batch_id.
+   */
+  public claimCanticlePush(
+    ear: string,
+    session: { generation: number; sessionId: string | null },
+    rows: ReadonlyArray<Omit<CanticleSettled, "ear">>,
+    cursor: { name: string; value: string },
+    exposures: readonly CanticleExposure[],
+  ): number {
+    return this.transaction(() => {
+      const now = this.clock.now();
+      const batchId = Number(
+        this.database
+          .prepare(
+            `INSERT INTO batches (ear, chat_id, kind, attach_generation, created_at)
+             VALUES (?, 'canticle', 'canticle', ?, ?)`,
+          )
+          .run(ear, session.generation, now).lastInsertRowid,
+      );
+      this.insertSettled(ear, rows, batchId);
+      this.setRuntimeState(cursor.name, cursor.value);
+      const insert = this.database.prepare(
+        `INSERT INTO canticle_custody (ear, path, mode, batch_id, session_id, generation,
+           identity, station, stream, key_id, epoch, seq, digest, shown, claimed_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      for (const exposure of exposures) {
+        insert.run(
+          ear,
+          exposure.path,
+          exposure.mode,
+          batchId,
+          session.sessionId,
+          session.generation,
+          exposure.identity,
+          exposure.station,
+          exposure.stream,
+          exposure.keyId,
+          exposure.epoch,
+          exposure.seq,
+          exposure.digest,
+          exposure.shown,
+          now,
+        );
+      }
+      return batchId;
+    });
+  }
+
+  /**
+   * A push no session's connection took gives its claim back, in one transaction: its
+   * batch, custody rows and tombstones go, and the cursor is put back, so its records wait
+   * for the next push as if this one had never been tried.
+   */
+  public releaseCanticlePush(
+    ear: string,
+    batchId: number,
+    cursor: { name: string; value: string },
+  ): void {
+    this.transaction(() => {
+      this.database
+        .prepare("DELETE FROM canticle_custody WHERE ear = ? AND batch_id = ?")
+        .run(ear, batchId);
+      this.database
+        .prepare("DELETE FROM canticle_settled WHERE ear = ? AND batch_id = ?")
+        .run(ear, batchId);
+      this.database
+        .prepare(
+          "DELETE FROM batches WHERE id = ? AND ear = ? AND kind = 'canticle'",
+        )
+        .run(batchId, ear);
+      this.setRuntimeState(cursor.name, cursor.value);
+    });
+  }
+
+  /**
+   * The host handed canticle batch `batchId` to the session (the shim's `offered`): its
+   * records are offered now, under the session's boundary now. Returns how many.
+   */
+  public offerCanticleCustody(
+    ear: string,
+    batchId: number,
+    at: number,
+    boundary: CompactionBoundary,
+  ): number {
+    return Number(
+      this.database
+        .prepare(
+          `UPDATE canticle_custody SET offered_at = ?, offer_boundary = ?, offer_boundary_known = ?
+           WHERE ear = ? AND batch_id = ? AND offered_at IS NULL`,
+        )
+        .run(at, boundary ?? null, boundary === undefined ? 0 : 1, ear, batchId)
+        .changes,
+    );
+  }
+
+  /** Whether `batchId` is one of this ear's canticle pushes that custody still holds. */
+  public isCanticleBatch(ear: string, batchId: number): boolean {
+    return (
+      this.database
+        .prepare(
+          "SELECT 1 AS hit FROM canticle_custody WHERE ear = ? AND batch_id = ? LIMIT 1",
+        )
+        .get(ear, batchId) !== undefined
+    );
+  }
+
+  /**
+   * The session named canticle batch `batchId` in a tool call. As a named Discord batch
+   * does in its chat, it echoes that batch and the earlier ones: every record of this ear
+   * offered in a canticle batch up to it, to that same session (its session id, or its
+   * attach when the id is unknown), not echoed yet. A batch the host never confirmed
+   * echoes nothing of its own. Returns how many records were echoed.
+   */
+  public echoCanticleCustody(
+    ear: string,
+    batchId: number,
+    echo: {
+      at: number;
+      kind: string;
+      sessionId: string | null;
+      generation: number;
+      boundary: CompactionBoundary;
+    },
+  ): number {
+    if (!this.isCanticleBatch(ear, batchId)) {
+      return 0;
+    }
+    return Number(
+      this.database
+        .prepare(
+          `UPDATE canticle_custody SET echoed_at = ?, echo_kind = ?, echo_batch = ?,
+             echo_session = ?, echo_boundary = ?, echo_boundary_known = ?
+           WHERE ear = ? AND batch_id IS NOT NULL AND batch_id <= ?
+             AND offered_at IS NOT NULL AND echoed_at IS NULL
+             AND (generation = ? OR (session_id IS NOT NULL AND session_id = ?))`,
+        )
+        .run(
+          echo.at,
+          echo.kind,
+          batchId,
+          echo.sessionId,
+          echo.boundary ?? null,
+          echo.boundary === undefined ? 0 : 1,
+          ear,
+          batchId,
+          echo.generation,
+          echo.sessionId,
+        ).changes,
+    );
+  }
+
+  /**
+   * `hear` returned these records' payloads to the session: each is an exposure offered
+   * and echoed at once, at the tool's return, under the session's boundary then.
+   */
+  public recordCanticleHear(
+    ear: string,
+    session: { generation: number; sessionId: string | null },
+    exposures: readonly CanticleExposure[],
+    at: number,
+    boundary: CompactionBoundary,
+  ): void {
+    const insert = this.database.prepare(
+      `INSERT INTO canticle_custody (ear, path, mode, batch_id, session_id, generation,
+         identity, station, stream, key_id, epoch, seq, digest, shown, claimed_at,
+         offered_at, offer_boundary, offer_boundary_known, echoed_at, echo_kind,
+         echo_session, echo_boundary, echo_boundary_known)
+       VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'hear', ?, ?, ?)`,
+    );
+    const known = boundary === undefined ? 0 : 1;
+    this.atomically(() => {
+      for (const exposure of exposures) {
+        insert.run(
+          ear,
+          exposure.path,
+          exposure.mode,
+          session.sessionId,
+          session.generation,
+          exposure.identity,
+          exposure.station,
+          exposure.stream,
+          exposure.keyId,
+          exposure.epoch,
+          exposure.seq,
+          exposure.digest,
+          exposure.shown,
+          at,
+          at,
+          boundary ?? null,
+          known,
+          at,
+          session.sessionId,
+          boundary ?? null,
+          known,
+        );
+      }
+    });
+  }
+
+  /** The ear's custody rows claimed at or after `since`, oldest first. */
+  public canticleCustody(ear: string, since: number): CanticleCustody[] {
+    return (
+      this.database
+        .prepare(
+          "SELECT * FROM canticle_custody WHERE ear = ? AND claimed_at >= ? ORDER BY id",
+        )
+        .all(ear, since) as unknown as CustodyRow[]
+    ).map(mapCustody);
+  }
+
+  /** The ear's custody rows for these record identities, oldest first. */
+  public canticleCustodyOf(
+    ear: string,
+    identities: readonly string[],
+  ): CanticleCustody[] {
+    const query = this.database.prepare(
+      "SELECT * FROM canticle_custody WHERE ear = ? AND identity = ? ORDER BY id",
+    );
+    return [...new Set(identities)]
+      .flatMap(
+        (identity) => query.all(ear, identity) as unknown as CustodyRow[],
+      )
+      .sort((a, b) => a.id - b.id)
+      .map(mapCustody);
+  }
+
+  /** Custody is whole for exposures claimed at or after this time. */
+  public canticleCustodySince(): number {
+    return Number(this.runtimeState(CUSTODY_SINCE) ?? 0);
   }
 
   /**
@@ -1548,6 +1965,16 @@ export class EventStore {
       this.database
         .prepare("DELETE FROM canticle_settled WHERE expires_at <= ?")
         .run(this.clock.now());
+      // Custody is kept for the retention window; once any of it goes, custody is whole
+      // only from the cutoff, and a window reaching further back reads as unknown.
+      const custody = Number(
+        this.database
+          .prepare("DELETE FROM canticle_custody WHERE claimed_at < ?")
+          .run(cutoff).changes,
+      );
+      if (custody > 0 && this.canticleCustodySince() < cutoff) {
+        this.setRuntimeState(CUSTODY_SINCE, String(cutoff));
+      }
       return events;
     });
   }
