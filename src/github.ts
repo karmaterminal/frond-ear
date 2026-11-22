@@ -122,6 +122,11 @@ export class GithubClient {
     this.now = options.now;
   }
 
+  /** The origin this client reads; a reload that moves it pauses the client's pass. */
+  public get origin(): string {
+    return this.apiBase;
+  }
+
   public get hasToken(): boolean {
     return this.token !== undefined;
   }
@@ -324,11 +329,20 @@ export type Baseline =
     }
   | { kind: "refused"; reason: string; retryAfterMs?: number; rate?: boolean };
 
+/** Whether one more request may go now, and if not, why. */
+export type Admission = "ok" | "budget" | "paused" | "rate" | "revoked";
+
 /**
- * Asks before each request whether the ear's budget allows one; every attempt counts,
- * 304s and failures included.
+ * The daemon's gate on every single request, registration and each poll continuation
+ * alike, after every await (🌫 on #114): GitHub on, the same origin, the repo still
+ * allowed for the ear, no standing backoff, and one attempt from the ear's budget (every
+ * attempt counts, 304s and failures included). `after` sees each answer, so a rate limit
+ * or a poll interval is taken in whatever becomes of the watch.
  */
-export type Spend = () => boolean;
+export interface Admit {
+  before(): Admission;
+  after(response: GithubResponse): void;
+}
 
 class Stop extends Error {
   public readonly outcome: PollOutcome;
@@ -341,14 +355,30 @@ class Stop extends Error {
 
 async function fetchOk(
   client: GithubClient,
-  spend: Spend,
+  admit: Admit,
   path: string,
   etag?: string,
 ): Promise<GithubResponse> {
-  if (!spend()) {
+  const gate = admit.before();
+  if (gate === "budget" || gate === "paused") {
     throw new Stop({ kind: "deferred" });
   }
+  if (gate === "rate") {
+    throw new Stop({
+      kind: "retry",
+      rate: true,
+      reason: "GitHub asked frond-ear to wait (a rate limit)",
+    });
+  }
+  if (gate === "revoked") {
+    throw new Stop({
+      kind: "terminal",
+      reason:
+        "the repo is no longer in this ear's github.repos (the daemon's config), so frond-ear reads it no more",
+    });
+  }
   const response = await client.get(path, etag);
+  admit.after(response);
   if (response.status === 200 || response.status === 304) {
     return response;
   }
@@ -416,7 +446,7 @@ const SINCE_SLACK_MS = 10 * 60_000;
  */
 async function commentBaseline(
   client: GithubClient,
-  spend: Spend,
+  admit: Admit,
   listPath: string,
   now: number,
 ): Promise<GithubCursor> {
@@ -431,13 +461,13 @@ async function commentBaseline(
       }
     }
   };
-  const first = await fetchOk(client, spend, `${listPath}?per_page=100&page=1`);
+  const first = await fetchOk(client, admit, `${listPath}?per_page=100&page=1`);
   take(first);
   if (first.lastPage !== undefined && first.lastPage > 1) {
     take(
       await fetchOk(
         client,
-        spend,
+        admit,
         `${listPath}?per_page=100&page=${first.lastPage}`,
       ),
     );
@@ -455,7 +485,7 @@ async function commentBaseline(
  */
 async function newComments(
   client: GithubClient,
-  spend: Spend,
+  admit: Admit,
   listPath: string,
   cursor: GithubCursor,
 ): Promise<{ items: ListItem[]; cursor: GithubCursor; pollAfterMs?: number }> {
@@ -467,7 +497,7 @@ async function newComments(
     const path = `${listPath}?since=${encodeURIComponent(since)}&per_page=100&page=${page}`;
     const response = await fetchOk(
       client,
-      spend,
+      admit,
       path,
       page === 1 ? cursor.etags[path] : undefined,
     );
@@ -507,7 +537,7 @@ async function newComments(
  */
 async function newReviews(
   client: GithubClient,
-  spend: Spend,
+  admit: Admit,
   listPath: string,
   cursor: GithubCursor,
   registering: boolean,
@@ -526,7 +556,7 @@ async function newReviews(
     const kept = cursor.pages?.[String(page)];
     const response = await fetchOk(
       client,
-      spend,
+      admit,
       `${listPath}?per_page=100&page=${page}`,
       kept?.etag,
     );
@@ -647,7 +677,7 @@ function stamp(now: number): string {
 
 async function pullRequest(
   client: GithubClient,
-  spend: Spend,
+  admit: Admit,
   target: GithubTarget,
   cursor: GithubCursor,
 ): Promise<{
@@ -656,7 +686,7 @@ async function pullRequest(
   pollAfterMs?: number;
 }> {
   const path = `${repoPath(target.repo)}/pulls/${segment(target.number)}`;
-  const response = await fetchOk(client, spend, path, cursor.etags[path]);
+  const response = await fetchOk(client, admit, path, cursor.etags[path]);
   if (response.status === 304) {
     return {
       pull: undefined,
@@ -701,7 +731,7 @@ interface Checks {
  */
 async function checksOn(
   client: GithubClient,
-  spend: Spend,
+  admit: Admit,
   target: GithubTarget,
   sha: string,
 ): Promise<Checks> {
@@ -710,7 +740,7 @@ async function checksOn(
   for (let page = 1; page <= GITHUB_LIMITS.maxPages; page += 1) {
     const response = await fetchOk(
       client,
-      spend,
+      admit,
       `${repoPath(target.repo)}/commits/${segment(sha)}/check-runs?per_page=100&page=${page}`,
     );
     const body = (response.body ?? {}) as CheckRuns;
@@ -723,7 +753,7 @@ async function checksOn(
   const combined = (
     await fetchOk(
       client,
-      spend,
+      admit,
       `${repoPath(target.repo)}/commits/${segment(sha)}/status`,
     )
   ).body as CombinedStatus | undefined;
@@ -889,7 +919,7 @@ function mergedFacts(
  */
 export async function baseline(
   client: GithubClient,
-  spend: Spend,
+  admit: Admit,
   target: GithubTarget,
   now: number,
 ): Promise<Baseline> {
@@ -898,7 +928,7 @@ export async function baseline(
     if (target.kind === "run") {
       const run = await fetchOk(
         client,
-        spend,
+        admit,
         `${repoPath(target.repo)}/actions/runs/${segment(target.number)}`,
       );
       const current = (run.body as RunAttempt | undefined)?.run_attempt;
@@ -913,7 +943,7 @@ export async function baseline(
       const bound = { ...target, attempt };
       const state = await fetchOk(
         client,
-        spend,
+        admit,
         `${repoPath(target.repo)}/actions/runs/${segment(target.number)}/attempts/${segment(attempt)}`,
       );
       const body = state.body as RunAttempt;
@@ -930,7 +960,7 @@ export async function baseline(
     if (target.kind === "issue") {
       const issue = await fetchOk(
         client,
-        spend,
+        admit,
         `${repoPath(target.repo)}/issues/${segment(target.number)}`,
       );
       if ((issue.body as Pull | undefined)?.pull_request !== undefined) {
@@ -941,7 +971,7 @@ export async function baseline(
       }
     }
     if (target.kind === "pr") {
-      const read = await pullRequest(client, spend, target, cursor);
+      const read = await pullRequest(client, admit, target, cursor);
       const pull = read.pull;
       const head = pull?.head?.sha;
       if (target.on === "merged") {
@@ -969,7 +999,7 @@ export async function baseline(
           };
         }
         const bound = { ...target, head };
-        const checks = await checksOn(client, spend, bound, head);
+        const checks = await checksOn(client, admit, bound, head);
         // Complete already: the first poll confirms it, as any other done.
         const watching: GithubCursor = {
           ...read.cursor,
@@ -982,7 +1012,7 @@ export async function baseline(
     if (target.on === "review") {
       const listed = await newReviews(
         client,
-        spend,
+        admit,
         listPath(target),
         { etags: {} },
         true,
@@ -993,7 +1023,7 @@ export async function baseline(
       return {
         kind: "ready",
         target,
-        cursor: await commentBaseline(client, spend, listPath(target), now),
+        cursor: await commentBaseline(client, admit, listPath(target), now),
       };
     }
     return { kind: "ready", target, cursor };
@@ -1031,7 +1061,7 @@ function listPath(target: GithubTarget): string {
 /** One poll of a registered watch. */
 export async function poll(
   client: GithubClient,
-  spend: Spend,
+  admit: Admit,
   target: GithubTarget,
   cursor: GithubCursor,
   now: number,
@@ -1040,7 +1070,7 @@ export async function poll(
     if (target.kind === "run") {
       const response = await fetchOk(
         client,
-        spend,
+        admit,
         `${repoPath(target.repo)}/actions/runs/${segment(target.number)}/attempts/${segment(target.attempt ?? 1)}`,
         cursor.etags.attempt,
       );
@@ -1068,8 +1098,8 @@ export async function poll(
     if (target.on === "review" || target.on === "comment") {
       const listed =
         target.on === "review"
-          ? await newReviews(client, spend, listPath(target), cursor, false)
-          : await newComments(client, spend, listPath(target), cursor);
+          ? await newReviews(client, admit, listPath(target), cursor, false)
+          : await newComments(client, admit, listPath(target), cursor);
       const items = listed.items;
       if (items.length > 0) {
         return {
@@ -1080,7 +1110,7 @@ export async function poll(
       }
       return unchanged(listed.cursor, listed.pollAfterMs);
     }
-    const read = await pullRequest(client, spend, target, cursor);
+    const read = await pullRequest(client, admit, target, cursor);
     if (target.on === "merged") {
       if (read.pull && (read.pull.merged || read.pull.state === "closed")) {
         return {
@@ -1098,7 +1128,7 @@ export async function poll(
         ? read.pull.head.sha
         : (cursor.currentHead ?? head);
     const next: GithubCursor = { ...read.cursor, currentHead: current };
-    const checks = await checksOn(client, spend, target, head);
+    const checks = await checksOn(client, admit, target, head);
     delete next.settled;
     if (checks.complete && cursor.settled === checks.signature) {
       return {

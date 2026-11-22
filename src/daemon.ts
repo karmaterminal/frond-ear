@@ -115,6 +115,7 @@ import {
   htmlUrl,
   parseTarget,
   poll,
+  type Admit,
   type GithubCursor,
   type GithubTarget,
   type PollOutcome,
@@ -2686,6 +2687,52 @@ export class Daemon {
     return true;
   }
 
+  /** Whether `repo` is in `ear`'s github.repos now. */
+  private githubAllows(ear: string, repo: string): boolean {
+    return (this.config.github?.repos[ear] ?? []).some(
+      (allowed) => allowed.toLowerCase() === repo.toLowerCase(),
+    );
+  }
+
+  /**
+   * The gate on every GitHub request for `ear`'s watch of `repo` (Admit): asked before
+   * each attempt, after every await, against the config as it is then.
+   */
+  private githubAdmit(
+    ear: string,
+    repo: string,
+    gh: GithubClient,
+    track: { pollAfterMs?: number } = {},
+  ): Admit {
+    return {
+      before: () => {
+        const github = this.config.github;
+        if (
+          this.stopped ||
+          !github?.enabled ||
+          github.apiBase.replace(/\/+$/u, "") !== gh.origin
+        ) {
+          return "paused";
+        }
+        if (!this.githubAllows(ear, repo)) {
+          return "revoked";
+        }
+        if (this.githubBackoffUntil() > this.clock.now()) {
+          return "rate";
+        }
+        return this.spendGithub(ear) ? "ok" : "budget";
+      },
+      after: (response) => {
+        if (response.pollIntervalMs !== undefined) {
+          track.pollAfterMs = Math.max(
+            track.pollAfterMs ?? 0,
+            response.pollIntervalMs,
+          );
+        }
+      },
+    };
+  }
+
   private async wakeOnTool(
     client: Client,
     args: Record<string, unknown>,
@@ -2702,11 +2749,7 @@ export class Daemon {
     const now = this.clock.now();
     const note = parseNote(args);
     const target = parseTarget(args);
-    if (
-      !(github.repos[ear] ?? []).some(
-        (repo) => repo.toLowerCase() === target.repo.toLowerCase(),
-      )
-    ) {
+    if (!this.githubAllows(ear, target.repo)) {
       throw new Error(
         `repo ${target.repo} is not in this ear's github.repos (the daemon's config); nothing was set`,
       );
@@ -2719,7 +2762,12 @@ export class Daemon {
         `GitHub asked frond-ear to wait until ${iso(backoff)} (a rate limit); nothing was set, try after it`,
       );
     }
-    const first = await baseline(gh, () => this.spendGithub(ear), target, now);
+    const first = await baseline(
+      gh,
+      this.githubAdmit(ear, target.repo, gh),
+      target,
+      now,
+    );
     if (first.kind === "refused") {
       if (first.rate) {
         this.backOffGithub(this.clock.now(), first.retryAfterMs);
@@ -2852,7 +2900,7 @@ export class Daemon {
       try {
         outcome = await poll(
           gh,
-          () => this.spendGithub(schedule.ear),
+          this.githubAdmit(schedule.ear, target.repo, gh),
           target,
           cursor,
           this.clock.now(),
