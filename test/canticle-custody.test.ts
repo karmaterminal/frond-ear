@@ -26,10 +26,12 @@ import { EventStore } from "../src/store.ts";
 import {
   canticleConfig,
   confirm,
-  type Host,
+  offered,
   OPS,
   order,
+  pressure,
   pushes,
+  SESSION,
   setup,
   status,
 } from "./canticle-host.ts";
@@ -44,7 +46,6 @@ import {
   PRINCIPAL,
 } from "./helpers.ts";
 
-const SESSION = "11111111-aaaa-4aaa-8aaa-000000000001";
 const OTHER_SESSION = "22222222-bbbb-4bbb-8bbb-000000000002";
 
 type Client = ReturnType<Harness["attach"]>;
@@ -98,50 +99,6 @@ function summary(h: Harness): Record<string, unknown> | undefined {
 /** `key:epoch:stream:seq` of an ops.fleet record the host sang, as custody keys it. */
 const identity = (seq: number, stream = "ops.fleet") =>
   `${OPS}:7:${stream}:${seq}`;
-
-let reports = 0;
-
-/**
- * The seat's pressure hook (#98), as a CLI client: the session's context reading with its
- * latest compaction marker (null: none yet). Evidence time is the harness clock.
- */
-async function pressure(
-  h: Harness,
-  boundary: string | null,
-  options: { sessionId?: string; tokens?: number | null } = {},
-): Promise<void> {
-  const cli = h.attach(undefined, { role: "cli" });
-  reports += 1;
-  await cli.send({
-    type: "pressure",
-    id: reports,
-    ear: "scribe",
-    sessionId: options.sessionId ?? SESSION,
-    tokens: options.tokens === undefined ? 1_000 : options.tokens,
-    band: null,
-    boundary,
-    at: h.clock.now(),
-  });
-  const result = cli.connection.results().at(-1)!;
-  assert.equal(result.ok, true, result.text);
-  cli.close();
-}
-
-/** Sings `seq`, lets immediate push it, and has the shim confirm it: the push. */
-async function offered(
-  h: Harness,
-  host: Host,
-  shim: Client,
-  seq: number,
-): Promise<Extract<DaemonMessage, { type: "event" }>> {
-  const before = pushes(shim).length;
-  host.sing(seq);
-  h.timers.advance(6_000);
-  assert.equal(pushes(shim).length, before + 1, `record ${seq} was pushed`);
-  const push = pushes(shim).at(-1)!;
-  await shim.send({ type: "offered", batchId: push.batchId! });
-  return push;
-}
 
 const recordOf = (view: Custody, seq: number) => {
   const record = view.records.find((item) => item.item === `7/${seq}`);
