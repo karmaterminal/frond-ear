@@ -1897,3 +1897,27 @@ test("restart: after a crash, a refresh that collapsed into the push left unconf
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test("revert: a refresh that superseded the record of a reverted push goes out to the next session, not held behind a record gone from the view", async () => {
+  const A = "a".repeat(64);
+  const { h, host } = setup({ mode: "immediate" });
+  try {
+    const first = h.attach("scribe", { sessionId: SESSION });
+    const x = { stateKey: "x", text: "x: deploying", digest: A };
+    host.sing(1, { ...x, ttlMs: 600_000 });
+    h.timers.advance(6_000);
+    assert.equal(pushes(first).length, 1, "record 1, never confirmed");
+    host.sing(2, { ...x, ttlMs: 600_000, flags: { refresh: true } });
+    host.pluck(1, x); // superseded by the refresh
+    h.timers.advance(2_000);
+    assert.equal(status(h).counts.refresh_collapsed, 1);
+    first.close();
+
+    const second = h.attach("scribe", { sessionId: SESSION });
+    h.timers.advance(6_000);
+    assert.equal(pushes(second).length, 1);
+    assert.deepEqual(order(pushes(second)[0]!.content), ["ops:ops.fleet/2"]);
+  } finally {
+    h.dispose();
+  }
+});

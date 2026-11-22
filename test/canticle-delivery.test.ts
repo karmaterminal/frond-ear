@@ -700,6 +700,24 @@ test("dedupe: a refresh heard while the record it re-issues still waits is held 
   }
 });
 
+test("dedupe: a refresh whose record has left the view (superseded, as the embedded receptor does) is not held behind it: it goes out", async () => {
+  const A = "a".repeat(64);
+  const { h, host } = setup({ mode: "immediate" });
+  try {
+    const shim = h.attach("scribe");
+    const keyed = { stateKey: "silas", text: "silas: deploying", digest: A };
+    host.sing(1, { ...keyed, ttlMs: 600_000 });
+    h.timers.advance(2_000); // record 1 waits out its debounce
+    host.sing(2, { ...keyed, ttlMs: 600_000, flags: { refresh: true } });
+    host.pluck(1, keyed); // the refresh supersedes it: it leaves the view
+    h.timers.advance(10_000);
+    assert.equal(pushes(shim).length, 1);
+    assert.deepEqual(order(pushes(shim)[0]!.content), ["ops:ops.fleet/2"]);
+  } finally {
+    h.dispose();
+  }
+});
+
 test("dedupe: a refresh of a record a mute passed over is news once the mute lifts, then collapses like any other", async () => {
   const { h, host } = setup({ mode: "immediate" });
   try {
