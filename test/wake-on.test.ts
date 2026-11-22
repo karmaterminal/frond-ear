@@ -855,3 +855,36 @@ test("wake_on: GitHub's strings reach frond-ear's own fact lines only in their k
     h.dispose();
   }
 });
+
+test("wake_on review: a review begun before the watch (a lower id, pending and unseen) fires when it is submitted after", async () => {
+  const fake = new FakeGithub();
+  fake.routes.set(`${R}/pulls/14`, {
+    body: { state: "open", head: { sha: S1 } },
+  });
+  let reviews: unknown[] = [
+    { id: 10, state: "APPROVED", body: "fine", user: { login: "r2" } },
+  ];
+  fake.routes.set(`${R}/pulls/14/reviews`, () => ({ body: reviews }));
+  const h = harness(config(), { githubFetch: fake.fetch });
+  try {
+    const shim = h.attach("scribe", { sessionId: A });
+    await watch(h, shim, { target: "pr", number: 14, on: "review" });
+    // r1 began review 9 before review 10 existed, and submits it now.
+    reviews = [
+      {
+        id: 9,
+        state: "CHANGES_REQUESTED",
+        body: "not yet",
+        user: { login: "r1" },
+      },
+      { id: 10, state: "APPROVED", body: "fine", user: { login: "r2" } },
+    ];
+    await advance(h, POLL);
+    const [event] = wakes(shim);
+    assert.ok(event, "review 9 fired");
+    assert.match(event.content, /review 9 by r1, state CHANGES_REQUESTED/u);
+    assert.doesNotMatch(event.content, /review 10 by/u);
+  } finally {
+    h.dispose();
+  }
+});
