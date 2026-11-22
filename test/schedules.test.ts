@@ -853,3 +853,33 @@ test("schedule: a doubt survives the shim reconnecting; a session change seen on
     h.dispose();
   }
 });
+
+test("schedule: the orphan clock counts from when the setter last held the ear, not from when it set the schedule", async () => {
+  for (const leave of ["clear", "detach"] as const) {
+    const h = harness();
+    try {
+      const shim = h.attach("scribe", { sessionId: A, hostPids: [HOST_PID] });
+      const set = await h.call(shim, "schedule", {
+        at: new Date(h.clock.now() + 20 * DAY).toISOString(),
+        note: "far off",
+      });
+      assert.equal(set.ok, true, set.text);
+      // A holds the ear, quietly, for almost seven days: no tick runs meanwhile.
+      h.timers.advance(7 * DAY - HOUR);
+      if (leave === "clear") {
+        await release(h, { sessionId: B, source: "clear", hostPid: HOST_PID });
+      } else {
+        shim.close();
+      }
+      h.timers.advance(2 * HOUR);
+      const status = earStatus(h).schedules;
+      assert.equal(status.active, 1, `${leave}: A held it until 2 h ago`);
+      assert.equal(status.retiredOrphaned, 0, leave);
+      // Seven days after A left, it is orphaned.
+      h.timers.advance(7 * DAY);
+      assert.equal(earStatus(h).schedules.retiredOrphaned, 1, leave);
+    } finally {
+      h.dispose();
+    }
+  }
+});
