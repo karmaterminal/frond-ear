@@ -22,8 +22,8 @@ import { createHash } from "node:crypto";
 
 import type { CustodyState, CustodyView } from "./canticle/custody.ts";
 import type { OutboundFile } from "./outbound-files.ts";
-import type { DiscordRest } from "./rest.ts";
-import type { CompactionBoundary, EventStore } from "./store.ts";
+import { definitive, type DiscordRest } from "./rest.ts";
+import type { CompactionBoundary, EgressResend, EventStore } from "./store.ts";
 import type { Clock } from "./types.ts";
 
 /** config `canticle.roomPolicy`: what the egress gate does with what it reads. */
@@ -178,17 +178,28 @@ export class RoomRefused extends Error {
  */
 export interface RoomPermit {
   readonly egressId: number;
-  /** One message of the reply this permit was opened for, in its chat. */
+  /**
+   * One message of the reply this permit was opened for, in its chat, under `nonce`.
+   * `owner` is the egress row that first sent that nonce: this permit's own for a new
+   * part, an earlier row's when an identical retry reuses it. Discord's answer for a
+   * reused nonce is that row's message (one message, whichever try posted it), so it is
+   * recorded as re-sent for that row, never as this output's own.
+   */
   send(
     content: string,
     replyTo: string | undefined,
     nonce: string,
     files: readonly OutboundFile[],
+    owner: number | null,
   ): Promise<{ id: string }>;
   /** The reaction or the edit this permit was opened for. */
   apply(): Promise<void>;
-  /** Records how the output went; after it the permit writes nothing. */
-  settle(outcome: "sent" | "error"): void;
+  /**
+   * Records how the output went; after it the permit writes nothing. A call that failed
+   * on a write Discord never answered (it may have been done) is `unconfirmed`, tied to
+   * that part's nonce for a reply; any other failure is `error`.
+   */
+  settle(ended: "sent" | "failed"): void;
 }
 
 /** The egress gate: one per daemon, holding the only reference to Discord's writes. */
@@ -236,6 +247,9 @@ export class RoomEgress {
     }
     const writes = this.#writes;
     const written: string[] = [];
+    const resent: EgressResend[] = [];
+    /** The latest write, if Discord never answered it: a reply part's nonce, or null. */
+    let unanswered: { nonce: string | null } | undefined;
     let settled = false;
     const live = () => {
       if (settled) {
@@ -244,46 +258,59 @@ export class RoomEgress {
         );
       }
     };
+    /** Makes one Discord write, keeping whether it went unanswered. */
+    const write = async <T>(nonce: string | null, call: () => Promise<T>) => {
+      unanswered = undefined;
+      try {
+        return await call();
+      } catch (error) {
+        if (!definitive(error)) unanswered = { nonce };
+        throw error;
+      }
+    };
     return {
       egressId,
-      send: async (content, replyTo, nonce, files) => {
+      send: async (content, replyTo, nonce, files, owner) => {
         live();
         if (output.tool !== "reply") {
           throw new Error(`a ${output.tool} permit sends no message`);
         }
-        const sent = await writes.sendMessage(
-          output.chatId,
-          content,
-          replyTo,
-          nonce,
-          files,
+        const sent = await write(nonce, () =>
+          writes.sendMessage(output.chatId, content, replyTo, nonce, files),
         );
-        written.push(sent.id);
+        if (owner === egressId) written.push(sent.id);
+        else resent.push({ egressId: owner, messageId: sent.id });
         return sent;
       },
       apply: async () => {
         live();
         if (output.tool === "react") {
-          await writes.addReaction(
-            output.chatId,
-            output.messageId,
-            output.emoji,
+          await write(null, () =>
+            writes.addReaction(output.chatId, output.messageId, output.emoji),
           );
         } else if (output.tool === "edit_message") {
-          await writes.editMessage(
-            output.chatId,
-            output.messageId,
-            output.text,
+          await write(null, () =>
+            writes.editMessage(output.chatId, output.messageId, output.text),
           );
           written.push(output.messageId);
         } else {
           throw new Error("a reply's permit sends its parts");
         }
       },
-      settle: (outcome) => {
+      settle: (ended) => {
         if (settled) return;
         settled = true;
-        this.#store.settleEgress(egressId, outcome, written, this.#clock.now());
+        this.#store.settleEgress(
+          egressId,
+          {
+            outcome:
+              ended === "sent" ? "sent" : unanswered ? "unconfirmed" : "error",
+            messageIds: written,
+            resent,
+            nonce: ended === "failed" ? (unanswered?.nonce ?? null) : null,
+          },
+          this.#clock.now(),
+        );
       },
     };
   }

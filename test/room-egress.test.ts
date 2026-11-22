@@ -1002,6 +1002,77 @@ test("unconfirmed: a store from an earlier build of the egress gate (no unconfir
   }
 });
 
+test("unconfirmed at startup: of the rows a previous process left pending, a reply with a part still unanswered and a reaction are unconfirmed; a reply whose every part was answered is error, keeping the message credited when Discord confirmed it", () => {
+  const directory = mkdtempSync(join(tmpdir(), "frond-ear-egress-"));
+  const path = join(directory, "ear.db");
+  try {
+    const store = new EventStore(path);
+    const open = (tool: "reply" | "react") =>
+      store.openEgress({
+        ear: "scribe",
+        tool,
+        chatId: CHANNEL,
+        target: null,
+        digest: "ab",
+        sessionId: SESSION,
+        speaker: "holder",
+        policy: "observe",
+        decision: "allow",
+        reason: "observed, not enforced",
+        history: "unknown",
+        reasons: [],
+        boundary: undefined,
+        sources: [],
+        since: 0,
+        decidedAt: 5,
+      });
+    const part = (key: string) => ({ key, id: key, part: 0, parts: 1 });
+    const cutMidSend = open("reply");
+    store.beginSend(
+      "k1",
+      CHANNEL,
+      "a",
+      "n1",
+      300_000,
+      "scribe",
+      part("k1"),
+      cutMidSend,
+    );
+    const cutAfterConfirm = open("reply");
+    store.beginSend(
+      "k2",
+      CHANNEL,
+      "b",
+      "n2",
+      300_000,
+      "scribe",
+      part("k2"),
+      cutAfterConfirm,
+    );
+    store.completeSend("n2", "900000000000000002", CHANNEL);
+    const reaction = open("react");
+    store.close();
+
+    const h = harness(testConfig(), { path });
+    try {
+      assert.deepEqual(
+        rows(h).map((row) => [row.id, row.outcome, row.nonce, row.messageIds]),
+        [
+          [cutMidSend, "unconfirmed", "n1", []],
+          [cutAfterConfirm, "error", null, ["900000000000000002"]],
+          [reaction, "unconfirmed", null, []],
+        ],
+      );
+      assert.ok(rows(h).every((row) => row.settledAt === h.clock.now()));
+      assert.ok(h.logs.some((line) => line.includes('"room.egress_released"')));
+    } finally {
+      h.dispose();
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("shutdown: a reply still waiting on Discord when the drain runs out keeps its row pending, unknown; nothing settles it after the store is handed back", async () => {
   const { h } = setup({ mode: "immediate" });
   try {

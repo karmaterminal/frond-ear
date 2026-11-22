@@ -335,13 +335,44 @@ export interface EgressRecord {
   since: number;
   decidedAt: number;
   /**
-   * `refused`: nothing sent. `pending`: allowed, the write not yet answered (after a
-   * crash, unknown). `sent`: every write confirmed. `error`: the call ended in an error.
+   * `refused`: nothing sent. `pending`: allowed, its call still running (a row a previous
+   * process left pending is settled when frond-ear starts). `sent`: every write it made
+   * was confirmed. `error`: the call ended in an error, and nothing it wrote is unknown.
+   * `unconfirmed`: a write it made was never answered, so it may have gone out; for a reply
+   * part, `nonce` names it, and the row becomes `sent` when Discord confirms that nonce.
    */
-  outcome: "refused" | "pending" | "sent" | "error";
-  /** The messages the output wrote that Discord confirmed (a reply's parts, the edited one). */
+  outcome: "refused" | "pending" | "sent" | "error" | "unconfirmed";
+  /**
+   * The messages this output posted (a reply's parts, by the nonces its own call first
+   * sent) or edited, as Discord confirmed them. A part an earlier row first sent is that
+   * row's, even when this row's retry got Discord's answer for it.
+   */
   messageIds: string[];
+  /** The nonce of the reply part this output's call left unanswered; null when none. */
+  nonce: string | null;
+  /**
+   * Parts this output re-sent under an earlier row's nonce (an identical retry), and the
+   * message Discord confirmed for each: credited to that row (`egressId`, null for a send
+   * from before egress rows were kept), never to this one.
+   */
+  resent: EgressResend[];
   settledAt: number | null;
+}
+
+/** A reply part one egress row re-sent under another's nonce, as Discord confirmed it. */
+export interface EgressResend {
+  egressId: number | null;
+  messageId: string;
+}
+
+/** How an allowed room output's call ended, as its permit saw it. */
+export interface EgressSettlement {
+  outcome: "sent" | "error" | "unconfirmed";
+  /** What it wrote under its own nonces (or edited), as Discord confirmed it. */
+  messageIds: readonly string[];
+  resent: readonly EgressResend[];
+  /** For `unconfirmed`: the nonce of the reply part left unanswered, if it was one. */
+  nonce: string | null;
 }
 
 interface EgressRow {
@@ -365,6 +396,8 @@ interface EgressRow {
   decided_at: number;
   outcome: EgressRecord["outcome"];
   message_ids: string;
+  nonce: string | null;
+  resent: string;
   settled_at: number | null;
 }
 
@@ -389,9 +422,50 @@ function mapEgress(row: EgressRow): EgressRecord {
     decidedAt: row.decided_at,
     outcome: row.outcome,
     messageIds: JSON.parse(row.message_ids) as string[],
+    nonce: row.nonce,
+    resent: JSON.parse(row.resent) as EgressResend[],
     settledAt: row.settled_at,
   };
 }
+
+/**
+ * The room_egress table (binary-canticle#161 item 3) under `name`, so a store from an
+ * earlier build can be rebuilt into the same shape.
+ */
+const egressTable = (name: string) => `
+  CREATE TABLE IF NOT EXISTS ${name} (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ear TEXT NOT NULL,
+    tool TEXT NOT NULL CHECK (tool IN ('reply', 'react', 'edit_message')),
+    chat_id TEXT NOT NULL,
+    target TEXT,
+    digest TEXT NOT NULL,
+    session_id TEXT,
+    speaker TEXT NOT NULL CHECK (speaker IN ('holder', 'superseded', 'other')),
+    policy TEXT NOT NULL,
+    decision TEXT NOT NULL CHECK (decision IN ('allow', 'refuse')),
+    reason TEXT NOT NULL,
+    history TEXT NOT NULL CHECK (history IN ('complete', 'incomplete', 'unknown')),
+    reasons TEXT NOT NULL,
+    boundary TEXT,
+    boundary_known INTEGER NOT NULL,
+    sources TEXT NOT NULL,
+    since INTEGER NOT NULL,
+    decided_at INTEGER NOT NULL,
+    outcome TEXT NOT NULL CHECK (outcome IN
+      ('refused', 'pending', 'sent', 'error', 'unconfirmed')),
+    message_ids TEXT NOT NULL DEFAULT '[]',
+    nonce TEXT,
+    resent TEXT NOT NULL DEFAULT '[]',
+    settled_at INTEGER
+  );
+`;
+
+/** The columns an earlier build's room_egress already had, which a rebuild copies. */
+const EGRESS_V1_COLUMNS =
+  "id, ear, tool, chat_id, target, digest, session_id, speaker, policy, decision, reason, " +
+  "history, reasons, boundary, boundary_known, sources, since, decided_at, outcome, " +
+  "message_ids, settled_at";
 
 /**
  * One derived publication frond-ear asked a station for (binary-canticle#161 item 4), by
@@ -605,7 +679,8 @@ export class EventStore {
         reply_key TEXT,
         reply_id TEXT,
         part INTEGER,
-        parts INTEGER
+        parts INTEGER,
+        egress_id INTEGER
       );
       CREATE INDEX IF NOT EXISTS outbound_intents_key
         ON outbound_intents (intent_key, state, created_at);
@@ -724,29 +799,7 @@ export class EventStore {
         ear TEXT NOT NULL,
         reverted_at INTEGER NOT NULL
       );
-      CREATE TABLE IF NOT EXISTS room_egress (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ear TEXT NOT NULL,
-        tool TEXT NOT NULL CHECK (tool IN ('reply', 'react', 'edit_message')),
-        chat_id TEXT NOT NULL,
-        target TEXT,
-        digest TEXT NOT NULL,
-        session_id TEXT,
-        speaker TEXT NOT NULL CHECK (speaker IN ('holder', 'superseded', 'other')),
-        policy TEXT NOT NULL,
-        decision TEXT NOT NULL CHECK (decision IN ('allow', 'refuse')),
-        reason TEXT NOT NULL,
-        history TEXT NOT NULL CHECK (history IN ('complete', 'incomplete', 'unknown')),
-        reasons TEXT NOT NULL,
-        boundary TEXT,
-        boundary_known INTEGER NOT NULL,
-        sources TEXT NOT NULL,
-        since INTEGER NOT NULL,
-        decided_at INTEGER NOT NULL,
-        outcome TEXT NOT NULL CHECK (outcome IN ('refused', 'pending', 'sent', 'error')),
-        message_ids TEXT NOT NULL DEFAULT '[]',
-        settled_at INTEGER
-      );
+      ${egressTable("room_egress")}
       CREATE INDEX IF NOT EXISTS room_egress_ear
         ON room_egress (ear, decided_at);
       CREATE TABLE IF NOT EXISTS derived_publications (
@@ -813,9 +866,33 @@ export class EventStore {
         "ALTER TABLE canticle_custody ADD COLUMN lineage TEXT",
       );
     }
+    // An earlier build of the egress gate had no `unconfirmed` outcome, nonce or resent:
+    // rebuild its table into this shape, keeping every row and id.
+    const egress = this.database
+      .prepare(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'room_egress'",
+      )
+      .get() as { sql: string };
+    if (!egress.sql.includes("'unconfirmed'")) {
+      this.transaction(() => {
+        this.database.exec(`
+          ${egressTable("room_egress_rebuilt")}
+          INSERT INTO room_egress_rebuilt (${EGRESS_V1_COLUMNS})
+            SELECT ${EGRESS_V1_COLUMNS} FROM room_egress;
+          DROP TABLE room_egress;
+          ALTER TABLE room_egress_rebuilt RENAME TO room_egress;
+          CREATE INDEX IF NOT EXISTS room_egress_ear
+            ON room_egress (ear, decided_at);
+        `);
+      });
+    }
+    this.database.exec(`
+      CREATE INDEX IF NOT EXISTS room_egress_nonce
+        ON room_egress (nonce) WHERE nonce IS NOT NULL;
+    `);
     // outbound_intents shipped without these columns; a database created before
-    // one of them gains it here. Its older rows read as no session's (#49) and
-    // no reply's (#55).
+    // one of them gains it here. Its older rows read as no session's (#49), no
+    // reply's (#55) and no egress row's (#161).
     const intentColumns = new Set(
       (
         this.database
@@ -829,6 +906,7 @@ export class EventStore {
       ["reply_id", "TEXT"],
       ["part", "INTEGER"],
       ["parts", "INTEGER"],
+      ["egress_id", "INTEGER"],
     ] as const) {
       if (!intentColumns.has(column)) {
         this.database.exec(
@@ -1678,7 +1756,10 @@ export class EventStore {
    * policy refused. Returns its id.
    */
   public openEgress(
-    row: Omit<EgressRecord, "id" | "outcome" | "messageIds" | "settledAt">,
+    row: Omit<
+      EgressRecord,
+      "id" | "outcome" | "messageIds" | "nonce" | "resent" | "settledAt"
+    >,
   ): number {
     const refused = row.decision === "refuse";
     return Number(
@@ -1713,19 +1794,137 @@ export class EventStore {
     );
   }
 
-  /** How an allowed room output went: once, from `pending`. */
-  public settleEgress(
-    id: number,
-    outcome: "sent" | "error",
-    messageIds: readonly string[],
-    at: number,
-  ): void {
-    this.database
+  /**
+   * How an allowed room output went: once, from `pending`. Its message ids join those
+   * `completeSend` already credited to it. An `unconfirmed` part whose nonce Discord has
+   * meanwhile confirmed (a concurrent identical retry got the answer) settles it `sent`.
+   */
+  public settleEgress(id: number, settled: EgressSettlement, at: number): void {
+    this.transaction(() => {
+      const row = this.database
+        .prepare(
+          "SELECT outcome, message_ids, resent FROM room_egress WHERE id = ?",
+        )
+        .get(id) as
+        | { outcome: string; message_ids: string; resent: string }
+        | undefined;
+      if (row?.outcome !== "pending") return;
+      let outcome = settled.outcome;
+      const resent = [
+        ...(JSON.parse(row.resent) as EgressResend[]),
+        ...settled.resent,
+      ];
+      if (outcome === "unconfirmed" && settled.nonce !== null) {
+        const intent = this.sentIntent(settled.nonce);
+        if (intent !== undefined) {
+          outcome = "sent";
+          if (intent.owner !== id) {
+            resent.push({
+              egressId: intent.owner,
+              messageId: intent.messageId,
+            });
+          }
+        }
+      }
+      const messageIds = [
+        ...new Set([
+          ...(JSON.parse(row.message_ids) as string[]),
+          ...settled.messageIds,
+        ]),
+      ];
+      this.database
+        .prepare(
+          `UPDATE room_egress SET outcome = ?, message_ids = ?, nonce = ?, resent = ?,
+             settled_at = ?
+           WHERE id = ?`,
+        )
+        .run(
+          outcome,
+          JSON.stringify(messageIds),
+          settled.nonce,
+          JSON.stringify(resent),
+          at,
+          id,
+        );
+    });
+  }
+
+  /** A send Discord confirmed: its message, and the egress row that first sent its nonce. */
+  private sentIntent(
+    nonce: string,
+  ): { messageId: string; owner: number | null } | undefined {
+    const intent = this.database
       .prepare(
-        `UPDATE room_egress SET outcome = ?, message_ids = ?, settled_at = ?
-         WHERE id = ? AND outcome = 'pending'`,
+        `SELECT message_id AS messageId, egress_id AS owner FROM outbound_intents
+         WHERE nonce = ? AND state = 'sent'`,
       )
-      .run(outcome, JSON.stringify(messageIds), at, id);
+      .get(nonce) as { messageId: string; owner: number | null } | undefined;
+    return intent;
+  }
+
+  /**
+   * Inside `completeSend`: Discord confirmed `nonce` as `messageId`. The message is the
+   * egress row's that first sent the nonce, and each row whose call left it unanswered
+   * is `sent` now; one that only re-sent it names it as re-sent for that row.
+   */
+  private reconcileEgress(nonce: string, messageId: string): void {
+    const owner = this.sentIntent(nonce)?.owner ?? null;
+    if (owner !== null) {
+      const row = this.database
+        .prepare("SELECT message_ids FROM room_egress WHERE id = ?")
+        .get(owner) as { message_ids: string } | undefined;
+      const ids = row ? (JSON.parse(row.message_ids) as string[]) : [];
+      if (row && !ids.includes(messageId)) {
+        this.database
+          .prepare("UPDATE room_egress SET message_ids = ? WHERE id = ?")
+          .run(JSON.stringify([...ids, messageId]), owner);
+      }
+    }
+    const waiting = this.database
+      .prepare(
+        "SELECT id, resent FROM room_egress WHERE nonce = ? AND outcome = 'unconfirmed'",
+      )
+      .all(nonce) as Array<{ id: number; resent: string }>;
+    for (const row of waiting) {
+      const resent = JSON.parse(row.resent) as EgressResend[];
+      if (row.id !== owner) resent.push({ egressId: owner, messageId });
+      this.database
+        .prepare(
+          `UPDATE room_egress SET outcome = 'sent', resent = ?, settled_at = ?
+           WHERE id = ?`,
+        )
+        .run(JSON.stringify(resent), this.clock.now(), row.id);
+    }
+  }
+
+  /**
+   * At startup: a row a previous process left `pending` had its call cut off. A reply
+   * whose part was still unanswered (an intent it first sent, still pending) is
+   * `unconfirmed`, tied to that nonce; a reaction or an edit may have applied, so it is
+   * `unconfirmed` too. A reply with nothing unanswered wrote only what its message ids
+   * say: `error`. Returns how many.
+   */
+  public releasePendingEgress(at: number): number {
+    return this.transaction(() => {
+      this.database
+        .prepare(
+          `UPDATE room_egress SET nonce = (
+             SELECT nonce FROM outbound_intents
+              WHERE egress_id = room_egress.id AND state = 'pending'
+              ORDER BY created_at DESC LIMIT 1)
+           WHERE outcome = 'pending'`,
+        )
+        .run();
+      return Number(
+        this.database
+          .prepare(
+            `UPDATE room_egress SET settled_at = ?, outcome =
+               CASE WHEN tool <> 'reply' OR nonce IS NOT NULL THEN 'unconfirmed' ELSE 'error' END
+             WHERE outcome = 'pending'`,
+          )
+          .run(at).changes,
+      );
+    });
   }
 
   /** The ear's egress rows decided at or after `since`, oldest first. */
@@ -2082,7 +2281,9 @@ export class EventStore {
    * whose session is sending, or null for any other client (a `frond-ear send`
    * script): an unconfirmed send is put to that ear's sessions alone. A session
    * retrying a script's pending send makes it the session's; a script's retry
-   * changes nothing.
+   * changes nothing. `egressId` is the egress row (#161) of the call sending it: a
+   * new intent is that row's, and a reused one stays the row's that first sent it
+   * (`owner`; null for an intent from before egress rows were kept).
    */
   public beginSend(
     key: string,
@@ -2092,15 +2293,18 @@ export class EventStore {
     reuseWindowMs: number,
     sessionEar: string | null,
     reply: ReplyPart,
-  ): { nonce: string; reused: boolean } {
+    egressId: number,
+  ): { nonce: string; reused: boolean; owner: number | null } {
     const now = this.clock.now();
     const pending = this.database
       .prepare(
-        `SELECT nonce FROM outbound_intents
+        `SELECT nonce, egress_id AS owner FROM outbound_intents
          WHERE intent_key = ? AND reply_id = ? AND state = 'pending' AND created_at >= ?
          ORDER BY created_at DESC LIMIT 1`,
       )
-      .get(key, reply.id, now - reuseWindowMs) as { nonce: string } | undefined;
+      .get(key, reply.id, now - reuseWindowMs) as
+      | { nonce: string; owner: number | null }
+      | undefined;
     if (pending) {
       this.database
         .prepare(
@@ -2108,14 +2312,14 @@ export class EventStore {
            WHERE nonce = ?`,
         )
         .run(now, sessionEar, pending.nonce);
-      return { nonce: pending.nonce, reused: true };
+      return { nonce: pending.nonce, reused: true, owner: pending.owner };
     }
     this.database
       .prepare(
         `INSERT INTO outbound_intents
            (nonce, intent_key, chat_id, preview, state, created_at, updated_at, session_ear,
-            reply_key, reply_id, part, parts)
-         VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)`,
+            reply_key, reply_id, part, parts, egress_id)
+         VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         nonce,
@@ -2129,11 +2333,15 @@ export class EventStore {
         reply.id,
         reply.part,
         reply.parts,
+        egressId,
       );
-    return { nonce, reused: false };
+    return { nonce, reused: false, owner: egressId };
   }
 
-  /** Discord confirmed the post: mark the intent sent and keep the receipt. */
+  /**
+   * Discord confirmed the post: mark the intent sent, keep the receipt, and credit the
+   * message to the egress row that first sent the nonce (#161), in one transaction.
+   */
   public completeSend(nonce: string, messageId: string, chatId: string): void {
     this.transaction(() => {
       this.database
@@ -2143,6 +2351,7 @@ export class EventStore {
         )
         .run(messageId, this.clock.now(), nonce);
       this.recordSent(messageId, chatId);
+      this.reconcileEgress(nonce, messageId);
     });
   }
 

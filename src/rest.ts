@@ -56,6 +56,20 @@ export class RestError extends Error {
 }
 
 /**
+ * Whether Discord refused a write outright (a 4xx other than 429), so nothing was done.
+ * Anything else (a timeout, a lost response, a 5xx, a rate limit past its retries) leaves
+ * the write unanswered: it may have been done.
+ */
+export function definitive(error: unknown): boolean {
+  return (
+    error instanceof RestError &&
+    error.status >= 400 &&
+    error.status < 500 &&
+    error.status !== 429
+  );
+}
+
+/**
  * Splits text into Discord-sized chunks, preferring paragraph, then line,
  * then word boundaries.
  */

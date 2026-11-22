@@ -78,7 +78,7 @@ import {
   loadOutboundFiles,
   type OutboundFile,
 } from "./outbound-files.ts";
-import { chunkMessage, RestError } from "./rest.ts";
+import { chunkMessage, definitive, RestError } from "./rest.ts";
 import { hearResult, iso, type HeardItem } from "./canticle/hear.ts";
 import {
   LETTER_LIMITS,
@@ -652,6 +652,11 @@ export class Daemon {
     const released = this.store.releaseIssuingDerived(this.clock.now());
     if (released > 0) {
       this.logger.log("warn", "canticle.derived_released", { released });
+    }
+    // Nor does any call own an egress row: one left pending was cut off mid-call.
+    const cutOff = this.store.releasePendingEgress(this.clock.now());
+    if (cutOff > 0) {
+      this.logger.log("warn", "room.egress_released", { rows: cutOff });
     }
     // The config may have changed while the daemon was down: re-check every
     // persisted queue against current routing and modes before any session
@@ -3075,8 +3080,9 @@ export class Daemon {
       if (!this.stopped) permit.settle("sent");
       return result;
     } catch (error) {
-      // After shutdown the store may be closed: the row stays pending, unknown.
-      if (!this.stopped) permit.settle("error");
+      // After shutdown the store may be closed: the row stays pending, settled when
+      // frond-ear next starts.
+      if (!this.stopped) permit.settle("failed");
       throw error;
     }
   }
@@ -3416,14 +3422,36 @@ export class Daemon {
    * #162's `derived_query` for an election frond-ear asked about: the station's answer,
    * with no send, refresh or retry. An unknown attempt, or a claimed one no publish in
    * this process still owns (a crash left it), that the station reports accepted with a
-   * receipt naming this election and payload is settled from it.
+   * receipt naming this election and payload is settled from it. It is the station's
+   * derived op too, so it makes no station call with config canticle.derivedPublication
+   * off, or once frond-ear is shutting down; shutdown drains one in flight, as it drains
+   * a publish.
    */
-  public async derivedQuery(
+  public derivedQuery(
+    ear: string,
+    electionId: string,
+  ): Promise<Record<string, unknown>> {
+    const work = this.queryDerived(ear, electionId);
+    this.inFlight.add(work);
+    const settled = () => this.inFlight.delete(work);
+    work.then(settled, settled);
+    return work;
+  }
+
+  private async queryDerived(
     ear: string,
     electionId: string,
   ): Promise<Record<string, unknown>> {
     if (!ELECTION_ID.test(electionId)) {
       throw new Error("election_id is 32 lowercase hex digits");
+    }
+    if (this.closing) {
+      throw new Error("closed: frond-ear is shutting down; no station call");
+    }
+    if (this.config.canticle?.derivedPublication !== true) {
+      throw new Error(
+        "closed: derived publication is off (config canticle.derivedPublication); no station call",
+      );
     }
     const route = this.options.derivedRoute;
     if (!route) {
@@ -3675,10 +3703,17 @@ export class Daemon {
       SEND_DEDUPE_WINDOW_MS,
       sessionEar,
       reply,
+      permit.egressId,
     );
     this.sendsInFlight.add(intent.nonce);
     try {
-      const sent = await permit.send(content, replyTo, intent.nonce, files);
+      const sent = await permit.send(
+        content,
+        replyTo,
+        intent.nonce,
+        files,
+        intent.owner,
+      );
       if (!this.stopped) {
         this.store.completeSend(intent.nonce, sent.id, chatId);
       }
@@ -3687,12 +3722,7 @@ export class Daemon {
       }
       return sent.id;
     } catch (error) {
-      if (
-        error instanceof RestError &&
-        error.status >= 400 &&
-        error.status < 500 &&
-        error.status !== 429
-      ) {
+      if (definitive(error)) {
         if (!this.stopped) {
           this.store.failSend(intent.nonce);
         }
