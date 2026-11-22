@@ -883,3 +883,46 @@ test("schedule: the orphan clock counts from when the setter last held the ear, 
     }
   }
 });
+
+test("schedule: a schedule held and unacked for a day keeps delivery storage linear and each event bounded", async () => {
+  const h = harness();
+  const path = join(h.directory, "ear.db");
+  try {
+    const shim = h.attach("scribe", { sessionId: A });
+    await every(h, shim, { every: "5m" });
+    h.timers.advance(DAY);
+    const all = wakes(shim);
+    const pushes = all.length;
+    assert.ok(pushes >= 288, `${pushes} pushes`);
+    const side = new DatabaseSync(path);
+    try {
+      const count = (table: string): number =>
+        side
+          .prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE name = ?")
+          .get(table)!.n === 0
+          ? 0
+          : (
+              side.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as {
+                n: number;
+              }
+            ).n;
+      const rows = count("wake_deliveries") + count("wake_delivery_items");
+      assert.ok(
+        rows <= 2 * pushes,
+        `${rows} delivery rows for ${pushes} pushes`,
+      );
+    } finally {
+      side.close();
+    }
+    const last = all[all.length - 1]!;
+    assert.ok(last.content.length < 4_000, `${last.content.length} characters`);
+    assert.ok(last.meta.wake_ids!.length < 100, last.meta.wake_ids);
+    assert.equal(last.meta.ticks, "288");
+    const settled = await h.call(shim, "ack", { nonce: last.meta.nonce });
+    assert.match(settled.text, /^288 wakes settled/u);
+    assert.ok(settled.text.length < 300, settled.text);
+    assert.equal(earStatus(h).schedules.owed, 0);
+  } finally {
+    h.dispose();
+  }
+});
