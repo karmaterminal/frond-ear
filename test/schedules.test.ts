@@ -682,3 +682,53 @@ test("schedule: the shim names its ancestors, so a hook's CLAUDE_PID finds it th
     [300],
   );
 });
+
+test("schedule: a suspended ear is not a stopped daemon: paused, wakes are written and held; removed, its schedules wait untouched and catch up coalesced", async () => {
+  const h = harness();
+  try {
+    const shim = h.attach("scribe", { sessionId: A });
+    const start = h.clock.now();
+    await every(h, shim);
+    h.daemon.reloadConfig(testConfig({ paused: true }));
+    h.timers.advance(2 * HOUR);
+    assert.equal(wakes(shim).length, 0, "paused: nothing pushed");
+    assert.equal(
+      earStatus(h).schedules.owed,
+      1,
+      "but the occurrence is written",
+    );
+    h.daemon.reloadConfig(testConfig());
+    const resumed = lastWake(shim);
+    assert.equal(resumed.meta.ticks, "2");
+
+    await h.call(shim, "ack", { nonce: resumed.meta.nonce });
+    // The ear leaves the config: its schedule keeps its due time and writes nothing.
+    h.daemon.reloadConfig(
+      testConfig({
+        ears: {
+          other: {
+            target: "claude-channel",
+            dms: false,
+            attachCanary: false,
+            channels: {},
+          },
+        },
+      }),
+    );
+    h.timers.advance(5 * HOUR);
+    h.daemon.reloadConfig(testConfig());
+    const back = h.attach("scribe", { sessionId: A });
+    const caught = lastWake(back);
+    assert.equal(
+      caught.meta.ticks,
+      "5",
+      "the five due times while it was gone, as one event",
+    );
+    assert.equal(
+      caught.meta.first_due,
+      new Date(start + 3 * HOUR).toISOString(),
+    );
+  } finally {
+    h.dispose();
+  }
+});
