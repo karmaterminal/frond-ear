@@ -43,7 +43,7 @@ import { EAR_PROTOCOL_VERSION, LineConnection } from "./protocol.ts";
 import { HttpDiscordRest, RecordingRest } from "./rest.ts";
 import { runSend } from "./send.ts";
 import { listenTcp, listenUnix } from "./server.ts";
-import { ChannelShim, TOOLS } from "./shim.ts";
+import { ancestorPids, ChannelShim, TOOLS } from "./shim.ts";
 import { EventStore } from "./store.ts";
 import type { DiscordMessage } from "./types.ts";
 
@@ -261,6 +261,7 @@ function runShim(): void {
     connect: connectToDaemon(env),
     ear: env.FROND_EAR_EAR || undefined,
     sessionId: env.CLAUDE_CODE_SESSION_ID || undefined,
+    hostPids: ancestorPids(),
     token: tcpTarget(env) ? tcpToken(env) : undefined,
   });
   shim.start();
@@ -312,6 +313,9 @@ async function runRelease(argv: string[]): Promise<void> {
     }
   }
   const ear = values.ear ?? process.env.FROND_EAR_EAR;
+  const hostPid = hook
+    ? Number(process.env.CLAUDE_PID) || undefined
+    : undefined;
   try {
     if (!ear) {
       throw new Error("release needs --ear <name> (or FROND_EAR_EAR)");
@@ -322,6 +326,9 @@ async function runRelease(argv: string[]): Promise<void> {
         ear,
         ...(source ? { source } : {}),
         ...(sessionId ? { sessionId } : {}),
+        // Claude Code gives its hooks CLAUDE_PID: the daemon ties this hook to the shim
+        // that process spawned, so a /clear's new session id reaches the ear (#111).
+        ...(hostPid ? { hostPid } : {}),
       },
       process.env,
       5_000,

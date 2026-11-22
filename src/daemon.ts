@@ -91,6 +91,18 @@ import {
   summaryLetters,
 } from "./letters.ts";
 import type { HearView } from "./canticle/receptor.ts";
+import {
+  WAKE_LIMITS,
+  attentionAt,
+  dueStep,
+  listSchedules,
+  parseSchedule,
+  readSchedule,
+  renderHeld,
+  renderWake,
+  shortSession,
+} from "./wakes.ts";
+import type { Schedule, Wake } from "./wake-store.ts";
 import type { CompactionBoundary, EventStore, ReplyPart } from "./store.ts";
 import type {
   BatchKind,
@@ -157,6 +169,14 @@ interface Client {
   deliveryWarned?: boolean;
   sessionId: string | undefined;
   pid: number | undefined;
+  /** The shim's ancestor pids, nearest first (#111): Claude Code's is among them. */
+  hostPids?: number[] | undefined;
+  /**
+   * Set when a SessionStart hook named another session than this attach's and frond-ear
+   * could not tie the hook to this shim (#111): a /clear it can't prove. While set, this
+   * client is nobody's session for wakes: nothing shown, settled, set or cancelled.
+   */
+  wakeDoubt?: { claimed: string; at: number; source: string };
 }
 
 /** A pressure hook's reading (#98), as the daemon keeps it. */
@@ -299,6 +319,18 @@ function isCatchUpChat(value: unknown): value is CatchUpChat {
 /** Whether snowflake `a` is newer than `b`. They are digit strings, so a longer one is newer. */
 function newerId(a: string, b: string): boolean {
   return a.length === b.length ? a > b : a.length > b.length;
+}
+
+/** Positive integer pids, at most 8; anything else names none. */
+function pidList(value: unknown): number[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const pids = value.filter(
+    (item): item is number =>
+      typeof item === "number" && Number.isSafeInteger(item) && item > 1,
+  );
+  return pids.length > 0 ? pids.slice(0, 8) : undefined;
 }
 
 function stringArg(
@@ -630,6 +662,9 @@ export class Daemon {
   private readonly canticle: CanticleDelivery | undefined;
   /** Derived publications this process is still working on, by row id (#161). */
   private readonly derivedInFlight = new Set<number>();
+  /** The one timer for schedules, watches, orphans and re-pushes (#111). */
+  private wakeTimer: unknown;
+  private wakeTicking = false;
 
   public constructor(options: DaemonOptions) {
     const { rest, ...kept } = options;
@@ -690,6 +725,8 @@ export class Daemon {
         })
       : undefined;
     this.canticle?.start();
+    // Schedules that came due while the daemon was down are owed now, coalesced.
+    this.wakeTick();
   }
 
   /**
@@ -802,10 +839,25 @@ export class Daemon {
     this.prune();
     this.tick();
     this.canticle?.reconfigured();
+    // An ear back in the config, or a lifted pause: what it is owed goes out now.
+    this.wakeTick();
   }
 
   /** Prunes against the *current* retention policy (it can change on reload). */
   public prune(): number {
+    const { droppedUnacked } = this.store.wakes.prune(
+      this.clock.now(),
+      WAKE_LIMITS,
+    );
+    for (const wake of droppedUnacked) {
+      // Never silently: counted per ear, and logged without its note.
+      this.store.increment(`wakes_dropped_unacked.${wake.ear}`);
+      this.logger.log("warn", "wake.dropped_unacked", {
+        ear: wake.ear,
+        scheduleId: wake.scheduleId,
+        wakeId: wake.id,
+      });
+    }
     return this.store.prune(this.config.limits.retentionMs);
   }
 
@@ -1524,24 +1576,7 @@ export class Daemon {
         return;
       case "session":
         if (client.ear && typeof message.sessionId === "string") {
-          // The same turnover rule as attach: a reading belongs to its session.
-          if (this.attached.get(client.ear) === client) {
-            if (
-              this.pressure.get(client.ear)?.sessionId !== message.sessionId
-            ) {
-              this.pressure.delete(client.ear);
-            }
-            if (this.holds.get(client.ear)?.sessionId !== message.sessionId) {
-              this.holds.delete(client.ear);
-            }
-            if (
-              this.holdNotices.get(client.ear)?.sessionId !== message.sessionId
-            ) {
-              this.holdNotices.delete(client.ear);
-            }
-          }
-          client.sessionId = message.sessionId;
-          this.store.updateEarSession(client.ear, message.sessionId);
+          this.turnSession(client, client.ear, message.sessionId);
         }
         return;
       case "status":
@@ -1637,6 +1672,7 @@ export class Daemon {
     client.role = message.role;
     client.pid = message.pid;
     client.sessionId = message.sessionId;
+    client.hostPids = pidList(message.hostPids);
     if (message.role === "tap") {
       const ear = message.ear;
       if (!ear || !this.config.ears[ear]) {
@@ -1756,8 +1792,44 @@ export class Daemon {
       const canary = renderCanary(ear, record.generation, nonce);
       client.connection.send({ type: "event", batchId: null, ...canary });
     }
+    // Every wake owed to this session comes back, one event per schedule; another
+    // session's are only named (#111).
+    this.deliverWakes(ear, { all: true, held: true });
     this.releaseArmed(ear);
     this.tick();
+    this.armWakes();
+  }
+
+  /**
+   * The attached client now speaks for `sessionId` (a `session` message, or a
+   * SessionStart hook proven to come from this shim's own Claude process): whatever
+   * belongs to a session follows the change, as at attach. A wake never moves: it stays
+   * its setter's, and the new session is told what is held (#111).
+   */
+  private turnSession(client: Client, ear: string, sessionId: string): void {
+    if (this.attached.get(ear) === client) {
+      if (this.pressure.get(ear)?.sessionId !== sessionId) {
+        this.pressure.delete(ear);
+      }
+      if (this.holds.get(ear)?.sessionId !== sessionId) {
+        this.holds.delete(ear);
+      }
+      if (this.holdNotices.get(ear)?.sessionId !== sessionId) {
+        this.holdNotices.delete(ear);
+      }
+    }
+    const changed = client.sessionId !== sessionId;
+    client.sessionId = sessionId;
+    delete client.wakeDoubt;
+    this.store.updateEarSession(ear, sessionId);
+    if (this.attached.get(ear) === client && changed) {
+      this.logger.log("info", "ear.session_changed", {
+        ear,
+        sessionId,
+      });
+      this.deliverWakes(ear, { all: true, held: true });
+      this.armWakes();
+    }
   }
 
   // ---- letters (#88) -----------------------------------------------------------------
@@ -1772,6 +1844,7 @@ export class Daemon {
     ear: string;
     source?: string;
     sessionId?: string;
+    hostPid?: number;
   }): { ok: boolean; text: string } {
     const ear = typeof message.ear === "string" ? message.ear : "";
     if (!this.config.ears[ear]) {
@@ -1803,10 +1876,38 @@ export class Daemon {
       };
     }
     if (sessionId !== client.sessionId) {
-      return {
-        ok: false,
-        text: `ear ${ear} is held by ${client.sessionId ? `session ${client.sessionId.slice(0, 8)}` : "a session whose id frond-ear does not know"}, not ${sessionId.slice(0, 8)}; nothing released`,
-      };
+      const refusal = `ear ${ear} is held by ${client.sessionId ? `session ${client.sessionId.slice(0, 8)}` : "a session whose id frond-ear does not know"}, not ${sessionId.slice(0, 8)}; nothing released`;
+      const hostPid = pidList([message.hostPid])?.[0];
+      const pids = client.hostPids ?? [];
+      if (hostPid === undefined || !pids.includes(hostPid)) {
+        if (hostPid !== undefined && pids.length > 0) {
+          // Another Claude process's hook: it says nothing about this shim's session.
+          return { ok: false, text: refusal };
+        }
+        // Claude Code keeps its MCP servers across /clear and /resume, so the shim
+        // still names the session it started for. A hook frond-ear can't tie to it may
+        // be that change, or not: fail closed for wakes until it knows (#111).
+        client.wakeDoubt = { claimed: sessionId, at: this.clock.now(), source };
+        this.logger.log("warn", "ear.wake_identity_doubt", {
+          ear,
+          source,
+          hookPid: hostPid !== undefined,
+          shimPids: pids.length > 0,
+        });
+        this.deliverWakes(ear, { all: false, held: true });
+        return {
+          ok: false,
+          text: `${refusal}. frond-ear can't tie this hook to the shim holding the ear (${hostPid === undefined ? "the hook gave no CLAUDE_PID" : "that shim gave no host pids"}), so the session it speaks for is in doubt: its wakes are held, not shown, settled, set or cancelled, until it is re-attached or its own session's hook runs again`,
+        };
+      }
+      // The hook comes from the Claude Code process that spawned this shim: the session
+      // there changed under it (a /clear or /resume). Its wakes stay its setter's.
+      this.turnSession(client, ear, sessionId);
+    } else if (client.wakeDoubt) {
+      delete client.wakeDoubt;
+      this.logger.log("info", "ear.wake_identity_known", { ear, source });
+      this.deliverWakes(ear, { all: true, held: false });
+      this.armWakes();
     }
     this.store.clearRuntimeState(`letters.armed.${ear}`);
     return { ok: true, text: this.deliverLetters(ear, client, source) };
@@ -2295,6 +2396,470 @@ export class Daemon {
     return `letters for ear ${ear}: ${parts.join(", ")}; sent as ${events} channel event${events === 1 ? "" : "s"}`;
   }
 
+  // ---- schedules and wakes (#111) ---------------------------------------------------
+
+  /**
+   * The session a client speaks for as far as wakes go: the holder's known session, or
+   * null (not the holder, no id, or in doubt since a /clear frond-ear couldn't tie to
+   * it). Null is nobody: it is shown, settles, sets and cancels nothing.
+   */
+  private wakeSession(client: Client): string | null {
+    const ear = client.ear;
+    if (!ear || !this.isAttachedSession(client, ear) || client.wakeDoubt) {
+      return null;
+    }
+    return client.sessionId ?? null;
+  }
+
+  private requireWakeSession(client: Client, what: string): string {
+    const session = this.wakeSession(client);
+    if (session !== null) {
+      return session;
+    }
+    if (client.wakeDoubt) {
+      throw new Error(
+        `frond-ear can't tell which session this shim speaks for: a ${cleanName(client.wakeDoubt.source)} hook named session ${shortSession(client.wakeDoubt.claimed)}, and it could not tie that hook to this shim. It won't ${what} until this session is re-attached or its own hook runs again; nothing was changed`,
+      );
+    }
+    throw new Error(
+      `frond-ear does not know this session's id (its shim had no CLAUDE_CODE_SESSION_ID), so it cannot ${what} for it; nothing was changed`,
+    );
+  }
+
+  private holderIdentity(ear: string): string {
+    const client = this.attached.get(ear);
+    if (!client) {
+      return "detached";
+    }
+    if (client.wakeDoubt) {
+      return "in-doubt";
+    }
+    return client.sessionId ? "known" : "unknown";
+  }
+
+  /** The holder's wake session per attached ear; touches each, so it is never orphaned. */
+  private wakeHolders(now: number): Map<string, string> {
+    const holders = new Map<string, string>();
+    for (const [ear, client] of this.attached) {
+      const session = this.wakeSession(client);
+      if (session !== null) {
+        holders.set(ear, session);
+        this.store.wakes.touchSetter(ear, session, now);
+      }
+    }
+    return holders;
+  }
+
+  /** What a watch targets, for its setter's eyes only. */
+  private targetText(schedule: Schedule): string | undefined {
+    return schedule.target === null ? undefined : undefined;
+  }
+
+  /**
+   * Pushes the attached session what it is owed: one event per schedule, carrying every
+   * owed occurrence of it under one fresh nonce. `all` replays everything (an attach or
+   * a session change); otherwise only schedules with an occurrence never pushed, or
+   * last pushed WAKE_LIMITS.repushMs ago. `held` also names, without their text, the
+   * wakes owed to other sessions. Never to taps: a tap is another reader.
+   */
+  private deliverWakes(
+    ear: string,
+    options: { all: boolean; held: boolean },
+  ): void {
+    const client = this.attached.get(ear);
+    if (!client || this.config.paused || this.stopped) {
+      return;
+    }
+    const now = this.clock.now();
+    const session = this.wakeSession(client);
+    const owed = this.store.wakes.owed(ear);
+    if (session !== null) {
+      const bySchedule = new Map<number, Wake[]>();
+      for (const wake of owed) {
+        if (wake.setter === session) {
+          bySchedule.set(wake.scheduleId, [
+            ...(bySchedule.get(wake.scheduleId) ?? []),
+            wake,
+          ]);
+        }
+      }
+      for (const [scheduleId, wakes] of bySchedule) {
+        const due =
+          options.all ||
+          wakes.some(
+            (wake) =>
+              wake.lastDeliveredAt === null ||
+              wake.lastDeliveredAt <= now - WAKE_LIMITS.repushMs,
+          );
+        const schedule = this.store.wakes.schedule(scheduleId);
+        if (!due || !schedule) {
+          continue;
+        }
+        const nonce = randomBytes(6).toString("hex");
+        const notification = renderWake(
+          schedule,
+          wakes,
+          nonce,
+          now,
+          this.targetText(schedule),
+        );
+        this.store.wakes.deliver(
+          {
+            nonce,
+            ear,
+            sessionId: session,
+            scheduleId,
+            wakeIds: wakes.map((wake) => wake.id),
+          },
+          now,
+        );
+        client.connection.send({
+          type: "event",
+          batchId: null,
+          content: notification.content,
+          meta: { ...notification.meta, ear },
+        });
+        this.logger.log("info", "wake.delivered", {
+          ear,
+          scheduleId,
+          wakes: wakes.length,
+        });
+      }
+    }
+    if (options.held) {
+      const held = renderHeld(
+        owed.filter((wake) => session === null || wake.setter !== session),
+        session !== null ? session : client.wakeDoubt ? "in-doubt" : "unknown",
+      );
+      if (held) {
+        client.connection.send({
+          type: "event",
+          batchId: null,
+          content: held.content,
+          meta: { ...held.meta, ear },
+        });
+      }
+    }
+  }
+
+  /**
+   * Every due step of every active schedule, each one transaction with the occurrence it
+   * owes; then orphans; then pushes. A removed ear's schedules wait untouched, their due
+   * times kept, and catch up coalesced if the ear comes back.
+   */
+  private wakeTick(): void {
+    if (this.wakeTimer !== undefined) {
+      this.timers.clearTimeout(this.wakeTimer);
+      this.wakeTimer = undefined;
+    }
+    if (this.stopped || this.closing) {
+      return;
+    }
+    const now = this.clock.now();
+    let failed = false;
+    try {
+      const holders = this.wakeHolders(now);
+      for (const schedule of this.store.wakes.active()) {
+        if (!this.config.ears[schedule.ear]) {
+          continue;
+        }
+        try {
+          const step = dueStep(schedule, now);
+          if (step) {
+            this.store.wakes.recordTicks(
+              schedule,
+              step.ticks,
+              step.advance,
+              now,
+              step.notice,
+            );
+            if ("end" in step.advance) {
+              this.logger.log("info", "wake.schedule_ended", {
+                ear: schedule.ear,
+                scheduleId: schedule.id,
+                state: step.advance.end,
+              });
+              continue;
+            }
+          }
+          if (
+            holders.get(schedule.ear) !== schedule.setter &&
+            now - schedule.setterSeenAt >= WAKE_LIMITS.orphanAfterMs
+          ) {
+            this.store.wakes.end(
+              schedule.id,
+              "orphaned",
+              "its setter had not held the ear for 7 days",
+              now,
+            );
+            this.logger.log("warn", "wake.schedule_orphaned", {
+              ear: schedule.ear,
+              scheduleId: schedule.id,
+            });
+          }
+        } catch (error) {
+          failed = true;
+          this.logger.log("error", "wake.step_failed", {
+            ear: schedule.ear,
+            scheduleId: schedule.id,
+            reason: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+      for (const ear of this.attached.keys()) {
+        this.deliverWakes(ear, { all: false, held: false });
+      }
+    } catch (error) {
+      failed = true;
+      this.logger.log("error", "wake.tick_failed", {
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    }
+    this.armWakes(failed ? now + WAKE_LIMITS.retryMs : undefined);
+  }
+
+  /**
+   * Arms the one wake timer for the soonest thing that needs the daemon: a due time, an
+   * expiry, an orphan deadline or a re-push. After a failed step nothing runs before
+   * `retryAt`, and a deadline a tick left past waits WAKE_LIMITS.retryMs, so nothing spins.
+   */
+  private armWakes(retryAt?: number): void {
+    if (this.wakeTimer !== undefined) {
+      this.timers.clearTimeout(this.wakeTimer);
+      this.wakeTimer = undefined;
+    }
+    if (this.stopped || this.closing) {
+      return;
+    }
+    const now = this.clock.now();
+    let next: number | undefined;
+    const consider = (at: number | null): void => {
+      if (at !== null && (next === undefined || at < next)) {
+        next = at;
+      }
+    };
+    const holders = new Map<string, string>();
+    for (const [ear, client] of this.attached) {
+      const session = this.wakeSession(client);
+      if (session !== null) {
+        holders.set(ear, session);
+      }
+    }
+    for (const schedule of this.store.wakes.active()) {
+      if (!this.config.ears[schedule.ear]) {
+        continue;
+      }
+      consider(attentionAt(schedule));
+      if (holders.get(schedule.ear) !== schedule.setter) {
+        consider(schedule.setterSeenAt + WAKE_LIMITS.orphanAfterMs);
+      }
+    }
+    if (!this.config.paused) {
+      for (const [ear, session] of holders) {
+        for (const wake of this.store.wakes.owed(ear)) {
+          if (wake.setter === session) {
+            consider(
+              wake.lastDeliveredAt === null
+                ? now
+                : wake.lastDeliveredAt + WAKE_LIMITS.repushMs,
+            );
+          }
+        }
+      }
+    }
+    if (retryAt !== undefined) {
+      // After a failed step nothing runs before the retry, however overdue.
+      next = Math.max(next ?? retryAt, retryAt);
+    }
+    if (next === undefined) {
+      return;
+    }
+    const delay =
+      retryAt === undefined && next <= now && this.wakeTicking
+        ? WAKE_LIMITS.retryMs
+        : Math.max(0, next - now);
+    this.wakeTimer = this.timers.setTimeout(() => {
+      this.wakeTimer = undefined;
+      this.wakeTicking = true;
+      try {
+        this.wakeTick();
+      } finally {
+        this.wakeTicking = false;
+      }
+    }, delay);
+  }
+
+  private checkWakeCaps(ear: string, setter: string): void {
+    const active = this.store.wakes
+      .active()
+      .filter((schedule) => schedule.ear === ear);
+    const mine = active.filter((schedule) => schedule.setter === setter).length;
+    if (mine >= WAKE_LIMITS.maxPerSession) {
+      throw new Error(
+        `this session already has ${mine} active schedules (the limit per session is ${WAKE_LIMITS.maxPerSession}); cancel one with the schedules tool first`,
+      );
+    }
+    if (active.length >= WAKE_LIMITS.maxPerEar) {
+      throw new Error(
+        `ear ${ear} already holds ${active.length} active schedules (the limit per ear is ${WAKE_LIMITS.maxPerEar}); ear_status counts those of sessions that no longer hold it under schedules.orphaned`,
+      );
+    }
+  }
+
+  private scheduleTool(client: Client, args: Record<string, unknown>): string {
+    const ear = this.requireHolder(client, "set a schedule");
+    const setter = this.requireWakeSession(client, "set a schedule");
+    const now = this.clock.now();
+    const request = parseSchedule(args, now);
+    this.checkWakeCaps(ear, setter);
+    const id = this.store.wakes.addSchedule({
+      ear,
+      setter,
+      kind: request.kind,
+      note: request.note,
+      periodMs: request.periodMs,
+      firstDue: request.firstDue,
+      nextDue: request.firstDue,
+      target: null,
+      cursor: null,
+      createdAt: now,
+      expiresAt: request.expiresAt,
+    });
+    this.logger.log("info", "wake.schedule_set", {
+      ear,
+      scheduleId: id,
+      kind: request.kind,
+    });
+    this.armWakes();
+    const when =
+      request.kind === "at"
+        ? `due ${iso(request.firstDue)}`
+        : `every ${request.periodMs! / 60_000} minutes from ${iso(request.firstDue)} (a fixed cadence: delivery and ack never shift it)`;
+    return `schedule ${id} set: ${when}; expires ${iso(request.expiresAt)}. When it comes due, frond-ear writes a wake owed to this session and pushes it as a kind="wake" event; it comes back (on every attach, and hourly while you hold the ear) until you ack that event's nonce. Ticks missed meanwhile come as one event. Another session, after a /clear say, is told it exists, never shown it. The schedules tool lists, reads or cancels it.`;
+  }
+
+  private schedulesTool(client: Client, args: Record<string, unknown>): string {
+    const ear = this.requireHolder(client, "read its schedules");
+    const viewer = this.wakeSession(client);
+    const now = this.clock.now();
+    const pick = (value: unknown): Schedule => {
+      const id = Number(value);
+      const schedule = Number.isInteger(id)
+        ? this.store.wakes.schedule(id)
+        : undefined;
+      if (!schedule || schedule.ear !== ear) {
+        throw new Error(`no schedule ${String(value)} on ear ${ear}`);
+      }
+      return schedule;
+    };
+    if (args.cancel !== undefined && args.cancel !== null) {
+      const schedule = pick(args.cancel);
+      if (viewer === null || viewer !== schedule.setter) {
+        throw new Error(
+          `only the session that set schedule ${schedule.id} can cancel it${viewer === null ? " (frond-ear can't tell which session this is)" : ""}; nothing changed`,
+        );
+      }
+      if (!this.store.wakes.end(schedule.id, "cancelled", "cancelled", now)) {
+        throw new Error(
+          `schedule ${schedule.id} already ended (${schedule.state})`,
+        );
+      }
+      this.logger.log("info", "wake.schedule_cancelled", {
+        ear,
+        scheduleId: schedule.id,
+      });
+      this.armWakes();
+      const owed = this.store.wakes
+        .owed(ear)
+        .filter((wake) => wake.scheduleId === schedule.id).length;
+      return `schedule ${schedule.id} cancelled: it will not fire again. ${
+        owed === 0
+          ? "It owed nothing."
+          : `${owed === 1 ? "1 wake it already owes stays" : `${owed} wakes it already owes stay`} owed until you ack ${owed === 1 ? "it" : "them"}.`
+      }`;
+    }
+    if (args.read !== undefined && args.read !== null) {
+      const schedule = pick(args.read);
+      return readSchedule(
+        schedule,
+        this.store.wakes.wakesOf(schedule.id),
+        viewer,
+        viewer === schedule.setter ? this.targetText(schedule) : undefined,
+      );
+    }
+    return listSchedules(
+      this.store.wakes.schedules(ear),
+      this.store.wakes.owed(ear),
+      viewer,
+      (schedule) =>
+        viewer === schedule.setter ? this.targetText(schedule) : undefined,
+    );
+  }
+
+  /** An ack naming a wake delivery's nonce: only its own session settles it. */
+  private ackWake(
+    client: Client,
+    delivery: { nonce: string; sessionId: string; scheduleId: number },
+  ): string {
+    const viewer = this.wakeSession(client);
+    if (viewer === null || viewer !== delivery.sessionId) {
+      throw new Error(
+        `wake nonce "${delivery.nonce}" was delivered to session ${shortSession(delivery.sessionId)}, not this one; nothing settled${client.wakeDoubt ? " (frond-ear can't tell which session this shim speaks for since a /clear it could not tie to it)" : ""}`,
+      );
+    }
+    const settled = this.store.wakes.ack(delivery.nonce, this.clock.now());
+    this.armWakes();
+    if (settled.length === 0) {
+      return `0 wakes settled: already settled (schedule ${delivery.scheduleId}); nothing delivered later is touched`;
+    }
+    this.logger.log("info", "wake.settled", {
+      ear: client.ear,
+      scheduleId: delivery.scheduleId,
+      wakes: settled.length,
+    });
+    return `${settled.length} wake${settled.length === 1 ? "" : "s"} settled (schedule ${delivery.scheduleId}: occurrence${settled.length === 1 ? "" : "s"} ${settled.join(", ")}); anything delivered later stays owed`;
+  }
+
+  /** Counts, times and caps: a status read never shows a note or a target. */
+  private schedulesView(ear: string): object {
+    const all = this.store.wakes.schedules(ear);
+    const active = all.filter((schedule) => schedule.state === "active");
+    const client = this.attached.get(ear);
+    const holder = client ? this.wakeSession(client) : null;
+    const owed = this.store.wakes.owed(ear);
+    const dues = active
+      .map((schedule) => schedule.nextDue)
+      .filter((at): at is number => at !== null);
+    const kind = (name: Schedule["kind"]): number =>
+      active.filter((schedule) => schedule.kind === name).length;
+    return {
+      active: active.length,
+      byKind: { at: kind("at"), every: kind("every"), github: kind("github") },
+      nextDueAt: dues.length > 0 ? Math.min(...dues) : null,
+      owed: owed.length,
+      owedToHolder:
+        holder === null
+          ? 0
+          : owed.filter((wake) => wake.setter === holder).length,
+      lastDeliveredAt: this.store.wakes.lastDeliveredAt(ear),
+      lastAckedAt: this.store.wakes.lastAckedAt(ear),
+      orphaned: active.filter((schedule) => schedule.setter !== holder).length,
+      retiredOrphaned: all.filter((schedule) => schedule.state === "orphaned")
+        .length,
+      droppedUnacked:
+        this.store.counters()[`wakes_dropped_unacked.${ear}`] ?? 0,
+      holderIdentity: this.holderIdentity(ear),
+      caps: {
+        maxPerEar: WAKE_LIMITS.maxPerEar,
+        maxPerSession: WAKE_LIMITS.maxPerSession,
+        minPeriodSeconds: WAKE_LIMITS.minPeriodMs / 1_000,
+        maxTtlDays: WAKE_LIMITS.maxTtlDays,
+        orphanAfterDays: WAKE_LIMITS.orphanAfterMs / 86_400_000,
+        maxNoteBytes: WAKE_LIMITS.maxNoteBytes,
+      },
+    };
+  }
+
   private requireHolder(client: Client, what: string): string {
     const ear = client.ear;
     if (!ear || !this.isAttachedSession(client, ear)) {
@@ -2664,6 +3229,10 @@ export class Daemon {
             });
             return `${settled} letter${settled === 1 ? "" : "s"} settled`;
           }
+          const delivery = this.store.wakes.delivery(client.ear, nonce);
+          if (delivery) {
+            return this.ackWake(client, delivery);
+          }
         }
         if (nonce) {
           if (!client.ear || !this.store.registerEar(client.ear, nonce)) {
@@ -2767,6 +3336,10 @@ export class Daemon {
         }
         return listLetters(this.store, ear, now, client.sessionId ?? null);
       }
+      case "schedule":
+        return this.scheduleTool(client, args);
+      case "schedules":
+        return this.schedulesTool(client, args);
       case "ear_status":
         return JSON.stringify(
           this.status(client.ear ?? stringArg(args, "ear")),
@@ -3913,6 +4486,7 @@ export class Daemon {
           nextFlushAt: this.store.nextDue(name) ?? null,
           attention: this.attentionView(name),
           letters: this.lettersView(name),
+          schedules: this.schedulesView(name),
           pressure: this.pressureView(name),
           hold: this.holdView(name),
           ...(canticleDelivery ? { canticleDelivery } : {}),
@@ -3974,6 +4548,10 @@ export class Daemon {
     if (this.sweepTimer !== undefined) {
       this.timers.clearTimeout(this.sweepTimer);
       this.sweepTimer = undefined;
+    }
+    if (this.wakeTimer !== undefined) {
+      this.timers.clearTimeout(this.wakeTimer);
+      this.wakeTimer = undefined;
     }
     this.canticle?.stop();
     let drained = true;

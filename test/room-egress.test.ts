@@ -63,6 +63,8 @@ const NOT_ROOM_OUTPUT = [
   "inbox",
   "leave_letter",
   "letters",
+  "schedule",
+  "schedules",
   "set_attention",
   "set_canticle_delivery",
 ];

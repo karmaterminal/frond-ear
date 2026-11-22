@@ -9,6 +9,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
+import { ancestorPids } from "../src/shim.ts";
 import { harness, testConfig } from "./helpers.ts";
 
 const A = "aaaaaaaa-1111-2222-3333-444444444444";
@@ -641,10 +642,43 @@ test("schedule: at fires once and retires; ear_status shows counts and times, ne
     assert.equal(earStatus(h).schedules.active, 0);
     assert.equal(earStatus(h).schedules.lastDeliveredAt, h.clock.now());
     h.timers.advance(5 * HOUR);
-    assert.equal(wakes(shim).length, 1, "a one-shot fires once");
+    // A one-shot fires once: what comes after is that occurrence pushed again, hourly,
+    // until it is acked.
+    assert.equal(earStatus(h).schedules.owed, 1);
+    assert.equal(wakes(shim).length, 6);
+    assert.ok(
+      wakes(shim).every((item) => item.meta.wake_ids === event.meta.wake_ids),
+    );
+    await h.call(shim, "ack", { nonce: lastWake(shim).meta.nonce });
+    h.timers.advance(5 * HOUR);
+    assert.equal(wakes(shim).length, 6, "settled: never again");
     const read = await h.call(shim, "schedules", { read: 1 });
     assert.match(read.text, /check the 03:06Z burst/u);
   } finally {
     h.dispose();
   }
+});
+
+test("schedule: the shim names its ancestors, so a hook's CLAUDE_PID finds it through a wrapper", () => {
+  // claude (100) → sh -c (200) → node shim; comm may hold spaces and parentheses.
+  const stats: Record<string, string> = {
+    "/proc/200/stat": "200 (sh) S 100 200 200 0",
+    "/proc/100/stat": "100 (claude (x) 2) S 1 100 100 0",
+  };
+  const read = (path: string): string => {
+    const stat = stats[path];
+    if (stat === undefined) {
+      throw new Error("ENOENT");
+    }
+    return stat;
+  };
+  assert.deepEqual(ancestorPids(read, 200), [200, 100]);
+  assert.deepEqual(ancestorPids(read, 200, 1), [200]);
+  // No /proc: the parent alone.
+  assert.deepEqual(
+    ancestorPids(() => {
+      throw new Error("ENOENT");
+    }, 300),
+    [300],
+  );
 });
