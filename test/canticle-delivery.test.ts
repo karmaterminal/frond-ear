@@ -680,6 +680,26 @@ test("dedupe: a refresh re-issue with an equal body digest is the pushed record 
   }
 });
 
+test("dedupe: a refresh heard while the record it re-issues still waits is held back, and collapses once that record is pushed (§7.9)", async () => {
+  const A = "a".repeat(64);
+  const { h, host } = setup({ mode: "immediate" });
+  try {
+    const shim = h.attach("scribe");
+    const keyed = { stateKey: "silas", text: "silas: deploying", digest: A };
+    host.sing(1, keyed);
+    h.timers.advance(2_000); // record 1 waits out its debounce
+    host.sing(2, { ...keyed, flags: { refresh: true } });
+    h.timers.advance(4_000);
+    assert.equal(pushes(shim).length, 1);
+    assert.deepEqual(order(pushes(shim)[0]!.content), ["ops:ops.fleet/1"]);
+    h.timers.advance(60_000);
+    assert.equal(pushes(shim).length, 1, "2 is 1 again");
+    assert.equal(status(h).counts.refresh_collapsed, 1);
+  } finally {
+    h.dispose();
+  }
+});
+
 test("dedupe: a refresh of a record a mute passed over is news once the mute lifts, then collapses like any other", async () => {
   const { h, host } = setup({ mode: "immediate" });
   try {

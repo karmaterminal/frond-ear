@@ -1832,3 +1832,68 @@ test("revert: a refresh that collapsed into a push the host never confirmed is g
     h.dispose();
   }
 });
+
+test("revert: a refresh kept collapsed into a record that waits again goes out if that record goes off air before it is pushed", async () => {
+  const A = "a".repeat(64);
+  const { h, host } = setup({ mode: "immediate", maxAgeMs: 120_000 });
+  try {
+    const first = h.attach("scribe", { sessionId: SESSION });
+    const x = { stateKey: "x", text: "x: deploying", digest: A };
+    host.sing(1, { ...x, ttlMs: 30_000 });
+    h.timers.advance(6_000);
+    assert.equal(pushes(first).length, 1, "record 1, never confirmed");
+    host.sing(2, { ...x, ttlMs: 600_000, flags: { refresh: true } });
+    h.timers.advance(2_000);
+    assert.equal(status(h).counts.refresh_collapsed, 1);
+    first.close(); // record 1 is still on air: it waits again
+    assert.equal(status(h).waiting, 1);
+    h.timers.advance(30_000); // no session; record 1 goes off air as it waits
+    assert.equal(status(h).counts.off_air_unpushed, 1);
+
+    const second = h.attach("scribe", { sessionId: SESSION });
+    h.timers.advance(6_000);
+    assert.equal(pushes(second).length, 1, "refresh 2 carries the body");
+    assert.deepEqual(order(pushes(second)[0]!.content), ["ops:ops.fleet/2"]);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("restart: after a crash, a refresh that collapsed into the push left unconfirmed stays collapsed when that push's record goes out again", async () => {
+  const A = "a".repeat(64);
+  const directory = mkdtempSync(join(tmpdir(), "frond-ear-custody-"));
+  const path = join(directory, "ear.db");
+  try {
+    const x = { stateKey: "x", text: "x: deploying", digest: A };
+    const first = setup({ mode: "immediate" }, {}, {}, { path });
+    const shim = first.h.attach("scribe", { sessionId: SESSION });
+    first.host.sing(1, { ...x, ttlMs: 600_000 });
+    first.h.timers.advance(6_000);
+    first.host.sing(2, { ...x, ttlMs: 600_000, flags: { refresh: true } });
+    first.h.timers.advance(2_000);
+    assert.equal(pushes(shim).length, 1);
+    assert.equal(status(first.h).counts.refresh_collapsed, 1);
+    const at = first.h.clock.now();
+    first.h.store.close(); // the process dies: nothing is reverted
+    rmSync(first.h.directory, { recursive: true, force: true });
+
+    const second = setup({ mode: "immediate" }, {}, {}, { path });
+    try {
+      second.h.clock.value = at + 5_000;
+      second.host.sing(1, { ...x, ttlMs: 600_000 });
+      second.host.sing(2, { ...x, ttlMs: 600_000, flags: { refresh: true } });
+      second.h.timers.advance(2_000);
+      const next = second.h.attach("scribe", { sessionId: SESSION });
+      second.h.timers.advance(6_000);
+      assert.equal(pushes(next).length, 1);
+      assert.deepEqual(order(pushes(next)[0]!.content), ["ops:ops.fleet/1"]);
+      await confirm(next);
+      second.h.timers.advance(60_000);
+      assert.equal(pushes(next).length, 1, "2 is 1 again");
+    } finally {
+      second.h.dispose();
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
