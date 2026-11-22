@@ -732,3 +732,118 @@ test("schedule: a suspended ear is not a stopped daemon: paused, wakes are writt
     h.dispose();
   }
 });
+
+/** A pressure hook's report (PostToolUse), as `frond-ear pressure --hook --ear` sends it. */
+async function pressure(
+  h: H,
+  fields: { sessionId: string; hostPid?: number },
+): Promise<{ ok: boolean; text: string }> {
+  const cli = h.attach(undefined, { role: "cli" });
+  const id = 19_000 + Math.floor(Math.random() * 1_000);
+  await cli.send({
+    type: "pressure",
+    id,
+    ear: "scribe",
+    tokens: 1_000,
+    band: null,
+    boundary: null,
+    at: h.clock.now(),
+    event: "PostToolUse",
+    ...fields,
+  });
+  const result = cli.connection.results().find((item) => item.id === id);
+  assert.ok(result, "pressure answered");
+  return result;
+}
+
+test("schedule: a /clear's new session survives the shim reconnecting and the daemon restarting; the old one's wakes stay hidden", async () => {
+  const h1 = harness();
+  const path = join(h1.directory, "ear.db");
+  try {
+    const shim = h1.attach("scribe", { sessionId: A, hostPids: [HOST_PID] });
+    await every(h1, shim, { note: "A's private sweep" });
+    h1.timers.advance(HOUR);
+    const owed = lastWake(shim);
+    const cleared = await release(h1, {
+      sessionId: B,
+      source: "clear",
+      hostPid: HOST_PID,
+    });
+    assert.equal(cleared.ok, true, cleared.text);
+
+    // The socket drops; the same shim says hello again with its spawn-time id, A.
+    const again = h1.attach("scribe", { sessionId: A, hostPids: [HOST_PID] });
+    assert.equal(earStatus(h1).sessionId, B, "still the cleared session");
+    assert.equal(wakes(again).length, 0, "A's wake is not pushed to B");
+    const ack = await h1.call(again, "ack", { nonce: owed.meta.nonce });
+    assert.equal(ack.ok, false);
+    await every(h1, again, { note: "B's own" });
+    const listed = await h1.call(again, "schedules");
+    assert.doesNotMatch(listed.text, /A's private sweep/u);
+    assert.match(listed.text, /set by this session · note: B's own/u);
+    again.close();
+    h1.store.close();
+
+    // The daemon restarts; the shim (same Claude process) says A again.
+    const h2 = harness(testConfig(), { path });
+    try {
+      h2.clock.value = h1.clock.now();
+      const after = h2.attach("scribe", { sessionId: A, hostPids: [HOST_PID] });
+      assert.equal(earStatus(h2).sessionId, B);
+      assert.ok(
+        !wakes(after).some((event) => /A's private sweep/u.test(event.content)),
+      );
+      // A genuinely new Claude process for A (another host pid) is A again.
+      const fresh = h2.attach("scribe", { sessionId: A, hostPids: [5151] });
+      assert.equal(earStatus(h2).sessionId, A);
+      assert.ok(
+        wakes(fresh).some((event) => /A's private sweep/u.test(event.content)),
+      );
+    } finally {
+      h2.dispose();
+    }
+  } finally {
+    try {
+      h1.store.close();
+    } catch {
+      // already closed
+    }
+    rmSync(h1.directory, { recursive: true, force: true });
+  }
+});
+
+test("schedule: a doubt survives the shim reconnecting; a session change seen only by the pressure hook (a /resume the matcher missed) fails closed or turns", async () => {
+  const h = harness();
+  try {
+    const old = h.attach("scribe", { sessionId: A });
+    await every(h, old, { note: "A's sweep" });
+    h.timers.advance(HOUR);
+    await release(h, { sessionId: B, source: "clear", hostPid: HOST_PID });
+    assert.equal(earStatus(h).schedules.holderIdentity, "in-doubt");
+    const again = h.attach("scribe", { sessionId: A });
+    assert.equal(
+      earStatus(h).schedules.holderIdentity,
+      "in-doubt",
+      "a reconnect is no proof",
+    );
+    assert.equal(wakes(again).length, 0);
+    const own = await release(h, { sessionId: A, source: "compact" });
+    assert.equal(own.ok, true, own.text);
+    assert.equal(earStatus(h).schedules.holderIdentity, "known");
+
+    // A /resume with no resume hook: the pressure hook names the other session.
+    const tied = h.attach("scribe", { sessionId: A, hostPids: [HOST_PID] });
+    const untied = await pressure(h, { sessionId: B });
+    assert.equal(untied.ok, false);
+    assert.equal(earStatus(h).schedules.holderIdentity, "in-doubt");
+    const ack = await h.call(tied, "schedules", { cancel: 1 });
+    assert.equal(ack.ok, false, "nothing through a shim in doubt");
+    const proven = await pressure(h, { sessionId: B, hostPid: HOST_PID });
+    assert.equal(proven.ok, true, proven.text);
+    assert.equal(earStatus(h).sessionId, B);
+    assert.equal(earStatus(h).schedules.holderIdentity, "known");
+    assert.ok(!wakes(tied).some((event) => /A's sweep/u.test(event.content)));
+  } finally {
+    h.dispose();
+  }
+});

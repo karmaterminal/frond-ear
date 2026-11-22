@@ -72,6 +72,8 @@ export type ClientMessage =
       idleFloor?: number;
       /** The hook event that read it; only PostToolUse and UserPromptSubmit can show a notice (#107). */
       event?: string;
+      /** The hook's CLAUDE_PID, as on a release (#111). */
+      hostPid?: number;
     };
 
 /** Messages from the daemon to a client. */
