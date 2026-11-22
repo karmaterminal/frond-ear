@@ -274,6 +274,95 @@ export interface Letter {
   releasesAtLeave: number;
 }
 
+/**
+ * One room output as the egress gate recorded it (binary-canticle#161 item 3): what it
+ * was and where it went (never its text), who spoke, what the policy decided, the
+ * speaker's custody then (the records it had echoed, by id and digest, never payload; the
+ * history flag; the compaction boundary) and how the write went.
+ */
+export interface EgressRecord {
+  id: number;
+  /** The ear whose custody was read: the speaker's, else the chat's. */
+  ear: string;
+  tool: "reply" | "react" | "edit_message";
+  chatId: string;
+  /** The message replied to, reacted to or edited; null for a plain reply. */
+  target: string | null;
+  /** SHA-256 of what went out (a reply's identity, an edit's text, an emoji). */
+  digest: string;
+  sessionId: string | null;
+  /** The session holding the ear, one it superseded, or no ear's session (a CLI). */
+  speaker: "holder" | "superseded" | "other";
+  policy: string;
+  decision: "allow" | "refuse";
+  reason: string;
+  history: "complete" | "incomplete" | "unknown";
+  reasons: string[];
+  boundary: CompactionBoundary;
+  /** The records the speaker had echoed in the window, with their state then. */
+  sources: Array<{ identity: string; digest: string | null; state: string }>;
+  /** Where the custody window began. */
+  since: number;
+  decidedAt: number;
+  /**
+   * `refused`: nothing sent. `pending`: allowed, the write not yet answered (after a
+   * crash, unknown). `sent`: every write confirmed. `error`: the call ended in an error.
+   */
+  outcome: "refused" | "pending" | "sent" | "error";
+  /** The messages the output wrote that Discord confirmed (a reply's parts, the edited one). */
+  messageIds: string[];
+  settledAt: number | null;
+}
+
+interface EgressRow {
+  id: number;
+  ear: string;
+  tool: EgressRecord["tool"];
+  chat_id: string;
+  target: string | null;
+  digest: string;
+  session_id: string | null;
+  speaker: EgressRecord["speaker"];
+  policy: string;
+  decision: EgressRecord["decision"];
+  reason: string;
+  history: EgressRecord["history"];
+  reasons: string;
+  boundary: string | null;
+  boundary_known: number;
+  sources: string;
+  since: number;
+  decided_at: number;
+  outcome: EgressRecord["outcome"];
+  message_ids: string;
+  settled_at: number | null;
+}
+
+function mapEgress(row: EgressRow): EgressRecord {
+  return {
+    id: row.id,
+    ear: row.ear,
+    tool: row.tool,
+    chatId: row.chat_id,
+    target: row.target,
+    digest: row.digest,
+    sessionId: row.session_id,
+    speaker: row.speaker,
+    policy: row.policy,
+    decision: row.decision,
+    reason: row.reason,
+    history: row.history,
+    reasons: JSON.parse(row.reasons) as string[],
+    boundary: boundaryOf(row.boundary, row.boundary_known),
+    sources: JSON.parse(row.sources) as EgressRecord["sources"],
+    since: row.since,
+    decidedAt: row.decided_at,
+    outcome: row.outcome,
+    messageIds: JSON.parse(row.message_ids) as string[],
+    settledAt: row.settled_at,
+  };
+}
+
 /** Where one Discord message sits in the reply it is part of (#55). */
 export interface ReplyPart {
   /** A hash of the chat, reply_to and whole text, so identical replies share it. */
@@ -529,6 +618,31 @@ export class EventStore {
         ear TEXT NOT NULL,
         reverted_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS room_egress (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ear TEXT NOT NULL,
+        tool TEXT NOT NULL CHECK (tool IN ('reply', 'react', 'edit_message')),
+        chat_id TEXT NOT NULL,
+        target TEXT,
+        digest TEXT NOT NULL,
+        session_id TEXT,
+        speaker TEXT NOT NULL CHECK (speaker IN ('holder', 'superseded', 'other')),
+        policy TEXT NOT NULL,
+        decision TEXT NOT NULL CHECK (decision IN ('allow', 'refuse')),
+        reason TEXT NOT NULL,
+        history TEXT NOT NULL CHECK (history IN ('complete', 'incomplete', 'unknown')),
+        reasons TEXT NOT NULL,
+        boundary TEXT,
+        boundary_known INTEGER NOT NULL,
+        sources TEXT NOT NULL,
+        since INTEGER NOT NULL,
+        decided_at INTEGER NOT NULL,
+        outcome TEXT NOT NULL CHECK (outcome IN ('refused', 'pending', 'sent', 'error')),
+        message_ids TEXT NOT NULL DEFAULT '[]',
+        settled_at INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS room_egress_ear
+        ON room_egress (ear, decided_at);
     `);
     // Custody is whole from the moment its table exists: a window that reaches back
     // before that (or before the prune's cutoff) reads as unknown, never as empty. A
@@ -1372,6 +1486,119 @@ export class EventStore {
       .all(ear) as unknown as CanticleChoice[];
   }
 
+  // ---- room egress (binary-canticle#161 item 3) ---------------------------------------
+
+  /**
+   * The egress gate's row for one room output, written before anything is sent: `pending`
+   * for an allowed one (a crash leaves it so), `refused`, settled at once, for one the
+   * policy refused. Returns its id.
+   */
+  public openEgress(
+    row: Omit<EgressRecord, "id" | "outcome" | "messageIds" | "settledAt">,
+  ): number {
+    const refused = row.decision === "refuse";
+    return Number(
+      this.database
+        .prepare(
+          `INSERT INTO room_egress (ear, tool, chat_id, target, digest, session_id, speaker,
+             policy, decision, reason, history, reasons, boundary, boundary_known, sources,
+             since, decided_at, outcome, settled_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          row.ear,
+          row.tool,
+          row.chatId,
+          row.target,
+          row.digest,
+          row.sessionId,
+          row.speaker,
+          row.policy,
+          row.decision,
+          row.reason,
+          row.history,
+          JSON.stringify(row.reasons),
+          row.boundary ?? null,
+          row.boundary === undefined ? 0 : 1,
+          JSON.stringify(row.sources),
+          row.since,
+          row.decidedAt,
+          refused ? "refused" : "pending",
+          refused ? row.decidedAt : null,
+        ).lastInsertRowid,
+    );
+  }
+
+  /** How an allowed room output went: once, from `pending`. */
+  public settleEgress(
+    id: number,
+    outcome: "sent" | "error",
+    messageIds: readonly string[],
+    at: number,
+  ): void {
+    this.database
+      .prepare(
+        `UPDATE room_egress SET outcome = ?, message_ids = ?, settled_at = ?
+         WHERE id = ? AND outcome = 'pending'`,
+      )
+      .run(outcome, JSON.stringify(messageIds), at, id);
+  }
+
+  /** The ear's egress rows decided at or after `since`, oldest first. */
+  public roomEgress(ear: string, since: number): EgressRecord[] {
+    return (
+      this.database
+        .prepare(
+          "SELECT * FROM room_egress WHERE ear = ? AND decided_at >= ? ORDER BY id",
+        )
+        .all(ear, since) as unknown as EgressRow[]
+    ).map(mapEgress);
+  }
+
+  /** ear_status's view of the ear's egress since `since`: decisions, and the latest refusal. */
+  public roomEgressSummary(
+    ear: string,
+    since: number,
+  ): {
+    allowed: number;
+    refused: number;
+    lastRefusal: {
+      at: number;
+      tool: string;
+      chatId: string;
+      reason: string;
+    } | null;
+  } {
+    const counts = this.database
+      .prepare(
+        `SELECT COALESCE(SUM(decision = 'allow'), 0) AS allowed,
+                COALESCE(SUM(decision = 'refuse'), 0) AS refused
+           FROM room_egress WHERE ear = ? AND decided_at >= ?`,
+      )
+      .get(ear, since) as { allowed: number; refused: number };
+    const last = this.database
+      .prepare(
+        `SELECT decided_at, tool, chat_id, reason FROM room_egress
+          WHERE ear = ? AND decided_at >= ? AND decision = 'refuse'
+          ORDER BY id DESC LIMIT 1`,
+      )
+      .get(ear, since) as
+      | { decided_at: number; tool: string; chat_id: string; reason: string }
+      | undefined;
+    return {
+      allowed: counts.allowed,
+      refused: counts.refused,
+      lastRefusal: last
+        ? {
+            at: last.decided_at,
+            tool: last.tool,
+            chatId: last.chat_id,
+            reason: last.reason,
+          }
+        : null,
+    };
+  }
+
   // ---- letters (#88) ---------------------------------------------------------------
 
   public leaveLetter(letter: {
@@ -2198,6 +2425,10 @@ export class EventStore {
       // A reverted push's id stays a canticle id as long as its custody would have.
       this.database
         .prepare("DELETE FROM canticle_reverted WHERE reverted_at < ?")
+        .run(cutoff);
+      // Egress rows are kept as long as the custody they recorded.
+      this.database
+        .prepare("DELETE FROM room_egress WHERE decided_at < ?")
         .run(cutoff);
       return events;
     });

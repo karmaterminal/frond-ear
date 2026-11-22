@@ -25,6 +25,15 @@ import {
 import { CanticleDelivery, exposure } from "./canticle/delivery.ts";
 import { messageText } from "./components.ts";
 import { CANTICLE_KEY_ID, CANTICLE_STATION, type Config } from "./config.ts";
+import {
+  RoomEgress,
+  RoomRefused,
+  unplaced,
+  type DiscordReads,
+  type RoomOutput,
+  type RoomPermit,
+  type SpeakerCustody,
+} from "./egress.ts";
 import type { StructuredLogger } from "./logger.ts";
 import {
   WakeLimiter,
@@ -445,6 +454,18 @@ function fileIdentity(files: readonly OutboundFile[]): string {
   return files.map((file) => `\nfile ${file.sha256} ${file.name}`).join("");
 }
 
+/** A reply's identity (#55): its chat, reply_to, whole text and files, hashed. */
+function replyKey(
+  chatId: string,
+  replyTo: string | undefined,
+  text: string,
+  files: readonly OutboundFile[],
+): string {
+  return createHash("sha256")
+    .update(`${chatId}\n${replyTo ?? ""}\n${text}${fileIdentity(files)}`)
+    .digest("hex");
+}
+
 /** Whole minutes and seconds, rounded down: "4 minutes 59 seconds". */
 function duration(ms: number): string {
   const seconds = Math.floor(ms / 1_000);
@@ -520,7 +541,9 @@ function replyFailure(
 export class Daemon {
   private config: Config;
   private readonly store: EventStore;
-  private readonly rest: DiscordRest;
+  /** Discord reads. Every write goes through `egress`, the room-output gate (#161). */
+  private readonly rest: DiscordReads;
+  private readonly egress: RoomEgress;
   private readonly logger: StructuredLogger;
   private readonly clock: Clock;
   private readonly timers: Timers;
@@ -592,6 +615,7 @@ export class Daemon {
     this.logger = options.logger;
     this.clock = options.clock ?? systemClock;
     this.timers = options.timers ?? systemTimers;
+    this.egress = new RoomEgress(options.rest, this.store, this.clock);
     this.botLimiter = new WakeLimiter(options.config.botLoop);
     this.ambientLimiter = new WakeLimiter(options.config.ambientWake);
     this.batchesBefore = this.store.batchHighWater();
@@ -2451,12 +2475,17 @@ export class Daemon {
         });
         // Superseded sessions included; null for a script or a tools-only shim.
         const sessionEar = client.attachedAs ?? null;
-        const { ids, earlier } = await this.sendReply(
-          chatId,
-          text,
-          replyTo,
-          sessionEar,
-          files,
+        const { ids, earlier } = await this.roomOutput(
+          client,
+          ear,
+          {
+            tool: "reply",
+            chatId,
+            replyTo,
+            identity: replyKey(chatId, replyTo, text, files),
+          },
+          (permit) =>
+            this.sendReply(permit, chatId, text, replyTo, sessionEar, files),
         );
         this.markSeenThrough(client, ear, chatId, horizon);
         this.store.increment("replies_sent");
@@ -2484,7 +2513,12 @@ export class Daemon {
           args,
           "react",
         );
-        await this.rest.addReaction(chatId, messageId, emoji);
+        await this.roomOutput(
+          client,
+          ear,
+          { tool: "react", chatId, messageId, emoji },
+          (permit) => permit.apply(),
+        );
         this.markSeenThrough(client, ear, chatId, horizon);
         return "reacted";
       }
@@ -2507,7 +2541,12 @@ export class Daemon {
           args,
           "edit_message",
         );
-        await this.rest.editMessage(chatId, messageId, text);
+        await this.roomOutput(
+          client,
+          ear,
+          { tool: "edit_message", chatId, messageId, text },
+          (permit) => permit.apply(),
+        );
         this.markSeenThrough(client, ear, chatId, horizon);
         return "edited";
       }
@@ -2967,6 +3006,112 @@ export class Daemon {
     );
   }
 
+  /**
+   * The one way a tool writes to a Discord room (binary-canticle#161 item 3). The egress
+   * gate reads the speaking session's custody now, asks config canticle.roomPolicy, and
+   * records the row before anything is sent; a refusal throws, and nothing is sent.
+   * `write` gets the permit, the only thing that can make the Discord call, for this
+   * output alone, and how it went is recorded on the row. A retry or replay comes back
+   * through here, so it is checked again; an earlier allow is never reused.
+   */
+  private async roomOutput<T>(
+    client: Client,
+    chatEar: string,
+    output: RoomOutput,
+    write: (permit: RoomPermit) => Promise<T>,
+  ): Promise<T> {
+    const policy = this.config.canticle?.roomPolicy ?? "observe";
+    let permit: RoomPermit;
+    try {
+      permit = this.egress.open(
+        output,
+        policy,
+        this.speakerCustody(client, chatEar),
+      );
+    } catch (error) {
+      if (error instanceof RoomRefused) {
+        this.logger.log("warn", "room.refused", {
+          tool: output.tool,
+          chatId: output.chatId,
+          policy,
+          egressId: error.egressId,
+          reason: error.reason,
+        });
+      }
+      throw error;
+    }
+    try {
+      const result = await write(permit);
+      if (!this.stopped) permit.settle("sent");
+      return result;
+    } catch (error) {
+      // After shutdown the store may be closed: the row stays pending, unknown.
+      if (!this.stopped) permit.settle("error");
+      throw error;
+    }
+  }
+
+  /**
+   * The custody a room output is judged by: the speaker's own. The session holding an ear
+   * is judged as canticle_custody and ear_status judge it, over the last CUSTODY_WINDOW_MS.
+   * A session it superseded, or whose ear was removed, keeps the exposures of its own
+   * attach, but frond-ear can't place them against a boundary; a CLI or tools-only
+   * connection has none. Both read as unknown.
+   */
+  private speakerCustody(client: Client, chatEar: string): SpeakerCustody {
+    const sessionId = client.sessionId ?? null;
+    if (
+      client.ear !== undefined &&
+      this.isAttachedSession(client, client.ear)
+    ) {
+      const { view, since } = this.custodyOver(client.ear, CUSTODY_WINDOW_MS);
+      return {
+        ear: client.ear,
+        speaker: "holder",
+        sessionId,
+        view,
+        boundary: this.boundary(client.ear),
+        since,
+      };
+    }
+    const now = this.clock.now();
+    const since = Math.max(0, now - CUSTODY_WINDOW_MS);
+    const unplacedNow: CustodyNow = {
+      session: { id: sessionId },
+      boundary: undefined,
+      idleCompactDueAt: null,
+      now,
+    };
+    if (client.attachedAs === undefined) {
+      return {
+        ear: chatEar,
+        speaker: "other",
+        sessionId,
+        view: unplaced(
+          custodyView([], unplacedNow),
+          "no ear's session is speaking (a CLI or tools-only connection): frond-ear holds no custody of its own for it",
+        ),
+        boundary: undefined,
+        since,
+      };
+    }
+    const ear = client.attachedAs;
+    const own = this.store
+      .canticleCustody(ear, since)
+      .filter((row) => row.generation === client.attachGeneration);
+    return {
+      ear,
+      speaker: "superseded",
+      sessionId,
+      view: unplaced(
+        custodyView(own, unplacedNow),
+        `this session no longer holds ear ${ear}, so frond-ear can't place what it was shown against its compaction boundary`,
+      ),
+      boundary: undefined,
+      since,
+    };
+  }
+
   /** ear_status's custody summary: the last CUSTODY_WINDOW_MS, counts and history only. */
   private custodySummary(ear: string): object {
     const { view } = this.custodyOver(ear, CUSTODY_WINDOW_MS);
@@ -3139,9 +3284,11 @@ export class Daemon {
    * and an unconfirmed part reuses its nonce. When a part fails, the error says
    * which parts went out. `files` ride on the last part, so they follow the text;
    * their digests are part of the reply's identity, so the same text with other
-   * files is a new reply, not a retry.
+   * files is a new reply, not a retry. Each part goes out through `permit`, the egress
+   * gate's for this reply alone.
    */
   private async sendReply(
+    permit: RoomPermit,
     chatId: string,
     text: string,
     replyTo: string | undefined,
@@ -3149,9 +3296,7 @@ export class Daemon {
     files: readonly OutboundFile[] = [],
   ): Promise<{ ids: string[]; earlier: number[] }> {
     const chunks = chunkMessage(text);
-    const key = createHash("sha256")
-      .update(`${chatId}\n${replyTo ?? ""}\n${text}${fileIdentity(files)}`)
-      .digest("hex");
+    const key = replyKey(chatId, replyTo, text, files);
     const id = this.store.resumeReply(
       key,
       chunks.length,
@@ -3171,6 +3316,7 @@ export class Daemon {
       try {
         ids.push(
           await this.sendOnce(
+            permit,
             chatId,
             chunk,
             index === 0 ? replyTo : undefined,
@@ -3204,6 +3350,7 @@ export class Daemon {
    * is told if the send stays ambiguous.
    */
   private async sendOnce(
+    permit: RoomPermit,
     chatId: string,
     content: string,
     replyTo: string | undefined,
@@ -3227,13 +3374,7 @@ export class Daemon {
     );
     this.sendsInFlight.add(intent.nonce);
     try {
-      const sent = await this.rest.sendMessage(
-        chatId,
-        content,
-        replyTo,
-        intent.nonce,
-        files,
-      );
+      const sent = await permit.send(content, replyTo, intent.nonce, files);
       if (!this.stopped) {
         this.store.completeSend(intent.nonce, sent.id, chatId);
       }
@@ -3442,6 +3583,14 @@ export class Daemon {
           hold: this.holdView(name),
           ...(canticleDelivery ? { canticleDelivery } : {}),
           ...(canticleCustody ? { canticleCustody } : {}),
+          roomEgress: {
+            policy: this.config.canticle?.roomPolicy ?? "observe",
+            windowMs: CUSTODY_WINDOW_MS,
+            ...this.store.roomEgressSummary(
+              name,
+              Math.max(0, this.clock.now() - CUSTODY_WINDOW_MS),
+            ),
+          },
         };
       });
     return {

@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { ROOM_POLICIES, type RoomPolicy } from "./egress.ts";
 import type { Mode } from "./types.ts";
 
 export interface ChannelConfig {
@@ -112,6 +113,13 @@ export interface CanticleConfig {
    * call either way.
    */
   derivedPublication: boolean;
+  /**
+   * What the egress gate does at every room output (binary-canticle#161 item 3): `observe`
+   * (default) records the speaker's custody and refuses nothing; `strict-fresh` refuses
+   * unless every source the session was exposed to is echoed within its current
+   * compaction boundary and its history is complete.
+   */
+  roomPolicy: RoomPolicy;
 }
 
 /** `off`: `hear` only. `digest`: a radio report per window. `immediate`: each new record. */
@@ -321,6 +329,13 @@ function parseCanticle(
   ) {
     throw new Error("canticle.derivedPublication must be true or false");
   }
+  const roomPolicy =
+    value.roomPolicy === undefined ? "observe" : value.roomPolicy;
+  if (!(ROOM_POLICIES as readonly unknown[]).includes(roomPolicy)) {
+    throw new Error(
+      `canticle.roomPolicy must be ${ROOM_POLICIES.join(" or ")}`,
+    );
+  }
   const deliveryInput = value.delivery ?? {};
   if (!isObject(deliveryInput)) {
     throw new Error("canticle.delivery must be an object of ear -> delivery");
@@ -346,6 +361,7 @@ function parseCanticle(
     muted: value.muted === true,
     delivery,
     derivedPublication: value.derivedPublication === true,
+    roomPolicy: roomPolicy as RoomPolicy,
   };
 }
 
