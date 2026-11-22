@@ -1039,3 +1039,64 @@ test("wake_on ci_done counts commit statuses too, and waits for done to hold on 
     h.dispose();
   }
 });
+
+test("wake_on: taking a repo off the ear's allowlist stops its watches reading it, on reload and after a restart", async () => {
+  const fake = new FakeGithub();
+  fake.routes.set(`${R}/pulls/18`, {
+    body: { state: "open", merged: false, head: { sha: S1 } },
+  });
+  fake.routes.set(`${R}/pulls/19`, {
+    body: { state: "open", merged: false, head: { sha: S1 } },
+  });
+  const h1 = harness(config(), { githubFetch: fake.fetch, githubToken: TOKEN });
+  try {
+    const shim = h1.attach("scribe", { sessionId: A });
+    await watch(h1, shim, { target: "pr", number: 18, on: "merged" });
+    await watch(h1, shim, { target: "pr", number: 19, on: "merged" });
+    const reads = (n: number) =>
+      fake.paths().filter((p) => p === `${R}/pulls/${n}`).length;
+    assert.equal(reads(18), 1);
+
+    // Reload: the repo is no longer allowed for this ear.
+    h1.daemon.reloadConfig(config({ repos: { scribe: [] } }));
+    await advance(h1, POLL);
+    assert.equal(reads(18), 1, "no read after the revocation");
+    assert.equal(reads(19), 1);
+    const notices = wakes(shim);
+    assert.equal(notices.length, 2, "each watch ends with one notice");
+    assert.match(notices[0]!.content, /no longer in this ear's github\.repos/u);
+    assert.equal(view(h1).active, 0);
+  } finally {
+    h1.dispose();
+  }
+
+  // Persisted watches, and a daemon that restarts with the repo gone from its config.
+  const fake2 = new FakeGithub();
+  fake2.routes.set(`${R}/pulls/20`, {
+    body: { state: "open", merged: false, head: { sha: S1 } },
+  });
+  const h2 = harness(config(), { githubFetch: fake2.fetch });
+  const path2 = join(h2.directory, "ear.db");
+  const shim = h2.attach("scribe", { sessionId: A });
+  await watch(h2, shim, { target: "pr", number: 20, on: "merged" });
+  const at = h2.clock.now();
+  h2.store.close();
+  const h3 = harness(config({ repos: { scribe: [] } }), {
+    path: path2,
+    githubFetch: fake2.fetch,
+  });
+  try {
+    h3.clock.value = at;
+    h3.attach("scribe", { sessionId: A });
+    await advance(h3, 2 * POLL);
+    assert.equal(
+      fake2.requests.length,
+      1,
+      "only the registration's read, ever",
+    );
+    assert.equal(view(h3).active, 0);
+  } finally {
+    h3.dispose();
+    rmSync(h2.directory, { recursive: true, force: true });
+  }
+});
