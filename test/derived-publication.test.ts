@@ -785,6 +785,93 @@ test("derived: the station control client reads one answer line however it arriv
   }
 });
 
+test("derived: a store from an earlier build, with derived publications but no publication key, opens and keys them in place", () => {
+  const directory = mkdtempSync(join(tmpdir(), "frond-ear-derived-key-"));
+  try {
+    const path = join(directory, "ear.db");
+    const before = new EventStore(path);
+    before.openDerived({
+      ear: "scribe",
+      sessionId: SESSION,
+      sources: [{ identity: identity(1), digest: digestOf(1) }],
+      audience: "lan",
+      payloadSha256: sha256(TEXT),
+      createdAt: 1_000,
+    });
+    before.close();
+    const database = new DatabaseSync(path);
+    database.exec("DROP INDEX derived_publications_key");
+    database.exec(
+      "ALTER TABLE derived_publications DROP COLUMN publication_key",
+    );
+    database.close();
+
+    const upgraded = new EventStore(path);
+    try {
+      assert.equal(
+        upgraded.standingDerived("scribe", [identity(1)], sha256(TEXT))?.state,
+        "issuing",
+      );
+    } finally {
+      upgraded.close();
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("derived: a publication a previous process left issuing (no derived_publish was ever sent for it) is released when frond-ear starts, so it blocks nothing", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "frond-ear-derived-issuing-"));
+  try {
+    const path = join(directory, "ear.db");
+    const before = new EventStore(path);
+    const issuing = before.openDerived({
+      ear: "scribe",
+      sessionId: SESSION,
+      sources: [{ identity: identity(1), digest: digestOf(1) }],
+      audience: "lan",
+      payloadSha256: sha256(TEXT),
+      createdAt: 1_000,
+    });
+    const claimed = before.openDerived({
+      ear: "scribe",
+      sessionId: SESSION,
+      sources: [{ identity: identity(2), digest: digestOf(2) }],
+      audience: "lan",
+      payloadSha256: sha256(TEXT),
+      createdAt: 1_000,
+    });
+    before.updateDerived(claimed, { state: "claimed", electionId: ELECTION });
+    before.close();
+
+    const { h } = setup(
+      { mode: "immediate" },
+      { derivedPublication: true },
+      {},
+      { path },
+    );
+    try {
+      const rows = h.store.derivedPublications("scribe");
+      const released = rows.find((row) => row.id === issuing)!;
+      assert.equal(released.state, "refused");
+      assert.match(
+        released.reason!,
+        /^released at startup: frond-ear stopped while the issuer was asked, before any derived_publish was sent/u,
+      );
+      assert.equal(
+        h.store.standingDerived("scribe", [identity(1)], sha256(TEXT)),
+        undefined,
+      );
+      // A claimed one may have published: it stays, for derivedQuery.
+      assert.equal(rows.find((row) => row.id === claimed)!.state, "claimed");
+    } finally {
+      h.dispose();
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("derived: a lost reply leaves the election unknown, and recovery is derived_query for the same election, never a second publish", async () => {
   const { h, station } = await heard(capable("drop"));
   try {
