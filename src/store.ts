@@ -767,8 +767,6 @@ export class EventStore {
       );
       CREATE INDEX IF NOT EXISTS derived_publications_election
         ON derived_publications (ear, election_id);
-      CREATE INDEX IF NOT EXISTS derived_publications_key
-        ON derived_publications (publication_key, state);
     `);
     // Custody is whole from the moment its table exists: a window that reaches back
     // before that (or before the prune's cutoff) reads as unknown, never as empty. A
@@ -841,6 +839,51 @@ export class EventStore {
     this.database.exec(`
       CREATE INDEX IF NOT EXISTS outbound_intents_reply
         ON outbound_intents (reply_key, reply_id, part);
+    `);
+    // An earlier build of derived publication kept no publication key: key its rows in
+    // place, so a standing publication still blocks the same one again.
+    const derivedColumns = new Set(
+      (
+        this.database
+          .prepare("PRAGMA table_info(derived_publications)")
+          .all() as Array<{ name: string }>
+      ).map((column) => column.name),
+    );
+    if (!derivedColumns.has("publication_key")) {
+      this.transaction(() => {
+        this.database.exec(
+          "ALTER TABLE derived_publications ADD COLUMN publication_key TEXT",
+        );
+        const keyed = this.database.prepare(
+          "UPDATE derived_publications SET publication_key = ? WHERE id = ?",
+        );
+        for (const row of this.database
+          .prepare(
+            "SELECT id, ear, sources, payload_sha256 FROM derived_publications",
+          )
+          .all() as Array<{
+          id: number;
+          ear: string;
+          sources: string;
+          payload_sha256: string;
+        }>) {
+          const sources = JSON.parse(row.sources) as Array<{
+            identity: string;
+          }>;
+          keyed.run(
+            publicationKey(
+              row.ear,
+              sources.map((source) => source.identity),
+              row.payload_sha256,
+            ),
+            row.id,
+          );
+        }
+      });
+    }
+    this.database.exec(`
+      CREATE INDEX IF NOT EXISTS derived_publications_key
+        ON derived_publications (publication_key, state);
     `);
   }
 
@@ -1821,6 +1864,23 @@ export class EventStore {
           )
           .run(...values, id, ...from).changes,
       ) > 0
+    );
+  }
+
+  /**
+   * At startup: a publication a previous process left `issuing` had no derived_publish
+   * sent for it (the request goes out only once it is `claimed`), so it is released,
+   * refused, and blocks nothing. Returns how many.
+   */
+  public releaseIssuingDerived(at: number): number {
+    return Number(
+      this.database
+        .prepare(
+          `UPDATE derived_publications SET state = 'refused', settled_at = ?,
+             reason = 'released at startup: frond-ear stopped while the issuer was asked, before any derived_publish was sent'
+           WHERE state = 'issuing'`,
+        )
+        .run(at).changes,
     );
   }
 

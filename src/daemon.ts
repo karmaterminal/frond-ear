@@ -648,6 +648,11 @@ export class Daemon {
     if (repaired > 0) {
       this.logger.log("warn", "ear.repaired_unscheduled", { repaired });
     }
+    // No publish of this process owns a row yet: one left issuing never reached the station.
+    const released = this.store.releaseIssuingDerived(this.clock.now());
+    if (released > 0) {
+      this.logger.log("warn", "canticle.derived_released", { released });
+    }
     // The config may have changed while the daemon was down: re-check every
     // persisted queue against current routing and modes before any session
     // can attach and flush.

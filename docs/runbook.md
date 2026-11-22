@@ -847,8 +847,13 @@ was stopped after the capsule was issued: custody moved, or frond-ear began shut
 came, or an answer without a receipt naming this election and this payload. An unknown one is never published again:
 `derivedQuery(ear, election_id)` asks the station about the same election and settles the row if the station reports
 it accepted with such a receipt (a row a publish in this process still owns is left to that publish). The prune keeps a
-row still `issuing`, `claimed` or `unknown` past `limits.retentionMs`: it is the record that its election may have
-published.
+row still `claimed` or `unknown` past `limits.retentionMs`: it is the record that its election may have published. A row
+a previous process left `issuing` never reached the station (the request goes out only once a row is `claimed`), so
+frond-ear releases it as `refused` when it starts. A `claimed` or `unknown` row the station keeps answering
+`station_claim_missing` or `claimed_unknown` for blocks that text from those sources for good: #162 says absence never
+proves an item wasn't emitted. Publish other text, or, once you have checked the station's air yourself, release it in
+the store:
+`sqlite3 "$XDG_STATE_HOME/frond-ear/frond-ear.db" "UPDATE derived_publications SET state='refused', reason='released by the operator' WHERE election_id='<id>'"`.
 
 ## Troubleshooting
 
