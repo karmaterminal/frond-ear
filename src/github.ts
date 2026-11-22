@@ -404,11 +404,15 @@ async function newItems(
       ? (response.body as ListItem[])
       : [];
     for (const item of items) {
-      if (typeof item.id === "number" && item.id > (cursor.baseline ?? 0)) {
+      const id = itemId(item.id);
+      if (id === undefined) {
+        continue;
+      }
+      if (id > (cursor.baseline ?? 0)) {
         found.push(item);
       }
-      if (typeof item.id === "number" && item.id > highest) {
-        highest = item.id;
+      if (id > highest) {
+        highest = id;
       }
     }
     delete etags[path];
@@ -458,8 +462,29 @@ interface RunAttempt {
   html_url?: string;
 }
 
+// GitHub's strings reach the daemon's own fact lines only in these shapes; anything else
+// reads "unknown". Free text goes in `quoted`, never here.
+const LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})(?:\[bot\])?$/u;
+const TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/u;
+
 function login(user: { login?: string } | null | undefined): string {
-  return typeof user?.login === "string" ? user.login.slice(0, 40) : "unknown";
+  return typeof user?.login === "string" && LOGIN.test(user.login)
+    ? user.login
+    : "unknown";
+}
+
+function time(value: unknown): string {
+  return typeof value === "string" && TIME.test(value) ? value : "unknown";
+}
+
+function sha(value: unknown): string {
+  return typeof value === "string" && SHA.test(value) ? value : "unknown";
+}
+
+function itemId(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0
+    ? value
+    : undefined;
 }
 
 function excerpt(text: string | null | undefined): string {
@@ -599,7 +624,7 @@ function itemFacts(
     `${describeTarget(target)}: ${items.length} new ${noun}${items.length === 1 ? "" : "s"} since the watch was set; observed ${stamp(now)}.`,
     ...shown.map(
       (item) =>
-        `${noun} ${item.id} by ${login(item.user)}${target.on === "review" ? `, state ${word(item.state)}` : ""} at ${String(item.submitted_at ?? item.created_at ?? "unknown").slice(0, 25)}`,
+        `${noun} ${item.id} by ${login(item.user)}${target.on === "review" ? `, state ${word(item.state)}` : ""} at ${time(item.submitted_at ?? item.created_at)}`,
     ),
   ];
   if (target.on === "review") {
@@ -612,7 +637,11 @@ function itemFacts(
   }
   return {
     lines,
-    url: shown[0]?.html_url ?? htmlUrl(target),
+    // frond-ear's own URL for the first item, never one GitHub's body supplied.
+    url:
+      shown[0] !== undefined
+        ? `${htmlUrl(target)}#${target.on === "review" ? "pullrequestreview" : "issuecomment"}-${shown[0].id}`
+        : htmlUrl(target),
     quoted: shown.map((item) => ({
       label: `${noun} ${item.id} by ${login(item.user)}`,
       text: excerpt(item.body),
@@ -628,10 +657,9 @@ function runFacts(
 ): WakeFacts {
   return {
     lines: [
-      `${describeTarget(target)}: completed with conclusion ${word(attempt.conclusion)} (completed is not success); head ${String(attempt.head_sha ?? "unknown").slice(0, 40)}; observed ${stamp(now)}${already ? ", already complete when the watch was set" : ""}.`,
+      `${describeTarget(target)}: completed with conclusion ${word(attempt.conclusion)} (completed is not success); head ${sha(attempt.head_sha)}; observed ${stamp(now)}${already ? ", already complete when the watch was set" : ""}.`,
     ],
-    url:
-      typeof attempt.html_url === "string" ? attempt.html_url : htmlUrl(target),
+    url: htmlUrl(target),
     quoted: [
       {
         label: "workflow name (as GitHub gave it)",
@@ -651,12 +679,12 @@ function mergedFacts(
   return {
     lines: pull.merged
       ? [
-          `${describeTarget(target)}: merged at ${String(pull.merged_at ?? "unknown").slice(0, 25)} by ${login(pull.merged_by)}, merge commit ${String(pull.merge_commit_sha ?? "unknown").slice(0, 40)}; observed ${stamp(now)}${suffix}.`,
+          `${describeTarget(target)}: merged at ${time(pull.merged_at)} by ${login(pull.merged_by)}, merge commit ${sha(pull.merge_commit_sha)}; observed ${stamp(now)}${suffix}.`,
         ]
       : [
           `${describeTarget(target)}: closed without merging; observed ${stamp(now)}${suffix}. The watch retires: it can no longer merge as watched.`,
         ],
-    url: typeof pull.html_url === "string" ? pull.html_url : htmlUrl(target),
+    url: htmlUrl(target),
   };
 }
 

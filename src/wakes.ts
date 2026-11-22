@@ -339,7 +339,9 @@ export function renderWake(
       ),
     );
     if (observed.url) {
-      lines.push(`- source: ${cleanName(observed.url).replace(/ /gu, "")}`);
+      lines.push(
+        `- source: ${cleanText(observed.url).replace(/\s/gu, "").slice(0, 300)}`,
+      );
     }
     for (const item of observed.quoted ?? []) {
       lines.push(
