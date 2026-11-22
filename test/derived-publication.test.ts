@@ -23,7 +23,14 @@ import {
   unixStationControl,
 } from "../src/canticle/derived.ts";
 import { EventStore } from "../src/store.ts";
-import { offered, OPS, pressure, SESSION, setup } from "./canticle-host.ts";
+import {
+  canticleConfig,
+  offered,
+  OPS,
+  pressure,
+  SESSION,
+  setup,
+} from "./canticle-host.ts";
 import type { Harness } from "./helpers.ts";
 
 type R = Record<string, unknown>;
@@ -869,6 +876,162 @@ test("derived: a publication a previous process left issuing (no derived_publish
     }
   } finally {
     rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("derived: with canticle.derivedPublication off, no station call at all: not derivedQuery (even for an election left unknown while it was on), not publish, not the capability probe", async () => {
+  const { h, station, issuer } = await heard(capable("drop"));
+  try {
+    assert.equal(
+      (await h.daemon.derivedPublish("scribe", [identity(1)], TEXT)).state,
+      "unknown",
+    );
+    assert.deepEqual(ops(station.requests), [
+      "derived_query",
+      "derived_publish",
+    ]);
+    h.daemon.reloadConfig(
+      canticleConfig({ mode: "immediate" }, { derivedPublication: false }),
+    );
+    await assert.rejects(
+      h.daemon.derivedQuery("scribe", ELECTION),
+      new Error(
+        "closed: derived publication is off (config canticle.derivedPublication); no station call",
+      ),
+    );
+    assert.deepEqual(
+      await h.daemon.derivedPublish("scribe", [identity(1)], `${TEXT}!`),
+      {
+        state: "closed",
+        reason:
+          "closed: derived publication is off (config canticle.derivedPublication)",
+      },
+    );
+    assert.deepEqual(
+      ops(station.requests),
+      ["derived_query", "derived_publish"],
+      "nothing more crossed the socket",
+    );
+    assert.equal(issuer.calls.length, 1);
+    assert.equal(h.store.derivedPublications("scribe")[0]!.state, "unknown");
+
+    // On again: the query goes to the station and settles the row.
+    h.daemon.reloadConfig(
+      canticleConfig({ mode: "immediate" }, { derivedPublication: true }),
+    );
+    assert.equal(
+      (await h.daemon.derivedQuery("scribe", ELECTION)).state,
+      "accepted",
+    );
+    assert.equal(h.store.derivedPublications("scribe")[0]!.state, "accepted");
+  } finally {
+    await station.close();
+    h.dispose();
+  }
+});
+
+test("derived: shutdown drains a derivedQuery in flight, which settles its row before the store is handed back; once shutting down, derivedQuery makes no station call", async () => {
+  let answerQuery: (() => void) | undefined;
+  const base = capable("drop");
+  const { h, station } = await heard(async (request) => {
+    if (request.op === "derived_query" && request.election_id === ELECTION) {
+      await new Promise<void>((resolve) => (answerQuery = resolve));
+    }
+    return base(request);
+  });
+  try {
+    assert.equal(
+      (await h.daemon.derivedPublish("scribe", [identity(1)], TEXT)).state,
+      "unknown",
+    );
+    const querying = h.daemon.derivedQuery("scribe", ELECTION);
+    for (let i = 0; i < 200 && answerQuery === undefined; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.ok(answerQuery, "the query is waiting on the station");
+    let stopped = false;
+    const stopping = h.daemon.shutdown(2_000).then((drained) => {
+      stopped = true;
+      return drained;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(stopped, false, "shutdown waits for the query");
+    answerQuery!();
+    assert.equal((await querying).state, "accepted");
+    assert.deepEqual(await stopping, { drained: true });
+    const row = h.store.derivedPublications("scribe")[0]!;
+    assert.deepEqual([row.state, row.acceptance], ["accepted", ACCEPTANCE]);
+
+    await assert.rejects(
+      h.daemon.derivedQuery("scribe", ELECTION),
+      new Error("closed: frond-ear is shutting down; no station call"),
+    );
+    assert.deepEqual(ops(station.requests), [
+      "derived_query",
+      "derived_publish",
+      "derived_query",
+    ]);
+  } finally {
+    answerQuery?.();
+    await station.close();
+    h.dispose();
+  }
+});
+
+test("derived: the capability is exactly #162's answer for an election no authority issues, {ok:false, error:station_claim_missing}; ok for it is an anomaly, and any other shape is absence, quoted; the issuer is never asked", async () => {
+  for (const [answer, reason] of [
+    [
+      { ok: true },
+      'an anomaly: it answered ok for the all-zero election, which no authority issues: {"ok":true}',
+    ],
+    [
+      {
+        ok: true,
+        election_id: "0".repeat(32),
+        state: "accepted",
+        acceptance: null,
+      },
+      `an anomaly: it answered ok for the all-zero election, which no authority issues: {"ok":true,"election_id":"${"0".repeat(32)}","state":"accepted","acceptance":null}`,
+    ],
+    [
+      { ok: false, error: "station_claim_missing", state: "claimed" },
+      'its answer is not #162\'s {"ok":false,"error":"station_claim_missing"}: {"ok":false,"error":"station_claim_missing","state":"claimed"}',
+    ],
+    [
+      { error: "station_claim_missing" },
+      'its answer is not #162\'s {"ok":false,"error":"station_claim_missing"}: {"error":"station_claim_missing"}',
+    ],
+    [
+      { ok: "false", error: "station_claim_missing" },
+      'its answer is not #162\'s {"ok":false,"error":"station_claim_missing"}: {"ok":"false","error":"station_claim_missing"}',
+    ],
+    [
+      { ok: false },
+      'its answer is not #162\'s {"ok":false,"error":"station_claim_missing"}: {"ok":false}',
+    ],
+    [
+      { ok: true, pad: "x".repeat(300) },
+      `an anomaly: it answered ok for the all-zero election, which no authority issues: ${JSON.stringify({ ok: true, pad: "x".repeat(300) }).slice(0, 200)}…`,
+    ],
+  ] as const) {
+    // A socket answering this to anything, derived_publish included.
+    const { h, station, issuer } = await heard(() => answer);
+    try {
+      assert.deepEqual(
+        await h.daemon.derivedPublish("scribe", [identity(1)], TEXT),
+        {
+          state: "closed",
+          reason: `closed: the station's control socket doesn't offer derived publication: ${reason}`,
+        },
+        reason,
+      );
+      assert.deepEqual(station.requests, [PROBE], reason);
+      assert.deepEqual(issuer.calls, [], "no election claimed");
+      assert.deepEqual(h.store.derivedPublications("scribe"), []);
+    } finally {
+      await station.close();
+      h.dispose();
+    }
   }
 });
 
