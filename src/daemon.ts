@@ -2767,9 +2767,11 @@ export class Daemon {
         `GitHub asked frond-ear to wait until ${iso(backoff)} (a rate limit); nothing was set, try after it`,
       );
     }
+    // The greatest x-poll-interval any of the registration's answers gave (🌫 on #114).
+    const track: { pollAfterMs?: number } = {};
     const first = await baseline(
       gh,
-      this.githubAdmit(ear, target.repo, gh),
+      this.githubAdmit(ear, target.repo, gh, track),
       target,
       now,
     );
@@ -2792,7 +2794,7 @@ export class Daemon {
       note,
       periodMs: null,
       firstDue: null,
-      nextDue: at + github.pollMs,
+      nextDue: at + Math.max(github.pollMs, track.pollAfterMs ?? 0),
       target: JSON.stringify(first.target),
       cursor: JSON.stringify(first.cursor),
       createdAt: at,
@@ -2897,13 +2899,15 @@ export class Daemon {
       // a fresh cursor: at worst one unconditional request
     }
     let outcome: PollOutcome;
+    // The greatest x-poll-interval of any answer this poll read.
+    const track: { pollAfterMs?: number } = {};
     if (!target) {
       outcome = { kind: "terminal", reason: "its target is unreadable" };
     } else {
       try {
         outcome = await poll(
           gh,
-          this.githubAdmit(schedule.ear, target.repo, gh),
+          this.githubAdmit(schedule.ear, target.repo, gh, track),
           target,
           cursor,
           this.clock.now(),
@@ -2955,7 +2959,9 @@ export class Daemon {
       case "unchanged":
         this.store.wakes.updateWatch(fresh.id, {
           cursor: JSON.stringify(outcome.cursor),
-          nextDue: now + Math.max(pollMs, outcome.pollAfterMs ?? 0),
+          nextDue:
+            now +
+            Math.max(pollMs, outcome.pollAfterMs ?? 0, track.pollAfterMs ?? 0),
           failures: 0,
           failingSince: null,
         });
@@ -3000,7 +3006,11 @@ export class Daemon {
         }
         const nextDue = outcome.rate
           ? this.backOffGithub(now, outcome.retryAfterMs)
-          : now + Math.min(pollMs * 2 ** failures, GITHUB_LIMITS.maxBackoffMs);
+          : now +
+            Math.max(
+              Math.min(pollMs * 2 ** failures, GITHUB_LIMITS.maxBackoffMs),
+              track.pollAfterMs ?? 0,
+            );
         this.store.wakes.updateWatch(fresh.id, {
           cursor: null,
           nextDue,
