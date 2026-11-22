@@ -107,10 +107,11 @@ export interface CanticleConfig {
   /** Per ear, what reaches its session unasked. An ear left out is `off`. */
   delivery: Record<string, CanticleEarDelivery>;
   /**
-   * Whether the derived-publication seam may ever open (binary-canticle#161). Off by
-   * default; even on, it stays closed unless every source record was heard whole and
-   * echoed within the session's current compaction boundary. frond-ear makes no station
-   * call either way.
+   * Whether derived publication may ever open (binary-canticle#161). Off by default, and
+   * off, frond-ear never calls a station's derived op. Even on, it stays closed unless
+   * every source record was heard whole and echoed within the session's current
+   * compaction boundary, and the owner's route and the station's capability hold
+   * (canticle/derived.ts).
    */
   derivedPublication: boolean;
   /**

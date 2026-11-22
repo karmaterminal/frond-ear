@@ -168,16 +168,17 @@ test("chokepoint: every tool is classified as room output or not; only the three
   }
 });
 
-test("chokepoint: no source file but the egress gate calls a Discord write (sendMessage, addReaction, editMessage)", () => {
+test("chokepoint: no source file but the egress gate (and rest.ts, which defines them) names a Discord write: sendMessage, addReaction, editMessage", () => {
   const root = join(import.meta.dirname, "..", "src");
   const files = readdirSync(root, { recursive: true, encoding: "utf8" })
     .filter((path) => path.endsWith(".ts"))
     .map((path) => join(root, path));
+  // By name, not only as a method call: a destructured or aliased write counts too.
   const callers = files.filter(
     (path) =>
       !path.endsWith(join("src", "egress.ts")) &&
       !path.endsWith(join("src", "rest.ts")) &&
-      /\.(?:sendMessage|addReaction|editMessage)\s*\(/u.test(
+      /\b(?:sendMessage|addReaction|editMessage)\b/u.test(
         readFileSync(path, "utf8"),
       ),
   );
