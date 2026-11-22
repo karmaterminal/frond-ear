@@ -35,7 +35,7 @@ class FakeGithub {
     headers: Record<string, string>;
     redirect: unknown;
   }> = [];
-  public readonly routes = new Map<string, Route | (() => Route)>();
+  public readonly routes = new Map<string, Route | ((path: string) => Route)>();
 
   public readonly fetch = async (
     url: string,
@@ -52,7 +52,7 @@ class FakeGithub {
     if (!found) {
       return new Response('{"message":"Not Found"}', { status: 404 });
     }
-    const route = typeof found === "function" ? found() : found;
+    const route = typeof found === "function" ? found(path) : found;
     if (route.etag && headers["if-none-match"] === route.etag) {
       return new Response(null, { status: 304, headers: { etag: route.etag } });
     }
@@ -700,47 +700,133 @@ test("wake_on: a watch is its setter's: another session sees no note, no repo, n
   }
 });
 
-test("wake_on comment: a full page is never trusted to a 304; a comment on the next page fires", async () => {
-  const fake = new FakeGithub();
-  const comments = Array.from({ length: 100 }, (_, index) => ({
-    id: index + 1,
+interface Comment {
+  id: number;
+  body: string;
+  updated_at: string;
+  user?: { login: string };
+}
+
+/** An issue's comments as GitHub lists them: by id, 100 a page, `since` and Link honoured. */
+function commentList(comments: () => Comment[]) {
+  return (path: string): Route => {
+    const url = new URL(`${API}${path}`);
+    const since = url.searchParams.get("since");
+    const page = Number(url.searchParams.get("page") ?? 1);
+    const all = comments().filter(
+      (comment) => since === null || comment.updated_at >= since,
+    );
+    const last = Math.max(1, Math.ceil(all.length / 100));
+    const body = all.slice((page - 1) * 100, page * 100);
+    const base = `${API}${url.pathname}?${since !== null ? `since=${encodeURIComponent(since)}&` : ""}per_page=100`;
+    return {
+      body,
+      etag: `"${since ?? ""}:${page}:${body.map((comment) => comment.id).join(".")}"`,
+      headers:
+        page < last
+          ? {
+              link: `<${base}&page=${page + 1}>; rel="next", <${base}&page=${last}>; rel="last"`,
+            }
+          : {},
+    };
+  };
+}
+
+const OLD = "1969-12-31T00:00:00Z";
+
+function old(count: number, from = 1): Comment[] {
+  return Array.from({ length: count }, (_, index) => ({
+    id: from + index,
     body: "old",
+    updated_at: OLD,
   }));
+}
+
+test("wake_on comment: a comment after a full page fires; none of those there at registration does", async () => {
+  const fake = new FakeGithub();
+  let comments = old(100);
   fake.routes.set(`${R}/pulls/8`, {
     body: { state: "open", head: { sha: S1 } },
   });
-  fake.routes.set(`${R}/issues/8/comments?per_page=100&page=1`, {
-    body: comments,
-    etag: '"page1"',
-    headers: {
-      link: `<${API}${R}/issues/8/comments?per_page=100&page=2>; rel="next"`,
-    },
-  });
-  let page2: Route = { body: [], etag: '"page2a"' };
-  fake.routes.set(`${R}/issues/8/comments?per_page=100&page=2`, () => page2);
+  fake.routes.set(
+    `${R}/issues/8/comments`,
+    commentList(() => comments),
+  );
   const h = harness(config(), { githubFetch: fake.fetch });
   try {
     const shim = h.attach("scribe", { sessionId: A });
     await watch(h, shim, { target: "pr", number: 8, on: "comment" });
     await advance(h, POLL);
     assert.equal(wakes(shim).length, 0);
-    const pageOne = fake.requests.filter((request) =>
-      request.url.endsWith("page=1"),
-    );
-    assert.ok(
-      pageOne.every(
-        (request) => request.headers["if-none-match"] === undefined,
-      ),
-    );
-    page2 = {
-      body: [{ id: 101, body: "new one", user: { login: "cael" } }],
-      etag: '"page2b"',
-    };
+    comments = [
+      ...comments,
+      {
+        id: 101,
+        body: "new one",
+        updated_at: new Date(h.clock.now()).toISOString(),
+        user: { login: "cael" },
+      },
+    ];
     await advance(h, POLL);
     const [event] = wakes(shim);
     assert.ok(event);
     assert.match(event.content, /comment 101 by cael/u);
     assert.match(event.content, /> new one/u);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("wake_on comment: more than 500 comments at registration are all baseline", async () => {
+  const fake = new FakeGithub();
+  fake.routes.set(`${R}/pulls/15`, {
+    body: { state: "open", head: { sha: S1 } },
+  });
+  fake.routes.set(
+    `${R}/issues/15/comments`,
+    commentList(() => old(650)),
+  );
+  const h = harness(config(), { githubFetch: fake.fetch });
+  try {
+    const shim = h.attach("scribe", { sessionId: A });
+    await watch(h, shim, { target: "pr", number: 15, on: "comment" });
+    await advance(h, 3 * POLL);
+    assert.equal(wakes(shim).length, 0, "no new comment, no wake");
+  } finally {
+    h.dispose();
+  }
+});
+
+test("wake_on comment: deletions that shrink the list never hide a new comment", async () => {
+  const fake = new FakeGithub();
+  let comments = old(150);
+  fake.routes.set(`${R}/pulls/16`, {
+    body: { state: "open", head: { sha: S1 } },
+  });
+  fake.routes.set(
+    `${R}/issues/16/comments`,
+    commentList(() => comments),
+  );
+  const h = harness(config(), { githubFetch: fake.fetch });
+  try {
+    const shim = h.attach("scribe", { sessionId: A });
+    await watch(h, shim, { target: "pr", number: 16, on: "comment" });
+    comments = comments.slice(60);
+    await advance(h, POLL);
+    assert.equal(wakes(shim).length, 0);
+    comments = [
+      ...comments,
+      {
+        id: 151,
+        body: "after the deletions",
+        updated_at: new Date(h.clock.now()).toISOString(),
+        user: { login: "rune" },
+      },
+    ];
+    await advance(h, POLL);
+    const [event] = wakes(shim);
+    assert.ok(event, "the new comment fired");
+    assert.match(event.content, /comment 151 by rune/u);
   } finally {
     h.dispose();
   }
