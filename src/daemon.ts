@@ -2723,6 +2723,11 @@ export class Daemon {
         return this.spendGithub(ear) ? "ok" : "budget";
       },
       after: (response) => {
+        // A rate limit is an instruction to the whole daemon: kept the moment it is
+        // read, whatever then becomes of this watch (retired, cancelled; 🌫 on #114).
+        if (response.rateLimited && !this.stopped) {
+          this.backOffGithub(this.clock.now(), response.retryAfterMs);
+        }
         if (response.pollIntervalMs !== undefined) {
           track.pollAfterMs = Math.max(
             track.pollAfterMs ?? 0,
@@ -2769,9 +2774,7 @@ export class Daemon {
       now,
     );
     if (first.kind === "refused") {
-      if (first.rate) {
-        this.backOffGithub(this.clock.now(), first.retryAfterMs);
-      }
+      // A rate limit in the answer is already kept, by the gate's `after`.
       throw new Error(`nothing was set: ${first.reason}`);
     }
     // The ear may have changed hands while GitHub answered.
