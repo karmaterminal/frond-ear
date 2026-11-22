@@ -1196,3 +1196,44 @@ test("wake_on: an x-poll-interval GitHub gives at registration sets the first po
     h.dispose();
   }
 });
+
+test("wake_on comment: 501 baseline comments that still match since fill pages 1–5; a new comment on page 6 is read (🌫 N1)", async () => {
+  const fake = new FakeGithub();
+  const h = harness(config(), { githubFetch: fake.fetch });
+  try {
+    // Updated inside the registration's ten-minute since slack: they all match since.
+    const recent = new Date(h.clock.now() - 60_000).toISOString();
+    let comments: Comment[] = Array.from({ length: 501 }, (_, index) => ({
+      id: index + 1,
+      body: "baseline",
+      updated_at: recent,
+    }));
+    fake.routes.set(`${R}/pulls/26`, {
+      body: { state: "open", head: { sha: S1 } },
+    });
+    fake.routes.set(
+      `${R}/issues/26/comments`,
+      commentList(() => comments),
+    );
+    const shim = h.attach("scribe", { sessionId: A });
+    await watch(h, shim, { target: "pr", number: 26, on: "comment" });
+    await advance(h, POLL);
+    assert.equal(wakes(shim).length, 0, "the baseline stays baseline");
+    comments = [
+      ...comments,
+      {
+        id: 502,
+        body: "the new one",
+        updated_at: new Date(h.clock.now()).toISOString(),
+        user: { login: "emeric" },
+      },
+    ];
+    await advance(h, POLL);
+    const [event] = wakes(shim);
+    assert.ok(event, "comment 502 on page 6 fired");
+    assert.match(event.content, /comment 502 by emeric/u);
+    assert.doesNotMatch(event.content, /new comments since/u);
+  } finally {
+    h.dispose();
+  }
+});
