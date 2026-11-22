@@ -3,6 +3,7 @@
 // RecordConsumer, on the harness clock; what comes out is what the attached session is sent.
 import assert from "node:assert/strict";
 
+import type { DerivedRoute } from "../src/canticle/derived.ts";
 import { RECORD_V, RecordConsumer } from "../src/canticle/records.ts";
 import type { Config } from "../src/config.ts";
 import {
@@ -44,6 +45,8 @@ export interface Song {
   age?: number;
   /** A non-text body (ctype 2), which no banner shows the text of. */
   binary?: true;
+  /** The record's scope (§4.3); `lan` by default. */
+  scope?: string;
   /** Merged over `times`; a field set to `undefined` is left out. */
   times?: R;
 }
@@ -138,7 +141,7 @@ export class Host {
       station: { name: station, principal: null },
       stream,
       class: "advisory",
-      scope: "lan",
+      scope: o.scope ?? "lan",
       hop: o.hop ?? 0,
       ...(o.stateKey !== undefined ? { state_key: o.stateKey } : {}),
       times: Object.fromEntries(
@@ -261,7 +264,7 @@ export function setup(
   delivery: unknown,
   canticle: R = {},
   top: R = {},
-  options: { path?: string } = {},
+  options: { path?: string; derivedRoute?: DerivedRoute } = {},
 ): { h: Harness; host: Host } {
   let host: Host | undefined;
   const h = harness(canticleConfig(delivery, canticle, top), {

@@ -1,3 +1,4 @@
+import type { DerivedRoute } from "../src/canticle/derived.ts";
 import type { HearView } from "../src/canticle/receptor.ts";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -205,6 +206,8 @@ export function harness(
     history?: (channelId: string, limit: number) => DiscordMessage[];
     /** Paths a reply's files never include (the real daemon passes its own state). */
     protectedPaths?: string[];
+    /** The owner's derived-publication route: an issuer and a station's control socket. */
+    derivedRoute?: DerivedRoute;
   } = {},
 ): Harness {
   const clock = new FakeClock();
@@ -233,6 +236,7 @@ export function harness(
     ...(options.protectedPaths
       ? { protectedPaths: options.protectedPaths }
       : {}),
+    ...(options.derivedRoute ? { derivedRoute: options.derivedRoute } : {}),
   });
   let callId = 0;
   const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
