@@ -433,7 +433,7 @@ test("derived: custody is judged again after every wait: a compaction while the 
         {
           state: "refused",
           electionId: ELECTION,
-          reason: `custody moved while the capsule was issued (${compaction}); election ${ELECTION} is left unpublished`,
+          reason: `stopped after the capsule was issued (${compaction}); election ${ELECTION} is left unpublished`,
         },
       );
       assert.deepEqual(station.requests, [PROBE], "no derived_publish");
@@ -443,6 +443,41 @@ test("derived: custody is judged again after every wait: a compaction while the 
       await station.close();
       h.dispose();
     }
+  }
+});
+
+test("derived: shutdown drains a publish in flight and stops it before the station gets it; once shutting down, nothing starts", async () => {
+  let harnessed: Harness | undefined;
+  let stopping: Promise<{ drained: boolean }> | undefined;
+  const issuer = fakeIssuer(undefined, async () => {
+    stopping = harnessed!.daemon.shutdown(2_000);
+  });
+  const { h, station } = await heard(capable(), { issuer });
+  harnessed = h;
+  try {
+    const outcome = await h.daemon.derivedPublish(
+      "scribe",
+      [identity(1)],
+      TEXT,
+    );
+    assert.deepEqual(outcome, {
+      state: "refused",
+      electionId: ELECTION,
+      reason: `stopped after the capsule was issued (closed: frond-ear is shutting down); election ${ELECTION} is left unpublished`,
+    });
+    assert.deepEqual(await stopping, { drained: true });
+    assert.deepEqual(station.requests, [PROBE], "no derived_publish");
+    const [row] = h.store.derivedPublications("scribe");
+    assert.deepEqual([row!.state, row!.electionId], ["refused", ELECTION]);
+
+    assert.deepEqual(
+      await h.daemon.derivedPublish("scribe", [identity(1)], TEXT),
+      { state: "closed", reason: "closed: frond-ear is shutting down" },
+    );
+    assert.deepEqual(station.requests, [PROBE]);
+  } finally {
+    await station.close();
+    h.dispose();
   }
 });
 
