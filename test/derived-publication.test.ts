@@ -57,20 +57,20 @@ type Answer = R | "drop" | string;
  */
 async function fakeStation(
   directory: string,
-  answer: (request: R) => Answer,
+  answer: (request: R) => Answer | Promise<Answer>,
 ): Promise<{ path: string; requests: R[]; close: () => Promise<void> }> {
   const path = join(directory, "station.sock");
   const requests: R[] = [];
   const server: Server = createServer((socket) => {
     let buffer = "";
     socket.setEncoding("utf8");
-    socket.on("data", (chunk: string) => {
+    socket.on("data", async (chunk: string) => {
       buffer += chunk;
       const newline = buffer.indexOf("\n");
       if (newline === -1) return;
       const request = JSON.parse(buffer.slice(0, newline)) as R;
       requests.push(request);
-      const reply = answer(request);
+      const reply = await answer(request);
       if (reply === "drop") {
         socket.destroy();
         return;
@@ -141,12 +141,14 @@ function fakeIssuer(
  * session attached, its hook reporting boundary b-1, and record 1 pushed and echoed.
  */
 async function heard(
-  answer: (request: R) => Answer,
+  answer: (request: R) => Answer | Promise<Answer>,
   options: {
     derivedPublication?: boolean;
     issuer?: ReturnType<typeof fakeIssuer>;
     /** Runs before each request goes to the station. */
     beforeRequest?: () => Promise<void>;
+    /** The store's file, for a test that opens a second daemon on it. */
+    path?: string;
   } = {},
 ) {
   const issuer = options.issuer ?? fakeIssuer();
@@ -165,6 +167,7 @@ async function heard(
         },
         issuer,
       },
+      ...(options.path ? { path: options.path } : {}),
     },
   );
   station = await fakeStation(h.directory, answer);
@@ -478,6 +481,290 @@ test("derived: shutdown drains a publish in flight and stops it before the stati
   } finally {
     await station.close();
     h.dispose();
+  }
+});
+
+test("derived: a publication left unknown, still in flight, or accepted is never published again: a later or concurrent call for the same text from the same sources is closed and points at derivedQuery, across a restart too", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "frond-ear-derived-"));
+  const path = join(directory, "ear.db");
+  try {
+    {
+      const { h, station, issuer } = await heard(capable("drop"), { path });
+      try {
+        assert.equal(
+          (await h.daemon.derivedPublish("scribe", [identity(1)], TEXT)).state,
+          "unknown",
+        );
+        // The caller tries again, as a caller naturally would after a failure.
+        assert.deepEqual(
+          await h.daemon.derivedPublish("scribe", [identity(1)], TEXT),
+          {
+            state: "closed",
+            reason: `closed: a publication of this text from these sources is already unknown (election ${ELECTION}); derivedQuery it rather than publish again`,
+          },
+        );
+        assert.deepEqual(ops(station.requests), [
+          "derived_query",
+          "derived_publish",
+        ]);
+        assert.equal(issuer.calls.length, 1, "no second election");
+        // Other text, or other sources, is another publication.
+        assert.notEqual(
+          (await h.daemon.derivedPublish("scribe", [identity(1)], `${TEXT}!`))
+            .state,
+          "closed",
+        );
+      } finally {
+        await station.close();
+        h.dispose();
+      }
+    }
+    // A restart on the same store: still never published again.
+    {
+      const { h, station, issuer } = await heard(capable(), { path });
+      try {
+        const outcome = await h.daemon.derivedPublish(
+          "scribe",
+          [identity(1)],
+          TEXT,
+        );
+        assert.equal(outcome.state, "closed");
+        assert.match(
+          (outcome as { reason: string }).reason,
+          /already unknown \(election 5e1ec7ed5e1ec7ed5e1ec7ed5e1ec7ed\)/u,
+        );
+        assert.deepEqual(issuer.calls, []);
+        assert.deepEqual(station.requests, []);
+      } finally {
+        await station.close();
+        h.dispose();
+      }
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+
+  // Two calls at once: one publishes, the other is closed while the first is in flight.
+  const { h, station, issuer } = await heard(capable());
+  try {
+    const [a, b] = await Promise.all([
+      h.daemon.derivedPublish("scribe", [identity(1)], TEXT),
+      h.daemon.derivedPublish("scribe", [identity(1)], TEXT),
+    ]);
+    assert.deepEqual(
+      [a.state, b.state].sort(),
+      ["accepted", "closed"],
+      JSON.stringify([a, b]),
+    );
+    const closed = (a.state === "closed" ? a : b) as { reason: string };
+    assert.match(
+      closed.reason,
+      /^closed: a publication of this text from these sources is already (issuing|claimed)/u,
+    );
+    assert.equal(issuer.calls.length, 1);
+    assert.equal(
+      ops(station.requests).filter((op) => op === "derived_publish").length,
+      1,
+    );
+    // Accepted is published: the same again is closed too.
+    assert.match(
+      (
+        (await h.daemon.derivedPublish("scribe", [identity(1)], TEXT)) as {
+          reason: string;
+        }
+      ).reason,
+      /already accepted \(election 5e1ec7ed5e1ec7ed5e1ec7ed5e1ec7ed\)/u,
+    );
+  } finally {
+    await station.close();
+    h.dispose();
+  }
+});
+
+test("derived: a query racing the publish it asks about leaves the row to the publish; a later query settles it accepted and clears the reason", async () => {
+  let answerPublish: (() => void) | undefined;
+  const base = capable();
+  const { h, station } = await heard(async (request) => {
+    if (request.op !== "derived_publish") return base(request);
+    await new Promise<void>((resolve) => (answerPublish = resolve));
+    return "drop";
+  });
+  try {
+    const publishing = h.daemon.derivedPublish("scribe", [identity(1)], TEXT);
+    for (let i = 0; i < 200 && answerPublish === undefined; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.ok(answerPublish, "the publish is waiting on the station");
+    const raced = await h.daemon.derivedQuery("scribe", ELECTION);
+    assert.equal(raced.state, "accepted");
+    let row = h.store.derivedPublications("scribe")[0]!;
+    assert.equal(row.state, "claimed", "the publish in flight owns its row");
+    answerPublish!();
+    assert.equal((await publishing).state, "unknown");
+    row = h.store.derivedPublications("scribe")[0]!;
+    assert.deepEqual([row.state, row.acceptance], ["unknown", null]);
+
+    await h.daemon.derivedQuery("scribe", ELECTION);
+    row = h.store.derivedPublications("scribe")[0]!;
+    assert.deepEqual(
+      [row.state, row.acceptance, row.reason],
+      ["accepted", ACCEPTANCE, null],
+    );
+  } finally {
+    answerPublish?.();
+    await station.close();
+    h.dispose();
+  }
+});
+
+test("derived: an acceptance is taken only with a receipt naming this election and this payload; otherwise the election stays unknown, by publish and by query", async () => {
+  for (const [acceptance, why] of [
+    [undefined, "the station said ok without its receipt"],
+    [
+      { ...ACCEPTANCE, election_id: "f".repeat(32) },
+      "the station's receipt names another election or payload",
+    ],
+    [
+      { ...ACCEPTANCE, payload_sha256: "0".repeat(64) },
+      "the station's receipt names another election or payload",
+    ],
+  ] as const) {
+    const answer =
+      acceptance === undefined ? { ok: true } : { ok: true, acceptance };
+    const { h, station } = await heard((request) =>
+      request.op === "derived_publish"
+        ? answer
+        : request.election_id === ELECTION
+          ? {
+              ok: true,
+              election_id: ELECTION,
+              state: "accepted",
+              ...(acceptance ? { acceptance } : {}),
+            }
+          : { ok: false, error: "station_claim_missing" },
+    );
+    try {
+      assert.deepEqual(
+        await h.daemon.derivedPublish("scribe", [identity(1)], TEXT),
+        {
+          state: "unknown",
+          electionId: ELECTION,
+          reason: `${why}; query election ${ELECTION}, never publish it again`,
+        },
+      );
+      await h.daemon.derivedQuery("scribe", ELECTION);
+      assert.equal(
+        h.store.derivedPublications("scribe")[0]!.state,
+        "unknown",
+        why,
+      );
+    } finally {
+      await station.close();
+      h.dispose();
+    }
+  }
+});
+
+test("derived: the prune keeps a publication still issuing, claimed or unknown, so its election is never published again; settled ones go with retention", () => {
+  const clock = { now: () => 10_000_000 };
+  const store = new EventStore(":memory:", clock);
+  try {
+    for (const state of [
+      "issuing",
+      "claimed",
+      "unknown",
+      "accepted",
+      "refused",
+    ] as const) {
+      const id = store.openDerived({
+        ear: "scribe",
+        sessionId: SESSION,
+        sources: [{ identity: identity(1), digest: digestOf(1) }],
+        audience: "lan",
+        payloadSha256: sha256(state),
+        createdAt: 1_000,
+      });
+      if (state !== "issuing") {
+        store.updateDerived(id, {
+          state:
+            state === "unknown" || state === "accepted" ? "claimed" : state,
+          electionId: ELECTION,
+        });
+        if (state === "unknown") {
+          store.updateDerived(id, { state: "unknown" });
+        }
+        if (state === "accepted") {
+          store.updateDerived(id, {
+            state: "accepted",
+            acceptance: ACCEPTANCE,
+          });
+        }
+      }
+    }
+    store.prune(1_000_000);
+    assert.deepEqual(
+      store.derivedPublications("scribe").map((row) => row.state),
+      ["issuing", "claimed", "unknown"],
+    );
+  } finally {
+    store.close();
+  }
+});
+
+test("derived: the station control client reads one answer line however it arrives, and gives no answer for a line over 64 KiB (bytes, not characters), a close without a newline, or silence", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "frond-ear-control-"));
+  const serve = async (
+    name: string,
+    onRequest: (socket: import("node:net").Socket) => void,
+  ) => {
+    const path = join(directory, `${name}.sock`);
+    const server = createServer((socket) => {
+      socket.once("data", () => onRequest(socket));
+    });
+    await new Promise<void>((resolve) => server.listen(path, resolve));
+    return { path, close: () => new Promise((r) => server.close(r)) };
+  };
+  try {
+    const split = await serve("split", (socket) => {
+      socket.write('{"ok": fal');
+      setTimeout(
+        () => socket.end('se, "error": "station_claim_missing"}\n'),
+        20,
+      );
+    });
+    assert.deepEqual(await unixStationControl(split.path).request(PROBE), {
+      ok: false,
+      error: "station_claim_missing",
+    });
+    await split.close();
+
+    const unterminated = await serve("unterminated", (socket) => {
+      socket.end('{"ok": true}');
+    });
+    await assert.rejects(
+      unixStationControl(unterminated.path).request(PROBE),
+      /its answer had no newline/u,
+    );
+    await unterminated.close();
+
+    // 40 000 two-byte characters: under 64 Ki characters, over 64 KiB.
+    const oversize = await serve("oversize", (socket) => {
+      socket.end(`"${"é".repeat(40_000)}`);
+    });
+    await assert.rejects(
+      unixStationControl(oversize.path).request(PROBE),
+      /its answer was over 64 KiB/u,
+    );
+    await oversize.close();
+
+    const silent = await serve("silent", () => {});
+    await assert.rejects(
+      unixStationControl(silent.path, 50).request(PROBE),
+      /no answer within 50 ms/u,
+    );
+    await silent.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
   }
 });
 
