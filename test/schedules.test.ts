@@ -962,3 +962,35 @@ test("schedule: a store from the build that kept one row per occurrence per push
     h.dispose();
   }
 });
+
+test("schedule: a deadline weeks off is slept in segments Node's setTimeout can hold, and still fires on time", async () => {
+  const h = harness();
+  try {
+    const delays: number[] = [];
+    const set = h.timers.setTimeout.bind(h.timers);
+    h.timers.setTimeout = (callback: () => void, ms: number): unknown => {
+      delays.push(ms);
+      return set(callback, ms);
+    };
+    const shim = h.attach("scribe", { sessionId: A });
+    const due = h.clock.now() + 29 * DAY;
+    const scheduled = await h.call(shim, "schedule", {
+      at: new Date(due).toISOString(),
+      note: "a month out",
+      ttl_days: 30,
+    });
+    assert.equal(scheduled.ok, true, scheduled.text);
+    // Node clamps anything over 2^31 - 1 ms to 1 ms (TimeoutOverflowWarning).
+    assert.ok(
+      delays.every((ms) => ms <= 2_147_483_647),
+      `largest timer ${Math.max(...delays)} ms`,
+    );
+    h.timers.advance(29 * DAY - 60_000);
+    assert.equal(wakes(shim).length, 0, "not before its time");
+    h.timers.advance(60_000);
+    assert.equal(wakes(shim).length, 1, "on time");
+    assert.ok(delays.every((ms) => ms <= 2_147_483_647));
+  } finally {
+    h.dispose();
+  }
+});
