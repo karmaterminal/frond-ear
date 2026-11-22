@@ -838,11 +838,17 @@ test("schedule: a doubt survives the shim reconnecting; a session change seen on
     assert.equal(earStatus(h).schedules.holderIdentity, "in-doubt");
     const ack = await h.call(tied, "schedules", { cancel: 1 });
     assert.equal(ack.ok, false, "nothing through a shim in doubt");
+    const before = wakes(tied).length;
     const proven = await pressure(h, { sessionId: B, hostPid: HOST_PID });
     assert.equal(proven.ok, true, proven.text);
     assert.equal(earStatus(h).sessionId, B);
     assert.equal(earStatus(h).schedules.holderIdentity, "known");
-    assert.ok(!wakes(tied).some((event) => /A's sweep/u.test(event.content)));
+    assert.ok(
+      !wakes(tied)
+        .slice(before)
+        .some((event) => /A's sweep/u.test(event.content)),
+      "nothing of A's after the turn to B",
+    );
   } finally {
     h.dispose();
   }

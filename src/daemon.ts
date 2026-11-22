@@ -192,6 +192,8 @@ interface Client {
   deliveryWarned?: boolean;
   sessionId: string | undefined;
   pid: number | undefined;
+  /** The session id the client said hello with: the shim's spawn-time id (#111). */
+  spawnSessionId?: string | undefined;
   /** The shim's ancestor pids, nearest first (#111): Claude Code's is among them. */
   hostPids?: number[] | undefined;
   /**
@@ -1698,6 +1700,7 @@ export class Daemon {
     client.pid = message.pid;
     client.sessionId = message.sessionId;
     client.hostPids = pidList(message.hostPids);
+    client.spawnSessionId = message.sessionId;
     if (message.role === "tap") {
       const ear = message.ear;
       if (!ear || !this.config.ears[ear]) {
@@ -1753,16 +1756,18 @@ export class Daemon {
     const nonce = this.config.ears[ear]?.attachCanary
       ? (this.options.nonce ?? (() => randomBytes(6).toString("hex")))()
       : null;
-    const record = this.store.attachEar(ear, message.sessionId ?? null, nonce);
+    // A turn or doubt kept for this shim's spawn-time id still holds (#111).
+    this.restoreTurn(client, ear);
+    const record = this.store.attachEar(ear, client.sessionId ?? null, nonce);
     // A reading belongs to the session that reported it; a new session starts with none.
-    if (this.pressure.get(ear)?.sessionId !== message.sessionId) {
+    if (this.pressure.get(ear)?.sessionId !== client.sessionId) {
       this.pressure.delete(ear);
     }
     // So is a hold: another session never inherits one.
-    if (this.holds.get(ear)?.sessionId !== message.sessionId) {
+    if (this.holds.get(ear)?.sessionId !== client.sessionId) {
       this.holds.delete(ear);
     }
-    if (this.holdNotices.get(ear)?.sessionId !== message.sessionId) {
+    if (this.holdNotices.get(ear)?.sessionId !== client.sessionId) {
       this.holdNotices.delete(ear);
     }
     client.ear = ear;
@@ -1772,7 +1777,7 @@ export class Daemon {
     this.logger.log("info", "ear.attached", {
       ear,
       generation: record.generation,
-      sessionId: message.sessionId ?? null,
+      sessionId: client.sessionId ?? null,
     });
     client.connection.send({
       type: "welcome",
@@ -1902,40 +1907,139 @@ export class Daemon {
     }
     if (sessionId !== client.sessionId) {
       const refusal = `ear ${ear} is held by ${client.sessionId ? `session ${client.sessionId.slice(0, 8)}` : "a session whose id frond-ear does not know"}, not ${sessionId.slice(0, 8)}; nothing released`;
-      const hostPid = pidList([message.hostPid])?.[0];
-      const pids = client.hostPids ?? [];
-      if (hostPid === undefined || !pids.includes(hostPid)) {
-        if (hostPid !== undefined && pids.length > 0) {
-          // Another Claude process's hook: it says nothing about this shim's session.
-          return { ok: false, text: refusal };
-        }
-        // Claude Code keeps its MCP servers across /clear and /resume, so the shim
-        // still names the session it started for. A hook frond-ear can't tie to it may
-        // be that change, or not: fail closed for wakes until it knows (#111).
-        client.wakeDoubt = { claimed: sessionId, at: this.clock.now(), source };
-        this.logger.log("warn", "ear.wake_identity_doubt", {
-          ear,
-          source,
-          hookPid: hostPid !== undefined,
-          shimPids: pids.length > 0,
-        });
-        this.deliverWakes(ear, { all: false, held: true });
-        return {
-          ok: false,
-          text: `${refusal}. frond-ear can't tie this hook to the shim holding the ear (${hostPid === undefined ? "the hook gave no CLAUDE_PID" : "that shim gave no host pids"}), so the session it speaks for is in doubt: its wakes are held, not shown, settled, set or cancelled, until it is re-attached or its own session's hook runs again`,
-        };
+      const heard = this.hookNamesSession(
+        client,
+        ear,
+        sessionId,
+        message.hostPid,
+        source,
+      );
+      if (heard.kind === "other-process") {
+        return { ok: false, text: refusal };
       }
-      // The hook comes from the Claude Code process that spawned this shim: the session
-      // there changed under it (a /clear or /resume). Its wakes stay its setter's.
-      this.turnSession(client, ear, sessionId);
+      if (heard.kind === "doubt") {
+        return { ok: false, text: `${refusal}. ${heard.text}` };
+      }
     } else if (client.wakeDoubt) {
-      delete client.wakeDoubt;
-      this.logger.log("info", "ear.wake_identity_known", { ear, source });
-      this.deliverWakes(ear, { all: true, held: false });
-      this.armWakes();
+      this.hookNamesSession(client, ear, sessionId, message.hostPid, source);
     }
     this.store.clearRuntimeState(`letters.armed.${ear}`);
     return { ok: true, text: this.deliverLetters(ear, client, source) };
+  }
+
+  /**
+   * A hook (a SessionStart release, or the pressure hook) names `sessionId` for the ear
+   * `client` holds (#111). Claude Code keeps its MCP servers across /clear and /resume, so
+   * the shim still names the session it was spawned for:
+   * - the holder's own session clears any doubt;
+   * - another session, from a hook whose CLAUDE_PID is one of the shim's ancestors, is
+   *   that change: the holder turns to it;
+   * - from a hook provably of another Claude process, it says nothing of this shim;
+   * - otherwise frond-ear can't tell, and fails closed: the shim's wake identity is in
+   *   doubt.
+   * A turn or a doubt is kept in the store, keyed by the id the shim says hello with, so
+   * a reconnect or a daemon restart can't hand the old session back (🍃 on #114).
+   */
+  private hookNamesSession(
+    client: Client,
+    ear: string,
+    sessionId: string,
+    rawPid: unknown,
+    source: string,
+  ):
+    | { kind: "same" | "turned" | "other-process" }
+    | { kind: "doubt"; text: string } {
+    if (sessionId === client.sessionId) {
+      if (client.wakeDoubt) {
+        delete client.wakeDoubt;
+        this.store.clearRuntimeState(`session.turn.${ear}`);
+        this.logger.log("info", "ear.wake_identity_known", { ear, source });
+        this.deliverWakes(ear, { all: true, held: false });
+        this.armWakes();
+      }
+      return { kind: "same" };
+    }
+    const hostPid = pidList([rawPid])?.[0];
+    const pids = client.hostPids ?? [];
+    const spawned = client.spawnSessionId;
+    if (hostPid !== undefined && pids.includes(hostPid)) {
+      if (spawned !== undefined && spawned !== sessionId) {
+        this.store.setRuntimeState(
+          `session.turn.${ear}`,
+          JSON.stringify({ spawned, current: sessionId, hostPid }),
+        );
+      } else {
+        this.store.clearRuntimeState(`session.turn.${ear}`);
+      }
+      // The session in the Claude Code process that spawned this shim changed under
+      // it. Its wakes stay their setter's.
+      this.turnSession(client, ear, sessionId);
+      return { kind: "turned" };
+    }
+    if (hostPid !== undefined && pids.length > 0) {
+      return { kind: "other-process" };
+    }
+    client.wakeDoubt = { claimed: sessionId, at: this.clock.now(), source };
+    if (spawned !== undefined) {
+      this.store.setRuntimeState(
+        `session.turn.${ear}`,
+        JSON.stringify({ spawned, doubt: client.wakeDoubt }),
+      );
+    }
+    this.logger.log("warn", "ear.wake_identity_doubt", {
+      ear,
+      source,
+      hookPid: hostPid !== undefined,
+      shimPids: pids.length > 0,
+    });
+    this.deliverWakes(ear, { all: false, held: true });
+    return {
+      kind: "doubt",
+      text: `frond-ear can't tie this hook to the shim holding the ear (${hostPid === undefined ? "the hook gave no CLAUDE_PID" : "that shim gave no host pids"}), so the session it speaks for is in doubt: its wakes are held, not shown, settled, set or cancelled, until its own session's hook runs again`,
+    };
+  }
+
+  /**
+   * What a hello inherits from a turn or a doubt kept for its ear (#111): the same shim
+   * (its spawn-time id, and the turn's Claude process among its ancestors) speaks for the
+   * session it was turned to, and a doubt stands until its own session's hook runs. A
+   * new Claude process with that id is that session, and the record goes.
+   */
+  private restoreTurn(client: Client, ear: string): void {
+    const raw = this.store.runtimeState(`session.turn.${ear}`);
+    if (raw === undefined || client.sessionId === undefined) {
+      return;
+    }
+    let kept: {
+      spawned?: unknown;
+      current?: unknown;
+      hostPid?: unknown;
+      doubt?: { claimed: string; at: number; source: string };
+    };
+    try {
+      kept = JSON.parse(raw) as typeof kept;
+    } catch {
+      this.store.clearRuntimeState(`session.turn.${ear}`);
+      return;
+    }
+    if (kept.spawned !== client.sessionId) {
+      return;
+    }
+    if (kept.doubt) {
+      client.wakeDoubt = kept.doubt;
+      this.logger.log("warn", "ear.wake_identity_doubt_kept", { ear });
+      return;
+    }
+    if (
+      typeof kept.current === "string" &&
+      typeof kept.hostPid === "number" &&
+      (client.hostPids ?? []).includes(kept.hostPid)
+    ) {
+      client.sessionId = kept.current;
+      this.logger.log("info", "ear.session_restored", { ear });
+      return;
+    }
+    this.store.clearRuntimeState(`session.turn.${ear}`);
   }
 
   /**
@@ -1953,6 +2057,7 @@ export class Daemon {
     idleFloor?: unknown;
     event?: unknown;
     boundaryAt?: unknown;
+    hostPid?: unknown;
   }): { ok: boolean; text: string; notice?: string } {
     const ear = typeof message.ear === "string" ? message.ear : "";
     if (!this.config.ears[ear]) {
@@ -1969,7 +2074,19 @@ export class Daemon {
       };
     }
     const client = this.attached.get(ear);
-    if (!client || client.sessionId !== sessionId) {
+    // A session change only the pressure hook saw (a /resume the release matcher left
+    // out) turns the holder when it is proven, and fails closed when it isn't (#111).
+    if (
+      !client ||
+      (client.sessionId !== sessionId &&
+        this.hookNamesSession(
+          client,
+          ear,
+          sessionId,
+          message.hostPid,
+          "pressure",
+        ).kind !== "turned")
+    ) {
       return {
         ok: false,
         text: `ear ${ear} is not held by session ${sessionId.slice(0, 8)}; its pressure is not kept`,

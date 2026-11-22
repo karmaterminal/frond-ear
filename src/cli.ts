@@ -69,7 +69,7 @@ usage:
   frond-ear tap --ear <name>          stream the batches pushed to an ear's attached session (read-only;\n                                      wakes a session without channel push; a shim must be attached)
   frond-ear release --ear <name> [--source <s>] [--session <id>] [--hook]
                                       release an ear's letters (#88) to its attached session; for a
-                                      SessionStart hook (matcher startup|compact|clear): --hook reads the
+                                      SessionStart hook (matcher startup|compact|clear|resume): --hook reads the
                                       hook's JSON on stdin (session_id, source) and CLAUDE_PID, which ties
                                       a /clear's new session to the shim (#111), and always exits 0
   frond-ear precompact --ear <name> [--session <id>] [--hook]

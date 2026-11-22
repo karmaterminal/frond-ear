@@ -255,7 +255,7 @@ Hook, in the seat's `.claude/settings.json` (use the daemon's socket environment
   "hooks": {
     "SessionStart": [
       {
-        "matcher": "startup|compact|clear",
+        "matcher": "startup|compact|clear|resume",
         "hooks": [
           {
             "type": "command",
@@ -274,8 +274,10 @@ Claude Code adds to the session's context: `frond-ear: letters for ear <ear>: 2 
 2 channel events`. When the daemon answered, a second line follows, even with no letters: a
 reminder that compaction gives no warning, and how to leave a letter. A session that's never told
 forgets the tool exists. It always exits 0, so a daemon that's down never blocks a session start
-(and then prints no reminder, since it couldn't take a letter). Leave `resume` out: a resumed
-session keeps its context.
+(and then prints no reminder, since it couldn't take a letter). Keep `clear` and `resume` in
+the matcher: they tell frond-ear which session holds the ear after a `/clear` or `/resume`
+(Schedules and wakes, below). For letters, a resume only hands the session its own unsettled
+letters again.
 
 **Letters into the compaction summary** (#102). The release only hands letters back after the
 compaction, as events. The summary that the next turn reasons from never saw them. Most
@@ -430,11 +432,19 @@ help, frond-ear would take the new session for the old one. So:
   shown, settled, set or cancelled through it until it re-attaches or its own session's hook runs
   again. `ear_status` shows `schedules.holderIdentity: "in-doubt"`. A hook from another Claude
   process, provably not the shim's, changes nothing.
-- Add `clear` to the release hook's matcher (`"matcher": "startup|compact|clear"`, as above). A
-  seat that uses `/resume` inside a running TUI adds `resume` too. That also hands the resumed
-  session its own unsettled letters again, which is harmless; without it, the shim keeps naming the
-  session from before the resume. The shim must be launched by Claude Code itself, or through
-  wrappers at most 6 levels deep: frond-ear reads the chain from `/proc`.
+- The release hook's matcher **must** include `clear` and `resume`:
+  `"matcher": "startup|compact|clear|resume"`, as above. `resume` also hands the resumed session
+  its own unsettled letters again, which is harmless. The shim must be launched by Claude Code
+  itself, or through wrappers at most 6 levels deep: frond-ear reads the chain from `/proc`.
+- The turn, or the doubt, is kept in the store, keyed by the id the shim said hello with. A
+  reconnect or a daemon restart leaves the shim naming its spawn-time id again, and frond-ear still
+  takes it for the session it turned to, while the turn's Claude process is among the shim's
+  ancestors. A doubt still stands after a reconnect. A new Claude process with that id is that
+  session again.
+- The backstop: the pressure hook (`frond-ear pressure --hook --ear`) also sends `CLAUDE_PID`. A
+  report naming another session than the holder's turns the holder when the pid ties it to the
+  shim, and puts its wakes in doubt when it can't. So a `/resume` the release matcher missed fails
+  closed on the session's next tool call, if the seat runs the pressure hook.
 
 **`wake_on`** (GitHub; **off** unless `github.enabled`): `{source: "github", repo, target: "pr" |
 "issue" | "run", number, on, note, ttl_days}`. The target says what `number` names.

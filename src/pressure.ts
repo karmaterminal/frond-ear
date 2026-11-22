@@ -726,8 +726,10 @@ export async function runPressureCommand(
   let notice: string | undefined;
   if (report) {
     try {
+      // CLAUDE_PID ties a session change this hook sees to the shim (#111).
+      const hostPid = Number(io.env.CLAUDE_PID) || undefined;
       const result = await request(
-        { type: "pressure", ...report },
+        { type: "pressure", ...report, ...(hostPid ? { hostPid } : {}) },
         io.env,
         REPORT_TIMEOUT_MS,
       );
