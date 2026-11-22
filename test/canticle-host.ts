@@ -1,0 +1,313 @@
+// The host-daemon side of record v1 and the canticle delivery setup the canticle tests share
+// (frond-ear#65; custody, binary-canticle#161): records go in through the real
+// RecordConsumer, on the harness clock; what comes out is what the attached session is sent.
+import assert from "node:assert/strict";
+
+import { RECORD_V, RecordConsumer } from "../src/canticle/records.ts";
+import type { Config } from "../src/config.ts";
+import {
+  harness,
+  testConfig,
+  type Harness,
+  type MemoryConnection,
+} from "./helpers.ts";
+
+export type R = Record<string, unknown>;
+
+/** Allowlisted station keys (`canticle.wakeKeys`), and one that isn't. */
+export const OPS = "f6eecf2f43082a97";
+export const ALPHA = "0a1b2c3d4e5f6071";
+export const STRAY = "9f8e7d6c5b4a3921";
+export const KEYS: Readonly<Record<string, string>> = {
+  ops: OPS,
+  alpha: ALPHA,
+  stray: STRAY,
+};
+export const TUNE = ["*:ops.fleet", "*:ops.deploy"];
+
+export interface Song {
+  station?: string;
+  stream?: string;
+  epoch?: number;
+  text?: string;
+  hop?: number;
+  /** Merged over all-false flags; `null` leaves `flags` out (a receptor too old to say). */
+  flags?: R | null;
+  stateKey?: string;
+  /** `body.sha256`, for a keyed item. */
+  digest?: string;
+  ttlMs?: number;
+  dedup?: "first" | "resurfaced";
+  /** The station's key id, when a manifest renamed the station. */
+  key?: string;
+  /** How old the record already was when the host receptor first heard it. */
+  age?: number;
+  /** Merged over `times`; a field set to `undefined` is left out. */
+  times?: R;
+}
+
+/**
+ * A host daemon's side of record v1, on the harness clock: one run's records into the
+ * real consumer while connected; while the link is down its stream goes on without us,
+ * and a rejoin gets the run's state back as a join snapshot (§14.18.3).
+ */
+export class Host {
+  readonly consumer = new RecordConsumer();
+  listening = true;
+  run = "a1b2";
+  /** What this run has on air (idem → frame fields), and each station's presence. */
+  readonly onAir = new Map<string, R>();
+  readonly stations = new Map<string, string>();
+  /** The `station:stream` pairs the ear follows (`canticle.tune`). */
+  tune: string[] = TUNE;
+  #seq = 0;
+  readonly #clock: { now(): number };
+
+  constructor(clock: { now(): number }) {
+    this.#clock = clock;
+  }
+
+  get now(): number {
+    return this.#clock.now();
+  }
+
+  #emit(type: string, extra: R): void {
+    this.#seq += 1;
+    if (!this.listening) return; // the run goes on; this connection misses it
+    this.consumer.feed(
+      { v: RECORD_V, type, rec_seq: this.#seq, run: this.run, ...extra },
+      this.now,
+    );
+  }
+
+  /** A run's first records: hello, landing state, health, and two stations calling CQ. */
+  start(run = this.run): void {
+    this.run = run;
+    this.#seq = 0;
+    this.onAir.clear();
+    this.#emit("hello", {});
+    this.landing();
+    this.#emit("health", { last_datagram_at: this.now, reasons: [] });
+    this.presence("ops", "EQUIPPED_SPEAKING");
+    this.presence("alpha", "EQUIPPED_QUIET");
+  }
+
+  landing(extra: R = {}): void {
+    this.#emit("landing_state", { mute: null, breaker: "closed", ...extra });
+  }
+
+  /** Receive health; `no_datagrams` makes every station read unknown. */
+  health(reasons: string[]): void {
+    this.#emit("health", { last_datagram_at: this.now, reasons });
+  }
+
+  presence(name: string, state: string): void {
+    this.stations.set(name, state);
+    this.#emit("presence", this.#presenceFields(name, state));
+  }
+
+  #presenceFields(name: string, state: string): R {
+    return {
+      station: { name, principal: null },
+      key_id: KEYS[name] ?? OPS,
+      state,
+    };
+  }
+
+  fields(seq: number, o: Song = {}): R {
+    const now = this.now;
+    const station = o.station ?? "ops";
+    const key = o.key ?? KEYS[station] ?? OPS;
+    const epoch = o.epoch ?? 7;
+    const stream = o.stream ?? "ops.fleet";
+    const ttl = o.ttlMs ?? 300_000;
+    const text = o.text ?? `deploy.started ${seq}`;
+    return {
+      frame: {
+        key_id: key,
+        epoch,
+        stream_id: stream,
+        seq,
+        kind: "item",
+        sha256: "00",
+        bytes: 100,
+      },
+      idem: `canticle:${key}:${epoch}:${stream}:${seq}`,
+      station: { name: station, principal: null },
+      stream,
+      class: "advisory",
+      scope: "lan",
+      hop: o.hop ?? 0,
+      ...(o.stateKey !== undefined ? { state_key: o.stateKey } : {}),
+      times: Object.fromEntries(
+        Object.entries({
+          issued_at: now - (o.age ?? 1_000),
+          expires_at: now + ttl + 5_000,
+          heard_at: now - 500,
+          local_expiry_at: now + ttl,
+          age_ms: o.age ?? 1_000,
+          ...o.times,
+        }).filter(([, value]) => value !== undefined),
+      ),
+      admission: "verified",
+      disposition: "surface",
+      dedup: o.dedup ?? "first",
+      versions: { manifest_sha256: "00", manifest_label: "test" },
+      body: {
+        ctype: 1,
+        text,
+        size: Buffer.byteLength(text),
+        ...(o.digest !== undefined ? { sha256: o.digest } : {}),
+      },
+      ...(o.flags === null
+        ? {}
+        : {
+            flags: {
+              refresh: false,
+              wake_derived: false,
+              exercise: false,
+              ...o.flags,
+            },
+          }),
+    };
+  }
+
+  sing(seq: number, o: Song = {}): void {
+    const fields = this.fields(seq, o);
+    this.onAir.set(fields.idem as string, fields);
+    this.#emit("frame", fields);
+  }
+
+  /** The station plucks one of its records. */
+  pluck(seq: number, o: Song = {}): void {
+    const idem = this.fields(seq, o).idem as string;
+    this.onAir.delete(idem);
+    this.#emit("retract", {
+      target: {},
+      idem,
+      reason: "plucked",
+      by: null,
+    });
+  }
+
+  /** The transport closed without a `bye`: the run is out of reach, not over. */
+  drop(): void {
+    this.consumer.closed(this.now);
+    this.listening = false;
+  }
+
+  /** A new connection asks for, and gets, a complete join snapshot of the run. */
+  rejoin(): void {
+    this.consumer.reconnected({ joinSnapshot: true });
+    this.listening = true;
+    const now = this.now;
+    const feed = (type: string, recSeq: number, extra: R) =>
+      this.consumer.feed(
+        { v: RECORD_V, type, rec_seq: recSeq, run: this.run, ...extra },
+        now,
+      );
+    feed("hello", 1, { join_snapshot: true });
+    this.#seq += 1;
+    const w = this.#seq; // the latest landing_state is the baseline, and W
+    feed("landing_state", w, { mute: null, breaker: "closed" });
+    const entries = [
+      ...[...this.stations].map(([name, state]) =>
+        this.#presenceFields(name, state),
+      ),
+      ...[...this.onAir.values()].filter(
+        (f) => (f.times as { local_expiry_at: number }).local_expiry_at > now,
+      ),
+    ];
+    entries.forEach((entry, i) =>
+      feed("snapshot", w, { snap_seq: i + 1, entry }),
+    );
+    feed("snapshot_end", w, {
+      watermark: w,
+      count: entries.length,
+      truncated: false,
+    });
+  }
+
+  view() {
+    return this.consumer.hearView(this.tune, this.now, this.listening);
+  }
+}
+
+/** The test config with canticle on, from the host daemon, delivering to `scribe`. */
+export function canticleConfig(
+  delivery: unknown,
+  canticle: R = {},
+  top: R = {},
+): Config {
+  return testConfig({
+    canticle: {
+      enabled: true,
+      source: "host-daemon",
+      hostSocket: "/nonexistent/canticle.sock",
+      tune: { scribe: TUNE },
+      wakeKeys: [OPS, ALPHA],
+      ...(delivery !== undefined ? { delivery: { scribe: delivery } } : {}),
+      ...canticle,
+    },
+    ...top,
+  });
+}
+
+export function setup(
+  delivery: unknown,
+  canticle: R = {},
+  top: R = {},
+  options: { path?: string } = {},
+): { h: Harness; host: Host } {
+  let host: Host | undefined;
+  const h = harness(canticleConfig(delivery, canticle, top), {
+    canticleHear: () => host!.view(),
+    ...options,
+  });
+  host = new Host(h.clock);
+  host.start();
+  return { h, host };
+}
+
+export const pushes = (client: { connection: MemoryConnection }) =>
+  client.connection.events().filter((event) => event.meta.kind === "canticle");
+
+export interface DeliveryStatus {
+  ceiling: string;
+  mode: string;
+  style: string;
+  muted?: string;
+  stations: Record<string, { ceiling: string; mode: string }>;
+  wakeKeys: number;
+  warning?: string;
+  windowMs: number;
+  debounceMs: number;
+  maxAgeMs: number;
+  waiting: number;
+  nextPushAt: number | null;
+  held: string | null;
+  lastPushAt: number | null;
+  pushesLastHour: number;
+  maxPushesPerHour: number;
+  reports: number;
+  counts: Record<string, number>;
+}
+
+export function status(h: Harness): DeliveryStatus {
+  const ears = (
+    h.daemon.status("scribe") as {
+      ears: Array<{ name: string; canticleDelivery?: DeliveryStatus }>;
+    }
+  ).ears;
+  const delivery = ears.find((ear) => ear.name === "scribe")?.canticleDelivery;
+  assert.ok(delivery, "ear_status shows scribe's canticle delivery");
+  return delivery;
+}
+
+/** `station:stream/seq` of each record a push carries, in the order it carries them. */
+export const order = (content: string) =>
+  [
+    ...content.matchAll(
+      /station="([\w-]+)" .*? stream=([\w.]+) item=\d+\/(\d+) /gu,
+    ),
+  ].map((m) => `${m[1]}:${m[2]}/${m[3]}`);
