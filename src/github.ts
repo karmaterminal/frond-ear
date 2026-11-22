@@ -18,6 +18,8 @@ export const GITHUB_LIMITS = {
   maxPages: 5,
   /** Pages of reviews a watch reads in full, every poll; a PR with more is refused. */
   maxReviewPages: 10,
+  /** Pages of commit statuses read per poll (100 each); a commit with more ends the watch. */
+  maxStatusPages: 10,
   /** Consecutive retryable failures (network, 5xx) before the watch gives up. */
   maxFailures: 8,
   /** How long a watch may keep failing, rate limits included, before it gives up. */
@@ -781,20 +783,52 @@ async function checksOn(
       break;
     }
   }
-  const combined = (
-    await fetchOk(
+  // Every context, page by page (GitHub's default page is 30): a context left unread
+  // could be the pending one (🌫 on #114).
+  const statuses: NonNullable<CombinedStatus["statuses"]> = [];
+  let statusTotal = 0;
+  let aggregate = "unknown";
+  for (let page = 1; page <= GITHUB_LIMITS.maxStatusPages; page += 1) {
+    const response = await fetchOk(
       client,
       admit,
-      `${repoPath(target.repo)}/commits/${segment(sha)}/status`,
-    )
-  ).body as CombinedStatus | undefined;
-  // With no statuses GitHub's combined state reads "pending": only real ones count.
-  const statuses = Array.isArray(combined?.statuses) ? combined.statuses : [];
+      `${repoPath(target.repo)}/commits/${segment(sha)}/status?per_page=100&page=${page}`,
+    );
+    const body = (response.body ?? {}) as CombinedStatus;
+    statusTotal = typeof body.total_count === "number" ? body.total_count : 0;
+    aggregate = word(body.state);
+    const batch = Array.isArray(body.statuses) ? body.statuses : [];
+    statuses.push(...batch);
+    if (
+      statuses.length >= statusTotal ||
+      batch.length === 0 ||
+      !response.hasNext
+    ) {
+      break;
+    }
+  }
+  if (
+    statuses.length < statusTotal &&
+    statuses.length >= GITHUB_LIMITS.maxStatusPages * 100
+  ) {
+    throw new Stop({
+      kind: "terminal",
+      reason: `the commit has ${statusTotal} commit statuses, more than the ${GITHUB_LIMITS.maxStatusPages * 100} frond-ear reads, so it can't tell they are all done`,
+    });
+  }
+  // With no statuses GitHub's combined state reads "pending": only real ones count. With
+  // some, done needs every one of them read, none pending, and the aggregate agreeing
+  // (a failure aggregate can stand beside a context still pending).
+  const statusesDone =
+    statusTotal === 0 ||
+    (statuses.length >= statusTotal &&
+      aggregate !== "pending" &&
+      statuses.every((status) => word(status.state) !== "pending"));
   const complete =
-    total + statuses.length > 0 &&
+    total + statusTotal > 0 &&
     runs.length >= total &&
     runs.every((run) => run.status === "completed") &&
-    statuses.every((status) => word(status.state) !== "pending");
+    statusesDone;
   const signature = [
     ...runs.map(
       (run) =>
