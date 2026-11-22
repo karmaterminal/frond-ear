@@ -16,6 +16,8 @@ export const GITHUB_LIMITS = {
   requestTimeoutMs: 15_000,
   /** Pages one poll may read of a review or comment list (100 items each). */
   maxPages: 5,
+  /** Pages of reviews a watch reads in full, every poll; a PR with more is refused. */
+  maxReviewPages: 10,
   /** Consecutive retryable failures (network, 5xx) before the watch gives up. */
   maxFailures: 8,
   /** How long a watch may keep failing, rate limits included, before it gives up. */
@@ -61,6 +63,14 @@ export interface GithubCursor {
   etags: Record<string, string>;
   /** ci_done on a PR: the PR's head when last read (it may have moved off the bound one). */
   currentHead?: string;
+  /**
+   * review: the submitted (non-pending) review ids seen so far. A review begun before the
+   * watch has a lower id and only shows once submitted, so "highest id" can't be the
+   * baseline (🍃 on #114).
+   */
+  seen?: number[];
+  /** review: each list page's ETag and item count when last read. */
+  pages?: Record<string, { etag?: string; count: number }>;
 }
 
 export type GithubFetch = (url: string, init: RequestInit) => Promise<Response>;
@@ -432,6 +442,80 @@ async function newItems(
   };
 }
 
+/**
+ * Submitted reviews not yet seen. Every poll walks the list from page 1, each page asked
+ * with its ETag: a 304 page is unchanged, and a page that was full goes on to the next,
+ * since a new review can land there. Pending reviews are never "seen", so one begun
+ * before the watch fires when it is submitted. Registering only fills `seen`.
+ */
+async function newReviews(
+  client: GithubClient,
+  spend: Spend,
+  listPath: string,
+  cursor: GithubCursor,
+  registering: boolean,
+): Promise<{ items: ListItem[]; cursor: GithubCursor; pollAfterMs?: number }> {
+  const seen = new Set(cursor.seen ?? []);
+  const pages: Record<string, { etag?: string; count: number }> = {};
+  const found: ListItem[] = [];
+  let pollAfterMs: number | undefined;
+  for (let page = 1; ; page += 1) {
+    if (page > GITHUB_LIMITS.maxReviewPages) {
+      throw new Stop({
+        kind: "terminal",
+        reason: `the PR has more than ${GITHUB_LIMITS.maxReviewPages * 100} reviews, more than frond-ear reads in full`,
+      });
+    }
+    const kept = cursor.pages?.[String(page)];
+    const response = await fetchOk(
+      client,
+      spend,
+      `${listPath}?per_page=100&page=${page}`,
+      kept?.etag,
+    );
+    pollAfterMs = response.pollIntervalMs ?? pollAfterMs;
+    let count: number;
+    if (response.status === 304 && kept) {
+      count = kept.count;
+      pages[String(page)] = kept;
+    } else {
+      const items = Array.isArray(response.body)
+        ? (response.body as ListItem[])
+        : [];
+      count = items.length;
+      pages[String(page)] = {
+        count,
+        ...(response.etag ? { etag: response.etag } : {}),
+      };
+      for (const item of items) {
+        const id = itemId(item.id);
+        if (
+          id === undefined ||
+          word(item.state) === "PENDING" ||
+          seen.has(id)
+        ) {
+          continue;
+        }
+        seen.add(id);
+        if (!registering) {
+          found.push(item);
+        }
+      }
+      if (count >= 100 && !response.hasNext) {
+        break;
+      }
+    }
+    if (count < 100) {
+      break;
+    }
+  }
+  return {
+    items: found,
+    cursor: { ...cursor, seen: [...seen].sort((a, b) => a - b), pages },
+    ...(pollAfterMs !== undefined ? { pollAfterMs } : {}),
+  };
+}
+
 interface Pull {
   state?: string;
   merged?: boolean;
@@ -788,7 +872,17 @@ export async function baseline(
         return { kind: "ready", target: bound, cursor: watching };
       }
     }
-    if (target.on === "review" || target.on === "comment") {
+    if (target.on === "review") {
+      const listed = await newReviews(
+        client,
+        spend,
+        listPath(target),
+        { etags: {} },
+        true,
+      );
+      return { kind: "ready", target, cursor: listed.cursor };
+    }
+    if (target.on === "comment") {
       const listed = await newItems(client, spend, listPath(target), {
         etags: {},
       });
@@ -864,10 +958,11 @@ export async function poll(
       return unchanged({ ...cursor, etags }, response.pollIntervalMs);
     }
     if (target.on === "review" || target.on === "comment") {
-      const listed = await newItems(client, spend, listPath(target), cursor);
-      const items = listed.items.filter(
-        (item) => target.on !== "review" || word(item.state) !== "PENDING",
-      );
+      const listed =
+        target.on === "review"
+          ? await newReviews(client, spend, listPath(target), cursor, false)
+          : await newItems(client, spend, listPath(target), cursor);
+      const items = listed.items;
       if (items.length > 0) {
         return {
           kind: "fire",
