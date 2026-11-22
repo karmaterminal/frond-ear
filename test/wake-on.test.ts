@@ -6,6 +6,7 @@
 import assert from "node:assert/strict";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
 import { harness, testConfig } from "./helpers.ts";
@@ -1098,5 +1099,78 @@ test("wake_on: taking a repo off the ear's allowlist stops its watches reading i
   } finally {
     h3.dispose();
     rmSync(h2.directory, { recursive: true, force: true });
+  }
+});
+
+test("wake_on: a 429 holds every watch back even when the watch that got it retires or was cancelled meanwhile", async () => {
+  const fake = new FakeGithub();
+  let limited = false;
+  const open = { body: { state: "open", merged: false, head: { sha: S1 } } };
+  fake.routes.set(`${R}/pulls/21`, () =>
+    limited ? { status: 429, headers: { "retry-after": "600" } } : open,
+  );
+  fake.routes.set(`${R}/pulls/22`, open);
+  const h = harness(config(), { githubFetch: fake.fetch });
+  try {
+    const shim = h.attach("scribe", { sessionId: A });
+    await watch(h, shim, { target: "pr", number: 21, on: "merged" });
+    await watch(h, shim, { target: "pr", number: 22, on: "merged" });
+    // Watch 21 has been failing for over a day: this answer ends it.
+    const side = new DatabaseSync(join(h.directory, "ear.db"));
+    side
+      .prepare("UPDATE schedules SET failing_since = ? WHERE id = 1")
+      .run(h.clock.now() - 25 * 60 * 60_000);
+    side.close();
+    limited = true;
+    await advance(h, POLL);
+    assert.equal(wakes(shim)[0]?.meta.ended, "failed", "21 retired");
+    const reads22 = () =>
+      fake.paths().filter((p) => p === `${R}/pulls/22`).length;
+    assert.equal(reads22(), 1, "22 waits out the Retry-After 21 was given");
+    assert.ok(
+      (view(h).github.backoffUntil as number) >= h.clock.now() + 500_000,
+    );
+    await advance(h, 600_000);
+    assert.ok(reads22() > 1, "and polls once it passes");
+  } finally {
+    h.dispose();
+  }
+
+  // Cancelled while its request was out: the 429 it got still holds for the rest.
+  const fake2 = new FakeGithub();
+  let slow = false;
+  let release: (() => void) | undefined;
+  fake2.routes.set(`${R}/pulls/23`, () =>
+    slow ? { status: 429, headers: { "retry-after": "600" } } : open,
+  );
+  fake2.routes.set(`${R}/pulls/24`, open);
+  const gated = async (url: string, init: RequestInit): Promise<Response> => {
+    if (slow && url.endsWith("/pulls/23")) {
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    }
+    return fake2.fetch(url, init);
+  };
+  const h2 = harness(config(), { githubFetch: gated });
+  try {
+    const shim = h2.attach("scribe", { sessionId: A });
+    const { id } = await watch(h2, shim, {
+      target: "pr",
+      number: 23,
+      on: "merged",
+    });
+    await watch(h2, shim, { target: "pr", number: 24, on: "merged" });
+    slow = true;
+    await advance(h2, POLL);
+    assert.ok(release, "23's poll is out");
+    await call(h2, shim, "schedules", { cancel: id });
+    release!();
+    await drain();
+    const reads24 = fake2.paths().filter((p) => p === `${R}/pulls/24`).length;
+    assert.equal(reads24, 1, "24 is not read on the heels of a 429");
+    assert.ok(view(h2).github.backoffUntil !== null);
+  } finally {
+    h2.dispose();
   }
 });
