@@ -30,8 +30,10 @@ import {
   derivedLineage,
   derivedTextFits,
   noAnswer,
+  payloadDigest,
   publishRequest,
   queryRequest,
+  receiptFor,
   stationWords,
   type DerivedLineage,
   type DerivedOutcome,
@@ -625,6 +627,8 @@ export class Daemon {
   private lastCatchUp: CatchUpRun | undefined;
   /** Canticle's push to sessions (frond-ear#65); present whenever a receptor runs. */
   private readonly canticle: CanticleDelivery | undefined;
+  /** Derived publications this process is still working on, by row id (#161). */
+  private readonly derivedInFlight = new Set<number>();
 
   public constructor(options: DaemonOptions) {
     this.options = options;
@@ -3252,7 +3256,18 @@ export class Daemon {
       this.logger.log("info", "canticle.derived_closed", { ear, reason });
       return { state: "closed", reason };
     };
+    // A publication in flight, unknown or accepted is never published again (#162: never
+    // a new election to retry an uncertain effect); only derivedQuery goes on from it.
+    const payloadSha256 = payloadDigest(text);
+    const standing = (): string | undefined => {
+      const prior = this.store.standingDerived(ear, sources, payloadSha256);
+      return prior
+        ? `closed: a publication of this text from these sources is already ${prior.state}${prior.electionId ? ` (election ${prior.electionId})` : ""}; derivedQuery it rather than publish again`
+        : undefined;
+    };
 
+    const before = standing();
+    if (before !== undefined) return closed(before);
     let judged = judge();
     if ("reason" in judged) return closed(judged.reason);
     const capability = await derivedCapability(route!.control);
@@ -3261,6 +3276,8 @@ export class Daemon {
         `closed: the station's control socket doesn't offer derived publication: ${capability.reason}`,
       );
     }
+    const meanwhile = standing();
+    if (meanwhile !== undefined) return closed(meanwhile);
     judged = judge();
     if ("reason" in judged) return closed(judged.reason);
     const { lineage } = judged;
@@ -3275,6 +3292,23 @@ export class Daemon {
       payloadSha256: lineage.payloadSha256,
       createdAt: this.clock.now(),
     });
+    this.derivedInFlight.add(id);
+    try {
+      return await this.issueAndPublish(ear, id, lineage, text, route!, judge);
+    } finally {
+      this.derivedInFlight.delete(id);
+    }
+  }
+
+  /** The issued part of `publishDerived`: the row `id` exists, `issuing`, and this owns it. */
+  private async issueAndPublish(
+    ear: string,
+    id: number,
+    lineage: DerivedLineage,
+    text: string,
+    route: DerivedRoute,
+    judge: () => { lineage: DerivedLineage } | { reason: string },
+  ): Promise<DerivedOutcome> {
     const settle = (outcome: DerivedOutcome): DerivedOutcome => {
       if (!this.stopped) {
         this.store.updateDerived(id, {
@@ -3282,13 +3316,14 @@ export class Daemon {
           ...("electionId" in outcome && outcome.electionId !== null
             ? { electionId: outcome.electionId }
             : {}),
-          ...("reason" in outcome ? { reason: outcome.reason } : {}),
+          reason: "reason" in outcome ? outcome.reason : null,
           ...(outcome.state === "accepted"
             ? { acceptance: outcome.acceptance }
             : {}),
           ...(outcome.state === "unknown"
             ? {}
             : { settledAt: this.clock.now() }),
+          from: ["issuing", "claimed"],
         });
       }
       this.logger.log("info", "canticle.derived", {
@@ -3301,7 +3336,7 @@ export class Daemon {
 
     let issued: { capsule: Uint8Array; electionId: string };
     try {
-      issued = await route!.issuer.issue(lineage, text);
+      issued = await route.issuer.issue(lineage, text);
     } catch (error) {
       return settle({
         state: "refused",
@@ -3319,7 +3354,11 @@ export class Daemon {
     }
     const electionId = issued.electionId;
     if (!this.stopped) {
-      this.store.updateDerived(id, { state: "claimed", electionId });
+      this.store.updateDerived(id, {
+        state: "claimed",
+        electionId,
+        from: ["issuing"],
+      });
     }
     const again = judge();
     if ("reason" in again) {
@@ -3331,7 +3370,7 @@ export class Daemon {
     }
     let answer: Record<string, unknown>;
     try {
-      answer = await route!.control.request(
+      answer = await route.control.request(
         publishRequest(issued.capsule, text),
       );
     } catch (error) {
@@ -3342,20 +3381,18 @@ export class Daemon {
       });
     }
     if (answer.ok === true) {
-      const acceptance = answer.acceptance;
+      const taken = receiptFor(
+        answer.acceptance,
+        electionId,
+        lineage.payloadSha256,
+      );
       return settle(
-        typeof acceptance === "object" &&
-          acceptance !== null &&
-          !Array.isArray(acceptance)
-          ? {
-              state: "accepted",
-              electionId,
-              acceptance: acceptance as Record<string, unknown>,
-            }
+        "receipt" in taken
+          ? { state: "accepted", electionId, acceptance: taken.receipt }
           : {
               state: "unknown",
               electionId,
-              reason: `the station said ok without its receipt; query election ${electionId}, never publish it again`,
+              reason: `${taken.why}; query election ${electionId}, never publish it again`,
             },
       );
     }
@@ -3368,8 +3405,9 @@ export class Daemon {
 
   /**
    * #162's `derived_query` for an election frond-ear asked about: the station's answer,
-   * with no send, refresh or retry. An unknown or claimed attempt it finds accepted is
-   * settled from the receipt.
+   * with no send, refresh or retry. An unknown attempt, or a claimed one no publish in
+   * this process still owns (a crash left it), that the station reports accepted with a
+   * receipt naming this election and payload is settled from it.
    */
   public async derivedQuery(
     ear: string,
@@ -3386,21 +3424,27 @@ export class Daemon {
     }
     const answer = await route.control.request(queryRequest(electionId));
     const row = this.store.derivedByElection(ear, electionId);
-    const acceptance = answer.acceptance;
     if (
       row &&
-      (row.state === "claimed" || row.state === "unknown") &&
+      (row.state === "unknown" ||
+        (row.state === "claimed" && !this.derivedInFlight.has(row.id))) &&
       answer.ok === true &&
-      answer.state === "accepted" &&
-      typeof acceptance === "object" &&
-      acceptance !== null &&
-      !Array.isArray(acceptance)
+      answer.state === "accepted"
     ) {
-      this.store.updateDerived(row.id, {
-        state: "accepted",
-        acceptance: acceptance as Record<string, unknown>,
-        settledAt: this.clock.now(),
-      });
+      const taken = receiptFor(
+        answer.acceptance,
+        electionId,
+        row.payloadSha256,
+      );
+      if ("receipt" in taken && !this.stopped) {
+        this.store.updateDerived(row.id, {
+          state: "accepted",
+          acceptance: taken.receipt,
+          reason: null,
+          settledAt: this.clock.now(),
+          from: ["claimed", "unknown"],
+        });
+      }
     }
     return answer;
   }

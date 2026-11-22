@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -433,6 +434,20 @@ interface DerivedRow {
   settled_at: number | null;
 }
 
+/** One publication's identity: the ear, its sources as a set, and its text's digest. */
+function publicationKey(
+  ear: string,
+  sources: readonly string[],
+  payloadSha256: string,
+): string {
+  return createHash("sha256")
+    .update(
+      JSON.stringify([ear, [...new Set(sources)].sort(), payloadSha256]),
+      "utf8",
+    )
+    .digest("hex");
+}
+
 function mapDerived(row: DerivedRow): DerivedPublication {
   return {
     id: row.id,
@@ -742,6 +757,7 @@ export class EventStore {
         sources TEXT NOT NULL,
         audience TEXT NOT NULL,
         payload_sha256 TEXT NOT NULL,
+        publication_key TEXT NOT NULL,
         state TEXT NOT NULL CHECK (state IN
           ('issuing', 'claimed', 'accepted', 'refused', 'unknown')),
         reason TEXT,
@@ -751,6 +767,8 @@ export class EventStore {
       );
       CREATE INDEX IF NOT EXISTS derived_publications_election
         ON derived_publications (ear, election_id);
+      CREATE INDEX IF NOT EXISTS derived_publications_key
+        ON derived_publications (publication_key, state);
     `);
     // Custody is whole from the moment its table exists: a window that reaches back
     // before that (or before the prune's cutoff) reads as unknown, never as empty. A
@@ -1737,8 +1755,8 @@ export class EventStore {
       this.database
         .prepare(
           `INSERT INTO derived_publications (ear, session_id, sources, audience,
-             payload_sha256, state, created_at)
-           VALUES (?, ?, ?, ?, ?, 'issuing', ?)`,
+             payload_sha256, publication_key, state, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, 'issuing', ?)`,
         )
         .run(
           row.ear,
@@ -1746,39 +1764,85 @@ export class EventStore {
           JSON.stringify(row.sources),
           row.audience,
           row.payloadSha256,
+          publicationKey(
+            row.ear,
+            row.sources.map((source) => source.identity),
+            row.payloadSha256,
+          ),
           row.createdAt,
         ).lastInsertRowid,
     );
   }
 
-  /** Moves a derived publication on: its election once issued, its outcome once known. */
+  /**
+   * Moves a derived publication on: its election once issued, its outcome once known.
+   * Only from one of `from` (any state when absent), so a settle that lost a race moves
+   * nothing. `reason: null` clears it; a field left out keeps its value.
+   */
   public updateDerived(
     id: number,
     change: {
       state: DerivedPublication["state"];
       electionId?: string;
-      reason?: string;
+      reason?: string | null;
       acceptance?: Record<string, unknown>;
       settledAt?: number;
+      from?: readonly DerivedPublication["state"][];
     },
-  ): void {
-    this.database
+  ): boolean {
+    const sets = ["state = ?"];
+    const values: Array<string | number | null> = [change.state];
+    if (change.electionId !== undefined) {
+      sets.push("election_id = ?");
+      values.push(change.electionId);
+    }
+    if (change.reason !== undefined) {
+      sets.push("reason = ?");
+      values.push(change.reason);
+    }
+    if (change.acceptance !== undefined) {
+      sets.push("acceptance = ?");
+      values.push(JSON.stringify(change.acceptance));
+    }
+    if (change.settledAt !== undefined) {
+      sets.push("settled_at = ?");
+      values.push(change.settledAt);
+    }
+    const from = change.from ?? [];
+    return (
+      Number(
+        this.database
+          .prepare(
+            `UPDATE derived_publications SET ${sets.join(", ")} WHERE id = ?${
+              from.length > 0
+                ? ` AND state IN (${from.map(() => "?").join(", ")})`
+                : ""
+            }`,
+          )
+          .run(...values, id, ...from).changes,
+      ) > 0
+    );
+  }
+
+  /**
+   * The ear's publication of this text from these sources (in any order) that still
+   * stands: in flight, unknown or accepted. A refused one doesn't.
+   */
+  public standingDerived(
+    ear: string,
+    sources: readonly string[],
+    payloadSha256: string,
+  ): DerivedPublication | undefined {
+    const row = this.database
       .prepare(
-        `UPDATE derived_publications SET state = ?,
-           election_id = COALESCE(?, election_id), reason = COALESCE(?, reason),
-           acceptance = COALESCE(?, acceptance), settled_at = COALESCE(?, settled_at)
-         WHERE id = ?`,
+        `SELECT * FROM derived_publications WHERE publication_key = ?
+           AND state IN ('issuing', 'claimed', 'unknown', 'accepted')
+         ORDER BY id DESC LIMIT 1`,
       )
-      .run(
-        change.state,
-        change.electionId ?? null,
-        change.reason ?? null,
-        change.acceptance === undefined
-          ? null
-          : JSON.stringify(change.acceptance),
-        change.settledAt ?? null,
-        id,
-      );
+      .get(publicationKey(ear, sources, payloadSha256)) as
+      | DerivedRow
+      | undefined;
+    return row ? mapDerived(row) : undefined;
   }
 
   /** The ear's derived publications, oldest first. */
@@ -2634,8 +2698,13 @@ export class EventStore {
       this.database
         .prepare("DELETE FROM room_egress WHERE decided_at < ?")
         .run(cutoff);
+      // An unsettled derived publication is kept until it settles: it is the record that
+      // its election may have published and must never be published again.
       this.database
-        .prepare("DELETE FROM derived_publications WHERE created_at < ?")
+        .prepare(
+          `DELETE FROM derived_publications WHERE created_at < ?
+           AND state IN ('accepted', 'refused')`,
+        )
         .run(cutoff);
       return events;
     });

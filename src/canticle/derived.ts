@@ -69,7 +69,7 @@ export function unixStationControl(
     request: (message) =>
       new Promise((resolve, reject) => {
         const socket = connect(path);
-        let buffer = "";
+        let buffer = Buffer.alloc(0);
         let done = false;
         const finish = (outcome: NoAnswer | Record<string, unknown>) => {
           if (done) return;
@@ -83,22 +83,21 @@ export function unixStationControl(
           () => finish(new NoAnswer(`no answer within ${timeoutMs} ms`)),
           timeoutMs,
         );
-        socket.setEncoding("utf8");
         socket.on("connect", () => {
           socket.write(`${JSON.stringify(message)}\n`);
         });
-        socket.on("data", (chunk: string) => {
-          buffer += chunk;
-          const newline = buffer.indexOf("\n");
-          if (newline === -1) {
-            if (buffer.length > LINE_LIMIT) {
-              finish(new NoAnswer("its answer was over 64 KiB"));
-            }
+        socket.on("data", (chunk: Buffer) => {
+          buffer = Buffer.concat([buffer, chunk]);
+          const newline = buffer.indexOf(0x0a);
+          // Bytes, as the station's own line ceiling counts them.
+          if ((newline === -1 ? buffer.length : newline) > LINE_LIMIT) {
+            finish(new NoAnswer("its answer was over 64 KiB"));
             return;
           }
+          if (newline === -1) return;
           let value: unknown;
           try {
-            value = JSON.parse(buffer.slice(0, newline));
+            value = JSON.parse(buffer.subarray(0, newline).toString("utf8"));
           } catch {
             finish(new NoAnswer("its answer wasn't JSON"));
             return;
@@ -112,7 +111,7 @@ export function unixStationControl(
         socket.on("end", () => {
           finish(
             new NoAnswer(
-              buffer === ""
+              buffer.length === 0
                 ? "it closed without answering"
                 : "its answer had no newline",
             ),
@@ -233,6 +232,33 @@ export type DerivedOutcome =
       acceptance: Record<string, unknown>;
     };
 
+/**
+ * The station's acceptance receipt, taken only when it names this election and this
+ * payload (#162's receipt carries both); otherwise why it isn't one.
+ */
+export function receiptFor(
+  acceptance: unknown,
+  electionId: string,
+  payloadSha256: string,
+): { receipt: Record<string, unknown> } | { why: string } {
+  if (
+    typeof acceptance !== "object" ||
+    acceptance === null ||
+    Array.isArray(acceptance)
+  ) {
+    return { why: "the station said ok without its receipt" };
+  }
+  const receipt = acceptance as Record<string, unknown>;
+  return receipt.election_id === electionId &&
+    receipt.payload_sha256 === payloadSha256
+    ? { receipt }
+    : { why: "the station's receipt names another election or payload" };
+}
+
+/** SHA-256 of the elected text, as #162's receipt names it. */
+export const payloadDigest = (text: string) =>
+  createHash("sha256").update(text, "utf8").digest("hex");
+
 /** Whether `text` is within #162's bound: 1 to 800 UTF-8 bytes. */
 export function derivedTextFits(text: string): boolean {
   const bytes = Buffer.byteLength(text, "utf8");
@@ -288,7 +314,7 @@ export function derivedLineage(
         seq: record.seq,
         ...record.lineage!,
       })),
-      payloadSha256: createHash("sha256").update(text, "utf8").digest("hex"),
+      payloadSha256: payloadDigest(text),
     },
   };
 }

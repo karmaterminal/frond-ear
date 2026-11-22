@@ -519,10 +519,27 @@ test("derived: a publication left unknown, still in flight, or accepted is never
         h.dispose();
       }
     }
-    // A restart on the same store: still never published again.
+    // A restart on the same store: still never published again, whatever custody says.
     {
-      const { h, station, issuer } = await heard(capable(), { path });
+      const issuer = fakeIssuer();
+      let station: Awaited<ReturnType<typeof fakeStation>> | undefined;
+      const { h } = setup(
+        { mode: "immediate" },
+        { derivedPublication: true },
+        {},
+        {
+          path,
+          derivedRoute: {
+            control: {
+              request: (message) =>
+                unixStationControl(station!.path).request(message),
+            },
+            issuer,
+          },
+        },
+      );
       try {
+        station = await fakeStation(h.directory, capable());
         const outcome = await h.daemon.derivedPublish(
           "scribe",
           [identity(1)],
@@ -536,7 +553,7 @@ test("derived: a publication left unknown, still in flight, or accepted is never
         assert.deepEqual(issuer.calls, []);
         assert.deepEqual(station.requests, []);
       } finally {
-        await station.close();
+        await station?.close();
         h.dispose();
       }
     }
