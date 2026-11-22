@@ -3,11 +3,15 @@
 // A push counter is not acknowledgement. Each exposure of a record to an ear's session is
 // kept in three steps, the way letters settle: claimed (deduplicated and handed to the
 // session's connection), offered (the host, the shim or Copilot extension, says it handed
-// the event to the session) and echoed (the session named the push's batch_id in a tool
-// call). `hear` returning a payload is an exposure offered and echoed at once, at its
-// return. Every step is stamped with the session's compaction boundary as its pressure hook
-// last reported it (#98), and compaction is the history cut: a record echoed before the
-// current boundary, or by another session, was exposed but is no longer in context.
+// the event to the session) and echoed (the session named that push's whole batch_id,
+// delivery token and all, in a tool call; no other push's id vouches for it). A push the
+// host never confirmed stays claimed only while its attach lasts (after a crash, until
+// the next attach): the revert then gives the claim back, row and all, and the record
+// waits to be pushed again. `hear` returning a payload is an exposure offered and echoed
+// at once, at its return. Every step is stamped with the session's compaction boundary as
+// its pressure hook last reported it (#98), and compaction is the history cut: a record
+// echoed before the current boundary, or by another session, was exposed but is no
+// longer in context.
 //
 // This module only reads custody: what each record's state is now, the `history` flag
 // over a window, and the closed-by-default seam a derived-publication path would ask.
@@ -283,10 +287,6 @@ export function custodyEntry(record: CustodyRecord): object {
       exposure.offeredAt === null ? null : boundary(exposure.offerBoundary),
     echoedAt: exposure.echoedAt,
     echo: exposure.echoKind,
-    // Echoed by naming a later push of the same session, as a later Discord batch does.
-    ...(exposure.echoBatch !== null && exposure.echoBatch !== exposure.batchId
-      ? { echoedThrough: "a later push" }
-      : {}),
     echoBoundary:
       exposure.echoedAt === null ? null : boundary(exposure.echoBoundary),
   };

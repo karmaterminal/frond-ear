@@ -962,7 +962,7 @@ test("store: custody is whole only from when it began and from the prune's cutof
             expiresAt: 9_999_999_999,
           },
         ],
-        { name: "canticle.cursor.scribe", value: "{}" },
+        { name: "canticle.cursor.scribe", value: "{}", before: "{}" },
         [exposure],
       );
       assert.equal(store.canticleCustody("scribe", 0).length, 1);
@@ -1113,7 +1113,7 @@ test("store: claiming a record over a lapsed tombstone row and giving the claim 
         "scribe",
         { generation: 1, sessionId: SESSION },
         [{ ...row, expiresAt: 5_500_000 }],
-        { name: "canticle.cursor.scribe", value: "{}" },
+        { name: "canticle.cursor.scribe", value: "{}", before: "{}" },
         [],
       );
       store.releaseCanticlePush("scribe", batch, {

@@ -24,6 +24,7 @@ import { channelInstructions } from "../src/render.ts";
 import {
   ALPHA,
   canticleConfig,
+  confirm,
   OPS,
   order,
   pushes,
@@ -478,6 +479,7 @@ test("dedupe: tombstones, a standing mute and the report cursor survive a frond-
         mode: "mute",
         station: "alpha",
       }); // no TTL: it stands
+      await confirm(shim); // the shim wrote the report, and said so
     } finally {
       first.h.dispose();
     }
@@ -990,6 +992,7 @@ test("dedupe: a record heard again with a later local expiry keeps its tombstone
       first.host.sing(1, { ttlMs: 60_000, dedup: "resurfaced" });
       first.h.timers.advance(30_000); // past the first tombstone, while the copy is fresh
       assert.equal(pushes(shim).length, 1);
+      await confirm(shim);
     } finally {
       first.h.dispose();
     }
@@ -1225,6 +1228,7 @@ test("holds: the hourly push budget holds records until the hour has room, throu
       first.host.sing(1, { ttlMs: 7_200_000 });
       first.h.timers.advance(6_000);
       assert.equal(pushes(shim).length, 1);
+      await confirm(shim);
     } finally {
       first.h.dispose();
     }

@@ -636,8 +636,9 @@ export class Daemon {
    * A canticle push, named as a Discord batch is (binary-canticle#161): the session's copy
    * carries `<id>-<token>` as its batch_id and a tap's the bare id. The shim answers
    * `offered` once it has handed the event to the session; only that makes its records
-   * offered, and only the session naming the id makes them echoed. Returns whether the
-   * session's connection took it.
+   * offered, and only the session naming the whole id makes them echoed. Returns whether
+   * the session's connection took it: a socket already gone takes nothing, and one that
+   * goes after taking it reverts the push when its close is handled.
    */
   private pushCanticle(
     ear: string,
@@ -649,12 +650,16 @@ export class Daemon {
       return false;
     }
     const token = this.pushToken(ear, client.attachGeneration, batchId);
-    client.connection.send({
-      type: "event",
-      batchId,
-      content: notification.content,
-      meta: { ...notification.meta, batch_id: `${batchId}-${token}` },
-    });
+    if (
+      !client.connection.send({
+        type: "event",
+        batchId,
+        content: notification.content,
+        meta: { ...notification.meta, batch_id: `${batchId}-${token}` },
+      })
+    ) {
+      return false;
+    }
     const tapped = {
       type: "event",
       batchId,
@@ -1331,11 +1336,22 @@ export class Daemon {
       // Socket close events can arrive after shutdown has handed the store
       // back to be closed; shutdown already reverted unconfirmed batches.
       if (!this.stopped) {
-        const reverted = this.store.revertUnconfirmed(ear);
+        const reverted = this.revertUnconfirmed(ear);
         this.logger.log("info", "ear.detached", { ear, reverted });
       }
     }
     client.ear = undefined;
+  }
+
+  /**
+   * Gives back every batch the host never confirmed to this ear: Discord events queue
+   * again, and a canticle push's claim goes back so its records wait again while they
+   * are on air (#161). Returns how many batches.
+   */
+  private revertUnconfirmed(ear: string): number {
+    const { batches, canticle } = this.store.revertUnconfirmed(ear);
+    this.canticle?.reverted(ear, canticle);
+    return batches;
   }
 
   private async handleMessage(client: Client, raw: unknown): Promise<void> {
@@ -1362,21 +1378,22 @@ export class Daemon {
         // are offered from here, under the session's boundary now (#161).
         if (client.ear && this.isAttachedSession(client, client.ear)) {
           const ear = client.ear;
-          this.store.atomically(() => {
-            if (
+          const canticle = this.store.atomically(
+            () =>
               this.store.confirmBatch(
                 message.batchId,
                 ear,
                 client.attachGeneration,
-              )
-            ) {
+              ) &&
               this.store.offerCanticleCustody(ear, message.batchId, {
                 at: this.clock.now(),
                 sessionId: client.sessionId ?? null,
                 boundary: this.boundary(ear),
-              });
-            }
-          });
+              }) > 0,
+          );
+          if (canticle) {
+            this.canticle?.confirmed(ear, message.batchId);
+          }
         }
         return;
       case "release":
@@ -1587,7 +1604,7 @@ export class Daemon {
       previous.connection.send({ type: "detached", reason: "superseded" });
       this.detach(previous);
     }
-    this.store.revertUnconfirmed(ear);
+    this.revertUnconfirmed(ear);
     const nonce = this.config.ears[ear]?.attachCanary
       ? (this.options.nonce ?? (() => randomBytes(6).toString("hex")))()
       : null;
@@ -2245,7 +2262,8 @@ export class Daemon {
    * the batch_id the model passed (clamped to what was confirmed), else the
    * latest confirmed batch at call start. Anything offered later stays unseen.
    * A named canticle push is echoed here, at the call (#161): `canticle` says the
-   * id was one, `echoed` how many of its records it echoed. A canticle id names the
+   * id was one, `echoed` how many of its records it echoed, and `forged` that the id
+   * lacked the push's own delivery token, so it echoed nothing. A canticle id names the
    * canticle stream, never a chat, so it acknowledges no Discord batch in any tool.
    */
   private seenHorizon(
@@ -2254,7 +2272,12 @@ export class Daemon {
     chatId: string | undefined,
     args: Record<string, unknown>,
     tool: string,
-  ): { horizon: number | undefined; canticle: boolean; echoed: number } {
+  ): {
+    horizon: number | undefined;
+    canticle: boolean;
+    echoed: number;
+    forged?: true;
+  } {
     if (!this.isAttachedSession(client, ear)) {
       return { horizon: undefined, canticle: false, echoed: 0 };
     }
@@ -2269,21 +2292,29 @@ export class Daemon {
       throw new Error("batch_id must be the batch_id from the event");
     }
     this.provenByUse(client, ear, batch, match[2]);
-    if (this.store.isCanticleBatch(ear, batch)) {
-      return {
-        horizon: undefined,
-        canticle: true,
-        echoed: this.echoCanticle(client, ear, batch, tool),
-      };
+    const generation = this.store.canticleBatchGeneration(ear, batch);
+    if (generation !== undefined) {
+      // The echo is the session's word that it heard the push, so only the id the push
+      // carried counts (🍃 on #112): the bare id is in taps, logs and the store, and is
+      // sequential. The token is keyed by the push's own attach generation, so the same
+      // session behind a reconnected shim still holds it, and by this process's secret,
+      // so one from before a restart can't be told from a forgery and echoes nothing.
+      return match[2] === this.pushToken(ear, generation, batch)
+        ? {
+            horizon: undefined,
+            canticle: true,
+            echoed: this.echoCanticle(client, ear, batch, tool),
+          }
+        : { horizon: undefined, canticle: true, echoed: 0, forged: true };
     }
     return { horizon: Math.min(batch, latest), canticle: false, echoed: 0 };
   }
 
   /**
-   * The session named a canticle push's batch_id in a tool call (#161): that push's
-   * records, and those of its earlier pushes to this session, are echoed now, under the
-   * session's boundary now. The id is the session's word that it heard them; a push, or
-   * a call that names no id, never is. Returns how many records it echoed.
+   * The session named a canticle push's whole batch_id in a tool call (#161): that
+   * push's records, and no other push's, are echoed now, under the session's boundary
+   * now. The id is the session's word that it heard them; a push, or a call that names
+   * no id, never is. Returns how many records it echoed.
    */
   private echoCanticle(
     client: Client,
@@ -2534,9 +2565,11 @@ export class Daemon {
         if (seen.canticle) {
           // A canticle push's batch_id echoes the push and marks no Discord event
           // seen, with or without chat_id (#161).
-          return seen.echoed > 0
-            ? `${seen.echoed} canticle record${seen.echoed === 1 ? "" : "s"} echoed as heard`
-            : "0 canticle records echoed: already echoed, or the push was never confirmed delivered to this session";
+          return seen.forged
+            ? "0 canticle records echoed: a canticle push is heard only by the batch_id its event carried, delivery token and all; this one's token is missing or wrong (pass the kind=\"canticle\" event's batch_id as it is)"
+            : seen.echoed > 0
+              ? `${seen.echoed} canticle record${seen.echoed === 1 ? "" : "s"} echoed as heard`
+              : "0 canticle records echoed: already echoed, or the push was never confirmed delivered to this session";
         }
         const marked = this.markSeenThrough(client, ear, chatId, seen.horizon);
         return `${marked} event${marked === 1 ? "" : "s"} marked seen`;
@@ -3439,7 +3472,7 @@ export class Daemon {
     // then stop all further ledger writes before closing connections (their
     // close events arrive asynchronously, after the store may be closed).
     for (const ear of this.attached.keys()) {
-      this.store.revertUnconfirmed(ear);
+      this.revertUnconfirmed(ear);
     }
     this.stopped = true;
     for (const client of this.clients) {
