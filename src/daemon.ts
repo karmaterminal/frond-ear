@@ -3254,10 +3254,15 @@ export class Daemon {
     if (next === undefined) {
       return;
     }
-    const delay =
+    // A deadline further off than one timer can hold is slept in segments: each one
+    // ends in a tick that finds nothing due and arms the next, against the stored
+    // absolute deadline (Node clamps a delay over 2^31 - 1 ms to 1 ms; 🌫 on #114).
+    const delay = Math.min(
       retryAt === undefined && next <= now && this.wakeTicking
         ? WAKE_LIMITS.retryMs
-        : Math.max(0, next - now);
+        : Math.max(0, next - now),
+      WAKE_LIMITS.maxTimerMs,
+    );
     this.wakeTimer = this.timers.setTimeout(() => {
       this.wakeTimer = undefined;
       this.wakeTicking = true;

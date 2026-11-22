@@ -49,6 +49,8 @@ export const WAKE_LIMITS = {
   pastSlackMs: MINUTE,
   /** After a step that failed (the store refused it), when to try again. */
   retryMs: MINUTE,
+  /** The longest single timer the daemon arms; a later deadline is slept in segments. */
+  maxTimerMs: DAY,
 } as const;
 
 export interface ScheduleRequest {
