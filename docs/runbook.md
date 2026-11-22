@@ -462,9 +462,15 @@ was observed, and the conclusions: completed is not success. Review and comment 
 names are external text, quoted under a label that says so (at most 600 characters each).
 
 - **Polling.** Every `github.pollSeconds` (default 120, at least 60), with `If-None-Match`, and never
-  faster than GitHub's `x-poll-interval`. The ETags, cursors and baselines are stored, so after a
-  restart nothing old is found again. A list page that was full is never asked conditionally, since
-  a new item can land on the next page. One poll runs at a time across the daemon.
+  faster than GitHub's `x-poll-interval`. Cursors, ETags and baselines are stored, so after a
+  restart nothing old is found again.
+  - A comment watch's baseline is the highest comment id at registration, read from page 1 and
+    the last page, whatever the list's length. Its polls list comments updated since just before
+    registration and count only higher ids. Deletions or edits can't hide a new one.
+  - A review watch keeps the set of submitted reviews it has seen. Every poll walks the list from
+    page 1, each page asked with its ETag. A review begun before the watch and submitted after it
+    fires. A PR with more than 1,000 reviews is refused.
+  - One poll runs at a time across the daemon.
 - **Two budgets.** GitHub doesn't count a correctly authenticated 304 against its primary rate
   limit. frond-ear counts **every** attempt anyway, 304s and failures included, against the ear's
   own `github.maxRequestsPerHour` (default 120). A spent budget defers polls to the next hour,

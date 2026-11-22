@@ -71,6 +71,11 @@ export interface GithubCursor {
   seen?: number[];
   /** review: each list page's ETag and item count when last read. */
   pages?: Record<string, { etag?: string; count: number }>;
+  /**
+   * comment: polls list comments updated since this time (shortly before registration)
+   * and count only ids above `baseline`, so no page cursor can go stale (🍃 on #114).
+   */
+  since?: string;
 }
 
 export type GithubFetch = (url: string, init: RequestInit) => Promise<Response>;
@@ -83,6 +88,8 @@ export interface GithubResponse {
   pollIntervalMs?: number;
   rateLimited: boolean;
   hasNext: boolean;
+  /** The page Link's rel="last" names, when it names one. */
+  lastPage?: number;
   /** Network failure or an unreadable body: no HTTP answer to go by. */
   error?: string;
 }
@@ -158,10 +165,16 @@ export class GithubClient {
         : rateLimited && Number.isFinite(reset) && reset > 0
           ? Math.max(0, reset * 1_000 - this.now())
           : undefined;
+    const last = /<[^>]*[?&]page=(\d+)[^>]*>;\s*rel="last"/u.exec(
+      header("link") ?? "",
+    )?.[1];
     const result: GithubResponse = {
       status: response.status,
       rateLimited,
       hasNext: /<[^>]+>;\s*rel="next"/u.test(header("link") ?? ""),
+      ...(last !== undefined && Number(last) > 0
+        ? { lastPage: Number(last) }
+        : {}),
       ...(header("etag") ? { etag: header("etag")! } : {}),
       ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
       ...(Number.isFinite(pollInterval) && pollInterval > 0
@@ -387,27 +400,74 @@ interface ListItem {
   user?: { login?: string } | null;
 }
 
+/** How far before registration a comment watch's `since` reaches (clock skew). */
+const SINCE_SLACK_MS = 10 * 60_000;
+
 /**
- * The items of a review or comment list after `cursor.baseline`, read from the page the
- * newest were on. A page that was full can grow onto the next, so only a page that was
- * not full is asked conditionally: its 304 is proof nothing was added.
+ * A comment watch's baseline: the highest comment id when it is set. Comments list by id,
+ * so it is on the last page: page 1, then the page Link's rel="last" names. Two requests
+ * however long the list.
  */
-async function newItems(
+async function commentBaseline(
+  client: GithubClient,
+  spend: Spend,
+  listPath: string,
+  now: number,
+): Promise<GithubCursor> {
+  let highest = 0;
+  const take = (response: GithubResponse): void => {
+    for (const item of Array.isArray(response.body)
+      ? (response.body as ListItem[])
+      : []) {
+      const id = itemId(item.id);
+      if (id !== undefined && id > highest) {
+        highest = id;
+      }
+    }
+  };
+  const first = await fetchOk(client, spend, `${listPath}?per_page=100&page=1`);
+  take(first);
+  if (first.lastPage !== undefined && first.lastPage > 1) {
+    take(
+      await fetchOk(
+        client,
+        spend,
+        `${listPath}?per_page=100&page=${first.lastPage}`,
+      ),
+    );
+  }
+  return {
+    etags: {},
+    baseline: highest,
+    since: new Date(now - SINCE_SLACK_MS).toISOString(),
+  };
+}
+
+/**
+ * Comments above the baseline among those updated since `cursor.since`. Page 1 is asked
+ * with its ETag while it was not full; later pages, rare, unconditionally.
+ */
+async function newComments(
   client: GithubClient,
   spend: Spend,
   listPath: string,
   cursor: GithubCursor,
 ): Promise<{ items: ListItem[]; cursor: GithubCursor; pollAfterMs?: number }> {
-  let page = cursor.page ?? 1;
-  const etags = { ...cursor.etags };
+  const since = cursor.since ?? new Date(0).toISOString();
+  const etags: Record<string, string> = {};
   const found: ListItem[] = [];
-  let highest = cursor.baseline ?? 0;
   let pollAfterMs: number | undefined;
-  for (let read = 0; read < GITHUB_LIMITS.maxPages; read += 1) {
-    const path = `${listPath}?per_page=100&page=${page}`;
-    const response = await fetchOk(client, spend, path, etags[path]);
+  for (let page = 1; page <= GITHUB_LIMITS.maxPages; page += 1) {
+    const path = `${listPath}?since=${encodeURIComponent(since)}&per_page=100&page=${page}`;
+    const response = await fetchOk(
+      client,
+      spend,
+      path,
+      page === 1 ? cursor.etags[path] : undefined,
+    );
     pollAfterMs = response.pollIntervalMs ?? pollAfterMs;
     if (response.status === 304) {
+      etags[path] = cursor.etags[path]!;
       break;
     }
     const items = Array.isArray(response.body)
@@ -415,29 +475,20 @@ async function newItems(
       : [];
     for (const item of items) {
       const id = itemId(item.id);
-      if (id === undefined) {
-        continue;
-      }
-      if (id > (cursor.baseline ?? 0)) {
+      if (id !== undefined && id > (cursor.baseline ?? 0)) {
         found.push(item);
       }
-      if (id > highest) {
-        highest = id;
-      }
     }
-    delete etags[path];
-    if (items.length >= 100 && response.hasNext) {
-      page += 1;
-      continue;
-    }
-    if (items.length < 100 && response.etag) {
+    if (page === 1 && items.length < 100 && response.etag) {
       etags[path] = response.etag;
     }
-    break;
+    if (items.length < 100 || !response.hasNext) {
+      break;
+    }
   }
   return {
     items: found,
-    cursor: { ...cursor, page, etags, baseline: cursor.baseline ?? highest },
+    cursor: { ...cursor, since, etags },
     ...(pollAfterMs !== undefined ? { pollAfterMs } : {}),
   };
 }
@@ -883,10 +934,11 @@ export async function baseline(
       return { kind: "ready", target, cursor: listed.cursor };
     }
     if (target.on === "comment") {
-      const listed = await newItems(client, spend, listPath(target), {
-        etags: {},
-      });
-      return { kind: "ready", target, cursor: listed.cursor };
+      return {
+        kind: "ready",
+        target,
+        cursor: await commentBaseline(client, spend, listPath(target), now),
+      };
     }
     return { kind: "ready", target, cursor };
   } catch (error) {
@@ -961,7 +1013,7 @@ export async function poll(
       const listed =
         target.on === "review"
           ? await newReviews(client, spend, listPath(target), cursor, false)
-          : await newItems(client, spend, listPath(target), cursor);
+          : await newComments(client, spend, listPath(target), cursor);
       const items = listed.items;
       if (items.length > 0) {
         return {
