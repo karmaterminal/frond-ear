@@ -11,6 +11,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { ROOM_OUTPUT_TOOLS } from "../src/egress.ts";
+import { RestError } from "../src/rest.ts";
 import { TOOLS } from "../src/shim.ts";
 import { EventStore } from "../src/store.ts";
 import {
@@ -492,6 +493,111 @@ test("persistence: the egress row is written before Discord is called, so a send
     assert.equal(reopened.roomEgress("scribe", 0).at(-1)!.outcome, "sent");
   } finally {
     reopened?.close();
+    h.dispose();
+  }
+});
+
+test("outcome: a definitive Discord refusal (4xx) settles the row as error with nothing confirmed", async () => {
+  const { h } = setup({ mode: "immediate" });
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    await pressure(h, "b-1");
+    h.rest.sendMessage = async () => {
+      throw new RestError(403, 50013, "Missing Permissions");
+    };
+    const result = await h.call(shim, "reply", {
+      chat_id: CHANNEL,
+      text: "no permission here",
+    });
+    assert.equal(result.ok, false);
+    assert.match(result.text, /Missing Permissions/u);
+    const row = rows(h).at(-1)!;
+    assert.deepEqual(
+      [row.decision, row.outcome, row.messageIds, row.settledAt],
+      ["allow", "error", [], h.clock.now()],
+    );
+  } finally {
+    h.dispose();
+  }
+});
+
+test("shutdown: a reply still waiting on Discord when the drain runs out keeps its row pending, unknown; nothing settles it after the store is handed back", async () => {
+  const { h } = setup({ mode: "immediate" });
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    await pressure(h, "b-1");
+    let release: (() => void) | undefined;
+    const send = h.rest.sendMessage.bind(h.rest);
+    h.rest.sendMessage = async (...args) => {
+      await new Promise<void>((resolve) => (release = resolve));
+      return send(...args);
+    };
+    await shim.send({
+      type: "call",
+      id: 901,
+      tool: "reply",
+      args: { chat_id: CHANNEL, text: "caught by the shutdown" },
+    });
+    assert.ok(release, "the send is waiting on Discord");
+    assert.deepEqual(await h.daemon.shutdown(20), { drained: false });
+    release!();
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    const row = rows(h).at(-1)!;
+    assert.deepEqual(
+      [row.decision, row.outcome, row.settledAt],
+      ["allow", "pending", null],
+    );
+  } finally {
+    h.dispose();
+  }
+});
+
+test("one decision per output: a reply's later parts go out under the decision its call got, even if a compaction is reported meanwhile; the next call is judged again", async () => {
+  const { h, host } = setup(
+    { mode: "immediate" },
+    { roomPolicy: "strict-fresh" },
+  );
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    await pressure(h, "b-1");
+    const push = await offered(h, host, shim, 1);
+    await h.call(shim, "ack", { batch_id: push.meta.batch_id });
+    const send = h.rest.sendMessage.bind(h.rest);
+    let parts = 0;
+    h.rest.sendMessage = async (...args) => {
+      parts += 1;
+      if (parts === 1) {
+        h.clock.advance(1_000);
+        await pressure(h, "compact-1", { tokens: null });
+      }
+      return send(...args);
+    };
+    const text = `${"a".repeat(1_990)}\n\n${"b".repeat(100)}`;
+    // The report mid-send takes ticks of its own, so wait for the result itself.
+    await shim.send({
+      type: "call",
+      id: 902,
+      tool: "reply",
+      args: { chat_id: CHANNEL, text },
+    });
+    let result = shim.connection.results().find((item) => item.id === 902);
+    for (let i = 0; i < 50 && result === undefined; i++) {
+      await new Promise((resolve) => setImmediate(resolve));
+      result = shim.connection.results().find((item) => item.id === 902);
+    }
+    assert.ok(result, "the reply answered");
+    assert.equal(result.ok, true, result.text);
+    assert.equal(writes(h).length, 2);
+    const row = rows(h).at(-1)!;
+    assert.deepEqual(
+      [row.decision, row.outcome, row.messageIds.length],
+      ["allow", "sent", 2],
+    );
+    const next = await h.call(shim, "reply", { chat_id: CHANNEL, text: "x" });
+    assert.equal(next.ok, false);
+    assert.match(next.text, REFUSED);
+  } finally {
     h.dispose();
   }
 });

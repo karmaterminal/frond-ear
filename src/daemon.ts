@@ -568,7 +568,8 @@ export class Daemon {
   private readonly logger: StructuredLogger;
   private readonly clock: Clock;
   private readonly timers: Timers;
-  private readonly options: DaemonOptions;
+  /** Without `rest`: the egress gate holds Discord's writes, and nothing else here. */
+  private readonly options: Omit<DaemonOptions, "rest">;
   private readonly clients = new Set<Client>();
   private readonly attached = new Map<string, Client>();
   /**
@@ -631,14 +632,15 @@ export class Daemon {
   private readonly derivedInFlight = new Set<number>();
 
   public constructor(options: DaemonOptions) {
-    this.options = options;
+    const { rest, ...kept } = options;
+    this.options = kept;
     this.config = options.config;
     this.store = options.store;
-    this.rest = options.rest;
+    this.rest = rest;
     this.logger = options.logger;
     this.clock = options.clock ?? systemClock;
     this.timers = options.timers ?? systemTimers;
-    this.egress = new RoomEgress(options.rest, this.store, this.clock);
+    this.egress = new RoomEgress(rest, this.store, this.clock);
     this.botLimiter = new WakeLimiter(options.config.botLoop);
     this.ambientLimiter = new WakeLimiter(options.config.ambientWake);
     this.batchesBefore = this.store.batchHighWater();
@@ -3190,7 +3192,9 @@ export class Daemon {
    * meanwhile (a compaction, a new session) stops it before anything is published. Then
    * the owner's issuer gets the lineage and returns the capsule, and the station gets
    * exactly `derived_publish`, never `sing`. An unanswered publish stays unknown: only
-   * `derivedQuery` for the same election settles it. Each issued attempt is recorded by
+   * `derivedQuery` for the same election settles it, and no publication of the same text
+   * from the same sources is made while one is in flight, unknown or accepted (#162:
+   * never a new election to retry an uncertain effect). Each issued attempt is recorded by
    * ids and digests, never the text. No model tool calls this (#162 adds none, and the
    * capsule stays out of any model's sight): it is the owner's integration's call. Like a
    * tool call, shutdown drains it, and nothing starts or reaches the station once

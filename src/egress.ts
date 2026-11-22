@@ -7,9 +7,11 @@
 // an egress row of the exposure state at that moment (the records the speaker had echoed,
 // by id and digest, never payload; the history flag; the compaction boundary) before
 // anything is sent. Only the permit it returns can write to Discord, and only the write it
-// was opened for, until it is settled: a retry or replay opens a new one and is checked
-// again. Bash, gh, files and other MCP servers reach rooms without frond-ear: they are
-// outside this check, and nothing here vouches for them.
+// was opened for, until it is settled. One decision covers one output: a reply's parts, and
+// the REST client's own waits on a rate limit, go out under the decision its call got (a
+// session doesn't compact inside its own tool call). A retry or replay of the call opens a
+// new permit and is checked again. Bash, gh, files and other MCP servers reach rooms
+// without frond-ear: they are outside this check, and nothing here vouches for them.
 //
 // The source-use rule itself is not adopted. `observe` (the default) refuses nothing and
 // records. `strict-fresh`, the unadopted "all history must be fresh" candidate, refuses

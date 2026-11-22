@@ -757,9 +757,11 @@ Before anything is sent, the gate:
 A refusal is the tool's error (`refused by canticle.roomPolicy strict-fresh: <reason>; nothing was sent …`). It sends
 nothing and marks no Discord event seen; a canticle `batch_id` in the call is still echoed, since the echo is the id
 in the call. Only the gate can call Discord's writes: the daemon's own REST handle is typed for reads, and a test
-fails if any other source file names `sendMessage`, `addReaction` or `editMessage`. A retry goes through the gate
-again and never reuses an earlier allow, so an unfinished reply retried after a compaction posts nothing more until
-the policy allows it; then it resumes as #55 says.
+fails if any other source file names `sendMessage`, `addReaction` or `editMessage`. One decision covers one output: a
+reply's parts, and the REST client's own waits on a Discord rate limit, go out under the decision its call got (a
+session doesn't compact inside its own tool call). A retry of the call goes through the gate again and never reuses
+an earlier allow, so an unfinished reply retried after a compaction posts nothing more until the policy allows it;
+then it resumes as #55 says.
 
 | Policy              | What it does                                                                                                                                                                                                                                                                                                                                                                                                               |
 | ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -820,7 +822,13 @@ owner's integration calls it. It stays closed, and says why, unless every one of
    class, hop, lineage root, station principal, expiry and `wake_derived`. Rows from before this read as none.
 5. The station's control socket offers the derived op. #162 has no capability advertisement, so frond-ear asks
    `derived_query` about an election no authority issues (all zeros): `station_claim_missing` means the op is
-   configured and this uid is admitted. Any other answer, or none, closes it in the station's words.
+   configured and this uid is admitted. Any other answer, or none, closes it in the station's words. The probe can't
+   see one thing: #162 refuses `derived_publish` (not `derived_query`) on a control socket not granted class
+   `chatter`. On such a socket the probe passes and the station refuses the publish, after the issuer has spent an
+   election: closed, but wasteful. Grant the socket `chatter`.
+6. No publication of the same text from the same sources is in flight, `unknown` or `accepted`. #162: the host never
+   makes a new election to retry an uncertain effect. So a later or concurrent call is closed and points at
+   `derivedQuery`; this is kept in the store, so it holds across a restart.
 
 Custody is judged again after each wait (the probe, the issuer), so a compaction or a new session meanwhile stops it
 before the station gets anything. Shutdown drains a publication in flight as it drains a tool call, and once frond-ear
@@ -836,8 +844,11 @@ the narrowest source scope) and the text, then sends the station exactly `derive
 Each issued attempt is a `derived_publications` row by source ids and digests, never the text: `issuing`, `claimed`
 (the election issued), then `accepted` with the station's receipt, `refused` (the issuer or the station said no, or it
 was stopped after the capsule was issued: custody moved, or frond-ear began shutting down), or `unknown` when no answer
-came. An unknown one is never published again:
-`derivedQuery(ear, election_id)` asks the station about the same election and settles the row if it was accepted.
+came, or an answer without a receipt naming this election and this payload. An unknown one is never published again:
+`derivedQuery(ear, election_id)` asks the station about the same election and settles the row if the station reports
+it accepted with such a receipt (a row a publish in this process still owns is left to that publish). The prune keeps a
+row still `issuing`, `claimed` or `unknown` past `limits.retentionMs`: it is the record that its election may have
+published.
 
 ## Troubleshooting
 
