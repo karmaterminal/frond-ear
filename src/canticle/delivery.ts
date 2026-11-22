@@ -516,7 +516,12 @@ export class CanticleDelivery {
     }
     /** What a mute passed over: settled, so no restart or reload pushes it later. */
     const muted: Settling[] = [];
-    for (const item of liveNow(view)) {
+    // Refreshes last, so one finds the record it re-issues already waiting (§7.9).
+    const heard = liveNow(view);
+    for (const item of [
+      ...heard.filter((item) => item.refresh !== true),
+      ...heard.filter((item) => item.refresh === true),
+    ]) {
       const id = identity(item);
       const waiting = state.waiting.get(id);
       if (waiting) {
@@ -535,6 +540,15 @@ export class CanticleDelivery {
         continue;
       }
       if (seen?.gen === state.gen) continue;
+      // §7.9 before the push: a refresh of a record still waiting is that record again.
+      // It is held back unread until the record is pushed (then it collapses) or leaves
+      // the wait unpushed (then it is news), as after a revert (#161).
+      if (
+        !this.#refreshOfPushed(ear, item, now) &&
+        this.#refreshOfWaiting(state, item)
+      ) {
+        continue;
+      }
       this.#see(state, id, expiresAt + SETTLE_SKEW_MS);
       const passed = this.#passOver(item, keys, modes);
       if (passed !== undefined) {
@@ -907,9 +921,9 @@ export class CanticleDelivery {
    * and the records wait for the next push, as a push no connection took leaves them,
    * along with what that push said was missed; one already off air is counted so, never
    * pushed late. The records of a push this process didn't make (a crash left it) or no
-   * longer keeps are read from the view on the next pass instead, if they are on air. A
-   * refresh that collapsed into a record that waits again stays collapsed; one whose
-   * record is gone is read again on the next pass, and is news.
+   * longer keeps, and those refreshes, are read from the view again on the next pass: a
+   * refresh is held back while the record it re-issues waits, so it collapses once that
+   * record is pushed, and is news if the record goes unpushed.
    */
   reverted(ear: string, released: readonly CanticleReverted[]): void {
     if (released.length === 0) return;
@@ -922,13 +936,8 @@ export class CanticleDelivery {
       ? config.canticle!.delivery[ear]!
       : undefined;
     const kept = this.#unconfirmed.get(ear);
-    let live: Set<string> | undefined;
-    const onAir = () =>
-      (live ??= new Set(liveNow(this.#deps.hear(ear)).map(identity)));
-    /** Records that wait again, or that the next pass reads again from the view. */
-    const again = new Set<string>();
     let records = 0;
-    for (const { batchId, identities } of released) {
+    for (const { batchId, identities, collapsed } of released) {
       const push = kept?.get(batchId);
       kept?.delete(batchId);
       records += identities.length;
@@ -942,23 +951,15 @@ export class CanticleDelivery {
         const waiting = push?.records.find((record) => record.id === id);
         if (waiting === undefined || delivery === undefined) {
           state.seen.delete(id);
-          if (onAir().has(id)) again.add(id);
+        } else if (state.waiting.has(id)) {
           continue;
-        }
-        again.add(id);
-        if (state.waiting.has(id)) continue;
-        if (waiting.expiresAt <= now) {
-          again.delete(id);
+        } else if (waiting.expiresAt <= now) {
           this.#miss(state, waiting.stream, "offAir");
-          continue;
+        } else {
+          this.#wait(state, waiting, delivery.bufferPerStream);
         }
-        this.#wait(state, waiting, delivery.bufferPerStream);
       }
-    }
-    for (const { collapsed } of released) {
-      for (const { identity: id, into } of collapsed) {
-        if (!into.some((record) => again.has(record))) state.seen.delete(id);
-      }
+      for (const id of collapsed) state.seen.delete(id);
     }
     this.#count(state, "reverted", released.length);
     this.#deps.logger.log("info", "canticle.push_reverted", {
@@ -1092,6 +1093,29 @@ export class CanticleDelivery {
 
   #count(state: EarState, name: string, by = 1): void {
     state.counts[name] = (state.counts[name] ?? 0) + by;
+  }
+
+  /** A refresh with an equal body of a record that waits now (§7.9). */
+  #refreshOfWaiting(state: EarState, item: LiveItem): boolean {
+    const key = refreshKey(item);
+    if (
+      item.refresh !== true ||
+      key === undefined ||
+      item.bodyDigest === undefined
+    ) {
+      return false;
+    }
+    const id = identity(item);
+    for (const waiting of state.waiting.values()) {
+      if (
+        waiting.id !== id &&
+        waiting.item.bodyDigest === item.bodyDigest &&
+        refreshKey(waiting.item) === key
+      ) {
+        return true;
+      }
+    }
+    return false;
   }
 
   #refreshOfPushed(ear: string, item: LiveItem, now: number): boolean {

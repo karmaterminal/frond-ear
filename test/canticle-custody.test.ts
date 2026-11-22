@@ -1702,7 +1702,7 @@ test("store: a revert gives back every canticle claim the host never confirmed: 
         {
           batchId: f,
           identities: ["k:7:s:7"],
-          collapsed: [{ identity: "k:7:s:8", into: ["k:7:s:7"] }],
+          collapsed: ["k:7:s:8"],
         },
       ]);
       assert.equal(settled().includes("k:7:s:8"), false);

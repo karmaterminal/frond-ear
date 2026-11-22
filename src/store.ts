@@ -230,13 +230,13 @@ function mapCustody(row: CustodyRow): CanticleCustody {
 }
 
 /**
- * A canticle push a revert gave back (#161): its records, and each refresh that had
- * collapsed into it (§7.9) with the records of the push it carries the same body as.
+ * A canticle push a revert gave back (#161): its records, and the refreshes that had
+ * collapsed into it (§7.9), whose tombstones went back with it.
  */
 export interface CanticleReverted {
   batchId: number;
   identities: string[];
-  collapsed: Array<{ identity: string; into: string[] }>;
+  collapsed: string[];
 }
 
 /** Since when custody is whole: set when the table is first made, moved by the prune. */
@@ -1920,8 +1920,7 @@ export class EventStore {
    * again while they are on air; the delivery cursor goes back to before the first such
    * push, unless a later push was confirmed since; and its id stays known as a canticle
    * push's, which names no chat. Returns how many batches it gave back and, for each
-   * canticle push, its record identities and each collapsed refresh with the records of
-   * the push it is the same body as.
+   * canticle push, its record identities and those of the refreshes collapsed into it.
    */
   public revertUnconfirmed(ear: string): {
     batches: number;
@@ -1964,30 +1963,14 @@ export class EventStore {
               )
               .all(ear, batch.id) as Array<{ identity: string }>
           ).map((row) => row.identity);
-          const settled = this.database
-            .prepare(
-              `SELECT identity, outcome, refresh_key AS refreshKey, digest
-               FROM canticle_settled WHERE ear = ? AND batch_id = ? ORDER BY identity`,
-            )
-            .all(ear, batch.id) as Array<{
-            identity: string;
-            outcome: string;
-            refreshKey: string | null;
-            digest: string | null;
-          }>;
-          const pushed = settled.filter((row) => row.outcome === "pushed");
-          const collapsed = settled
-            .filter((row) => row.outcome === "collapsed")
-            .map((row) => ({
-              identity: row.identity,
-              into: pushed
-                .filter(
-                  (seed) =>
-                    seed.refreshKey === row.refreshKey &&
-                    seed.digest === row.digest,
-                )
-                .map((seed) => seed.identity),
-            }));
+          const collapsed = (
+            this.database
+              .prepare(
+                `SELECT identity FROM canticle_settled
+                 WHERE ear = ? AND batch_id = ? AND outcome = 'collapsed' ORDER BY identity`,
+              )
+              .all(ear, batch.id) as Array<{ identity: string }>
+          ).map((row) => row.identity);
           this.dropCanticleClaim(ear, batch.id);
           this.database
             .prepare(

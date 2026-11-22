@@ -634,7 +634,8 @@ and died before it said so. A record heard again with a later
 local expiry (a restarted receptor's new δ̂, §14.6.3) keeps its tombstone until then. Once a tombstone has
 lapsed, though, a receptor that hears the record again as new (after a restart, with a later local expiry) can
 have it pushed once more, still within §14.18.5's bound; it is marked late if it is older than `maxAgeMs` by
-then. A refresh re-issue with the same body as a pushed record is not pushed (§7.9). A record first heard under a
+then. A refresh re-issue with the same body as a pushed record is not pushed (§7.9), and one of a record still waiting to
+be pushed is held back until it is: then it collapses, and if the record goes unpushed it is news. A record first heard under a
 mute is never pushed, even after the mute lifts or frond-ear restarts. A config reload re-reads what is on air,
 as a restart does, and a key taken off `wakeKeys` holds back what it had waiting.
 
