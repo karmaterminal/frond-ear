@@ -518,6 +518,7 @@ export class CanticleDelivery {
     const muted: Settling[] = [];
     // Refreshes last, so one finds the record it re-issues already waiting (§7.9).
     const heard = liveNow(view);
+    const live = new Set(heard.map(identity));
     for (const item of [
       ...heard.filter((item) => item.refresh !== true),
       ...heard.filter((item) => item.refresh === true),
@@ -540,12 +541,14 @@ export class CanticleDelivery {
         continue;
       }
       if (seen?.gen === state.gen) continue;
-      // §7.9 before the push: a refresh of a record still waiting is that record again.
-      // It is held back unread until the record is pushed (then it collapses) or leaves
-      // the wait unpushed (then it is news), as after a revert (#161).
+      // §7.9 before the push: a refresh of a record still waiting on air is that record
+      // again. It is held back unread until the record is pushed (then it collapses) or
+      // leaves the view or the wait unpushed (then it is news), as after a revert (#161).
+      // A record the refresh superseded (the embedded receptor drops it from the view at
+      // once) can't be pushed, so it holds nothing back.
       if (
         !this.#refreshOfPushed(ear, item, now) &&
-        this.#refreshOfWaiting(state, item)
+        this.#refreshOfWaiting(state, item, live)
       ) {
         continue;
       }
@@ -1095,8 +1098,12 @@ export class CanticleDelivery {
     state.counts[name] = (state.counts[name] ?? 0) + by;
   }
 
-  /** A refresh with an equal body of a record that waits now (§7.9). */
-  #refreshOfWaiting(state: EarState, item: LiveItem): boolean {
+  /** A refresh with an equal body of a record that waits now, on air in `live` (§7.9). */
+  #refreshOfWaiting(
+    state: EarState,
+    item: LiveItem,
+    live: ReadonlySet<string>,
+  ): boolean {
     const key = refreshKey(item);
     if (
       item.refresh !== true ||
@@ -1109,6 +1116,7 @@ export class CanticleDelivery {
     for (const waiting of state.waiting.values()) {
       if (
         waiting.id !== id &&
+        live.has(waiting.id) &&
         waiting.item.bodyDigest === item.bodyDigest &&
         refreshKey(waiting.item) === key
       ) {
