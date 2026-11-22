@@ -25,6 +25,7 @@ import { ChannelShim } from "../src/shim.ts";
 import { EventStore } from "../src/store.ts";
 import {
   canticleConfig,
+  confirm,
   type Host,
   OPS,
   order,
@@ -703,7 +704,10 @@ test("restart: custody survives a frond-ear restart on the same store; the bound
       const stale = await second.h.call(shim, "ack", {
         batch_id: two.meta.batch_id,
       });
-      assert.match(stale.text, /^0 canticle records echoed: .*delivery token/u);
+      assert.equal(
+        stale.text,
+        "0 canticle records echoed: that push went out before frond-ear last restarted, so its delivery token can't be checked any more; hear shows its records again while they are live",
+      );
       assert.equal(recordOf(await custody(second.h, shim), 2).state, "offered");
       // The record pushed before the restart is not pushed again.
       second.host.sing(1);
@@ -1348,9 +1352,13 @@ test("revert: a report the host never confirmed gives back its cursor with its c
     const first = h.attach("scribe", { sessionId: SESSION });
     host.sing(1);
     host.sing(2);
+    host.sing(3, { ttlMs: 2_000 }); // off air before the report
     h.timers.advance(11_000);
     assert.equal(pushes(first).length, 1);
     assert.equal(pushes(first)[0]!.meta.report, "1");
+    const line =
+      /^ops:ops\.fleet: 2 new records \(items 7\/1 to 7\/2\), 1 went off air unpushed:$/mu;
+    assert.match(pushes(first)[0]!.content, line);
     first.close();
     assert.equal(status(h).waiting, 2);
     assert.equal(status(h).reports, 0, "the report number is given back");
@@ -1367,8 +1375,8 @@ test("revert: a report the host never confirmed gives back its cursor with its c
     ]);
     assert.match(
       report.content,
-      /^ops:ops\.fleet: 2 new records \(items 7\/1 to 7\/2\):$/mu,
-      "new records, not out of order",
+      line,
+      "new records, not out of order, and what it missed",
     );
     await second.send({ type: "offered", batchId: report.batchId! });
     host.sing(3);
@@ -1382,6 +1390,7 @@ test("revert: a report the host never confirmed gives back its cursor with its c
     );
     assert.equal(status(h).pushesLastHour, 2);
     assert.deepEqual(status(h).counts, {
+      off_air_unpushed: 1,
       reports: 3,
       records_pushed: 5,
       reverted: 1,
@@ -1676,5 +1685,113 @@ test("store: a revert gives back every canticle claim the host never confirmed: 
     }
   } finally {
     rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+// ---- the independent review of the fix (9eafe13..81d9de1) ------------------------------
+
+test("revert: a reverted push's id still names a canticle push: it echoes nothing and marks no Discord event seen, in ack or reply", async () => {
+  const { h, host } = setup({ mode: "immediate" });
+  try {
+    const first = h.attach("scribe", { sessionId: SESSION });
+    // A Discord batch, offered and unread.
+    h.daemon.ingest(
+      message({
+        channel_id: CHANNEL,
+        guild_id: GUILD,
+        author: { id: PRINCIPAL, username: "figs" },
+        content: "<@" + BOT + "> ping",
+        mentions: [{ id: BOT }],
+      }),
+    );
+    h.timers.advance(2_000);
+    const discord = first.connection
+      .events()
+      .filter((event) => event.meta.kind === "mention")
+      .at(-1)!;
+    await first.send({ type: "offered", batchId: discord.batchId! });
+    // A push the shim wrote but never confirmed; then its connection goes.
+    host.sing(1);
+    h.timers.advance(6_000);
+    const lost = pushes(first).at(-1)!;
+    first.close();
+
+    const second = h.attach("scribe", { sessionId: SESSION });
+    const unseen = () =>
+      (
+        h.daemon.status("scribe") as {
+          ears: Array<{ events: Record<string, number> }>;
+        }
+      ).ears[0]!.events.offered;
+    assert.equal(unseen(), 1);
+    const acked = await h.call(second, "ack", { batch_id: lost.meta.batch_id });
+    assert.equal(
+      acked.text,
+      "0 canticle records echoed: that push was given back unconfirmed when its connection went, and its records go out again under a new batch_id; name that one",
+    );
+    const replied = await h.call(second, "reply", {
+      chat_id: CHANNEL,
+      text: "on it",
+      batch_id: lost.meta.batch_id,
+    });
+    assert.equal(replied.ok, true, replied.text);
+    assert.equal(unseen(), 1, "the Discord batch is still unseen");
+
+    // The record went out again under a new id, and that one echoes.
+    h.timers.advance(6_000);
+    const again = pushes(second).at(-1)!;
+    assert.notEqual(again.batchId, lost.batchId);
+    await second.send({ type: "offered", batchId: again.batchId! });
+    assert.equal(
+      (await h.call(second, "ack", { batch_id: again.meta.batch_id })).text,
+      "1 canticle record echoed as heard",
+    );
+    assert.equal(unseen(), 1);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("revert: a refresh that collapsed into a push the host never confirmed is given back with it: it goes out once its original is off air, and stays collapsed into one that goes out again", async () => {
+  const A = "a".repeat(64);
+  const B = "b".repeat(64);
+  const { h, host } = setup({ mode: "immediate" });
+  try {
+    const first = h.attach("scribe", { sessionId: SESSION });
+    const x = { stateKey: "x", text: "x: deploying", digest: A };
+    const y = { stateKey: "y", text: "y: deploying", digest: B };
+    host.sing(1, { ...x, ttlMs: 9_000 });
+    host.sing(3, { ...y, ttlMs: 600_000 });
+    h.timers.advance(6_000);
+    assert.equal(pushes(first).length, 1, "1 and 3, never confirmed");
+    // Their refreshes, same bodies: each collapses into the push.
+    host.sing(2, { ...x, ttlMs: 600_000, flags: { refresh: true } });
+    host.sing(4, { ...y, ttlMs: 600_000, flags: { refresh: true } });
+    h.timers.advance(2_000);
+    assert.equal(status(h).counts.refresh_collapsed, 2);
+    h.timers.advance(2_000); // record 1 goes off air; 2 carries its body on
+    first.close();
+
+    const second = h.attach("scribe", { sessionId: SESSION });
+    h.timers.advance(6_000);
+    assert.equal(pushes(second).length, 1);
+    assert.deepEqual(order(pushes(second)[0]!.content), [
+      "ops:ops.fleet/2",
+      "ops:ops.fleet/3",
+    ]);
+    await confirm(second);
+    h.timers.advance(60_000);
+    assert.equal(pushes(second).length, 1, "4 is 3 again, which went out");
+    assert.deepEqual(
+      h.store
+        .canticleCustody("scribe", 0)
+        .map((row) => [row.identity, row.offeredAt !== null]),
+      [
+        [identity(2), true],
+        [identity(3), true],
+      ],
+    );
+  } finally {
+    h.dispose();
   }
 });
