@@ -78,7 +78,12 @@ export interface WakeDelivery {
   sessionId: string;
   scheduleId: number;
   deliveredAt: number;
-  wakeIds: number[];
+  /**
+   * The push showed every owed occurrence of its schedule with an id up to this one, and
+   * only those: a push always carries all that the schedule owes, and an occurrence
+   * written later has a higher id. One row per push, however many it showed.
+   */
+  throughWakeId: number;
 }
 
 const SCHEDULE_COLUMNS = `id, ear, setter, kind, note, period_ms AS periodMs, first_due AS firstDue,
@@ -139,12 +144,8 @@ export const WAKE_SCHEMA = `
     ear TEXT NOT NULL,
     session_id TEXT NOT NULL,
     schedule_id INTEGER NOT NULL,
-    delivered_at INTEGER NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS wake_delivery_items (
-    nonce TEXT NOT NULL,
-    wake_id INTEGER NOT NULL,
-    PRIMARY KEY (nonce, wake_id)
+    delivered_at INTEGER NOT NULL,
+    through_wake_id INTEGER NOT NULL DEFAULT 0
   );
 `;
 
@@ -164,6 +165,36 @@ export class WakeStore {
     this.database = database;
     this.transaction = transaction;
     database.exec(WAKE_SCHEMA);
+    // An earlier build of this branch kept one item row per occurrence per push (🍃 on
+    // #114): fold each delivery's items into its range, then drop them.
+    const columns = new Set(
+      (
+        database.prepare("PRAGMA table_info(wake_deliveries)").all() as Array<{
+          name: string;
+        }>
+      ).map((column) => column.name),
+    );
+    if (!columns.has("through_wake_id")) {
+      database.exec(
+        "ALTER TABLE wake_deliveries ADD COLUMN through_wake_id INTEGER NOT NULL DEFAULT 0",
+      );
+    }
+    const items = database
+      .prepare(
+        "SELECT 1 AS hit FROM sqlite_master WHERE type = 'table' AND name = 'wake_delivery_items'",
+      )
+      .get();
+    if (items !== undefined) {
+      transaction(() => {
+        database.exec(`
+          UPDATE wake_deliveries SET through_wake_id = COALESCE((
+            SELECT MAX(wake_id) FROM wake_delivery_items i
+             WHERE i.nonce = wake_deliveries.nonce), 0)
+           WHERE through_wake_id = 0;
+          DROP TABLE wake_delivery_items;
+        `);
+      });
+    }
   }
 
   public addSchedule(schedule: {
@@ -442,15 +473,17 @@ export class WakeStore {
   }
 
   /**
-   * One push of `wakeIds` to `sessionId` under `nonce`. The first delivery freezes each
-   * occurrence: later ticks open a new one.
+   * One push of every owed occurrence of a schedule, through `throughWakeId`, to
+   * `sessionId` under `nonce`. The first delivery freezes each occurrence: later ticks
+   * open a new one.
    */
   public deliver(delivery: Omit<WakeDelivery, "deliveredAt">, now: number) {
     this.transaction(() => {
       this.database
         .prepare(
-          `INSERT INTO wake_deliveries (nonce, ear, session_id, schedule_id, delivered_at)
-           VALUES (?, ?, ?, ?, ?)`,
+          `INSERT INTO wake_deliveries (nonce, ear, session_id, schedule_id, delivered_at,
+             through_wake_id)
+           VALUES (?, ?, ?, ?, ?, ?)`,
         )
         .run(
           delivery.nonce,
@@ -458,57 +491,56 @@ export class WakeStore {
           delivery.sessionId,
           delivery.scheduleId,
           now,
+          delivery.throughWakeId,
         );
-      const item = this.database.prepare(
-        "INSERT INTO wake_delivery_items (nonce, wake_id) VALUES (?, ?)",
-      );
-      const wake = this.database.prepare(
-        `UPDATE wakes SET delivered_at = COALESCE(delivered_at, ?), deliveries = deliveries + 1,
-           last_delivered_at = ? WHERE id = ?`,
-      );
-      for (const id of delivery.wakeIds) {
-        item.run(delivery.nonce, id);
-        wake.run(now, now, id);
-      }
+      this.database
+        .prepare(
+          `UPDATE wakes SET delivered_at = COALESCE(delivered_at, ?), deliveries = deliveries + 1,
+             last_delivered_at = ?
+           WHERE schedule_id = ? AND id <= ? AND acked_at IS NULL`,
+        )
+        .run(now, now, delivery.scheduleId, delivery.throughWakeId);
     });
   }
 
   public delivery(ear: string, nonce: string): WakeDelivery | undefined {
-    const row = this.database
+    return this.database
       .prepare(
         `SELECT nonce, ear, session_id AS sessionId, schedule_id AS scheduleId,
-                delivered_at AS deliveredAt
+                delivered_at AS deliveredAt, through_wake_id AS throughWakeId
            FROM wake_deliveries WHERE ear = ? AND nonce = ?`,
       )
-      .get(ear, nonce) as Omit<WakeDelivery, "wakeIds"> | undefined;
-    if (!row) {
-      return undefined;
-    }
-    const items = this.database
-      .prepare(
-        "SELECT wake_id AS id FROM wake_delivery_items WHERE nonce = ? ORDER BY wake_id",
-      )
-      .all(nonce) as Array<{ id: number }>;
-    return { ...row, wakeIds: items.map((item) => item.id) };
+      .get(ear, nonce) as WakeDelivery | undefined;
   }
 
   /** Settles the occurrences delivery `nonce` showed and nothing else. Returns their ids. */
   public ack(nonce: string, now: number): number[] {
     return this.transaction(() => {
+      const delivery = this.database
+        .prepare(
+          `SELECT schedule_id AS scheduleId, through_wake_id AS through
+             FROM wake_deliveries WHERE nonce = ?`,
+        )
+        .get(nonce) as { scheduleId: number; through: number } | undefined;
+      if (!delivery) {
+        return [];
+      }
+      // Only occurrences that existed at the push: those written later have higher ids,
+      // and one never delivered before this push can't be under its range.
       const ids = (
         this.database
           .prepare(
-            `SELECT w.id AS id FROM wakes w JOIN wake_delivery_items i ON i.wake_id = w.id
-              WHERE i.nonce = ? AND w.acked_at IS NULL ORDER BY w.id`,
+            `SELECT id FROM wakes WHERE schedule_id = ? AND id <= ? AND acked_at IS NULL
+               AND delivered_at IS NOT NULL ORDER BY id`,
           )
-          .all(nonce) as Array<{ id: number }>
+          .all(delivery.scheduleId, delivery.through) as Array<{ id: number }>
       ).map((row) => row.id);
-      const settle = this.database.prepare(
-        "UPDATE wakes SET acked_at = ? WHERE id = ? AND acked_at IS NULL",
-      );
-      for (const id of ids) {
-        settle.run(now, id);
-      }
+      this.database
+        .prepare(
+          `UPDATE wakes SET acked_at = ? WHERE schedule_id = ? AND id <= ?
+             AND acked_at IS NULL AND delivered_at IS NOT NULL`,
+        )
+        .run(now, delivery.scheduleId, delivery.through);
       return ids;
     });
   }
@@ -555,10 +587,10 @@ export class WakeStore {
         )
         .run(now - limits.keepEndedMs);
       this.database.exec(
-        `DELETE FROM wake_delivery_items
-          WHERE wake_id NOT IN (SELECT id FROM wakes);
-         DELETE FROM wake_deliveries
-          WHERE nonce NOT IN (SELECT nonce FROM wake_delivery_items);`,
+        `DELETE FROM wake_deliveries
+          WHERE NOT EXISTS (SELECT 1 FROM wakes w
+            WHERE w.schedule_id = wake_deliveries.schedule_id
+              AND w.id <= wake_deliveries.through_wake_id);`,
       );
       return { droppedUnacked };
     });

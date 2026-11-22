@@ -99,6 +99,7 @@ import {
   parseNote,
   parseSchedule,
   parseTtl,
+  occurrenceList,
   readSchedule,
   renderHeld,
   renderWake,
@@ -3013,7 +3014,7 @@ export class Daemon {
             ear,
             sessionId: session,
             scheduleId,
-            wakeIds: wakes.map((wake) => wake.id),
+            throughWakeId: Math.max(...wakes.map((wake) => wake.id)),
           },
           now,
         );
@@ -3348,7 +3349,7 @@ export class Daemon {
       scheduleId: delivery.scheduleId,
       wakes: settled.length,
     });
-    return `${settled.length} wake${settled.length === 1 ? "" : "s"} settled (schedule ${delivery.scheduleId}: occurrence${settled.length === 1 ? "" : "s"} ${settled.join(", ")}); anything delivered later stays owed`;
+    return `${settled.length} wake${settled.length === 1 ? "" : "s"} settled (schedule ${delivery.scheduleId}: occurrence${settled.length === 1 ? "" : "s"} ${occurrenceList(settled)}); anything delivered later stays owed`;
   }
 
   /** Counts, times and caps: a status read never shows a note or a target. */

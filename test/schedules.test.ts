@@ -10,6 +10,7 @@ import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
 import { ancestorPids } from "../src/shim.ts";
+import { EventStore } from "../src/store.ts";
 import { harness, testConfig } from "./helpers.ts";
 
 const A = "aaaaaaaa-1111-2222-3333-444444444444";
@@ -922,6 +923,41 @@ test("schedule: a schedule held and unacked for a day keeps delivery storage lin
     assert.match(settled.text, /^288 wakes settled/u);
     assert.ok(settled.text.length < 300, settled.text);
     assert.equal(earStatus(h).schedules.owed, 0);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("schedule: a store from the build that kept one row per occurrence per push folds into ranges, and its nonces still settle", () => {
+  const h = harness();
+  const path = join(h.directory, "old.db");
+  try {
+    const old = new DatabaseSync(path);
+    old.exec(`
+      CREATE TABLE wake_deliveries (nonce TEXT PRIMARY KEY, ear TEXT NOT NULL,
+        session_id TEXT NOT NULL, schedule_id INTEGER NOT NULL, delivered_at INTEGER NOT NULL);
+      CREATE TABLE wake_delivery_items (nonce TEXT NOT NULL, wake_id INTEGER NOT NULL,
+        PRIMARY KEY (nonce, wake_id));
+      INSERT INTO wake_deliveries VALUES ('n1', 'scribe', 'sess', 1, 5);
+      INSERT INTO wake_delivery_items VALUES ('n1', 3), ('n1', 4);
+    `);
+    old.close();
+    const store = new EventStore(path, h.clock);
+    try {
+      assert.equal(store.wakes.delivery("scribe", "n1")?.throughWakeId, 4);
+    } finally {
+      store.close();
+    }
+    const after = new DatabaseSync(path);
+    assert.equal(
+      after
+        .prepare(
+          "SELECT COUNT(*) AS n FROM sqlite_master WHERE name = 'wake_delivery_items'",
+        )
+        .get()!.n,
+      0,
+    );
+    after.close();
   } finally {
     h.dispose();
   }

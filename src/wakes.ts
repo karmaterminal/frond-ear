@@ -275,6 +275,17 @@ function facts(wake: Wake): WakeFacts | undefined {
   }
 }
 
+/** At most this many occurrence ids are listed in an event or an ack; more are a range. */
+export const MAX_LISTED_OCCURRENCES = 8;
+
+/** Occurrence ids as a reader takes them: listed when few, a count and range when many. */
+export function occurrenceList(ids: number[]): string {
+  if (ids.length <= MAX_LISTED_OCCURRENCES) {
+    return ids.join(", ");
+  }
+  return `${ids[0]}–${ids[ids.length - 1]} (${ids.length} in all)`;
+}
+
 /** A schedule's description for its setter: when and how it comes due. */
 export function describe(schedule: Schedule, target?: string): string {
   if (schedule.kind === "github") {
@@ -312,7 +323,7 @@ export function renderWake(
   const header = [
     `[schedule ${schedule.id}`,
     describe(schedule, target),
-    `occurrence${owed.length === 1 ? "" : "s"} ${owed.map((wake) => wake.id).join(", ")}`,
+    `occurrence${owed.length === 1 ? "" : "s"} ${occurrenceList(owed.map((wake) => wake.id))}`,
     ...(ticks.length > 0
       ? [
           tickCount === 1
@@ -327,7 +338,11 @@ export function renderWake(
     ended ? `ended: ${ended}` : `expires ${iso(schedule.expiresAt)}`,
   ].join(" · ");
   const lines = [`${header}]`, "your note:", quote(schedule.note)];
-  for (const wake of owed) {
+  // The daemon's facts of the latest few: a tick carries none, so in practice these are a
+  // watch's trigger and a schedule's ended notice.
+  for (const wake of owed
+    .filter((item) => item.facts !== null)
+    .slice(-MAX_LISTED_OCCURRENCES)) {
     const observed = facts(wake);
     if (!observed) {
       continue;
@@ -372,7 +387,11 @@ export function renderWake(
       kind: "wake",
       schedule_id: String(schedule.id),
       schedule_kind: schedule.kind,
-      wake_ids: owed.map((wake) => wake.id).join(","),
+      wake_ids:
+        owed.length <= MAX_LISTED_OCCURRENCES
+          ? owed.map((wake) => wake.id).join(",")
+          : `${owed[0]!.id}..${owed[owed.length - 1]!.id}`,
+      wakes: String(owed.length),
       nonce,
       ticks: String(tickCount),
       missed: String(Math.max(0, tickCount - 1)),
