@@ -16,7 +16,12 @@
 // The source-use rule itself is not adopted. `observe` (the default) refuses nothing and
 // records. `strict-fresh`, the unadopted "all history must be fresh" candidate, refuses
 // unless the speaker's history is complete: every record it was exposed to in the window
-// offered and echoed within its current compaction boundary, nothing unknown.
+// offered and echoed within its current compaction boundary, nothing unknown. It is a
+// freshness-of-attention gate, not an output-content check: it never reads the output.
+//
+// A write Discord never answered may have gone out: its row is `unconfirmed`, never
+// `error`, and for a reply part it stays tied to the part's nonce, so the message an
+// identical retry gets back under that nonce is credited to the row that first sent it.
 
 import { createHash } from "node:crypto";
 
