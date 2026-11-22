@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -77,6 +77,21 @@ export interface Config {
   paused: boolean;
   /** Optional binary-canticle receptor. Absent or disabled: no socket, nothing heard or pushed. */
   canticle?: CanticleConfig;
+  /** `wake_on` GitHub (#111). Absent or disabled: the tool refuses and nothing is polled. */
+  github?: GithubConfig;
+}
+
+export interface GithubConfig {
+  /** Off by default: no watch is set or polled until an operator turns it on. */
+  enabled: boolean;
+  /** The one origin the daemon reads (https). Its token goes nowhere else. */
+  apiBase: string;
+  /** How often a watch polls; GitHub's x-poll-interval can only lengthen it. */
+  pollMs: number;
+  /** HTTP attempts per ear per hour, every one counted (304s and failures included). */
+  maxRequestsPerHour: number;
+  /** Per ear, the owner/name repositories its sessions may watch. An ear left out: none. */
+  repos: Record<string, string[]>;
 }
 
 export interface CanticleConfig {
@@ -736,7 +751,76 @@ export function parseConfig(candidate: unknown): Config {
     },
     paused: candidate.paused === true,
     ...canticleField(parseCanticle(candidate.canticle, ears)),
+    ...githubField(parseGithub(candidate.github, ears)),
   };
+}
+
+const GITHUB_REPO = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/u;
+
+function parseGithub(
+  value: unknown,
+  ears: Record<string, EarConfig>,
+): GithubConfig | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!isObject(value)) {
+    throw new Error("github must be an object");
+  }
+  if (value.enabled !== undefined && typeof value.enabled !== "boolean") {
+    throw new Error("github.enabled must be true or false");
+  }
+  const apiBase =
+    value.apiBase === undefined ? "https://api.github.com" : value.apiBase;
+  let origin: URL;
+  try {
+    origin = new URL(String(apiBase));
+  } catch {
+    throw new Error("github.apiBase must be an https URL");
+  }
+  if (origin.protocol !== "https:" || origin.username || origin.password) {
+    throw new Error("github.apiBase must be an https URL with no credentials");
+  }
+  const pollSeconds = integer(value.pollSeconds, 120, "github.pollSeconds", 60);
+  const maxRequestsPerHour = integer(
+    value.maxRequestsPerHour,
+    120,
+    "github.maxRequestsPerHour",
+    1,
+  );
+  const repos: Record<string, string[]> = {};
+  if (value.repos !== undefined) {
+    if (!isObject(value.repos)) {
+      throw new Error("github.repos must be an object of ear -> [owner/name]");
+    }
+    for (const [ear, list] of Object.entries(value.repos)) {
+      if (!ears[ear]) {
+        throw new Error(`github.repos.${ear}: no such ear`);
+      }
+      const names = stringArray(list, `github.repos.${ear}`);
+      for (const name of names) {
+        if (!GITHUB_REPO.test(name)) {
+          throw new Error(
+            `github.repos.${ear}: ${JSON.stringify(name)} must be owner/name`,
+          );
+        }
+      }
+      repos[ear] = names;
+    }
+  }
+  return {
+    enabled: value.enabled === true,
+    apiBase: String(apiBase).replace(/\/+$/u, ""),
+    pollMs: pollSeconds * 1_000,
+    maxRequestsPerHour,
+    repos,
+  };
+}
+
+function githubField(github: GithubConfig | undefined): {
+  github?: GithubConfig;
+} {
+  return github ? { github } : {};
 }
 
 function canticleField(canticle: CanticleConfig | undefined): {
@@ -800,6 +884,29 @@ export function runtimeOptions(
     dryRun,
     allowInject: dryRun || env.FROND_EAR_ALLOW_INJECT === "1",
   };
+}
+
+/**
+ * The daemon's read-only GitHub token for `wake_on` (#111), from FROND_EAR_GITHUB_TOKEN_FILE
+ * only: a file only its owner can read (0600 or tighter). Unset: watches read unauthenticated.
+ * The token stays in the daemon; it is never logged, shown in status or passed to a shim.
+ */
+export function readGithubToken(env: NodeJS.ProcessEnv): string | undefined {
+  const file = env.FROND_EAR_GITHUB_TOKEN_FILE;
+  if (!file) {
+    return undefined;
+  }
+  const mode = statSync(file).mode & 0o777;
+  if ((mode & 0o077) !== 0) {
+    throw new Error(
+      `FROND_EAR_GITHUB_TOKEN_FILE must be readable by its owner only (mode 0600), not ${mode.toString(8).padStart(4, "0")}`,
+    );
+  }
+  const token = readFileSync(file, "utf8").trim();
+  if (!token) {
+    throw new Error("FROND_EAR_GITHUB_TOKEN_FILE is empty");
+  }
+  return token;
 }
 
 /** Reads the bot token from DISCORD_BOT_TOKEN_FILE or DISCORD_BOT_TOKEN. */

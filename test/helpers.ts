@@ -208,6 +208,9 @@ export function harness(
     protectedPaths?: string[];
     /** The owner's derived-publication route: an issuer and a station's control socket. */
     derivedRoute?: DerivedRoute;
+    /** A fake GitHub for wake_on (#111), and the token the daemon sends it. */
+    githubFetch?: (url: string, init: RequestInit) => Promise<Response>;
+    githubToken?: string;
   } = {},
 ): Harness {
   const clock = new FakeClock();
@@ -237,6 +240,8 @@ export function harness(
       ? { protectedPaths: options.protectedPaths }
       : {}),
     ...(options.derivedRoute ? { derivedRoute: options.derivedRoute } : {}),
+    ...(options.githubFetch ? { githubFetch: options.githubFetch } : {}),
+    ...(options.githubToken ? { githubToken: options.githubToken } : {}),
   });
   let callId = 0;
   const flush = () => new Promise<void>((resolve) => setImmediate(resolve));

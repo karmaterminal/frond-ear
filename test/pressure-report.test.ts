@@ -220,6 +220,7 @@ function run(
     delete base.FROND_EAR_EAR;
     delete base.FROND_EAR_TCP;
     delete base.CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS;
+    delete base.CLAUDE_PID;
     const child = spawn(
       process.execPath,
       ["--disable-warning=ExperimentalWarning", CLI, "pressure", ...argv],

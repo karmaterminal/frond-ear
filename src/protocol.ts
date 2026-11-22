@@ -12,6 +12,12 @@ export type ClientMessage =
       ear?: string;
       pid?: number;
       sessionId?: string;
+      /**
+       * The shim's parent process and its ancestors, nearest first (#111): the Claude Code
+       * process that spawned it is among them, so a SessionStart hook naming that process
+       * (its CLAUDE_PID) can be tied to this shim across a /clear.
+       */
+      hostPids?: number[];
       client?: { name: string; version: string };
       token?: string;
     }
@@ -27,6 +33,8 @@ export type ClientMessage =
       ear: string;
       source?: string;
       sessionId?: string;
+      /** The hook's CLAUDE_PID: the Claude Code process whose session it names (#111). */
+      hostPid?: number;
     }
   /**
    * A seat's PreCompact hook: the letters to carry into the summary (#102), and
@@ -64,6 +72,8 @@ export type ClientMessage =
       idleFloor?: number;
       /** The hook event that read it; only PostToolUse and UserPromptSubmit can show a notice (#107). */
       event?: string;
+      /** The hook's CLAUDE_PID, as on a release (#111). */
+      hostPid?: number;
     };
 
 /** Messages from the daemon to a client. */

@@ -16,6 +16,7 @@ import {
   defaultSocketPath,
   loadConfigFile,
   readBotToken,
+  readGithubToken,
   runtimeOptions,
 } from "./config.ts";
 import { watchConfigFile } from "./config-watch.ts";
@@ -43,7 +44,7 @@ import { EAR_PROTOCOL_VERSION, LineConnection } from "./protocol.ts";
 import { HttpDiscordRest, RecordingRest } from "./rest.ts";
 import { runSend } from "./send.ts";
 import { listenTcp, listenUnix } from "./server.ts";
-import { ChannelShim, TOOLS } from "./shim.ts";
+import { ancestorPids, ChannelShim, TOOLS } from "./shim.ts";
 import { EventStore } from "./store.ts";
 import type { DiscordMessage } from "./types.ts";
 
@@ -68,8 +69,9 @@ usage:
   frond-ear tap --ear <name>          stream the batches pushed to an ear's attached session (read-only;\n                                      wakes a session without channel push; a shim must be attached)
   frond-ear release --ear <name> [--source <s>] [--session <id>] [--hook]
                                       release an ear's letters (#88) to its attached session; for a
-                                      SessionStart hook (matcher startup|compact): --hook reads the hook's
-                                      JSON on stdin (session_id, source) and always exits 0
+                                      SessionStart hook (matcher startup|compact|clear|resume): --hook reads the
+                                      hook's JSON on stdin (session_id, source) and CLAUDE_PID, which ties
+                                      a /clear's new session to the shim (#111), and always exits 0
   frond-ear precompact --ear <name> [--session <id>] [--hook]
                                       print the session's unsettled letters (#102) as compaction-summary
                                       instructions; for a PreCompact hook: --hook reads session_id on
@@ -108,6 +110,8 @@ async function runDaemon(argv: string[]): Promise<void> {
   const runtime = runtimeOptions(env, { dryRun: values["dry-run"] === true });
   const config = loadConfigFile(runtime.configPath);
   const token = runtime.dryRun ? "" : readBotToken(env);
+  // wake_on's read-only token (#111): only in the daemon, never logged or passed on.
+  const githubToken = readGithubToken(env);
   const logger = new StructuredLogger(undefined, token ? [token] : []);
   const store = new EventStore(runtime.databasePath);
   const pruned = store.prune(config.limits.retentionMs);
@@ -168,7 +172,11 @@ async function runDaemon(argv: string[]): Promise<void> {
       `${runtime.databasePath}-shm`,
       ...(env.DISCORD_BOT_TOKEN_FILE ? [env.DISCORD_BOT_TOKEN_FILE] : []),
       ...(env.FROND_EAR_TOKEN_FILE ? [env.FROND_EAR_TOKEN_FILE] : []),
+      ...(env.FROND_EAR_GITHUB_TOKEN_FILE
+        ? [env.FROND_EAR_GITHUB_TOKEN_FILE]
+        : []),
     ],
+    ...(githubToken ? { githubToken } : {}),
     allowInject: runtime.allowInject,
     ...(sharedToken ? { token: sharedToken } : {}),
     gatewayStatus: () =>
@@ -261,6 +269,7 @@ function runShim(): void {
     connect: connectToDaemon(env),
     ear: env.FROND_EAR_EAR || undefined,
     sessionId: env.CLAUDE_CODE_SESSION_ID || undefined,
+    hostPids: ancestorPids(),
     token: tcpTarget(env) ? tcpToken(env) : undefined,
   });
   shim.start();
@@ -312,6 +321,9 @@ async function runRelease(argv: string[]): Promise<void> {
     }
   }
   const ear = values.ear ?? process.env.FROND_EAR_EAR;
+  const hostPid = hook
+    ? Number(process.env.CLAUDE_PID) || undefined
+    : undefined;
   try {
     if (!ear) {
       throw new Error("release needs --ear <name> (or FROND_EAR_EAR)");
@@ -322,6 +334,9 @@ async function runRelease(argv: string[]): Promise<void> {
         ear,
         ...(source ? { source } : {}),
         ...(sessionId ? { sessionId } : {}),
+        // Claude Code gives its hooks CLAUDE_PID: the daemon ties this hook to the shim
+        // that process spawned, so a /clear's new session id reaches the ear (#111).
+        ...(hostPid ? { hostPid } : {}),
       },
       process.env,
       5_000,

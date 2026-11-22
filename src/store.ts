@@ -3,6 +3,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
+import { WakeStore } from "./wake-store.ts";
 import type {
   BatchKind,
   Clock,
@@ -596,6 +597,8 @@ function newerSnowflake(a: string, b: string): string {
 export class EventStore {
   private readonly database: DatabaseSync;
   private readonly clock: Clock;
+  /** Daemon-held schedules, watches and the wakes they owe (#111). */
+  public readonly wakes: WakeStore;
 
   public constructor(path: string, clock: Clock = systemClock) {
     if (path !== ":memory:") {
@@ -971,6 +974,10 @@ export class EventStore {
       CREATE INDEX IF NOT EXISTS derived_publications_key
         ON derived_publications (publication_key, state);
     `);
+    this.wakes = new WakeStore(
+      this.database,
+      <T>(work: () => T): T => this.transaction(work),
+    );
   }
 
   public close(): void {

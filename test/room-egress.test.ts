@@ -63,8 +63,11 @@ const NOT_ROOM_OUTPUT = [
   "inbox",
   "leave_letter",
   "letters",
+  "schedule",
+  "schedules",
   "set_attention",
   "set_canticle_delivery",
+  "wake_on",
 ];
 
 /** Arguments that take each tool as far as it goes; `message` is a frond-ear message. */

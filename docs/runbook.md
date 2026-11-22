@@ -183,14 +183,15 @@ claude --resume <session id> --dangerously-load-development-channels server:fron
 
 ## 6. Operating
 
-| Task                        | How                                                                                                                              |
-| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| Status                      | `node src/cli.ts status`, or ask Claude to call `ear_status`                                                                     |
-| Pause pushes                | Set `"paused": true` in the config; it reloads live                                                                              |
-| Read what Claude missed     | Claude calls `inbox`; everything stays in SQLite until the retention window expires                                              |
-| Logs                        | JSON lines on the daemon's stderr. Message text and tokens are redacted.                                                         |
-| Post from a script          | `node src/cli.ts send --chat <id> "<text>"`, below                                                                               |
-| Letters across a compaction | `leave_letter`, then a `SessionStart` hook running `release --hook` (and a `PreCompact` hook running `precompact --hook`), below |
+| Task                         | How                                                                                                                              |
+| ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| Status                       | `node src/cli.ts status`, or ask Claude to call `ear_status`                                                                     |
+| Pause pushes                 | Set `"paused": true` in the config; it reloads live                                                                              |
+| Read what Claude missed      | Claude calls `inbox`; everything stays in SQLite until the retention window expires                                              |
+| Logs                         | JSON lines on the daemon's stderr. Message text and tokens are redacted.                                                         |
+| Post from a script           | `node src/cli.ts send --chat <id> "<text>"`, below                                                                               |
+| Letters across a compaction  | `leave_letter`, then a `SessionStart` hook running `release --hook` (and a `PreCompact` hook running `precompact --hook`), below |
+| Wakes that outlive a session | `schedule`, `wake_on`, `schedules`; the same `SessionStart` hook with `clear` in its matcher, below                              |
 
 **Posting from a script.** `frond-ear send --chat <id> <text…>` posts the text as the daemon's
 bot, for scripts such as a watchdog that posts an outage alert when a host goes down. It finds
@@ -254,7 +255,7 @@ Hook, in the seat's `.claude/settings.json` (use the daemon's socket environment
   "hooks": {
     "SessionStart": [
       {
-        "matcher": "startup|compact",
+        "matcher": "startup|compact|clear|resume",
         "hooks": [
           {
             "type": "command",
@@ -273,8 +274,10 @@ Claude Code adds to the session's context: `frond-ear: letters for ear <ear>: 2 
 2 channel events`. When the daemon answered, a second line follows, even with no letters: a
 reminder that compaction gives no warning, and how to leave a letter. A session that's never told
 forgets the tool exists. It always exits 0, so a daemon that's down never blocks a session start
-(and then prints no reminder, since it couldn't take a letter). Leave `resume` out: a resumed
-session keeps its context.
+(and then prints no reminder, since it couldn't take a letter). Keep `clear` and `resume` in
+the matcher: they tell frond-ear which session holds the ear after a `/clear` or `/resume`
+(Schedules and wakes, below). For letters, a resume only hands the session its own unsettled
+letters again.
 
 **Letters into the compaction summary** (#102). The release only hands letters back after the
 compaction, as events. The summary that the next turn reasons from never saw them. Most
@@ -371,6 +374,137 @@ apart. The ceiling and the pending-bytes reading keep a hold far from the limit,
 proof. Until a seat's own trial shows what happens, treat a hold as an opt-in experiment, and keep
 it short. It costs tokens too: idle compaction exists because the one-hour cache has expired, so
 the next turn after a blocked one re-reads the whole context uncached.
+
+### Schedules and wakes: what the daemon keeps for a session (#111)
+
+A `CronCreate` job lives in the Claude Code process. It is gone after a crash, after `/clear`, and
+after Claude Code's 7 days for a recurring job; a Monitor that waits on a PR dies the same way. The
+daemon outlives all of that, so it holds these instead. A **wake** is a notification, never a
+command: its `kind="wake"` event carries the setter's own note, quoted, frond-ear's facts, and any
+external text quoted and labelled as untrusted evidence.
+
+**`schedule`** takes `at` (ISO 8601 with its zone, or epoch ms), `every` (seconds, or `"90m"`,
+`"2h"`, `"1d"`; at least 5 minutes), or both (`at` is then the first due time); a `note` (≤ 2000
+bytes); and `ttl_days` (1 to 30, default 30). Over a limit it refuses, never trims.
+
+- **Fixed cadence.** `every` comes due at first due time + k × period. Delivery and ack never shift
+  it. A wall clock that jumps back fires nothing twice; one that jumps forward is coalesced.
+- **One transaction per due step.** frond-ear writes the occurrence (a stable id and a generation)
+  and advances or retires the schedule in the same SQLite transaction. A crash before it commits
+  loses nothing: the due time is still stored, and the restart fires it. A crash after it commits
+  replays that same occurrence, never a second one.
+- **Coalesced.** An occurrence takes in further due ticks only until it is first pushed. After that
+  it is frozen, and the next tick opens a new generation. Each push sends **one event per
+  schedule**, carrying every occurrence still owed under one nonce, with `ticks`, `missed`,
+  `first_due`, `latest_due` and `late_ms` in its meta.
+- **Owed until acked.** `ack` with the event's `nonce` settles exactly the occurrences that event
+  showed. A later generation stays owed, and an old nonce never settles it. Only the session the
+  push went to can settle it; anyone else is refused and nothing settles. A push is not an ack. An
+  owed wake is pushed again on every attach, and while its setter holds the ear: 1 h after its
+  first push, then twice as long each time, up to a day.
+- **Cancel and expiry stop future wakes only.** `schedules` with `cancel: id` (only its setter can)
+  stops further ticks. A wake already owed stays owed until acked. At its ttl a schedule writes one
+  last owed wake saying it expired and will not fire again; nothing goes silent, as the 11-18 sweep
+  did. An owed wake nobody settles is dropped 30 days after it was written, and counted in
+  `ear_status` (`schedules.droppedUnacked`).
+- **Limits.** 16 active schedules or watches per session, 32 per ear, a 5-minute minimum period,
+  30 days ttl. A setter that has not held the ear for 7 days has its schedules **retired as
+  orphaned**: no more ticks, what they already owe stays owed. `ear_status` counts active schedules
+  whose setter isn't the holder (`schedules.orphaned`) and those retired (`retiredOrphaned`).
+
+**Whose wake it is, across `/clear`.** The policy is **metadata only**. A wake belongs to the
+session that set it and never moves. Another session holding the ear later is told, in a
+`kind="wake_note"` event, which schedules of which short session id are held. It sees them in
+`schedules` as ids, kinds, states, times and owed counts, never a note or a target. It cannot read
+them, settle them or cancel them. When the setter holds the ear again (A → B → A), its wakes come
+back.
+
+Claude Code keeps its MCP servers across `/clear` and `/resume` (2.1.316). The shim keeps running
+under the `CLAUDE_CODE_SESSION_ID` it started with, while the conversation gets a new id. Without
+help, frond-ear would take the new session for the old one. So:
+
+- The shim sends its ancestor pids in `hello`. Claude Code gives its hooks `CLAUDE_PID`, and
+  `frond-ear release --hook` sends it. A `SessionStart` hook that names another session, whose
+  `CLAUDE_PID` is one of the holding shim's ancestors, moves the holder to that session id. That is
+  the `/clear` (or `/resume`) inside that process. Its wakes stay its setter's.
+- A hook frond-ear can't tie to the shim (an older shim, a hook with no `CLAUDE_PID`, or a non-Linux
+  host behind a wrapper) puts that shim's wake identity **in doubt**, and it fails closed. Nothing is
+  shown, settled, set or cancelled through it until it re-attaches or its own session's hook runs
+  again. `ear_status` shows `schedules.holderIdentity: "in-doubt"`. A hook from another Claude
+  process, provably not the shim's, changes nothing.
+- The release hook's matcher **must** include `clear` and `resume`:
+  `"matcher": "startup|compact|clear|resume"`, as above. `resume` also hands the resumed session
+  its own unsettled letters again, which is harmless. The shim must be launched by Claude Code
+  itself, or through wrappers at most 6 levels deep: frond-ear reads the chain from `/proc`.
+- The turn, or the doubt, is kept in the store, keyed by the id the shim said hello with. A
+  reconnect or a daemon restart leaves the shim naming its spawn-time id again, and frond-ear still
+  takes it for the session it turned to, while the turn's Claude process is among the shim's
+  ancestors. A doubt still stands after a reconnect. A new Claude process with that id is that
+  session again.
+- The backstop: the pressure hook (`frond-ear pressure --hook --ear`) also sends `CLAUDE_PID`. A
+  report naming another session than the holder's turns the holder when the pid ties it to the
+  shim, and puts its wakes in doubt when it can't. So a `/resume` the release matcher missed fails
+  closed on the session's next tool call, if the seat runs the pressure hook.
+
+**`wake_on`** (GitHub; **off** unless `github.enabled`): `{source: "github", repo, target: "pr" |
+"issue" | "run", number, on, note, ttl_days}`. The target says what `number` names.
+
+| target  | on                              | binds, and fires when                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| ------- | ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pr`    | `review`, `comment`             | Reviews or comments there at registration are the baseline. Fires on the first one after it (a pending review doesn't count). A review is not an approval: its state is shown as GitHub gives it.                                                                                                                                                                                                                                                           |
+| `pr`    | `merged`                        | Fires when merged, or when closed without merging. Already so at registration: fires at once.                                                                                                                                                                                                                                                                                                                                                               |
+| `pr`    | `ci_done` (optional `head_sha`) | Binds the PR's current head (`head_sha` must be it). Fires when that commit has check runs or commit statuses, every run completed and every status read (all pages) with none pending and the combined state not pending, read the same on two polls in a row (so a second wave of checks holds it open). If the head moves first, it fires saying so, and that is not a CI result. Checks on any other commit never fire it. "No checks yet" is not done. |
+| `issue` | `comment`                       | As for a PR. A number that names a PR is refused.                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `run`   | `ci_done` (optional `attempt`)  | Binds one attempt (default: the current one). A rerun is another attempt; an earlier attempt's result never fires it. Already complete at registration: fires at once.                                                                                                                                                                                                                                                                                      |
+
+The wake carries the canonical URL, the exact head, run, attempt and review or comment ids, when it
+was observed, and the conclusions: completed is not success. Review and comment bodies and check
+names are external text, quoted under a label that says so (at most 600 characters each).
+
+- **Polling.** Every `github.pollSeconds` (default 120, at least 60), with `If-None-Match`, and never
+  faster than GitHub's `x-poll-interval`. Cursors, ETags and baselines are stored, so after a
+  restart nothing old is found again.
+  - A comment watch's baseline is the highest comment id at registration, read from page 1 and
+    the last page, whatever the list's length. Its polls list comments updated since just before registration and count only higher ids, reading page 1 and then the list's tail (the last page, walking back while it is all new), so baseline comments that still match can't hide one. Deletions or edits can't hide a new one.
+  - A review watch keeps the set of submitted reviews it has seen. Every poll walks the list from
+    page 1, each page asked with its ETag. A review begun before the watch and submitted after it
+    fires. A PR with more than 1,000 reviews is refused.
+  - One poll runs at a time across the daemon.
+- **Two budgets.** GitHub doesn't count a correctly authenticated 304 against its primary rate
+  limit. frond-ear counts **every** attempt anyway, 304s and failures included, against the ear's
+  own `github.maxRequestsPerHour` (default 120). A spent budget defers polls to the next hour,
+  failing nothing. A 429, or a 403 that is a rate limit, backs every watch off for its
+  `Retry-After` (or until `x-ratelimit-reset`). That backoff is stored, so a restart still waits.
+  `ear_status` shows `schedules.github.requestsThisHour` and `backoffUntil`.
+- **Failing visibly.** A 401, 403, 404, 410 or 422, or a redirect, retires the watch with one owed
+  wake that says why, written in the same transaction. frond-ear never follows a redirect, so the
+  token never leaves `github.apiBase`. Network errors and 5xx back off (2^n × the poll period, at
+  most an hour), and after 8 in a row, or 24 hours of failing, the watch ends the same way.
+- **Credentials.** `FROND_EAR_GITHUB_TOKEN_FILE`: a file readable by its owner only (mode 0600;
+  the daemon refuses anything looser). Use a fine-grained, **read-only** token scoped to the repos
+  you list. Unset, watches read unauthenticated (public repos, a low limit). The token stays in the
+  daemon. It is never logged, never in status (`github.token` says only whether one is set), and
+  never passed to a shim. frond-ear only issues GET requests.
+- **Allowed repos per ear.** `github.repos.<ear>` lists the `owner/name` repos its sessions may
+  watch, so a session can't borrow the token's wider visibility by asking. A watch's target is shown
+  only to its setter.
+
+```json
+"github": {
+  "enabled": true,
+  "pollSeconds": 120,
+  "maxRequestsPerHour": 120,
+  "repos": { "my-ear": ["karmaterminal/frond-ear"] }
+}
+```
+
+`ear_status` under `schedules` shows `active`, `byKind`, `nextDueAt`, `owed`, `owedToHolder`,
+`lastDeliveredAt`, `lastAckedAt`, `orphaned`, `retiredOrphaned`, `droppedUnacked`,
+`holderIdentity`, `github` and `caps`. These are counts and times for seat-pulse, never a note or a
+target. The daemon logs `wake.schedule_set`, `wake.delivered`, `wake.settled`,
+`wake.schedule_ended`, `wake.schedule_orphaned`, `wake.watch_set`, `wake.github_polled`,
+`wake.watch_fired`, `wake.watch_failed`, `wake.github_backoff` and `ear.wake_identity_doubt`, none
+of them with a note, a target's text or the token.
 
 ### Context pressure (Claude Code)
 
