@@ -3188,15 +3188,32 @@ export class Daemon {
    * exactly `derived_publish`, never `sing`. An unanswered publish stays unknown: only
    * `derivedQuery` for the same election settles it. Each issued attempt is recorded by
    * ids and digests, never the text. No model tool calls this (#162 adds none, and the
-   * capsule stays out of any model's sight): it is the owner's integration's call.
+   * capsule stays out of any model's sight): it is the owner's integration's call. Like a
+   * tool call, shutdown drains it, and nothing starts or reaches the station once
+   * frond-ear is shutting down.
    */
-  public async derivedPublish(
+  public derivedPublish(
+    ear: string,
+    sources: readonly string[],
+    text: string,
+  ): Promise<DerivedOutcome> {
+    const work = this.publishDerived(ear, sources, text);
+    this.inFlight.add(work);
+    const settled = () => this.inFlight.delete(work);
+    work.then(settled, settled);
+    return work;
+  }
+
+  private async publishDerived(
     ear: string,
     sources: readonly string[],
     text: string,
   ): Promise<DerivedOutcome> {
     const route = this.options.derivedRoute;
     const judge = (): { lineage: DerivedLineage } | { reason: string } => {
+      if (this.closing) {
+        return { reason: "closed: frond-ear is shutting down" };
+      }
       const view = this.sourceCustody(ear, sources);
       const gate = derivedPublication(
         this.config.canticle?.derivedPublication === true,
@@ -3301,13 +3318,15 @@ export class Daemon {
       });
     }
     const electionId = issued.electionId;
-    this.store.updateDerived(id, { state: "claimed", electionId });
+    if (!this.stopped) {
+      this.store.updateDerived(id, { state: "claimed", electionId });
+    }
     const again = judge();
     if ("reason" in again) {
       return settle({
         state: "refused",
         electionId,
-        reason: `custody moved while the capsule was issued (${again.reason}); election ${electionId} is left unpublished`,
+        reason: `stopped after the capsule was issued (${again.reason}); election ${electionId} is left unpublished`,
       });
     }
     let answer: Record<string, unknown>;

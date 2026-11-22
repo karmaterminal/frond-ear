@@ -823,7 +823,8 @@ owner's integration calls it. It stays closed, and says why, unless every one of
    configured and this uid is admitted. Any other answer, or none, closes it in the station's words.
 
 Custody is judged again after each wait (the probe, the issuer), so a compaction or a new session meanwhile stops it
-before the station gets anything.
+before the station gets anything. Shutdown drains a publication in flight as it drains a tool call, and once frond-ear
+is shutting down none starts or reaches the station.
 
 #162's transport takes only `derived_publish` with exactly `op`, `capsule_b64` and `text`, and `derived_query` with
 exactly `op` and `election_id`, one JSON line per connection. Lineage, audience and signer are not request fields:
@@ -833,8 +834,9 @@ identity, payload digest and the lineage above; the author, the session holding 
 the narrowest source scope) and the text, then sends the station exactly `derived_publish`.
 
 Each issued attempt is a `derived_publications` row by source ids and digests, never the text: `issuing`, `claimed`
-(the election issued), then `accepted` with the station's receipt, `refused` (the issuer or the station said no, or
-custody moved while the capsule was issued), or `unknown` when no answer came. An unknown one is never published again:
+(the election issued), then `accepted` with the station's receipt, `refused` (the issuer or the station said no, or it
+was stopped after the capsule was issued: custody moved, or frond-ear began shutting down), or `unknown` when no answer
+came. An unknown one is never published again:
 `derivedQuery(ear, election_id)` asks the station about the same election and settles the row if it was accepted.
 
 ## Troubleshooting
