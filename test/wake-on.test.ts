@@ -328,6 +328,12 @@ test("wake_on ci_done binds the PR's head: yesterday's completed checks never wa
   });
   let onS2: unknown = { total_count: 0, check_runs: [] };
   fake.routes.set(`${R}/commits/${S2}/check-runs`, () => ({ body: onS2 }));
+  // No commit statuses: GitHub's combined status then reads pending with none.
+  for (const sha of [S2, S3, S4]) {
+    fake.routes.set(`${R}/commits/${sha}/status`, {
+      body: { state: "pending", total_count: 0, statuses: [] },
+    });
+  }
   const h = harness(config(), { githubFetch: fake.fetch });
   try {
     const shim = h.attach("scribe", { sessionId: A });
@@ -362,7 +368,8 @@ test("wake_on ci_done binds the PR's head: yesterday's completed checks never wa
         { name: "lint", status: "completed", conclusion: "failure" },
       ],
     };
-    await advance(h, POLL);
+    // Done is a reading that holds on two polls in a row.
+    await advance(h, 2 * POLL);
     const [done] = wakes(shim);
     assert.ok(done);
     assert.match(
@@ -970,6 +977,64 @@ test("wake_on review: a review begun before the watch (a lower id, pending and u
     assert.ok(event, "review 9 fired");
     assert.match(event.content, /review 9 by r1, state CHANGES_REQUESTED/u);
     assert.doesNotMatch(event.content, /review 10 by/u);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("wake_on ci_done counts commit statuses too, and waits for done to hold on two polls, so a second wave of checks doesn't fire it early", async () => {
+  const fake = new FakeGithub();
+  fake.routes.set(`${R}/pulls/17`, {
+    body: { state: "open", head: { sha: S1 } },
+  });
+  let runs: unknown[] = [
+    { name: "build", status: "in_progress", conclusion: null },
+  ];
+  fake.routes.set(`${R}/commits/${S1}/check-runs`, () => ({
+    body: { total_count: runs.length, check_runs: runs },
+  }));
+  let status: unknown = {
+    state: "pending",
+    total_count: 1,
+    statuses: [{ context: "ci/external", state: "pending" }],
+  };
+  fake.routes.set(`${R}/commits/${S1}/status`, () => ({ body: status }));
+  const h = harness(config(), { githubFetch: fake.fetch });
+  try {
+    const shim = h.attach("scribe", { sessionId: A });
+    await watch(h, shim, { target: "pr", number: 17, on: "ci_done" });
+    runs = [{ name: "build", status: "completed", conclusion: "success" }];
+    await advance(h, 3 * POLL);
+    assert.equal(wakes(shim).length, 0, "the external status is still pending");
+
+    status = {
+      state: "success",
+      total_count: 1,
+      statuses: [{ context: "ci/external", state: "success" }],
+    };
+    await advance(h, POLL);
+    assert.equal(wakes(shim).length, 0, "one complete reading is not yet done");
+    // A second wave: a workflow the first one triggered adds a run.
+    runs = [
+      { name: "build", status: "completed", conclusion: "success" },
+      { name: "deploy-preview", status: "queued", conclusion: null },
+    ];
+    await advance(h, POLL);
+    assert.equal(wakes(shim).length, 0, "the second wave holds it open");
+    runs = [
+      { name: "build", status: "completed", conclusion: "success" },
+      { name: "deploy-preview", status: "completed", conclusion: "success" },
+    ];
+    await advance(h, POLL);
+    assert.equal(wakes(shim).length, 0);
+    await advance(h, POLL);
+    const [done] = wakes(shim);
+    assert.ok(done, "complete on two polls in a row");
+    assert.match(
+      done.content,
+      /all 2 check runs and 1 commit status on 1{40} completed/u,
+    );
+    assert.match(done.content, /> ci\/external: success/u);
   } finally {
     h.dispose();
   }
