@@ -1638,3 +1638,44 @@ test("#119 re-review: records dropped from delivery's buffer are not told again 
     h.dispose();
   }
 });
+
+test("#119 re-review 1: records pushed before a reload are not told as dropped when the live set evicts them after it", async () => {
+  const delivery = { mode: "immediate", maxPushesPerHour: 360, maxItems: 10 };
+  const { h, host } = setup(delivery);
+  try {
+    const shim = h.attach("scribe");
+    const deploy = { stream: "ops.deploy", ttlMs: 3_600_000 };
+    for (let round = 0; round < 30; round++) {
+      for (let i = 1; i <= 10; i++) host.sing(round * 10 + i, deploy);
+      h.timers.advance(6_000);
+    }
+    h.timers.advance(6_000);
+    assert.equal(tally(shim, "ops:ops.deploy").pushed, 300);
+    // A reload: what is on air is read again; the pushed records stay decided.
+    h.daemon.reloadConfig(canticleConfig(delivery));
+    h.timers.advance(1_000);
+    for (let s = 1; s <= 15; s++) {
+      for (let n = 1; n <= 300; n++) {
+        host.sing(n, {
+          station: `stray${s}`,
+          key: STRAY,
+          epoch: s,
+          ttlMs: 3_600_000,
+        });
+      }
+    }
+    assert.ok(
+      host.consumer.liveStatus(h.clock.now()).omitted["ops:ops.deploy"]!.total >
+        0,
+    );
+    host.sing(1);
+    h.timers.advance(6_000);
+    assert.equal(
+      overflowTold(shim, "ops:ops.deploy"),
+      0,
+      "the session has them",
+    );
+  } finally {
+    h.dispose();
+  }
+});
