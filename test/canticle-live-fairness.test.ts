@@ -3725,6 +3725,41 @@ for (const regain of REGAINED) {
 }
 
 for (const { keys, name } of ROTATIONS) {
+  test(`#119 E2 (an entry of its own at first; ${name}, and back): a stream with an entry of its own, counted together as one push is given back, that loses that place and gets one back from the next push, keeps its latest key`, async () => {
+    const [latest, stale] = keys;
+    const { h, shim, sing, pause, free } = await spent();
+    try {
+      // The first counts s511 together, owed nothing; s0's note, owed, makes it go.
+      pause(true);
+      sing(latest, 1, [...range(1, 256), 511, ...range(257, 508)]);
+      pause(false);
+      sing(latest, 1, [0]);
+      free();
+      // The second counts s1, s2, s3 and s511 together. Given back, s1 takes the last
+      // place free and s2 takes s511's; then s511 gets one back.
+      sing(latest, 2, [...range(4, 259), 1, 2, 3, 511]);
+      free();
+      sing(stale, 3, [511]);
+      free();
+      pause(true);
+      sing(latest, 4, [511]);
+      assert.equal(pendingNotes(h)["s511:ops.fleet"]?.owed, false, "its own");
+      pause(false);
+      shim.close(); // all given back, the earliest first
+      const next = h.attach("scribe", { sessionId: SESSION });
+      const off = offBut(512, 511);
+      assert.equal(wakesUnder(h, next, stale, off), 0, "the stale key");
+      assert.equal(foldedPlace(h, "s511:ops.fleet")?.key, latest, "a place");
+      assert.equal(wakesUnder(h, next, latest, off), 1, "the latest key");
+      const total = 256 + 1 + 252 + 1 + (256 + 4) + 1 + 1;
+      assert.equal(omissionsTold(pushes(next)[0]!.content), total, "told");
+    } finally {
+      h.dispose();
+    }
+  });
+}
+
+for (const { keys, name } of ROTATIONS) {
   test(`#119 E2, control (${name}): a stream that loses the place an earlier push gave back, and gets one back from a later push, takes the later push's key`, async () => {
     const [stale, latest] = keys;
     const { h, shim, sing, pause, free } = await spent();
