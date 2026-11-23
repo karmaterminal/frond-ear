@@ -736,11 +736,15 @@ binary-canticle#168 §2.7a), the push ends with a `local omissions` note: per st
 span of times. `push_budget`, `paused`, `no_session`, `breaker_open` and `breaker_half_open` name the hold a record
 went off air under; `expired_waiting` is one that went off air waiting for its push (say, sent on to a report due
 after its expiry); `live_overflow` is what the live set dropped that this ear would have pushed (an allowlisted
-key, sung at hop 0, not wake-derived). Each record is told once: one the live set evicts after this ear pushed it,
-passed it over or dropped it from its own buffer isn't told again, and one the ear was waiting to push stops
-waiting and is told as `live_overflow`. What the live set dropped past the 256 tuned streams it counts one by one
-is a single `other tuned streams` line: no station is known, so it says whether this ear would have pushed them is
-unknown, and it only rides with a push that goes anyway. A record that left the view first (plucked, superseded,
+key, sung at hop 0, not wake-derived). Each record is told once. A drop isn't told if the record is back on view,
+if this ear pushed it or passed it over, or if a push already said it won't come (dropped from the ear's own full
+buffer, or told as an earlier drop, say of a copy that came back and was refused again). One the ear was waiting
+to push stops waiting and is told as `live_overflow`, and so is a pushed record the live set dropped while its push
+was unconfirmed, once that push is given back. What a push said won't come is remembered in memory only, so after a
+frond-ear restart a copy refused again is told again. What the live set dropped past the 256 tuned streams it
+counts one by one is a single `other tuned streams` line: no station is known, so it says whether this ear would
+have pushed them is unknown. It only rides with a push that goes anyway, and not at all while nothing could be
+pushed (no `wakeKeys`, or a mute over every station). A record that left the view first (plucked, superseded,
 the link went) isn't frond-ear's doing, and is only counted, as before. What hasn't been told yet survives a restart
 (`canticle.withheld.<ear>` in the store), and a note in a push the host never confirmed is told again once that
 push is given back.

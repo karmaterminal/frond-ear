@@ -32,8 +32,8 @@
 // 3-5; #168 §2.7a "local omission"): a record that goes off air while a hold or the push
 // budget keeps it, or while it waits for its push, and what the record source's live set
 // dropped of records the ear would have pushed, go into the next push's coverage note with
-// the reason and the span of times, each record once (one the live set evicts after it was
-// pushed, passed over or dropped from a full buffer is told already). A push that says
+// the reason and the span of times, each record once (one the live set drops after it was
+// pushed, passed over, dropped from a full buffer or told of is not told again). A push that says
 // records wait for the next one keeps
 // its word: if they go off air instead, and nothing else is waiting to carry the note, a
 // push of its own carries it, as does what the budget held, when the budget next allows a
@@ -73,7 +73,7 @@ import type {
 import type { Clock, Timers } from "../types.ts";
 import { iso, joinedLate, onAir, renderItem, secs, token } from "./hear.ts";
 import type { HearView, LiveItem } from "./receptor.ts";
-import type { LiveOmission } from "./records.ts";
+import type { LiveDrop, LiveOmission } from "./records.ts";
 
 /** How often each delivering ear's view is read. */
 export const POLL_MS = 1_000;
@@ -211,6 +211,11 @@ interface Waiting {
   promised?: true;
   /** The last view didn't show it (retracted, superseded, or the link is down). */
   gone?: true;
+  /**
+   * When the record source's live set dropped it while a push that carried it was still
+   * unconfirmed: given back, it is told as that drop unless it is back on view.
+   */
+  dropped?: number;
 }
 
 /** Where pushes left off, per ear; saved with each push's tombstones. */
@@ -346,13 +351,16 @@ interface EarState {
   missed: Map<string, Missed>;
   /**
    * Per `station:stream` (and `OTHER`), what the record source's live set had dropped of
-   * what a push could carry (its entry, that entry's total and evicted total, and when it
-   * last dropped one) as of the last pass, so each drop is told once.
+   * what a push could carry (its entry, that entry's total, and when it last dropped one)
+   * as of the last pass, so each drop is told once.
    */
-  overflow: Map<
-    string,
-    { serial: number; total: number; evicted: number; at: number }
-  >;
+  overflow: Map<string, { serial: number; total: number; at: number }>;
+  /**
+   * Identity → when to forget it: records a push or its footer has said this ear won't get
+   * (dropped from a full buffer, or by the record source's live set), until their local
+   * expiry, so a later drop of one is not told again.
+   */
+  reported: Map<string, number>;
   counts: Record<string, number>;
   cursor: Cursor;
   /** `missed` (or what an unconfirmed push carried) changed since it was last saved. */
@@ -507,6 +515,18 @@ class Modes {
     return chosen !== undefined && RANK[chosen] < RANK[ceiling]
       ? chosen
       : ceiling;
+  }
+
+  /** Whether a push could carry anything: no mute over the whole ear, and a ceiling that pushes. */
+  pushesAny(): boolean {
+    if (this.muted !== undefined) return false;
+    if (this.#choices.some((c) => c.scope === "*" && c.mode === "mute")) {
+      return false;
+    }
+    return [
+      this.#delivery.mode,
+      ...Object.values(this.#delivery.stations),
+    ].some((mode) => RANK[mode] > 0);
   }
 
   get style(): ReportStyle {
@@ -688,6 +708,9 @@ export class CanticleDelivery {
     for (const [id, seen] of state.seen) {
       if (seen.until <= now) state.seen.delete(id);
     }
+    for (const [id, until] of state.reported) {
+      if (until <= now) state.reported.delete(id);
+    }
     // A record that goes off air while still on view was withheld here (§2.7a local
     // omission): by whatever holds pushes now, or, with nothing holding them, by its wait.
     // One the view had already lost (retracted, superseded, the link went) was not.
@@ -703,12 +726,12 @@ export class CanticleDelivery {
         );
       }
     }
-    this.#overflow(ear, state, view, keys, modes, now);
+    const heard = liveNow(view);
+    const live = new Set(heard.map(identity));
+    this.#overflow(ear, state, view, live, keys, modes, now);
     /** What a mute passed over: settled, so no restart or reload pushes it later. */
     const muted: Settling[] = [];
     // Refreshes last, so one finds the record it re-issues already waiting (§7.9).
-    const heard = liveNow(view);
-    const live = new Set(heard.map(identity));
     for (const item of [
       ...heard.filter((item) => item.refresh !== true),
       ...heard.filter((item) => item.refresh === true),
@@ -865,24 +888,36 @@ export class CanticleDelivery {
    * coverage note as `live_overflow`, owed. A drop no push would ever have carried wakes
    * nobody; `hear` still names it.
    *
-   * Told once per record: of what the live set evicted (held, then gave up), delivery
-   * counts only what it never saw. One it pushed, passed over, or dropped from its own
-   * buffer is told already (or not this ear's to tell); one it waits on stops waiting and
-   * is counted here, with when it went. An eviction past what the source still names is
-   * counted, since it can't be looked up: at worst told twice, never left out.
+   * Told once per record, by identity: a drop is not told if the record is on view again,
+   * if this ear pushed or passed it over, or if a push or its footer already said it won't
+   * come (dropped from a full buffer, or an earlier drop of it). One it waits on stops
+   * waiting and is told with its stream. A drop past what the source still names can't be
+   * looked up and is told: at worst twice, never left out. A record pushed in a push not
+   * yet confirmed is marked, so a revert that gives the push back tells it as this drop.
    *
    * What the live set dropped past the streams it counts one by one (`otherOmitted`) has no
-   * station to meet the boundary: it rides with the next push as one line saying so, and
+   * station to meet the boundary: unless nothing could be pushed at all (no `wakeKeys`, or
+   * a mute over every station), it rides with the next push as one line saying so, and
    * never asks for a push of its own.
    */
   #overflow(
     ear: string,
     state: EarState,
     view: HearView,
+    live: ReadonlySet<string>,
     keys: ReadonlySet<string>,
     modes: Modes,
     now: number,
   ): void {
+    // Given back after the live set dropped it: told now, unless it is on view again.
+    for (const waiting of [...state.waiting.values()]) {
+      if (waiting.dropped === undefined) continue;
+      if (live.has(waiting.id)) delete waiting.dropped;
+      else if (this.#passOver(waiting.item, keys, modes) === undefined) {
+        this.#unwait(state, waiting);
+        this.#withhold(state, waiting, waiting.dropped);
+      }
+    }
     const entries: Array<[string, LiveOmission]> = [
       ...(view.omitted ?? []).map(
         (o) => [`${o.station}:${o.stream}`, o] as [string, LiveOmission],
@@ -897,13 +932,13 @@ export class CanticleDelivery {
       if (!listed.has(stream)) state.overflow.delete(stream);
     }
     const settled = this.#settled.get(ear);
+    let unconfirmed: Map<string, Waiting> | undefined;
     for (const [stream, o] of entries) {
       const before = state.overflow.get(stream);
       const same = before !== undefined && before.serial === o.serial;
       state.overflow.set(stream, {
         serial: o.serial,
         total: o.pushableTotal,
-        evicted: o.evictedTotal,
         at: o.to,
       });
       // First seen: only what would still be on air (its window); after, every new drop.
@@ -914,35 +949,40 @@ export class CanticleDelivery {
           ? o.pushable
           : o.pushableTotal;
       if (added <= 0) continue;
-      const since = same
-        ? before.evicted
-        : before === undefined
-          ? o.evictedTotal - o.evicted
-          : 0;
-      // Every new drop is told, but for the evictions this ear has seen: refused records,
-      // and evictions past what the source still names, never were.
+      const since = o.pushableTotal - added;
       let told = added;
-      for (const e of (o.evictions ?? []).filter((e) => e.n > since)) {
-        const id = identity(e);
+      const fresh: LiveDrop[] = [];
+      for (const d of (o.drops ?? []).filter((d) => d.n > since)) {
+        const id = identity(d);
         const waiting = state.waiting.get(id);
-        if (waiting === undefined) {
-          // Pushed, passed over or dropped from the buffer: told already, or not this ear's.
-          if (
-            (settled?.get(id) ?? 0) > now ||
-            state.seen.get(id)?.gen === state.gen
-          ) {
-            told -= 1;
+        if (waiting !== undefined && !live.has(id)) {
+          told -= 1;
+          // Passed over this pass anyway (a mode or the boundary changed): not ours to tell.
+          if (this.#passOver(waiting.item, keys, modes) !== undefined) continue;
+          this.#unwait(state, waiting);
+          this.#withhold(state, waiting, d.at);
+        } else if (
+          live.has(id) ||
+          (settled?.get(id) ?? 0) > now ||
+          (state.reported.get(id) ?? 0) > now ||
+          state.seen.get(id)?.gen === state.gen
+        ) {
+          // On view again, pushed or passed over, or told already: not a drop to tell.
+          told -= 1;
+          if ((settled?.get(id) ?? 0) > now) {
+            unconfirmed ??= new Map(
+              [...(this.#unconfirmed.get(ear)?.values() ?? [])].flatMap(
+                (push) => push.records.map((w) => [w.id, w] as const),
+              ),
+            );
+            const pushed = unconfirmed.get(id);
+            if (pushed !== undefined) pushed.dropped ??= d.at;
           }
-          continue;
-        }
-        told -= 1;
-        // Passed over this pass anyway (a mode or the boundary changed): not ours to tell.
-        if (this.#passOver(waiting.item, keys, modes) !== undefined) continue;
-        this.#unwait(state, waiting);
-        this.#withhold(state, waiting.stream, waiting.item.key, e.at);
+        } else fresh.push(d);
       }
       if (told <= 0) continue;
       if (stream === OTHER) {
+        if (keys.size === 0 || !modes.pushesAny()) continue;
         this.#count(state, "live_overflow_other", told);
         const missed = this.#missed(state, OTHER, o.key);
         if (missed === undefined) continue;
@@ -953,33 +993,50 @@ export class CanticleDelivery {
           same ? Math.max(o.from, before.at) : o.from,
           o.to,
         );
-        state.dirty = true;
-        continue;
+      } else {
+        const mode = modes.of({ key: o.key, station: o.station });
+        if (!keys.has(o.key.toLowerCase()) || mode === "off" || mode === "mute")
+          continue;
+        this.#count(state, "live_overflow", told);
+        const missed = this.#missed(state, stream, o.key);
+        if (missed === undefined) continue;
+        missed.key = o.key;
+        // Dropped after the last pass looked: from then, or this window's start if later.
+        const from = same ? Math.max(o.from, before.at) : o.from;
+        widen(missed.withheld, "live_overflow", told, from, o.to);
+        missed.owed = true;
       }
-      const mode = modes.of({ key: o.key, station: o.station });
-      if (!keys.has(o.key.toLowerCase()) || mode === "off" || mode === "mute")
-        continue;
-      this.#count(state, "live_overflow", told);
-      const missed = this.#missed(state, stream, o.key);
-      if (missed === undefined) continue;
-      missed.key = o.key;
-      // Dropped after the last pass looked: from then, or this window's start if later.
-      const from = same ? Math.max(o.from, before.at) : o.from;
-      widen(missed.withheld, "live_overflow", told, from, o.to);
-      missed.owed = true;
+      for (const d of fresh) {
+        this.#report(state, identity(d), d.until + SETTLE_SKEW_MS);
+      }
       state.dirty = true;
     }
   }
 
-  /** A record that waited was evicted by the live set at `at`: told with its stream, owed. */
-  #withhold(state: EarState, stream: string, key: string, at: number): void {
+  /** A record that waited was dropped by the live set at `at`: told with its stream, owed. */
+  #withhold(state: EarState, waiting: Waiting, at: number): void {
     this.#count(state, "live_overflow");
-    const missed = this.#missed(state, stream, key);
+    this.#report(state, waiting.id, waiting.expiresAt + SETTLE_SKEW_MS);
+    const missed = this.#missed(state, waiting.stream, waiting.item.key);
     if (missed === undefined) return;
-    missed.key = key;
+    missed.key = waiting.item.key;
     widen(missed.withheld, "live_overflow", 1, at, at);
     missed.owed = true;
     state.dirty = true;
+  }
+
+  /** A push or its footer said this record won't come: a later drop of it isn't told again. */
+  #report(state: EarState, id: string, until: number): void {
+    if (!state.reported.has(id) && state.reported.size >= MAX_SEEN) {
+      // The soonest to lapse goes first; at worst that record is told again.
+      let soonest: string | undefined;
+      let at = Infinity;
+      for (const [key, lapses] of state.reported) {
+        if (lapses < at) [soonest, at] = [key, lapses];
+      }
+      if (soonest !== undefined) state.reported.delete(soonest);
+    }
+    state.reported.set(id, Math.max(until, state.reported.get(id) ?? 0));
   }
 
   /** The cadence a push of its own carries owed notes on, or undefined if none may. */
@@ -1330,7 +1387,9 @@ export class CanticleDelivery {
         } else if (state.waiting.has(id)) {
           continue;
         } else if (waiting.expiresAt <= now) {
-          this.#miss(state, waiting, "offAir");
+          if (waiting.dropped !== undefined) {
+            this.#withhold(state, waiting, waiting.dropped);
+          } else this.#miss(state, waiting, "offAir");
         } else {
           this.#wait(state, waiting, delivery.bufferPerStream);
         }
@@ -1360,6 +1419,7 @@ export class CanticleDelivery {
         held: undefined,
         missed: new Map(),
         overflow: new Map(),
+        reported: new Map(),
         counts: {},
         cursor,
         dirty: false,
@@ -1548,8 +1608,10 @@ export class CanticleDelivery {
     if (missed === undefined) return;
     missed.key = waiting.item.key;
     state.dirty = true;
-    if (kind === "dropped") missed.dropped += 1;
-    else if (reason === undefined) missed.offAir += 1;
+    if (kind === "dropped") {
+      missed.dropped += 1;
+      this.#report(state, waiting.id, waiting.expiresAt + SETTLE_SKEW_MS);
+    } else if (reason === undefined) missed.offAir += 1;
     else {
       const heard = waiting.item.heardAt;
       widen(missed.withheld, reason, 1, heard, heard);

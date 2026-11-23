@@ -1473,7 +1473,11 @@ test("#119 re-review 1: records the live set refused and told are not told again
     h.dispose();
   }
 
-  const second = setup({ mode: "immediate", maxPushesPerHour: 360 });
+  const second = setup({
+    mode: "immediate",
+    maxPushesPerHour: 360,
+    maxItems: 10,
+  });
   try {
     const { h, host } = second;
     const shim = h.attach("scribe");

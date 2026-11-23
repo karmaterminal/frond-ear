@@ -60,8 +60,8 @@ const MAX_OMITTED_STREAMS = 256;
 const UNTUNED = "untuned";
 /** Where a tuned stream's drops are counted past `MAX_OMITTED_STREAMS`. */
 const OTHER_TUNED = "other";
-/** Tuned records the live set evicted that a push could have carried, kept by identity. */
-const MAX_EVICTIONS = MAX_LIVE;
+/** Tuned records the live set dropped that a push could have carried, kept by identity. */
+const MAX_DROPS = MAX_LIVE;
 /** The join-snapshot entry cap (§14.18.3 "Join snapshot", [PROPOSED DEFAULT]). */
 export const MAX_SNAPSHOT_ENTRIES = 511;
 /** …and of entry bytes; an entry is measured as its JSON, which is never above its line. */
@@ -230,11 +230,13 @@ class LiveSet {
   }
 }
 
-/** One record the live set evicted: its identity, and `n`, its place in `evictedTotal`. */
-export interface LiveEviction {
+/** One record the live set dropped: its identity, and `n`, its place in `pushableTotal`. */
+export interface LiveDrop {
   n: number;
-  /** When the live set evicted it (this host's clock). */
+  /** When the live set dropped it (this host's clock). */
   at: number;
+  /** Its local expiry: it would be on air until then. */
+  until: number;
   key: string;
   epoch: number;
   stream: string;
@@ -247,10 +249,10 @@ export interface LiveEviction {
  * between `from` and `to` (this host's clock); and `total`, every one since this entry
  * began (`serial`), which delivery compares with what it has already reported. The
  * `pushable` counts are those sung at hop 0 and not wake-derived: the only ones a push
- * could have carried. Of those, `evicted` (this window) and `evictedTotal` (since the entry
- * began) the set held and then gave up; the rest it refused on arrival. Delivery may have
- * pushed, dropped or still wait on an evicted record, so `hearView` names the latest
- * evictions in `evictions` (oldest first), and delivery counts only those it never saw.
+ * could have carried. A dropped record may be one delivery already pushed, dropped, told
+ * of or still waits on (the set held it, then gave it up; or a copy of it came back and was
+ * refused), so `hearView` names the latest pushable drops in `drops`, and delivery counts
+ * only those it never accounted for.
  */
 export interface LiveOmission {
   station: string;
@@ -264,13 +266,11 @@ export interface LiveOmission {
   total: number;
   pushable: number;
   pushableTotal: number;
-  evicted: number;
-  evictedTotal: number;
   /**
-   * In a `hearView`: the latest of `evictedTotal` still kept (at most `MAX_LIVE` across every
-   * entry); one past the bound is known only by its count.
+   * In a `hearView`: the latest of `pushableTotal` still kept, oldest first (at most
+   * `MAX_LIVE` across every entry); one past the bound is known only by its count.
    */
-  evictions?: LiveEviction[];
+  drops?: LiveDrop[];
   /** Tells this entry from an earlier one for the same share that was let go. */
   serial: number;
 }
@@ -429,12 +429,12 @@ export class RecordConsumer {
    * window opened: the ears `hearView` shows that count to.
    */
   readonly #otherPatterns = new Set<string>();
-  /** The latest pushable evictions, by entry (its key and serial), oldest first. */
-  readonly #evictions = new Map<
+  /** The latest pushable tuned drops, by entry (its key and serial), oldest first. */
+  readonly #drops = new Map<
     number,
-    LiveEviction & { entry: string; serial: number }
+    LiveDrop & { entry: string; serial: number }
   >();
-  #evictionSeq = 0;
+  #dropSeq = 0;
   /**
    * Patterns tuned (by `retune`) while the untuned share was dropping records that would
    * still be on air: until `until`, such a stream's records from before `at` may be missing.
@@ -932,15 +932,12 @@ export class RecordConsumer {
     }
     const oldest = this.#live.oldest(giver)!;
     this.#live.delete(oldest.idem);
-    this.#drop(giver, oldest, nowMs, true);
+    this.#drop(giver, oldest, nowMs);
     return true;
   }
 
-  /**
-   * The live set dropped `r` from `share` (`evicted`: held, then given up; else refused on
-   * arrival): counted against it, and receive health says so.
-   */
-  #drop(share: string, r: LiveRecord, nowMs: number, evicted = false): void {
+  /** The live set dropped `r` from `share`: counted against it, and receive health says so. */
+  #drop(share: string, r: LiveRecord, nowMs: number): void {
     const tuned = share !== UNTUNED;
     const at =
       tuned && !this.#omitted.has(share) ? this.#room(share, nowMs) : share;
@@ -957,8 +954,6 @@ export class RecordConsumer {
         total: 0,
         pushable: 0,
         pushableTotal: 0,
-        evicted: 0,
-        evictedTotal: 0,
         serial: ++this.#omittedSerial,
       };
       this.#omitted.set(at, o);
@@ -967,7 +962,6 @@ export class RecordConsumer {
       // The last window's records are all off air by now: a new one opens.
       o.count = 0;
       o.pushable = 0;
-      o.evicted = 0;
       o.from = nowMs;
       if (at === OTHER_TUNED) this.#otherPatterns.clear();
     }
@@ -984,25 +978,22 @@ export class RecordConsumer {
     if (r.item.hop === 0 && r.item.wakeDerived === false) {
       o.pushable += 1;
       o.pushableTotal += 1;
-      if (evicted) {
-        o.evicted += 1;
-        o.evictedTotal += 1;
-      }
-      // No ear reads an untuned share's entry, so only a tuned eviction is kept by name.
-      if (evicted && tuned) {
+      // No ear reads an untuned share's entry, so only a tuned drop is kept by name.
+      if (tuned) {
         const { key, epoch, stream, seq } = r.item;
-        this.#evictions.set(++this.#evictionSeq, {
+        this.#drops.set(++this.#dropSeq, {
           entry: at,
           serial: o.serial,
-          n: o.evictedTotal,
+          n: o.pushableTotal,
           at: nowMs,
+          until: r.localExpiryAt,
           key,
           epoch,
           stream,
           seq,
         });
-        if (this.#evictions.size > MAX_EVICTIONS) {
-          this.#evictions.delete(this.#evictions.keys().next().value!);
+        if (this.#drops.size > MAX_DROPS) {
+          this.#drops.delete(this.#drops.keys().next().value!);
         }
       }
     }
@@ -1043,7 +1034,6 @@ export class RecordConsumer {
     for (const o of this.#omitted.values()) {
       o.count = 0;
       o.pushable = 0;
-      o.evicted = 0;
       o.until = 0;
     }
     this.#retuned.clear();
@@ -1373,7 +1363,7 @@ export class RecordConsumer {
   /**
    * What one ear hears now, through its `station:stream` tune, and what the live set
    * dropped that the ear would hear: per tuned stream (each with its `total` and latest
-   * evictions, for delivery), the shared count past `MAX_OMITTED_STREAMS` when a pattern of
+   * drops, for delivery), the shared count past `MAX_OMITTED_STREAMS` when a pattern of
    * this ear's took in a stream it counts, the untuned share's open window, and patterns
    * tuned while it was dropping records.
    */
@@ -1385,17 +1375,17 @@ export class RecordConsumer {
     const tuned = (station: string, stream: string) =>
       tunes(patterns, station, stream);
     this.#syncOverflow(nowMs);
-    const evictions = new Map<string, LiveEviction[]>();
-    for (const { entry, serial, ...e } of this.#evictions.values()) {
+    const drops = new Map<string, LiveDrop[]>();
+    for (const { entry, serial, ...d } of this.#drops.values()) {
       if (this.#omitted.get(entry)?.serial !== serial) continue;
-      let list = evictions.get(entry);
-      if (list === undefined) evictions.set(entry, (list = []));
-      list.push(e);
+      let list = drops.get(entry);
+      if (list === undefined) drops.set(entry, (list = []));
+      list.push(d);
     }
     const view = (share: string, o: LiveOmission): LiveOmission => ({
       ...o,
-      ...(o.until > nowMs ? {} : { count: 0, pushable: 0, evicted: 0 }),
-      evictions: evictions.get(share) ?? [],
+      ...(o.until > nowMs ? {} : { count: 0, pushable: 0 }),
+      drops: drops.get(share) ?? [],
     });
     const omitted = [...this.#omitted]
       .filter(
