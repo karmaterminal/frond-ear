@@ -1428,3 +1428,209 @@ test("#119 review 5: what the live set evicts after delivery pushed it, or dropp
     }
   }
 });
+
+// Independent review of the repair: what is reported once stays reported once.
+
+/** 16 full shares: ops:ops.fleet's 256 first (the first of the largest), then 15 strays'. */
+function sixteenShares(host: Host, ttlMs = 300_000) {
+  for (let n = 1; n <= 256; n++) host.sing(n, { ttlMs });
+  for (let s = 1; s <= 15; s++) {
+    for (let n = 1; n <= 256; n++) {
+      host.sing(n, { station: `stray${s}`, key: STRAY, epoch: s, ttlMs });
+    }
+  }
+}
+
+/** live_overflow counts a stream's coverage-note lines told, across every push. */
+const overflowTold = (shim: Parameters<typeof pushes>[0], stream: string) =>
+  pushes(shim)
+    .flatMap((push) => [
+      ...push.content.matchAll(
+        new RegExp(
+          `^- ${stream.replace(/\./gu, "\\.")}: (\\d+) dropped by frond-ear's full live set \\(live_overflow; `,
+          "gmu",
+        ),
+      ),
+    ])
+    .reduce((n, m) => n + Number(m[1]), 0);
+
+test("#119 re-review 1: records the live set refused and told are not told again when their copies are refused again; a pushed record's refused copy is not told at all", async () => {
+  const { h, host } = setup({ mode: "immediate", maxPushesPerHour: 360 });
+  try {
+    const shim = h.attach("scribe");
+    const deploy = { stream: "ops.deploy", ttlMs: 3_600_000 };
+    for (let n = 1; n <= MAX_LIVE + 50; n++) host.sing(n, deploy);
+    h.timers.advance(6_000);
+    assert.equal(overflowTold(shim, "ops:ops.deploy"), 50);
+    // The host sends the 50 again (a restarted receptor's resurfaced copies): refused again.
+    for (let n = MAX_LIVE + 1; n <= MAX_LIVE + 50; n++) {
+      host.sing(n, { ...deploy, dedup: "resurfaced" });
+    }
+    host.sing(1);
+    h.timers.advance(6_000);
+    assert.equal(overflowTold(shim, "ops:ops.deploy"), 50, "told once");
+  } finally {
+    h.dispose();
+  }
+
+  const second = setup({ mode: "immediate", maxPushesPerHour: 360 });
+  try {
+    const { h, host } = second;
+    const shim = h.attach("scribe");
+    const deploy = { stream: "ops.deploy", ttlMs: 3_600_000 };
+    for (let round = 0; round < 30; round++) {
+      for (let i = 1; i <= 10; i++) host.sing(round * 10 + i, deploy);
+      h.timers.advance(6_000);
+    }
+    h.timers.advance(6_000);
+    for (let s = 1; s <= 15; s++) {
+      for (let n = 1; n <= 300; n++) {
+        host.sing(n, {
+          station: `stray${s}`,
+          key: STRAY,
+          epoch: s,
+          ttlMs: 3_600_000,
+        });
+      }
+    }
+    // Copies of pushed records the flood evicted come back, and are refused.
+    for (let n = 1; n <= 10; n++)
+      host.sing(n, { ...deploy, dedup: "resurfaced" });
+    host.sing(1);
+    h.timers.advance(6_000);
+    assert.equal(tally(shim, "ops:ops.deploy").pushed, 300);
+    assert.equal(
+      overflowTold(shim, "ops:ops.deploy"),
+      0,
+      "the session has them",
+    );
+  } finally {
+    second.h.dispose();
+  }
+});
+
+test("#119 re-review 2: a record the live set evicts and admits again before delivery's next pass is pushed, and not told as dropped", async () => {
+  const { h, host } = setup({
+    mode: "immediate",
+    maxPushesPerHour: 360,
+    bufferPerStream: 256,
+    maxItems: 10,
+  });
+  try {
+    const shim = h.attach("scribe");
+    sixteenShares(host);
+    h.timers.advance(1_000); // ops's 256 wait
+    host.sing(1, { station: "stray16", key: STRAY, epoch: 16, ttlMs: 300_000 });
+    host.pluck(256, { station: "stray15", key: STRAY, epoch: 15 }); // a place frees
+    host.sing(1, { dedup: "resurfaced", ttlMs: 300_000 }); // ops's first, back on air
+    assert.ok(
+      host.view().items.some((i) => i.station === "ops" && i.seq === "1"),
+    );
+    for (let t = 0; t < 30; t++) h.timers.advance(1_000);
+    assert.ok(
+      pushes(shim).some((push) =>
+        order(push.content).includes("ops:ops.fleet/1"),
+      ),
+      "pushed",
+    );
+    assert.equal(overflowTold(shim, "ops:ops.fleet"), 0);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("#119 re-review 3: with every station muted, the shared count past 256 tuned streams is not told, then or after the mute lifts", async () => {
+  const delivery = { mode: "immediate", maxPushesPerHour: 360 };
+  const { h, host } = setup(delivery, { muted: true });
+  try {
+    const shim = h.attach("scribe");
+    const key = overflowEntries(host, "ops.deploy", 3_600_000);
+    for (let n = 1; n <= 20; n++) {
+      host.sing(n, {
+        station: "s999",
+        key: key(999),
+        stream: "ops.deploy",
+        ttlMs: 3_600_000,
+      });
+    }
+    h.timers.advance(2_000);
+    h.daemon.reloadConfig(canticleConfig(delivery));
+    host.sing(1);
+    h.timers.advance(6_000);
+    assert.equal(pushes(shim).length, 1);
+    assert.deepEqual(order(pushes(shim)[0]!.content), ["ops:ops.fleet/1"]);
+    assert.doesNotMatch(pushes(shim)[0]!.content, /other tuned streams/u);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("#119 re-review 4: a pushed record the live set evicts while its push is unconfirmed is told as the live set's drop once the push is given back", async () => {
+  const { h, host } = setup({
+    mode: "immediate",
+    maxPushesPerHour: 360,
+    bufferPerStream: 256,
+    maxItems: 10,
+  });
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    sixteenShares(host);
+    h.timers.advance(6_000);
+    assert.deepEqual(order(pushes(shim)[0]!.content).slice(0, 1), [
+      "ops:ops.fleet/1",
+    ]);
+    // Unconfirmed: the flood's next record evicts ops's first, which that push carried.
+    host.sing(1, { station: "stray16", key: STRAY, epoch: 16, ttlMs: 300_000 });
+    h.timers.advance(1_000);
+    shim.close(); // given back
+    const next = h.attach("scribe", { sessionId: SESSION });
+    h.timers.advance(6_000);
+    assert.equal(overflowTold(next, "ops:ops.fleet"), 1, "told at once");
+    assert.ok(
+      !order(pushes(next)[0]!.content).includes("ops:ops.fleet/1"),
+      "never pushed from memory",
+    );
+    for (let t = 0; t < 400; t++) h.timers.advance(1_000);
+    host.sing(257, { ttlMs: 300_000 });
+    for (let t = 0; t < 60; t++) h.timers.advance(1_000);
+    assert.equal(overflowTold(next, "ops:ops.fleet"), 1, "and only once");
+    assert.ok(
+      pushes(next).every(
+        (push) =>
+          !/^ops:ops\.fleet: \d+ went off air unpushed/mu.test(push.content),
+      ),
+    );
+  } finally {
+    h.dispose();
+  }
+});
+
+test("#119 re-review: records dropped from delivery's buffer are not told again when the live set evicts them after a reload", async () => {
+  const delivery = { mode: "immediate", maxPushesPerHour: 360, maxItems: 10 };
+  const { h, host } = setup(delivery);
+  try {
+    const shim = h.attach("scribe");
+    const deploy = { stream: "ops.deploy", ttlMs: 3_600_000 };
+    for (let n = 1; n <= 300; n++) host.sing(n, deploy);
+    h.timers.advance(30_000); // the buffer keeps the newest 32; the rest are told dropped
+    h.daemon.reloadConfig(canticleConfig(delivery));
+    for (let s = 1; s <= 15; s++) {
+      for (let n = 1; n <= 300; n++) {
+        host.sing(n, {
+          station: `stray${s}`,
+          key: STRAY,
+          epoch: s,
+          ttlMs: 3_600_000,
+        });
+      }
+    }
+    assert.ok(
+      host.consumer.liveStatus(h.clock.now()).omitted["ops:ops.deploy"]!.total >
+        0,
+    );
+    h.timers.advance(30_000);
+    assert.equal(overflowTold(shim, "ops:ops.deploy"), 0);
+  } finally {
+    h.dispose();
+  }
+});
