@@ -210,6 +210,24 @@ export class Host {
     });
   }
 
+  /**
+   * A keyed record's successor: the host retracts the record `old` it supersedes (same
+   * key, stream and state_key), then sings `seq`, in the order binary-canticle's host
+   * daemon emits them (its listener reports the supersession before the item).
+   */
+  supersede(old: number, seq: number, o: Song): void {
+    const target = this.fields(old, o);
+    const successor = this.fields(seq, o);
+    this.onAir.delete(target.idem as string);
+    this.#emit("retract", {
+      target: {},
+      idem: target.idem,
+      reason: "superseded",
+      by: { idem: successor.idem },
+    });
+    this.sing(seq, o);
+  }
+
   /** The transport closed without a `bye`: the run is out of reach, not over. */
   drop(): void {
     this.consumer.closed(this.now);
