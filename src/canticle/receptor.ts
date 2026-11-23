@@ -132,6 +132,11 @@ export interface HearView {
    * `station:stream`. Not set by the embedded receptor, whose listener keeps per-key quotas.
    */
   omitted?: import("./records.ts").LiveOmission[];
+  /**
+   * Record v1: the live set's drops past the tuned streams it counts one by one (station
+   * and stream empty), when one of this ear's patterns took in a stream they came from.
+   */
+  otherOmitted?: import("./records.ts").LiveOmission;
   /** Record v1: the untuned share's drops, while any of them would still be on air. */
   untunedOmitted?: { count: number; from: number; to: number; until: number };
   /**

@@ -32,11 +32,13 @@
 // Every map here has a fixed bound (§14.18.2 "nothing in the pipe is unbounded").
 // The live set is admitted against the tune (binary-canticle#168 §2.4 step 2, #171 F9):
 // each tuned station:stream is a share of its own, and every untuned one is admitted
-// under one share together. When the set is full, the share holding the most gives up a
-// record, so a flood, tuned or not, fills only its own share and a quiet stream still
-// gets in. What the set drops is counted against the share that lost it, degrades receive
-// health while those records would still be on air (`live_overflow_tuned` or
-// `live_overflow_untuned`), and reaches `hear` and the next push as a local omission (§2.7a).
+// under one share together. No ear reads an untuned record, so when the set is full the
+// untuned share gives way first; only then does the tuned share holding the most give up a
+// record. A flood, tuned or not, fills only its own share, and a quiet tuned stream gets
+// in within the bound `#makeRoom` states. What the set drops is counted against the share
+// that lost it, degrades receive health while those records would still be on air
+// (`live_overflow_tuned` or `live_overflow_untuned`), and reaches `hear` and the next push
+// as a local omission (§2.7a).
 // Framing: at most 64 KiB per line and nesting depth 8 (§14.18.2 [PROPOSED DEFAULT]).
 // Status outlives a reconnect (frond-ear#59): `hello` clears receive health, so `counts`
 // (the process's life) counts every health reason each time it is raised, and
@@ -58,6 +60,8 @@ const MAX_OMITTED_STREAMS = 256;
 const UNTUNED = "untuned";
 /** Where a tuned stream's drops are counted past `MAX_OMITTED_STREAMS`. */
 const OTHER_TUNED = "other";
+/** Tuned records the live set evicted that a push could have carried, kept by identity. */
+const MAX_EVICTIONS = MAX_LIVE;
 /** The join-snapshot entry cap (§14.18.3 "Join snapshot", [PROPOSED DEFAULT]). */
 export const MAX_SNAPSHOT_ENTRIES = 511;
 /** …and of entry bytes; an entry is measured as its JSON, which is never above its line. */
@@ -189,15 +193,12 @@ class LiveSet {
     return idem === undefined ? undefined : this.#all.get(idem)?.record;
   }
 
-  /** The share holding the most, the untuned one first among equals. */
-  largest(): { share: string; count: number } | undefined {
+  /** The tuned share holding the most; the untuned one never competes (`#makeRoom`). */
+  largestTuned(): { share: string; count: number } | undefined {
     let best: { share: string; count: number } | undefined;
     for (const [share, idems] of this.#shares) {
-      if (
-        best === undefined ||
-        idems.size > best.count ||
-        (idems.size === best.count && share === UNTUNED)
-      ) {
+      if (share === UNTUNED) continue;
+      if (best === undefined || idems.size > best.count) {
         best = { share, count: idems.size };
       }
     }
@@ -229,13 +230,27 @@ class LiveSet {
   }
 }
 
+/** One record the live set evicted: its identity, and `n`, its place in `evictedTotal`. */
+export interface LiveEviction {
+  n: number;
+  /** When the live set evicted it (this host's clock). */
+  at: number;
+  key: string;
+  epoch: number;
+  stream: string;
+  seq: string;
+}
+
 /**
  * What the live set dropped from one share (§2.7a local omission, `live_overflow`): the
  * records of its current window, which would still be on air until `until`, dropped
  * between `from` and `to` (this host's clock); and `total`, every one since this entry
  * began (`serial`), which delivery compares with what it has already reported. The
  * `pushable` counts are those sung at hop 0 and not wake-derived: the only ones a push
- * could have carried.
+ * could have carried. Of those, `evicted` (this window) and `evictedTotal` (since the entry
+ * began) the set held and then gave up; the rest it refused on arrival. Delivery may have
+ * pushed, dropped or still wait on an evicted record, so `hearView` names the latest
+ * evictions in `evictions` (oldest first), and delivery counts only those it never saw.
  */
 export interface LiveOmission {
   station: string;
@@ -249,6 +264,13 @@ export interface LiveOmission {
   total: number;
   pushable: number;
   pushableTotal: number;
+  evicted: number;
+  evictedTotal: number;
+  /**
+   * In a `hearView`: the latest of `evictedTotal` still kept (at most `MAX_LIVE` across every
+   * entry); one past the bound is known only by its count.
+   */
+  evictions?: LiveEviction[];
   /** Tells this entry from an earlier one for the same share that was let go. */
   serial: number;
 }
@@ -402,6 +424,17 @@ export class RecordConsumer {
   /** Per share, what the live set dropped (tuned streams, at most `MAX_OMITTED_STREAMS`). */
   readonly #omitted = new Map<string, LiveOmission>();
   #omittedSerial = 0;
+  /**
+   * Tune patterns that take in a stream whose drops went to the shared count, since its
+   * window opened: the ears `hearView` shows that count to.
+   */
+  readonly #otherPatterns = new Set<string>();
+  /** The latest pushable evictions, by entry (its key and serial), oldest first. */
+  readonly #evictions = new Map<
+    number,
+    LiveEviction & { entry: string; serial: number }
+  >();
+  #evictionSeq = 0;
   /**
    * Patterns tuned (by `retune`) while the untuned share was dropping records that would
    * still be on air: until `until`, such a stream's records from before `at` may be missing.
@@ -861,32 +894,53 @@ export class RecordConsumer {
   }
 
   /**
-   * The set is full, and nothing in it has expired: the share holding the most gives up a
-   * record. If that is the newcomer's own (or it holds within one of the most), the
-   * newcomer is refused; otherwise that share's oldest record goes. So a flood, tuned or
-   * not, fills only its own share, and a quiet stream's record always finds room. Either
-   * way the share that lost a record counts it. Delivery waits on at most a stream's
-   * newest `bufferPerStream` (at most 256), so the oldest of the share holding the most
-   * is one it still waits on only with 16 or more full shares; that one is then counted
-   * twice (here, and off air there), never as delivered.
+   * The set is full, and nothing in it has expired. No ear reads an untuned record
+   * (`hearView` reads through the tune), so the untuned share gives way first: an untuned
+   * newcomer is refused, and a tuned one takes the place of the oldest untuned record while
+   * there is one. Only with none left does the tuned share holding the most give up a
+   * record: if that is the newcomer's own, or holds within one of it, the newcomer is
+   * refused; otherwise that share's oldest record goes. Either way the share that lost a
+   * record counts it.
+   *
+   * So a flood fills only its own share, and with nothing untuned left, a tuned record gets
+   * in only if some tuned share holds at least two more than its own. Each tuned stream can
+   * therefore keep at least ⌈4096/S⌉ − 1 records whatever the others send, S being the
+   * tuned streams holding records, itself included: a stream's first record finds room
+   * unless 4096 tuned streams hold one record each (a `*:` tune over that many stations).
+   *
+   * A share's own records go oldest first, and a full share refuses its newest. Record v1
+   * declares no stream's shape (#168 §2.1's latest-state or ordered events; the stream
+   * descriptor that would carry it is unbuilt), so latest-state streams are kept the same
+   * way. A keyed record still replaces its predecessor: the host daemon retracts a
+   * superseded record before it emits the successor, which then finds the place free.
    */
   #makeRoom(share: string, r: LiveRecord, nowMs: number): boolean {
-    const largest = this.#live.largest()!;
+    if (share === UNTUNED) {
+      this.#drop(UNTUNED, r, nowMs);
+      return false;
+    }
+    const giver =
+      this.#live.count(UNTUNED) > 0
+        ? UNTUNED
+        : this.#live.largestTuned()!.share;
     if (
-      largest.share === share ||
-      largest.count - this.#live.count(share) < 2
+      giver !== UNTUNED &&
+      (giver === share || this.#live.count(giver) - this.#live.count(share) < 2)
     ) {
       this.#drop(share, r, nowMs);
       return false;
     }
-    const oldest = this.#live.oldest(largest.share)!;
+    const oldest = this.#live.oldest(giver)!;
     this.#live.delete(oldest.idem);
-    this.#drop(largest.share, oldest, nowMs);
+    this.#drop(giver, oldest, nowMs, true);
     return true;
   }
 
-  /** The live set dropped `r` from `share`: counted against it, and receive health says so. */
-  #drop(share: string, r: LiveRecord, nowMs: number): void {
+  /**
+   * The live set dropped `r` from `share` (`evicted`: held, then given up; else refused on
+   * arrival): counted against it, and receive health says so.
+   */
+  #drop(share: string, r: LiveRecord, nowMs: number, evicted = false): void {
     const tuned = share !== UNTUNED;
     const at =
       tuned && !this.#omitted.has(share) ? this.#room(share, nowMs) : share;
@@ -903,6 +957,8 @@ export class RecordConsumer {
         total: 0,
         pushable: 0,
         pushableTotal: 0,
+        evicted: 0,
+        evictedTotal: 0,
         serial: ++this.#omittedSerial,
       };
       this.#omitted.set(at, o);
@@ -911,7 +967,15 @@ export class RecordConsumer {
       // The last window's records are all off air by now: a new one opens.
       o.count = 0;
       o.pushable = 0;
+      o.evicted = 0;
       o.from = nowMs;
+      if (at === OTHER_TUNED) this.#otherPatterns.clear();
+    }
+    if (at === OTHER_TUNED) {
+      for (const p of this.#tune) {
+        if (tunes([p], r.item.station, r.item.stream))
+          this.#otherPatterns.add(p);
+      }
     }
     o.count += 1;
     o.to = nowMs;
@@ -920,6 +984,27 @@ export class RecordConsumer {
     if (r.item.hop === 0 && r.item.wakeDerived === false) {
       o.pushable += 1;
       o.pushableTotal += 1;
+      if (evicted) {
+        o.evicted += 1;
+        o.evictedTotal += 1;
+      }
+      // No ear reads an untuned share's entry, so only a tuned eviction is kept by name.
+      if (evicted && tuned) {
+        const { key, epoch, stream, seq } = r.item;
+        this.#evictions.set(++this.#evictionSeq, {
+          entry: at,
+          serial: o.serial,
+          n: o.evictedTotal,
+          at: nowMs,
+          key,
+          epoch,
+          stream,
+          seq,
+        });
+        if (this.#evictions.size > MAX_EVICTIONS) {
+          this.#evictions.delete(this.#evictions.keys().next().value!);
+        }
+      }
     }
     o.key = r.item.key;
     this.#count("live_overflow");
@@ -958,6 +1043,7 @@ export class RecordConsumer {
     for (const o of this.#omitted.values()) {
       o.count = 0;
       o.pushable = 0;
+      o.evicted = 0;
       o.until = 0;
     }
     this.#retuned.clear();
@@ -1286,8 +1372,10 @@ export class RecordConsumer {
 
   /**
    * What one ear hears now, through its `station:stream` tune, and what the live set
-   * dropped that the ear would hear: per tuned stream (each with its `total`, for delivery),
-   * the untuned share's open window, and patterns tuned while it was dropping records.
+   * dropped that the ear would hear: per tuned stream (each with its `total` and latest
+   * evictions, for delivery), the shared count past `MAX_OMITTED_STREAMS` when a pattern of
+   * this ear's took in a stream it counts, the untuned share's open window, and patterns
+   * tuned while it was dropping records.
    */
   hearView(
     patterns: readonly string[],
@@ -1297,6 +1385,18 @@ export class RecordConsumer {
     const tuned = (station: string, stream: string) =>
       tunes(patterns, station, stream);
     this.#syncOverflow(nowMs);
+    const evictions = new Map<string, LiveEviction[]>();
+    for (const { entry, serial, ...e } of this.#evictions.values()) {
+      if (this.#omitted.get(entry)?.serial !== serial) continue;
+      let list = evictions.get(entry);
+      if (list === undefined) evictions.set(entry, (list = []));
+      list.push(e);
+    }
+    const view = (share: string, o: LiveOmission): LiveOmission => ({
+      ...o,
+      ...(o.until > nowMs ? {} : { count: 0, pushable: 0, evicted: 0 }),
+      evictions: evictions.get(share) ?? [],
+    });
     const omitted = [...this.#omitted]
       .filter(
         ([share, o]) =>
@@ -1304,9 +1404,11 @@ export class RecordConsumer {
           share !== OTHER_TUNED &&
           tuned(o.station, o.stream),
       )
-      .map(([, o]) =>
-        o.until > nowMs ? { ...o } : { ...o, count: 0, pushable: 0 },
-      );
+      .map(([share, o]) => view(share, o));
+    const other = this.#omitted.get(OTHER_TUNED);
+    const otherHeard =
+      other !== undefined &&
+      [...this.#otherPatterns].some((p) => patterns.includes(p));
     const untuned = this.#omitted.get(UNTUNED);
     const retuned = [...this.#retuned]
       .filter(([pattern]) => patterns.includes(pattern))
@@ -1354,6 +1456,7 @@ export class RecordConsumer {
       })),
       items,
       ...(omitted.length > 0 ? { omitted } : {}),
+      ...(otherHeard ? { otherOmitted: view(OTHER_TUNED, other) } : {}),
       ...(untuned !== undefined && untuned.until > nowMs
         ? {
             untunedOmitted: {

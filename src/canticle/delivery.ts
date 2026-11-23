@@ -32,7 +32,9 @@
 // 3-5; #168 §2.7a "local omission"): a record that goes off air while a hold or the push
 // budget keeps it, or while it waits for its push, and what the record source's live set
 // dropped of records the ear would have pushed, go into the next push's coverage note with
-// the reason and the span of times. A push that says records wait for the next one keeps
+// the reason and the span of times, each record once (one the live set evicts after it was
+// pushed, passed over or dropped from a full buffer is told already). A push that says
+// records wait for the next one keeps
 // its word: if they go off air instead, and nothing else is waiting to carry the note, a
 // push of its own carries it, as does what the budget held, when the budget next allows a
 // push. It is a push like any other, inside every hold and the budget: no other wake, and
@@ -71,6 +73,7 @@ import type {
 import type { Clock, Timers } from "../types.ts";
 import { iso, joinedLate, onAir, renderItem, secs, token } from "./hear.ts";
 import type { HearView, LiveItem } from "./receptor.ts";
+import type { LiveOmission } from "./records.ts";
 
 /** How often each delivering ear's view is read. */
 export const POLL_MS = 1_000;
@@ -109,11 +112,19 @@ const RANK: Readonly<Record<DeliveryMode, number>> = {
  * A record's identity, `key:epoch:stream:seq`: RFC §7.4's identity tuple, with the stream
  * by name (one to one with its id, §5.4). What dedupe compares, never the text.
  */
-export function identity(item: LiveItem): string {
+export function identity(
+  item: Pick<LiveItem, "key" | "epoch" | "stream" | "seq">,
+): string {
   return `${item.key.toLowerCase()}:${item.epoch}:${item.stream}:${item.seq}`;
 }
 
 const streamOf = (item: LiveItem) => `${item.station}:${item.stream}`;
+
+/**
+ * Where the coverage note keeps what the record source's live set dropped past the tuned
+ * streams it counts one by one: no `station:stream` is empty.
+ */
+const OTHER = "";
 
 /**
  * One record as custody keeps an exposure of it (binary-canticle#161): its identity and
@@ -334,11 +345,14 @@ interface EarState {
   held: string | undefined;
   missed: Map<string, Missed>;
   /**
-   * Per `station:stream`, what the record source's live set had dropped of what a push
-   * could carry (its entry, that entry's total, and when it last dropped one) as of the
-   * last pass, so each drop is told once.
+   * Per `station:stream` (and `OTHER`), what the record source's live set had dropped of
+   * what a push could carry (its entry, that entry's total and evicted total, and when it
+   * last dropped one) as of the last pass, so each drop is told once.
    */
-  overflow: Map<string, { serial: number; total: number; at: number }>;
+  overflow: Map<
+    string,
+    { serial: number; total: number; evicted: number; at: number }
+  >;
   counts: Record<string, number>;
   cursor: Cursor;
   /** `missed` (or what an unconfirmed push carried) changed since it was last saved. */
@@ -381,7 +395,7 @@ function loadMissed(saved: unknown): Map<string, Missed> {
     if (missed.size >= MAX_CURSOR_STREAMS) break;
     const m = value as Partial<SavedMissed> | null;
     if (
-      !stream.includes(":") ||
+      (stream !== OTHER && !stream.includes(":")) ||
       typeof m !== "object" ||
       m === null ||
       !isCount(m.offAir) ||
@@ -689,7 +703,7 @@ export class CanticleDelivery {
         );
       }
     }
-    this.#overflow(state, view, keys, modes);
+    this.#overflow(ear, state, view, keys, modes, now);
     /** What a mute passed over: settled, so no restart or reload pushes it later. */
     const muted: Settling[] = [];
     // Refreshes last, so one finds the record it re-issues already waiting (§7.9).
@@ -850,27 +864,46 @@ export class CanticleDelivery {
    * ear could be pushed (allowlisted key, a mode that pushes), goes into the next push's
    * coverage note as `live_overflow`, owed. A drop no push would ever have carried wakes
    * nobody; `hear` still names it.
+   *
+   * Told once per record: of what the live set evicted (held, then gave up), delivery
+   * counts only what it never saw. One it pushed, passed over, or dropped from its own
+   * buffer is told already (or not this ear's to tell); one it waits on stops waiting and
+   * is counted here, with when it went. An eviction past what the source still names is
+   * counted, since it can't be looked up: at worst told twice, never left out.
+   *
+   * What the live set dropped past the streams it counts one by one (`otherOmitted`) has no
+   * station to meet the boundary: it rides with the next push as one line saying so, and
+   * never asks for a push of its own.
    */
   #overflow(
+    ear: string,
     state: EarState,
     view: HearView,
     keys: ReadonlySet<string>,
     modes: Modes,
+    now: number,
   ): void {
+    const entries: Array<[string, LiveOmission]> = [
+      ...(view.omitted ?? []).map(
+        (o) => [`${o.station}:${o.stream}`, o] as [string, LiveOmission],
+      ),
+      ...(view.otherOmitted !== undefined
+        ? [[OTHER, view.otherOmitted] as [string, LiveOmission]]
+        : []),
+    ];
     // Only streams the view still lists: the source lets go of an entry long off air.
-    const listed = new Set(
-      (view.omitted ?? []).map((o) => `${o.station}:${o.stream}`),
-    );
+    const listed = new Set(entries.map(([stream]) => stream));
     for (const stream of state.overflow.keys()) {
       if (!listed.has(stream)) state.overflow.delete(stream);
     }
-    for (const o of view.omitted ?? []) {
-      const stream = `${o.station}:${o.stream}`;
+    const settled = this.#settled.get(ear);
+    for (const [stream, o] of entries) {
       const before = state.overflow.get(stream);
       const same = before !== undefined && before.serial === o.serial;
       state.overflow.set(stream, {
         serial: o.serial,
         total: o.pushableTotal,
+        evicted: o.evictedTotal,
         at: o.to,
       });
       // First seen: only what would still be on air (its window); after, every new drop.
@@ -881,19 +914,72 @@ export class CanticleDelivery {
           ? o.pushable
           : o.pushableTotal;
       if (added <= 0) continue;
+      const since = same
+        ? before.evicted
+        : before === undefined
+          ? o.evictedTotal - o.evicted
+          : 0;
+      // Every new drop is told, but for the evictions this ear has seen: refused records,
+      // and evictions past what the source still names, never were.
+      let told = added;
+      for (const e of (o.evictions ?? []).filter((e) => e.n > since)) {
+        const id = identity(e);
+        const waiting = state.waiting.get(id);
+        if (waiting === undefined) {
+          // Pushed, passed over or dropped from the buffer: told already, or not this ear's.
+          if (
+            (settled?.get(id) ?? 0) > now ||
+            state.seen.get(id)?.gen === state.gen
+          ) {
+            told -= 1;
+          }
+          continue;
+        }
+        told -= 1;
+        // Passed over this pass anyway (a mode or the boundary changed): not ours to tell.
+        if (this.#passOver(waiting.item, keys, modes) !== undefined) continue;
+        this.#unwait(state, waiting);
+        this.#withhold(state, waiting.stream, waiting.item.key, e.at);
+      }
+      if (told <= 0) continue;
+      if (stream === OTHER) {
+        this.#count(state, "live_overflow_other", told);
+        const missed = this.#missed(state, OTHER, o.key);
+        if (missed === undefined) continue;
+        widen(
+          missed.withheld,
+          "live_overflow",
+          told,
+          same ? Math.max(o.from, before.at) : o.from,
+          o.to,
+        );
+        state.dirty = true;
+        continue;
+      }
       const mode = modes.of({ key: o.key, station: o.station });
       if (!keys.has(o.key.toLowerCase()) || mode === "off" || mode === "mute")
         continue;
-      this.#count(state, "live_overflow", added);
+      this.#count(state, "live_overflow", told);
       const missed = this.#missed(state, stream, o.key);
       if (missed === undefined) continue;
       missed.key = o.key;
       // Dropped after the last pass looked: from then, or this window's start if later.
       const from = same ? Math.max(o.from, before.at) : o.from;
-      widen(missed.withheld, "live_overflow", added, from, o.to);
+      widen(missed.withheld, "live_overflow", told, from, o.to);
       missed.owed = true;
       state.dirty = true;
     }
+  }
+
+  /** A record that waited was evicted by the live set at `at`: told with its stream, owed. */
+  #withhold(state: EarState, stream: string, key: string, at: number): void {
+    this.#count(state, "live_overflow");
+    const missed = this.#missed(state, stream, key);
+    if (missed === undefined) return;
+    missed.key = key;
+    widen(missed.withheld, "live_overflow", 1, at, at);
+    missed.owed = true;
+    state.dirty = true;
   }
 
   /** The cadence a push of its own carries owed notes on, or undefined if none may. */
@@ -1987,9 +2073,16 @@ function render(input: RenderInput): {
     const header = "local omissions (frond-ear withheld these itself):";
     if (compact) {
       const records = entries.reduce((n, e) => n + e.span.count, 0);
-      const streams = new Set(entries.map((e) => e.stream)).size;
+      const streams = new Set(
+        entries.map((e) => e.stream).filter((stream) => stream !== OTHER),
+      ).size;
+      const where = !entries.some((e) => e.stream === OTHER)
+        ? plural(streams, "stream")
+        : streams > 0
+          ? `${plural(streams, "stream")} and other tuned streams`
+          : "other tuned streams";
       return [
-        `${header} ${plural(records, "record")} on ${plural(streams, "stream")}; ear_status counts them.`,
+        `${header} ${plural(records, "record")} on ${where}; ear_status counts them.`,
       ];
     }
     const named = entries.slice(0, MAX_MISSED_LINES);
@@ -2000,6 +2093,9 @@ function render(input: RenderInput): {
           reason === "live_overflow"
             ? `between ${iso(span.from)} and ${iso(span.to)}`
             : `heard ${iso(span.from)} to ${iso(span.to)}`;
+        if (stream === OTHER) {
+          return `- other tuned streams: ${span.count} ${WITHHELD[reason] ?? `withheld (${token(reason)})`} (${token(reason)}; ${when}), past the 256 streams it names one by one, so which stations, and whether this ear would push them, is unknown.`;
+        }
         return `- ${token(stream)}: ${span.count} ${WITHHELD[reason] ?? `withheld (${token(reason)})`} (${token(reason)}; ${when}).`;
       }),
       ...(entries.length > named.length

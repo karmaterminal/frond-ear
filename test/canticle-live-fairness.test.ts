@@ -102,8 +102,8 @@ test("live set (c): every record the live set drops degrades receive health with
   assert.equal(c.counts.live_overflow, 10);
   assert.equal(c.counts.live_overflow_untuned, 10);
 
-  // A tuned flood takes its share from the untuned one; past it, its own records go.
-  for (let n = 1; n <= MAX_LIVE; n++) {
+  // A tuned flood takes every untuned record's place first; past that, its own newest go.
+  for (let n = 1; n <= MAX_LIVE + 5; n++) {
     host.sing(n, { station: "stray", stream: "ops.deploy", ttlMs: 60_000 });
   }
   assert.ok(
@@ -112,10 +112,11 @@ test("live set (c): every record the live set drops degrades receive health with
   );
   const live = c.liveStatus(time.now());
   assert.equal(live.max, MAX_LIVE);
-  assert.ok(live.size <= MAX_LIVE);
+  assert.deepEqual(live.shares, { "stray:ops.deploy": MAX_LIVE });
   const deploy = live.omitted["stray:ops.deploy"]!;
   const untuned = live.omitted.untuned!;
-  assert.ok(deploy.count > 0 && untuned.count > 10, JSON.stringify(live));
+  assert.equal(deploy.count, 5, JSON.stringify(live));
+  assert.equal(untuned.count, MAX_LIVE + 10);
   assert.equal(
     c.counts.live_overflow,
     deploy.total + untuned.total,
@@ -587,6 +588,8 @@ test("hear: local omissions name at most five streams and count the rest; a stre
     total: i + 1,
     pushable: i + 1,
     pushableTotal: i + 1,
+    evicted: 0,
+    evictedTotal: 0,
     serial: i + 1,
     from: now - 10_000,
     to: now - 1_000,
@@ -1029,6 +1032,31 @@ test("#119 review, blocker (ii): tuned and untuned at 2048 each, a new tuned rec
   assert.equal(status.omitted.untuned!.count, 1);
 });
 
+test("#119 review, blocker: records a retune leaves untuned give way first to a tuned arrival, counted as untuned", () => {
+  const time = clock();
+  const host = new Host(time, ["*:ops.fleet", "*:ops.deploy"]);
+  host.start();
+  for (let n = 1; n <= MAX_LIVE; n++) {
+    host.sing(n, { stream: "ops.deploy", ttlMs: 3_600_000 });
+  }
+  host.tune = ["*:ops.fleet"];
+  host.sing(1, { ttlMs: 3_600_000 });
+  assert.deepEqual(quietSeqs(host), [1]);
+  const c = host.consumer;
+  const deploy = c
+    .hearView(["*:ops.deploy"], time.now(), true)
+    .items.map((item) => Number(item.seq))
+    .sort((a, b) => a - b);
+  assert.deepEqual(deploy, range(2, MAX_LIVE), "the oldest of them went");
+  const live = c.liveStatus(time.now());
+  assert.deepEqual(live.shares, {
+    untuned: MAX_LIVE - 1,
+    "ops:ops.fleet": 1,
+  });
+  assert.equal(live.omitted.untuned!.count, 1);
+  assert.equal(live.omitted["ops:ops.deploy"], undefined);
+});
+
 test("#119 review 2: a tuned record finds room only if some tuned share holds two more than its own; a `*:` tune over 4096 stations of one record each refuses a new quiet stream, counts it and degrades receive health", () => {
   const key = (i: number) => i.toString(16).padStart(16, "0");
   const singer = (host: Host) => (i: number, n: number) =>
@@ -1166,6 +1194,67 @@ test("#119 review 3: the shared count past 256 tuned streams rides with the next
   }
 });
 
+test("#119 review 3: a shared-count note not yet told survives a restart, and one in a push a crash left unconfirmed is told again", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "frond-ear-other-"));
+  const path = join(directory, "ear.db");
+  const delivery = { mode: "immediate", maxPushesPerHour: 360 };
+  const line =
+    /^- other tuned streams: 5 dropped by frond-ear's full live set \(live_overflow; between \S+Z and \S+Z\), past the 256 streams it names one by one, so which stations, and whether this ear would push them, is unknown\.$/mu;
+  try {
+    const first = setup(delivery, {}, {}, { path });
+    try {
+      first.h.attach("scribe", { sessionId: SESSION });
+      const key = overflowEntries(first.host, "ops.deploy", 3_600_000);
+      for (let n = 1; n <= 20; n++) {
+        first.host.sing(n, {
+          station: "s999",
+          key: key(999),
+          stream: "ops.deploy",
+          ttlMs: 3_600_000,
+        });
+      }
+      first.h.timers.advance(2_000); // read and saved; nothing pushes it on its own
+      assert.equal(status(first.h).counts.live_overflow_other, 5);
+    } finally {
+      first.h.dispose();
+    }
+    const second = setup(delivery, {}, {}, { path });
+    let at: number;
+    try {
+      const shim = second.h.attach("scribe", { sessionId: SESSION });
+      second.host.sing(1);
+      second.h.timers.advance(6_000);
+      assert.equal(pushes(shim).length, 1, "rides with the first push");
+      assert.match(pushes(shim)[0]!.content, line);
+      at = second.h.clock.now();
+      // The process dies before the host confirms that push.
+      second.h.store.close();
+      rmSync(second.h.directory, { recursive: true, force: true });
+    } catch (error) {
+      second.h.dispose();
+      throw error;
+    }
+    const third = setup(delivery, {}, {}, { path });
+    try {
+      third.h.clock.value = at + 10_000;
+      const shim = third.h.attach("scribe", { sessionId: SESSION });
+      third.host.sing(1); // still on air: the record waits again, and the note rides with it
+      third.h.timers.advance(6_000);
+      assert.equal(pushes(shim).length, 1, "given back: the record again");
+      assert.deepEqual(order(pushes(shim)[0]!.content), ["ops:ops.fleet/1"]);
+      assert.match(pushes(shim)[0]!.content, line, "and the note with it");
+      await confirm(shim);
+      third.host.sing(2);
+      third.h.timers.advance(6_000);
+      assert.doesNotMatch(pushes(shim)[1]!.content, /other tuned streams/u);
+    } finally {
+      third.h.dispose();
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("#119 review 4: record v1 declares no stream's shape, so a tuned flood's full share keeps its oldest and refuses its newest; a keyed record's successor still takes its predecessor's place, which the host retracts first", () => {
   const time = clock();
   const host = new Host(time, ["*:ops.fleet"]);
@@ -1210,6 +1299,12 @@ test("#119 review 5: with 16 full shares, a record delivery waits on that the li
       host.consumer.liveStatus(h.clock.now()).omitted["ops:ops.fleet"]!.count,
       1,
       "ops's oldest, which delivery waits on, was evicted",
+    );
+    h.timers.advance(1_000);
+    assert.match(
+      h.store.runtimeState("canticle.withheld.scribe") ?? "",
+      /"ops:ops\.fleet":\{[^}]*"withheld":\[\["live_overflow",\{"count":1,/u,
+      "told at the next push, and saved for it until then",
     );
     // Until every one of them is pushed or off air; then one more push carries what's left.
     for (let t = 0; t < 310; t++) h.timers.advance(1_000);

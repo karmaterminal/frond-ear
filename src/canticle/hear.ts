@@ -194,7 +194,9 @@ const MAX_OMISSION_LINES = 5;
 /**
  * What frond-ear's own live set dropped that this ear would hear (binary-canticle#168
  * §2.7a local omissions): each tuned stream while a record it lost would still be on air,
- * the untuned share likewise, and a pattern tuned while that share was dropping records.
+ * the shared count past the streams it names one by one (a stream filter can't tell what
+ * that holds, so it shows either way), the untuned share likewise, and a pattern tuned
+ * while that share was dropping records.
  */
 export function omissionLines(
   view: HearView,
@@ -222,6 +224,12 @@ export function omissionLines(
   if (streams.length > MAX_OMISSION_LINES) {
     lines.push(
       `(${streams.length - MAX_OMISSION_LINES} more tuned streams lost records to frond-ear's full live set; ear_status counts them.)`,
+    );
+  }
+  const other = view.otherOmitted;
+  if (other !== undefined && other.count > 0 && other.until > now) {
+    lines.push(
+      `local omission (live_overflow): other tuned streams: ${other.count} record${other.count === 1 ? "" : "s"} dropped by frond-ear's full live set between ${iso(other.from)} and ${iso(other.to)}, past the 256 streams it names one by one, so which streams is unknown; they would be on air until ${iso(other.until)}.`,
     );
   }
   const untuned = view.untunedOmitted;
