@@ -1780,7 +1780,13 @@ interface SavedNote {
   withheld: Array<[string, { count: number; from: number; to: number }]>;
   key: string;
   owed: boolean;
-  streams?: string[];
+  streams?: Array<{
+    stream: string;
+    key: string;
+    owed: boolean;
+    withheld: boolean;
+    missed: boolean;
+  }>;
   more?: true;
 }
 
@@ -2748,3 +2754,341 @@ test("#119 second review, re-review 6: a given-back FOLDED owed for a stream wit
     }
   }
 });
+
+// 🌫's re-review of round 2 (6022698074), R3: a note given back from several unconfirmed
+// pushes keeps the station key of the latest push that carried it, whatever order the
+// pushes come back in, live or after a crash; a note since any of them keeps its own.
+
+/** Each key rotation, earlier key first, with its name. */
+const ROTATIONS = [
+  { keys: [OPS, ALPHA], name: "OPS, then ALPHA" },
+  { keys: [ALPHA, OPS], name: "ALPHA, then OPS" },
+] as const;
+
+/** Every station s0, s1, … but `but`'s off: only that stream's note can push on its own. */
+const offBut = (streams: number, but: number) =>
+  Object.fromEntries(
+    range(0, streams - 1)
+      .filter((i) => i !== but)
+      .map((i) => [`s${i}`, "off"]),
+  );
+
+/** A folded stream's place among the saved notes not told yet. */
+const foldedPlace = (h: Harnessed, stream: string) =>
+  pendingNotes(h)["*"]?.streams?.find((f) => f.stream === stream);
+
+/**
+ * Reloads with `key` alone on wakeKeys and every s<i> station but `but`'s off, then gives
+ * the ear a minute: how many pushes it brought.
+ */
+function wakesUnder(
+  h: Harnessed,
+  shim: Parameters<typeof pushes>[0],
+  key: string,
+  streams: number,
+  but: number,
+): number {
+  const before = pushes(shim).length;
+  h.daemon.reloadConfig(
+    canticleConfig(
+      {
+        mode: "immediate",
+        maxPushesPerHour: 1,
+        stations: offBut(streams, but),
+      },
+      { wakeKeys: [key] },
+    ),
+  );
+  h.timers.advance(60_000);
+  return pushes(shim).length - before;
+}
+
+/**
+ * 🌫's R3 setup, at one push an hour: that push spent and confirmed, stations s0, s1, …
+ * (`streams` of them, one key, distinct epochs) each sing a 10 s record under `first`,
+ * which goes off air under the spent budget; once the hour frees, the note goes out on its
+ * own, unconfirmed: past 256 streams, s256 on is folded. Then the stations `again` names
+ * (every one by default) sing under `later`, and go off air too: with `pushed` 2, that
+ * note goes out the next hour, unconfirmed as well; with 1, it waits for a push, owed.
+ */
+async function rotated(
+  [first, later]: readonly [string, string],
+  streams: number,
+  options: { pushed?: 1 | 2; again?: readonly number[]; path?: string } = {},
+) {
+  const { h, host } = setup(
+    { mode: "immediate", maxPushesPerHour: 1 },
+    {},
+    {},
+    options,
+  );
+  const shim = h.attach("scribe", { sessionId: SESSION });
+  host.sing(1);
+  h.timers.advance(6_000);
+  await confirm(shim);
+  const sing = (key: string, seq: number, stations: readonly number[]) => {
+    for (const i of stations) {
+      host.sing(seq, { station: `s${i}`, key, epoch: 100 + i, ttlMs: 10_000 });
+    }
+    h.timers.advance(12_000); // off air under the spent budget: owed
+  };
+  const free = () =>
+    h.timers.advance(status(h).lastPushAt! + 3_600_000 + 6_000 - h.clock.now());
+  sing(first, 1, range(0, streams - 1));
+  free();
+  assert.equal(pushes(shim).length, 2, "the first note, on its own");
+  sing(later, 2, options.again ?? range(0, streams - 1));
+  if ((options.pushed ?? 2) === 2) {
+    free();
+    assert.equal(pushes(shim).length, 3, "the later note, on its own");
+  }
+  return { h, host, shim };
+}
+
+/**
+ * The process holding `h` dies (nothing reverts its unconfirmed pushes), and a fresh one
+ * starts on the same database at `path`, a second later. With `pass`, a delivery pass
+ * reads the saved notes before the attach reverts the pushes; else the revert reads them.
+ */
+function crashed(
+  h: Harnessed,
+  path: string,
+  pass: boolean,
+  delivery: Record<string, unknown>,
+  canticle: Record<string, unknown> = {},
+) {
+  const at = h.clock.now();
+  h.store.close();
+  rmSync(h.directory, { recursive: true, force: true });
+  const again = setup(delivery, canticle, {}, { path }).h;
+  again.clock.value = at + 1_000;
+  if (pass) again.timers.advance(1_000);
+  return { h: again, shim: again.attach("scribe", { sessionId: SESSION }) };
+}
+
+for (const { keys, name } of ROTATIONS) {
+  test(`#119 re-review R3 (${name}): two unconfirmed notes for 257 streams, under a key and then a later one, given back on a disconnect: every stream keeps the later key, so the folded one pushes on its own under that key alone, never under the earlier`, async () => {
+    const [first, later] = keys;
+    const { h, shim } = await rotated(keys, 257);
+    try {
+      shim.close(); // both given back, the earlier first
+      const place = foldedPlace(h, "s256:ops.fleet");
+      assert.equal(place?.key, later, "the folded stream's key");
+      assert.equal(place?.owed, true, "owed");
+      assert.equal(
+        pendingNotes(h)["s0:ops.fleet"]?.key,
+        later,
+        "a named one's",
+      );
+      const next = h.attach("scribe", { sessionId: SESSION });
+      assert.equal(wakesUnder(h, next, first, 257, 256), 0, "earlier key");
+      assert.equal(wakesUnder(h, next, later, 257, 256), 1, "later key");
+      assert.equal(omissionsTold(pushes(next)[0]!.content), 2 * 257);
+      await confirm(next);
+      h.timers.advance(3_600_000);
+      assert.equal(pushes(next).length, 1, "once");
+    } finally {
+      h.dispose();
+    }
+  });
+}
+
+for (const pass of [false, true]) {
+  for (const { keys, name } of ROTATIONS) {
+    test(`#119 re-review R3 (${name}; ${pass ? "a pass reads the saved notes, then the revert" : "the revert reads the saved notes"}): the same two notes left unconfirmed by a crash: a fresh process on the saved database gives both back with the later key`, async () => {
+      const [first, later] = keys;
+      const directory = mkdtempSync(join(tmpdir(), "frond-ear-rotated-"));
+      const path = join(directory, "ear.db");
+      try {
+        const { h } = await rotated(keys, 257, { path });
+        const again = crashed(
+          h,
+          path,
+          pass,
+          {
+            mode: "immediate",
+            maxPushesPerHour: 1,
+            stations: offBut(257, 256),
+          },
+          { wakeKeys: [first] },
+        );
+        try {
+          const place = foldedPlace(again.h, "s256:ops.fleet");
+          assert.equal(place?.key, later, "the folded stream's key");
+          assert.equal(place?.owed, true, "owed");
+          assert.equal(pendingNotes(again.h)["s0:ops.fleet"]?.key, later);
+          again.h.timers.advance(60_000);
+          assert.equal(pushes(again.shim).length, 0, "earlier key");
+          assert.equal(
+            wakesUnder(again.h, again.shim, later, 257, 256),
+            1,
+            "later key",
+          );
+          assert.equal(omissionsTold(pushes(again.shim)[0]!.content), 2 * 257);
+        } finally {
+          again.h.dispose();
+        }
+      } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    });
+  }
+}
+
+for (const again of [range(0, 256), [256]]) {
+  for (const { keys, name } of ROTATIONS) {
+    test(`#119 re-review R3, control (${name}; ${again.length === 1 ? "named" : "folded"} since): a note since an unconfirmed push, under a later key, keeps that key when the push is given back, folded or named over the push's fold; a blind overwrite would push under the earlier key`, async () => {
+      const [first, later] = keys;
+      const { h, shim } = await rotated(keys, 257, { pushed: 1, again });
+      try {
+        // s256's note since is folded behind 256 named ones, or named on its own.
+        assert.equal(
+          pendingNotes(h)["s256:ops.fleet"]?.key,
+          again.length === 1 ? later : undefined,
+        );
+        shim.close(); // the earlier note given back
+        const place = foldedPlace(h, "s256:ops.fleet");
+        assert.equal(place?.key, later, "kept");
+        assert.equal(place?.owed, true, "owed");
+        if (again.length > 1) {
+          assert.equal(pendingNotes(h)["s0:ops.fleet"]?.key, later);
+        }
+        const next = h.attach("scribe", { sessionId: SESSION });
+        assert.equal(wakesUnder(h, next, first, 257, 256), 0, "earlier key");
+        assert.equal(wakesUnder(h, next, later, 257, 256), 1, "later key");
+        assert.equal(
+          omissionsTold(pushes(next)[0]!.content),
+          257 + again.length,
+        );
+      } finally {
+        h.dispose();
+      }
+    });
+  }
+}
+
+for (const crash of [undefined, "the revert reads", "a pass reads"]) {
+  for (const { keys, name } of ROTATIONS) {
+    test(`#119 re-review R3, named (${name}; ${crash === undefined ? "a disconnect" : `a crash, ${crash} the saved notes`}): one stream's two unconfirmed notes, under a key and then a later one, given back: its own entry keeps the later key`, async () => {
+      const [first, later] = keys;
+      const directory = mkdtempSync(join(tmpdir(), "frond-ear-rotated-"));
+      const path = join(directory, "ear.db");
+      try {
+        const { h, shim } = await rotated(keys, 1, { path });
+        let ear: { h: Harnessed; shim: Parameters<typeof pushes>[0] };
+        if (crash === undefined) {
+          shim.close();
+          ear = { h, shim: h.attach("scribe", { sessionId: SESSION }) };
+        } else {
+          ear = crashed(h, path, crash === "a pass reads", {
+            mode: "immediate",
+            maxPushesPerHour: 1,
+          });
+        }
+        try {
+          assert.equal(pendingNotes(ear.h)["s0:ops.fleet"]?.key, later);
+          assert.equal(pendingNotes(ear.h)["s0:ops.fleet"]?.owed, true);
+          assert.equal(wakesUnder(ear.h, ear.shim, first, 1, 0), 0, "earlier");
+          assert.equal(wakesUnder(ear.h, ear.shim, later, 1, 0), 1, "later");
+          assert.equal(omissionsTold(pushes(ear.shim)[0]!.content), 2);
+        } finally {
+          ear.h.dispose();
+        }
+      } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    });
+  }
+}
+
+/**
+ * At one push an hour, an unconfirmed push carries s0's record 1 under `first` (30 s) and
+ * spends the hour; s0's record 2, under `later`, goes off air under the spent budget,
+ * owed, and so does record 1, before anything is given back. With `pushed`, the note goes
+ * out on its own the next hour, unconfirmed too.
+ */
+async function carried(
+  [first, later]: readonly [string, string],
+  pushed: boolean,
+) {
+  const { h, host } = setup({ mode: "immediate", maxPushesPerHour: 1 });
+  const shim = h.attach("scribe", { sessionId: SESSION });
+  host.sing(1, { station: "s0", key: first, epoch: 100, ttlMs: 30_000 });
+  h.timers.advance(6_000);
+  assert.deepEqual(order(pushes(shim)[0]!.content), ["s0:ops.fleet/1"]);
+  host.sing(2, { station: "s0", key: later, epoch: 100, ttlMs: 10_000 });
+  h.timers.advance(30_000);
+  assert.equal(pendingNotes(h)["s0:ops.fleet"]?.key, later, "owed since");
+  if (pushed) {
+    h.timers.advance(status(h).lastPushAt! + 3_600_000 + 6_000 - h.clock.now());
+    assert.equal(pushes(shim).length, 2, "the note, on its own");
+  }
+  return { h, host, shim };
+}
+
+for (const pushed of [false, true]) {
+  for (const { keys, name } of ROTATIONS) {
+    test(`#119 re-review R3, sibling (${name}; the later note ${pushed ? "in a later unconfirmed push" : "waiting since"}): a record a given-back push carried, off air by then, is told as of that push, so the later note's key is kept`, async () => {
+      const [first, later] = keys;
+      const { h, shim } = await carried(keys, pushed);
+      try {
+        shim.close(); // given back: record 1 is off air, so it is told
+        assert.equal(pendingNotes(h)["s0:ops.fleet"]?.key, later, "kept");
+        assert.equal(pendingNotes(h)["s0:ops.fleet"]?.offAir, 1);
+        const next = h.attach("scribe", { sessionId: SESSION });
+        assert.equal(wakesUnder(h, next, first, 1, 0), 0, "earlier key");
+        assert.equal(wakesUnder(h, next, later, 1, 0), 1, "later key");
+        const push = pushes(next)[0]!.content;
+        assert.equal(offAirTold(push), 1);
+        assert.equal(omissionsTold(push), 1);
+      } finally {
+        h.dispose();
+      }
+    });
+  }
+}
+
+for (const { keys, name } of ROTATIONS) {
+  test(`#119 re-review R3, sibling (${name}): a pushed record the live set evicts while its push is unconfirmed, told as that drop on the pass after the push is given back, is told as of that push, so a note since keeps its later key`, async () => {
+    const [first, later] = keys;
+    const { h, host } = setup({
+      mode: "immediate",
+      maxPushesPerHour: 360,
+      bufferPerStream: 256,
+      maxItems: 10,
+    });
+    try {
+      const shim = h.attach("scribe", { sessionId: SESSION });
+      // 16 full shares, ops:ops.fleet's first: its record 1 under `first`, the rest
+      // hear-only.
+      host.sing(1, { key: first, ttlMs: 300_000 });
+      for (let n = 2; n <= 256; n++) {
+        host.sing(n, { key: STRAY, epoch: 50, ttlMs: 300_000 });
+      }
+      for (let s = 1; s <= 15; s++) {
+        for (let n = 1; n <= 256; n++) {
+          host.sing(n, { station: `stray${s}`, key: STRAY, epoch: s });
+        }
+      }
+      h.timers.advance(6_000);
+      assert.deepEqual(order(pushes(shim)[0]!.content), ["ops:ops.fleet/1"]);
+      // Unconfirmed: the flood's next record evicts record 1, and the full share refuses
+      // ops:ops.fleet's record 2 under `later`, which is told as a drop of its own, owed.
+      host.sing(1, { station: "stray16", key: STRAY, epoch: 16 });
+      host.sing(2, { key: later, epoch: 60, ttlMs: 300_000 });
+      h.timers.advance(1_000);
+      assert.equal(pendingNotes(h)["ops:ops.fleet"]?.key, later, "the drop");
+      shim.close(); // given back: record 1 waits again, marked dropped
+      const next = h.attach("scribe", { sessionId: SESSION });
+      h.timers.advance(1_000); // and is told as the live set's drop
+      const note = pendingNotes(h)["ops:ops.fleet"];
+      assert.equal(withheldSum({ note: note! }, "live_overflow"), 2, "both");
+      assert.equal(note?.key, later, "kept");
+      assert.equal(wakesUnder(h, next, first, 1, 0), 0, "earlier key");
+      assert.equal(wakesUnder(h, next, later, 1, 0), 1, "later key");
+      assert.equal(overflowTold(next, "ops:ops.fleet"), 2);
+    } finally {
+      h.dispose();
+    }
+  });
+}
