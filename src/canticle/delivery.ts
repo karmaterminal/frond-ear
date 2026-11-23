@@ -236,9 +236,9 @@ interface Waiting {
    */
   dropped?: number;
   /**
-   * Given back by an unconfirmed push (its batch id), and not on view since: what it tells
-   * of its stream (its key, should it go unpushed) is as of that push, and when it was
-   * heard (`Missed.heard`).
+   * Given back by an unconfirmed push (its batch id; the last, if more than one did): what
+   * it tells of its stream (its key, should it go unpushed) is as of that push, and when
+   * it was heard (`Missed.heard`). Being on view again makes it no newer.
    */
   asOf?: number;
 }
@@ -418,11 +418,11 @@ interface Keyed {
 }
 
 /**
- * Whether `note`'s key goes over `than`'s: when it is later (by `Missed.asOf`, then
- * `heard`, none of which is earliest; batch ids only grow), or as late and told since, as
- * a note noted or told now is (of two notes since every push, the one noted last). A note
- * a push gives back was told before anything here as late as it (each push takes all
- * that waits), so with `givenBack` it has to be later.
+ * Whether `note`'s key goes over `than`'s: when it is later (by `Missed.asOf`, none being
+ * latest, then `heard`, none being earliest; batch ids only grow), or as late and told
+ * since, as a note noted or told now is (of two notes since every push, the one noted
+ * last). A note a push gives back was told before anything here as late as it (each push
+ * takes all that waits), so with `givenBack` it has to be later.
  */
 function supersedes(note: Keyed, than: Keyed, givenBack: boolean): boolean {
   const [a, b] = [note.asOf ?? Infinity, than.asOf ?? Infinity];
@@ -1058,7 +1058,6 @@ export class CanticleDelivery {
       if (waiting) {
         waiting.item = item;
         delete waiting.gone;
-        delete waiting.asOf; // on view again: no longer only what a push gave back
         continue;
       }
       const expiresAt = now + item.expiresInMs;

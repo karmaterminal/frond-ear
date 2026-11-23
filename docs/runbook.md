@@ -766,10 +766,10 @@ the host never confirmed is told again once that push is given back. Given back,
 station key told of it, named or counted together, whatever order the pushes come back in (a disconnect, a new attach,
 frond-ear stopping, or the first attach after a crash): a later push's note beats an earlier one's, a record a push
 carried beats the notes that push carried (the last heard of its records wins), and a note since beats them all. A
-note carried again by a later push is no newer for it. So after a station's key changes, a note given back wakes
-under the newer key that any push given back with it, or any note since, carried. It does not know the key of a push
-the host did confirm: if the host confirmed a later push but not an earlier one, the earlier one's note comes back
-with the key it carried.
+note carried again by a later push is no newer for it, nor is a record given back for being on air again. So after a
+station's key changes, a note given back wakes under the newer key that any push given back with it, or any note
+since, carried. It does not know the key of a push the host did confirm: if the host confirmed a later push but not an
+earlier one, the earlier one's note comes back with the key it carried.
 
 **Late records.** A record that wasn't heard live just now has a `late:` line under its banner's timing line:
 `late: heard 54s ago (snapshot)`, `late: heard 7s ago (resurfaced)`, or
