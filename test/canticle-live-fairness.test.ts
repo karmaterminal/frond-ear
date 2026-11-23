@@ -3464,12 +3464,20 @@ for (const { keys, name } of ROTATIONS) {
  * (under `k2`, heard 10 s later, or with `same` in the same instant, on air for over three
  * minutes). The station plucks both while b is unconfirmed, and b is given back: both wait
  * off view. rX goes off air, and its note goes out again in push c, set off by s1's
- * record; rY goes off air after c went out.
+ * record; rY goes off air after c went out. With `mirror`, rY (still heard last) goes off
+ * air first and goes out in c, and rX after c.
  */
 async function split(
   [k1, k2]: readonly [string, string],
-  options: { folded?: boolean; same?: boolean; path?: string } = {},
+  options: {
+    folded?: boolean;
+    same?: boolean;
+    mirror?: boolean;
+    path?: string;
+  } = {},
 ) {
+  const [ttlX, ttlY] = options.mirror ? [200_000, 50_000] : [60_000, 200_000];
+  const [before, since] = options.mirror ? [k2, k1] : [k1, k2];
   const { h, host } = setup(
     { mode: "immediate", maxPushesPerHour: 1 },
     {},
@@ -3495,9 +3503,9 @@ async function split(
   host.sing(1, { station: "s0", key: k1, epoch: 100, ttlMs: 10_000 });
   h.timers.advance(12_000); // off air under the spent budget: owed
   h.timers.advance(frees - 20_000 - h.clock.now());
-  host.sing(2, { station: "s0", key: k1, epoch: 100, ttlMs: 60_000 }); // rX
+  host.sing(2, { station: "s0", key: k1, epoch: 100, ttlMs: ttlX }); // rX
   if (!options.same) h.timers.advance(10_000);
-  host.sing(3, { station: "s0", key: k2, epoch: 100, ttlMs: 200_000 }); // rY
+  host.sing(3, { station: "s0", key: k2, epoch: 100, ttlMs: ttlY }); // rY
   h.timers.advance(frees + 1_000 - h.clock.now());
   assert.equal(pushes(shim).length, 2, "b");
   assert.equal(order(pushes(shim)[1]!.content).length, 2, "rX and rY");
@@ -3505,49 +3513,50 @@ async function split(
   host.pluck(3, { station: "s0", key: k2, epoch: 100 });
   shim.close(); // b given back: rX and rY wait off view
   const next = h.attach("scribe", { sessionId: SESSION });
-  h.timers.advance(frees + 45_000 - h.clock.now()); // rX goes off air
-  assert.equal(s0Key(h), k1, "rX told");
+  h.timers.advance(frees + 45_000 - h.clock.now()); // rX (or rY) goes off air
+  assert.equal(s0Key(h), before, "told before c");
   host.sing(1, { station: "s1", key: OPS, epoch: 200, ttlMs: 20_000 });
   h.timers.advance(6_000);
   assert.equal(pushes(next).length, 1, "c");
-  assert.equal(offAirTold(pushes(next)[0]!.content), 1, "rX in c");
-  h.timers.advance(frees + 210_000 - h.clock.now()); // rY goes off air
-  assert.equal(pendingNotes(h)["s0:ops.fleet"]?.key, k2, "rY told, since c");
+  assert.equal(offAirTold(pushes(next)[0]!.content), 1, "in c");
+  h.timers.advance(frees + 210_000 - h.clock.now()); // rY (or rX) goes off air
+  assert.equal(pendingNotes(h)["s0:ops.fleet"]?.key, since, "told since c");
   return { h, shim: next };
 }
 
-for (const crash of [undefined, "the revert reads", "a pass reads"]) {
-  for (const { keys, name } of ROTATIONS) {
-    test(`#119 R3 re-review G1 (${name}; ${crash === undefined ? "a disconnect" : `a crash, ${crash} the saved notes`}): of a given-back push's two records of one stream, told on either side of a later push, the last heard leaves its key when that push is given back too`, async () => {
-      const [k1, k2] = keys;
-      const directory = mkdtempSync(join(tmpdir(), "frond-ear-split-"));
-      const path = join(directory, "ear.db");
-      try {
-        const { h, shim } = await split(keys, { path });
-        let ear: { h: Harnessed; shim: Parameters<typeof pushes>[0] };
-        if (crash === undefined) {
-          shim.close(); // c given back
-          ear = { h, shim: h.attach("scribe", { sessionId: SESSION }) };
-        } else {
-          ear = crashed(h, path, crash === "a pass reads", {
-            mode: "immediate",
-            maxPushesPerHour: 1,
-          });
-        }
+for (const mirror of [false, true]) {
+  for (const crash of [undefined, "the revert reads", "a pass reads"]) {
+    for (const { keys, name } of ROTATIONS) {
+      test(`#119 R3 re-review G1 (${name}; ${mirror ? "the last heard told first, " : ""}${crash === undefined ? "a disconnect" : `a crash, ${crash} the saved notes`}): of a given-back push's two records of one stream, told on either side of a later push, the last heard leaves its key when that push is given back too`, async () => {
+        const [k1, k2] = keys;
+        const directory = mkdtempSync(join(tmpdir(), "frond-ear-split-"));
+        const path = join(directory, "ear.db");
         try {
-          assert.equal(pendingNotes(ear.h)["s0:ops.fleet"]?.key, k2, "rY's");
-          assert.equal(wakesUnder(ear.h, ear.shim, k1, othersOff), 0, "k1");
-          assert.equal(wakesUnder(ear.h, ear.shim, k2, othersOff), 1, "k2");
+          const { h, shim } = await split(keys, { mirror, path });
+          let ear: { h: Harnessed; shim: Parameters<typeof pushes>[0] };
+          if (crash === undefined) {
+            shim.close(); // c given back
+            ear = { h, shim: h.attach("scribe", { sessionId: SESSION }) };
+          } else {
+            ear = crashed(h, path, crash === "a pass reads", {
+              mode: "immediate",
+              maxPushesPerHour: 1,
+            });
+          }
+          try {
+            assert.equal(pendingNotes(ear.h)["s0:ops.fleet"]?.key, k2, "rY's");
+            assert.equal(wakesUnder(ear.h, ear.shim, k1, othersOff), 0, "k1");
+            assert.equal(wakesUnder(ear.h, ear.shim, k2, othersOff), 1, "k2");
+          } finally {
+            ear.h.dispose();
+          }
         } finally {
-          ear.h.dispose();
+          rmSync(directory, { recursive: true, force: true });
         }
-      } finally {
-        rmSync(directory, { recursive: true, force: true });
-      }
-    });
+      });
+    }
   }
 }
-
 for (const variant of ["folded", "same"] as const) {
   for (const { keys, name } of ROTATIONS) {
     test(`#119 R3 re-review G1 (${name}; ${variant === "folded" ? "s0 folded" : "rX and rY heard in the same instant"}): given back on a disconnect, s0 keeps rY's key: ${variant === "folded" ? "folded or named alike" : "a note a push gives back takes no tie from one told since"}`, async () => {
