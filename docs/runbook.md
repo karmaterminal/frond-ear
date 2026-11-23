@@ -748,8 +748,16 @@ What the live set dropped past the 256 tuned streams it counts one by one is a s
 station is known, so it says whether this ear would have pushed them is unknown. It only rides with a push that goes
 anyway, and not at all while nothing could be pushed (no `wakeKeys`, or a mute over every station). A record that
 left the view first (plucked, superseded, the link went) isn't frond-ear's doing, and is only counted, as before.
-What hasn't been told yet survives a restart (`canticle.withheld.<ear>` in the store), and a note in a push the host
-never confirmed is told again once that push is given back.
+A note shows five lines one by one and counts the rest, records included (`(251 more local omissions, 266 records; …)`).
+It keeps up to 256 streams by name; past them, what it has to say goes into one `and N more across M streams` line,
+by reason, so every record is accounted for. A note owed a push of its own takes a named place from one that isn't,
+so the push it is owed still comes. A note pushes on its own only while its station could be pushed now: its key on
+`wakeKeys`, a mode that pushes, no mute, as the config and the session's choices stand now, not when it was owed.
+One that a reload or a restart left outside that waits, still owed, rides with the next push that goes, and `hear`
+says it waits (`the next push reports 1 it withheld (local omissions); nothing pushes it on its own now, …`). Neither
+the `other tuned streams` line nor the `and N more` line asks for a push of its own: neither has a station to meet
+the boundary. What hasn't been told yet survives a restart (`canticle.withheld.<ear>` in the store), and a note in a
+push the host never confirmed is told again once that push is given back.
 
 **Late records.** A record that wasn't heard live just now has a `late:` line under its banner's timing line:
 `late: heard 54s ago (snapshot)`, `late: heard 7s ago (resurfaced)`, or

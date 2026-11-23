@@ -2224,3 +2224,26 @@ test("#119 second review R2: at the bound, a note owed a push takes a named plac
     h.dispose();
   }
 });
+
+test("#119 second review R2: a note too long for limits.maxNotificationChars sums up in one line, what it folded counted with the rest", async () => {
+  const { h, shim, frees, wakeKeys } = await promised(258);
+  try {
+    h.daemon.reloadConfig(
+      canticleConfig(
+        { mode: "immediate", maxItems: 1, maxPushesPerHour: 1 },
+        { wakeKeys },
+        { limits: { maxNotificationChars: 500 } },
+      ),
+    );
+    h.timers.advance(frees + 6_000 - h.clock.now());
+    assert.equal(pushes(shim).length, 2);
+    const note = pushes(shim)[1]!.content;
+    assert.ok(note.length <= 500, `${note.length} chars`);
+    assert.match(
+      note,
+      /^local omissions \(frond-ear withheld these itself\): 257 records on 257 streams; ear_status counts them\.$/mu,
+    );
+  } finally {
+    h.dispose();
+  }
+});
