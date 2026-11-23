@@ -3104,44 +3104,50 @@ for (const { keys, name } of ROTATIONS) {
   });
 }
 
-for (const pass of [false, true]) {
-  test(`#119 re-review R3, upgrade (${pass ? "a pass reads the saved notes, then the revert" : "the revert reads the saved notes"}): notes an earlier build saved, which say no push they are as of, are as of the push that carried them, so a crash's given-back push can't put its earlier key over the notes since`, async () => {
-    const [first, later] = [OPS, ALPHA];
-    const directory = mkdtempSync(join(tmpdir(), "frond-ear-rotated-"));
-    const path = join(directory, "ear.db");
-    try {
-      const { h } = await rotated([first, later], 257, { pushed: 1, path });
-      // As an earlier build saved them: the carried push's notes without `asOf`.
-      const name = "canticle.withheld.scribe";
-      const saved = h.store.runtimeState(name)!;
-      assert.match(saved, /"carried":\{"\d+":\{.*"asOf":\d+/u);
-      h.store.setRuntimeState(name, saved.replace(/,"asOf":[\d.]+/gu, ""));
-      assert.doesNotMatch(h.store.runtimeState(name)!, /asOf/u);
-      const again = crashed(
-        h,
-        path,
-        pass,
-        { mode: "immediate", maxPushesPerHour: 1, stations: offBut(257, 256) },
-        { wakeKeys: [first] },
-      );
+for (const pushed of [1, 2] as const) {
+  for (const pass of [false, true]) {
+    test(`#119 re-review R3, upgrade (${pushed === 1 ? "a push, then notes since" : "two pushes"}; ${pass ? "a pass reads the saved notes, then the revert" : "the revert reads the saved notes"}): notes an earlier build saved, which say no push they are as of, are as of the push that carried them, so a crash's given-back push can't put its earlier key over a later push's or the notes since`, async () => {
+      const [first, later] = [OPS, ALPHA];
+      const directory = mkdtempSync(join(tmpdir(), "frond-ear-rotated-"));
+      const path = join(directory, "ear.db");
       try {
-        assert.equal(foldedPlace(again.h, "s256:ops.fleet")?.key, later);
-        assert.equal(pendingNotes(again.h)["s0:ops.fleet"]?.key, later);
-        again.h.timers.advance(60_000);
-        assert.equal(pushes(again.shim).length, 0, "earlier key");
-        assert.equal(
-          wakesUnder(again.h, again.shim, later, offBut(257, 256)),
-          1,
-          "later key",
+        const { h } = await rotated([first, later], 257, { pushed, path });
+        // As an earlier build saved them: the carried pushes' notes without `asOf`.
+        const name = "canticle.withheld.scribe";
+        const saved = h.store.runtimeState(name)!;
+        assert.match(saved, /"carried":\{"\d+":\{.*"asOf":\d+/u);
+        h.store.setRuntimeState(name, saved.replace(/,"asOf":[\d.]+/gu, ""));
+        assert.doesNotMatch(h.store.runtimeState(name)!, /asOf/u);
+        const again = crashed(
+          h,
+          path,
+          pass,
+          {
+            mode: "immediate",
+            maxPushesPerHour: 1,
+            stations: offBut(257, 256),
+          },
+          { wakeKeys: [first] },
         );
-        assert.equal(omissionsTold(pushes(again.shim)[0]!.content), 2 * 257);
+        try {
+          assert.equal(foldedPlace(again.h, "s256:ops.fleet")?.key, later);
+          assert.equal(pendingNotes(again.h)["s0:ops.fleet"]?.key, later);
+          again.h.timers.advance(60_000);
+          assert.equal(pushes(again.shim).length, 0, "earlier key");
+          assert.equal(
+            wakesUnder(again.h, again.shim, later, offBut(257, 256)),
+            1,
+            "later key",
+          );
+          assert.equal(omissionsTold(pushes(again.shim)[0]!.content), 2 * 257);
+        } finally {
+          again.h.dispose();
+        }
       } finally {
-        again.h.dispose();
+        rmSync(directory, { recursive: true, force: true });
       }
-    } finally {
-      rmSync(directory, { recursive: true, force: true });
-    }
-  });
+    });
+  }
 }
 
 /**

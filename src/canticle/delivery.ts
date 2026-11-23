@@ -319,15 +319,17 @@ interface Missed {
   /** The station key of its latest record: the boundary a push of its own meets. */
   key: string;
   /**
-   * When `key` is as of, by the pushes that carried it: a note's, just before the first
-   * push that carried it (its batch id less ½), since the note was written before that
-   * push went, and a push carrying it again makes it no later; a record's that a push
-   * carried and gave back, that push (its batch id), since the record was on air when it
-   * went. None for a key noted since every push, which is the latest. Notes merged back
-   * in keep the later key by it, never by the merge's order.
+   * When `key` is as of, by the pushes that carried it (their batch ids): a note's, the
+   * first push that carried it (a push carrying it again makes it no later); a record's
+   * that a push carried and gave back, that push. None for a key noted since every push,
+   * which is the latest. Notes merged back in keep the later key by it (`supersedes`),
+   * never by the merge's order.
    */
   asOf?: number;
-  /** A record's `asOf` only: when it was heard, so of one push's records the last heard is the later. */
+  /**
+   * A record's only: when it was heard. As of one push, its notes (written before it went)
+   * come before its records (on air when it went), and its records in the order heard.
+   */
   heard?: number;
   /** Owed a push of its own: a push said these wait, or the push budget held them. */
   owed: boolean;
@@ -416,11 +418,11 @@ interface Keyed {
 }
 
 /**
- * Whether `note`'s key goes over `than`'s: when it is later (by `Missed.asOf`, then, of one
- * push's records, `heard`; batch ids only grow), or as late and told since, as a note
- * noted or told now is (of two notes since every push, the one noted last). A note a push
- * gives back was told before anything here as late as it (each push takes all that
- * waits), so with `givenBack` it has to be later.
+ * Whether `note`'s key goes over `than`'s: when it is later (by `Missed.asOf`, then
+ * `heard`, none of which is earliest; batch ids only grow), or as late and told since, as
+ * a note noted or told now is (of two notes since every push, the one noted last). A note
+ * a push gives back was told before anything here as late as it (each push takes all
+ * that waits), so with `givenBack` it has to be later.
  */
 function supersedes(note: Keyed, than: Keyed, givenBack: boolean): boolean {
   const [a, b] = [note.asOf ?? Infinity, than.asOf ?? Infinity];
@@ -438,12 +440,12 @@ function takeKey(into: Keyed, from: Keyed): void {
 }
 
 /**
- * `missed` as push `batchId` carries it: a key no push carried before is as of just
- * before this one; one already as of an earlier push stays so.
+ * `missed` as push `batchId` carries it: a key no push carried before is as of this one;
+ * one already as of an earlier push stays so.
  */
 function carriedBy(missed: Missed, batchId: number): Missed {
-  missed.asOf ??= batchId - 0.5;
-  for (const f of missed.streams?.values() ?? []) f.asOf ??= batchId - 0.5;
+  missed.asOf ??= batchId;
+  for (const f of missed.streams?.values() ?? []) f.asOf ??= batchId;
   return missed;
 }
 
@@ -452,10 +454,6 @@ const given = (waiting: Waiting): Partial<Keyed> =>
   waiting.asOf === undefined
     ? {}
     : { asOf: waiting.asOf, heard: waiting.item.heardAt };
-
-/** A saved `asOf` that reads: a batch id, or one less ½. */
-const isAsOf = (value: unknown): value is number =>
-  typeof value === "number" && isCount(value * 2);
 
 /** Adds `from`'s counts and spans to `into`, which is owed if either is. */
 function addMissed(into: Missed, from: Missed): void {
@@ -739,7 +737,7 @@ function loadMissed(saved: unknown): Map<string, Missed> {
         const { key, owed, withheld, missed } = g;
         streams.set(g.stream, {
           key,
-          ...(isAsOf(g.asOf) ? { asOf: g.asOf } : {}),
+          ...(isCount(g.asOf) ? { asOf: g.asOf } : {}),
           ...(isCount(g.heard) ? { heard: g.heard } : {}),
           owed,
           withheld,
@@ -752,7 +750,7 @@ function loadMissed(saved: unknown): Map<string, Missed> {
       dropped: m.dropped,
       withheld,
       key: m.key,
-      ...(isAsOf(m.asOf) ? { asOf: m.asOf } : {}),
+      ...(isCount(m.asOf) ? { asOf: m.asOf } : {}),
       ...(isCount(m.heard) ? { heard: m.heard } : {}),
       owed: m.owed,
       ...(stream === FOLDED ? { streams } : {}),
