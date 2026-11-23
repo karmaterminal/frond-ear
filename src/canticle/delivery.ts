@@ -960,7 +960,9 @@ export class CanticleDelivery {
           // Passed over this pass anyway (a mode or the boundary changed): not ours to tell.
           if (this.#passOver(waiting.item, keys, modes) !== undefined) continue;
           this.#unwait(state, waiting);
-          this.#withhold(state, waiting, d.at);
+          // Told as dropped once already (it came back, then went again): not again.
+          if ((state.reported.get(id) ?? 0) > now) state.seen.delete(id);
+          else this.#withhold(state, waiting, d.at);
         } else if (
           live.has(id) ||
           (settled?.get(id) ?? 0) > now ||
