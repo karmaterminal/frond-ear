@@ -25,7 +25,7 @@ amendments, which bind this design as acceptance criteria.
 | #     | Question                    | Decision                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | ----- | --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 1     | Who writes                  | The host daemon, after it has verified a frame and saved the state that frame implies. It appends each frame its receptor surfaces, and mirrors each retraction. Stations never write the canticle lane.                                                                                                                                                                                                                                                                                                                                                                                                        |
-| 1     | What a reader may assume    | Only that something with write access appended these bytes. The reader re-verifies each station signature against its own manifest and checks expiry on its own clock. It trusts order, completeness and retractions only when the writer's signature on the envelope verifies, under a writer key the owner-signed manifest names. Whoever holds that key can hide content, and choose which genuine, unexpired frames are read and in what order. It can't forge content or lengthen its life, and it can't undo a removal the reader has read.                                                               |
+| 1     | What a reader may assume    | Only that something with write access appended these bytes. The reader re-verifies each station signature against its own manifest and checks expiry on its own clock. It trusts order, completeness and retractions only when the writer's signature on the envelope verifies, under a writer key the owner-signed manifest names. Whoever holds that key can hide content, and choose which genuine, unexpired frames are read and in what order. It can't forge content or lengthen its life, and it can't undo a removal the reader has read, short of overflowing the retract guards, which is reported.   |
 | 1     | Which ring                  | A ringserver instance of the canticle lane's own, one per retention class. It listens on IPv4, accepts only loopback peers, and grants no address write or trusted access. Write is granted by `AUTH` to the daemon alone and revoked only by disconnecting. No host firewall.                                                                                                                                                                                                                                                                                                                                  |
 | 1     | Stream axes                 | Every lane declares #116's three axes. The canticle lane is shape per stream, time `replay`, loss `tolerated`: the station → daemon hop is lossy, and the ring detects loss only from the writer on. Recovered streams need a spool binding, not this lane.                                                                                                                                                                                                                                                                                                                                                     |
 | 2     | Packet                      | One ring packet per surfaced frame per writer run, plus one per retraction and a few control packets. Each packet is a 48-byte envelope, a body (for a frame, the station's canonical frame byte for byte) and a 64-byte Ed25519 writer signature, under `BC_<key_id>_<stream_id>/CANTICLE`.                                                                                                                                                                                                                                                                                                                    |
@@ -159,7 +159,7 @@ axes the manifest declares for it (Q-B9).
 | Freshness                                       | The signed `expires_at`, read on the reader's clock (§5.1)                                                   | The ring evicts by size, not by TTL (RFC:2752), so retained packets outlive their items.                                                                                                                          |
 | Identity                                        | The frame's own tuple, never the ring stream id or the packet id                                             | Stream ids are text the writer chooses. Packet ids are handed out again after a crash (Appendix A, E3 and E4).                                                                                                    |
 | Order and completeness                          | The (run, seq) and `stream_seq` under the writer's signature                                                 | A lapped reader is skipped forward without notice (E2), crash recovery reuses ids in place and can serve them out of order (E3, E4), and any client allowed to write can plant ids (`rs:src/dlclient.c:916-933`). |
-| Admission (dedup, plucks, supersession, quotas) | The reader's own listener, judging frames in the writer's signed order, plus the writer's signed retractions | The daemon's decisions are not carried in the ring; only its frames and its retractions are. Of the listener's checks, only the epoch rule depends on order (§4.3, rule 6).                                       |
+| Admission (dedup, plucks, supersession, quotas) | The reader's own listener, judging frames in the writer's signed order, plus the writer's signed retractions | The daemon's decisions are not carried in the ring; only its frames and its retractions are. Of the listener's checks, the epoch rule, class changes and quotas depend on order (§4.3, rule 6).                   |
 
 **Why verify again when the writer already did.** It costs one Ed25519 verification per new frame, not per loop
 copy, at a few frames a second at most (§6). In return, the ringserver process, its ACLs, its other writers and the
@@ -168,8 +168,9 @@ ring file all drop out of what must be trusted for content.
 **What the writer is trusted for:**
 
 - **Availability, completeness and order.** The writer controls what reaches the ring and in what order. The
-  reader's listener judges each frame in the writer's order. Of its checks, only the epoch rule (RFC:312) depends on
-  order, and on the ring path it judges a frame at its own writer position (§4.3, rule 6).
+  reader's listener judges each frame in the writer's order. Three of its checks depend on order: the epoch rule
+  (RFC:312), which the ring path judges at each frame's own writer position (§4.3, rule 6), and the class-change rule
+  and the occupancy quotas, which only ever refuse, and report what they refuse.
 - **Retractions.** A retract packet only ever removes an item, so a forged one can hide content but never show it.
 - **Hearing time and clock offset, within bounds.** Admission uses both: `heard_at` is clamped to no later than now,
   and `offset_ms` to between −60 s and 0 (§5.1).
@@ -180,13 +181,15 @@ about content:
 - **It can hide anything,** by withholding packets or forging retractions.
 - **It can show a genuine frame the daemon didn't surface:** one the daemon never heard, or an older-epoch frame the
   daemon refused as `epoch-regression`, placed before the point where the key's epoch rose. It can place one there
-  when it appends, or later in a hole it left. By leaving out a PLUCK or a retraction, it can also keep showing an
-  item the daemon removed; the host socket's retracts still remove that item if the socket carried the retraction
-  (§4.4).
+  when it appends, or later: in a hole it left, or as a stream's next packet under an earlier seq. By leaving out a
+  PLUCK or a retraction, it can also keep showing an item the daemon removed; the host socket's retracts still remove
+  that item if the socket carried the retraction (§4.4).
 - **It can never** show content no manifest station signed, or keep an item past its signed expiry on the reader's
   clock (§5.1). It can't bring back an item that a frame or retraction the reader has read removes: plucks,
-  supersession marks and retract guards don't depend on order (RFC §7.7, §7.8; §4.1). And it can't have a frame
-  judged against any epoch mark but the one at that frame's own position (§4.3, rule 6).
+  supersession marks and retract guards don't depend on order (RFC §7.7, §7.8; §4.1), and only retract guards are
+  ever dropped early. The one exception is reported: flooding the reader past 16 384 retract guards drops the one
+  expiring soonest (`guard_overflow`, §4.1), and its item could then come back. And a frame is judged against the
+  epoch mark at its own position among the packets read so far (§4.3, rule 6).
 
 **Why the envelope is signed, not tagged with a shared key.**
 
@@ -357,10 +360,10 @@ they only remove, never admit or show.
     say which packet it is (§4.3, rule 3). It never passes an undecided run's first packet (§4.3, §4.6);
   - the tune set at the last start, and the `ring_joined_late` and `stream_joined_late` flags (§4.3, rule 7);
   - for each tracked run (§4.3, rule 5): its number and the daemon run it names, its first packet id, the last `seq`
-    and control sequence read, its state (current, undecided, or ended and how: its `bye` read, superseded, bound
-    away, gone quiet in a blind state, retired, tail unknown), and for each tuned stream its last `stream_seq` and
-    missing ranges, and for each open hole the packet id, pkttime and (run, seq) of the last packet before it, where
-    its refill starts;
+    and control sequence read, its state (current, undecided, foreign (writing while not current), or ended and how:
+    its `bye` read, superseded, bound away, gone quiet in a blind state, retired, tail unknown), and for each tuned
+    stream its last `stream_seq` and missing ranges, and for each open hole the packet id, pkttime and (run, seq) of
+    the last packet before it, where its refill starts;
   - the last 64 ended runs, by number and daemon run, each with the ordinal of its ending, and the highest run ever
     ended;
   - for each key, its rise history: the earliest writer position at which it reached each epoch, at most 8 rises
@@ -423,8 +426,8 @@ they only remove, never admit or show.
      the crash lost, then hands their ids to new packets in the same slots. A connection that has just read such a
      packet then misses the new one written into that slot, and a fresh `STREAM` can deliver ids out of order (E4).
      The signed sequences show the miss as a hole, which a refill fills. A packet id only locates a packet: the
-     reader validates by (run, seq, digest), orders by (run, seq) and `stream_seq`, and never takes order or identity
-     from the id.
+     reader validates by (run, seq, digest), orders by writer position (rule 6) and `stream_seq`, and never takes
+     order or identity from the id.
 5. **Runs.** These rules answer 🌫's replay cut and 🍃's H2.
    - **A run is bound to a daemon incarnation.** Its `hello` and `tick`s name the daemon's record v1 `run`, random hex
      chosen at each daemon start (RFC:2176), and its own previous run (W6). The host socket's latest `hello` gives the
@@ -459,33 +462,40 @@ they only remove, never admit or show.
      arrive while the main stream is caught up with the ring's head, and go on for more than a tick interval. A replay
      of history doesn't: its seqs are old, or it arrives during a catch-up. A run that keeps writing raises
      `two_writers`, with health `degraded`, and its packets are skipped as `foreign_run`; if it had ended, it stays
-     ended. If it isn't bound, it blinds nothing: the current run's content keeps flowing, and `two_writers` clears
-     once it has sent nothing for three tick intervals. If it is bound too, two runs name the live daemon run, and
+     ended. It is tracked as foreign, with its first packet id, so a frond-ear restart keeps it (§4.2). A run _goes
+     quiet_ when it has sent nothing for three tick intervals, timed on the reader's clock while the main stream is
+     caught up. If the run that keeps writing isn't bound, it blinds nothing: the current run's content keeps
+     flowing, and `two_writers` clears once it goes quiet. If it is bound too, two runs name the live daemon run, and
      nothing new from either is shown (next point).
    - **Blind states have health and an exit.** The reader can be connected and reading, yet able to show nothing
      new:
      - `run_unbound`: the current run hasn't named the live daemon run for three tick intervals while the socket is
        connected;
-     - `two_writers`: two runs are bound to the live daemon run;
+     - `two_writers` with both runs bound: two runs name the live daemon run;
      - `manifest_mismatch`, in `primary` (§8).
 
      Each makes health `degraded` with reason `ring_blind`, adds a header line to `hear`, and logs once. A counter is
      never the only signal. They clear:
      - `run_unbound`, when a run bound to the live daemon run becomes current, by the rules above, so never an ended
        one;
-     - `two_writers`, once no more than one bound run is still writing, the others having sent nothing for three tick
-       intervals, and that run has never ended. If it isn't current, the quiet current run ends, and it becomes
-       current, rewinding to its first packet as a refill does (rule 6). If that packet is gone, the rewind starts
-       from `EarliestPacketID`, and what the ring no longer holds of the run is reported, never skipped: a `ring_gap`
-       for each of its streams first read past `stream_seq` 1, and one for the control sequence if its `hello` is
-       gone (§4.4). If the only bound run still writing has ended, it stays ended: the current run stays current, and
-       the reader stays `ring_blind`. If none is still writing, the quiet current run stays current, and the ring is
-       `writer_silent` (§4.4) until a run takes over by the rules above;
+     - `two_writers`, when every bound run but one has gone quiet and that one has never ended, or when all have gone
+       quiet:
+       - if the one still writing isn't current, the quiet current run ends, and it becomes current, rewinding to its
+         first packet as a refill does (rule 6). If that packet is gone, the rewind starts from `EarliestPacketID`,
+         and what the ring no longer holds of the run is reported, never skipped: a `ring_gap` for each of its
+         streams first read past `stream_seq` 1, and one for the control sequence if its `hello` is gone (§4.4);
+       - if all have gone quiet, the quiet current run stays current, and the ring is `writer_silent` (§4.4) until a
+         run takes over by the rules above.
+
+       An ended run never becomes current again: while the only bound run still writing has ended, the current run
+       stays current and the reader stays `ring_blind`. If the socket reports a new daemon run meanwhile, neither
+       run is bound any more, `two_writers` stops blinding, and the rules above decide;
+
      - `manifest_mismatch`, at a frond-ear restart with the daemon's manifest.
 
-   - **At most 16 runs are tracked** with open holes, hidden items or an undecided state. Beyond that the oldest
-     ended one is retired: its tail is reported as unknown if no `bye` was read (§4.4), its open holes become loss,
-     and its items stay hidden until confirmed or expired.
+   - **At most 16 runs are tracked** with open holes, hidden items, an undecided state, or writing while not
+     current. Beyond that the oldest ended one is retired: its tail is reported as unknown if no `bye` was read
+     (§4.4), its open holes become loss, and its items stay hidden until confirmed or expired.
 
 6. **Holes and refills, per stream.** This rule answers 🍃's H1.
    - For each tuned stream of each tracked run, the reader tracks the `stream_seq`s it is missing, as at most 8
@@ -506,15 +516,19 @@ they only remove, never admit or show.
      writer position. Positions are ordered by run, in the order the runs ended with the current run last (§4.2), then
      by seq.
      - frond-ear persists each key's **rise history**: for each epoch the key has reached, the earliest position of a
-       frame admitted at it (§4.2). The mark at a position is the highest epoch reached at or before it.
+       frame that took it there (§4.2). The listener raises the mark for every frame it takes in past its quotas, a
+       PLUCK or an item then dropped as plucked or superseded included. The mark at a position is the highest epoch
+       reached at or before it.
      - A frame is admitted only if its epoch is at least the mark at its own position. A frame above that mark is a
-       rise at its own position, and its epoch's recorded position moves back to it. So a refill is judged as it
-       would have been in writer order, and never against a mark that rose after its position.
-     - A frame refused at its position counts as `epoch-regression` and changes nothing. A refilled one leaves its
-       stream hidden until the witnesses confirm its items (§4.4), as for a hole the refill couldn't fill.
-     - Per key, the history keeps the last rise at or before the oldest open hole on the key's streams, and every
-       rise after it: at most 8 [PROPOSED]. Beyond that, the oldest rise is dropped, and every position before the
-       next one is judged against the dropped rise's epoch, which only ever refuses more.
+       rise at its own position, and its epoch's recorded position moves back to it. So a refill, or any packet read
+       out of writer order, is judged as it would have been in writer order among the packets read so far, never
+       against a mark that rose after its position. A frame already admitted isn't judged again.
+     - A frame refused at its position counts as `epoch-regression` and changes nothing. One read out of writer
+       order, by a refill or otherwise, leaves its stream hidden until the witnesses confirm its items (§4.4), as for
+       a hole the refill couldn't fill.
+     - The history keeps each key's last 8 rises [PROPOSED]. A position before the oldest kept rise is judged against
+       the epoch of the last rise dropped, which only ever refuses more. A run that has dropped out of the 64 ended
+       runs kept (§4.2) counts as before every other.
 
      The writer is trusted for this order, and for nothing about content (§2). The listener's occupancy quotas
      (`listener.ts:1039-1093`) are unchanged; a refilled frame refused over quota is reported, never dropped silently.
@@ -568,7 +582,7 @@ they only remove, never admit or show.
 | packets of an ended run, or of an unbound run at or below the highest ended        | History, rollback leftovers, or a replay                                                                                                        | `stale_run` (a count), unless they fill an open hole                                                               | Unchanged                                                                                                        |
 | a run that isn't current keeps writing (§4.3, rule 5)                              | A second writer                                                                                                                                 | `two_writers` and `foreign_run`; health `degraded`; `ring_blind` if both are bound                                 | Unchanged; nothing new shown if blind                                                                            |
 | a lower run bound to the live daemon run                                           | A regressed writer                                                                                                                              | `run_regressed`                                                                                                    | As for a run's end                                                                                               |
-| a refilled frame refused at its writer position (§4.3, rule 6)                     | The writer's order contradicts itself, or the key's rise history overflowed                                                                     | `epoch-regression` (a count)                                                                                       | That stream's items heard before the hole stay hidden until confirmed                                            |
+| a frame read out of writer order and refused at its position (§4.3, rule 6)        | The writer's order contradicts itself, or the key's rise history overflowed                                                                     | `epoch-regression` (a count)                                                                                       | That stream's items heard before the hole stay hidden until confirmed                                            |
 | a writer signature fails                                                           | Not from the writer                                                                                                                             | `unauthenticated` (a count)                                                                                        | Unchanged                                                                                                        |
 | no `tick` for three intervals                                                      | The writer is silent, the ring is unreachable, or a forged flood under the control id buries the `tick`s (§4.6)                                 | `writer_silent`: blind, and saying so                                                                              | Kept; expiry carries on                                                                                          |
 
@@ -611,7 +625,7 @@ lost, and S's `hello` names R but not R's last seq.
 aside), so nothing later in that run can confirm a hidden item. Waiting for expiry could hide a stream for up to
 86 400 s, for `finding-ref` (RFC:383). So a hidden item is shown again only when a sound witness confirms it, or it
 leaves at its local expiry. A stream hidden only for a hole that its refill filled completely, with no frame refused
-at its writer position (§4.3, rule 6), or for a pending drop that its sequence settled unbroken (§4.6), is shown again
+at its position (§4.3, rule 6), or for a pending drop that its sequence settled unbroken (§4.6), is shown again
 at once. Otherwise, let `W` be the envelope `rec_seq` of the
 packet that revealed the hole (the stream's next packet, or the `tick`), or of the new run's `hello`. Three things
 confirm:
@@ -694,7 +708,7 @@ don't stop a flood from exhausting the reader. So, in this order, before anythin
    256 KiB per key, and 8 MiB in all [PROPOSED]; the control id counts as one key, and its packets are verified
    first. They decide runs (§4.3, rule 5), so when a frame is verified, every control packet read before it has
    been verified or dropped. A frame is judged under the run state at its own read position: one read before a
-   `hello` that ends its run is still that run's.
+   `hello` that ends its run is still that run's, and is hidden with that run's items under the same `W` (§4.4).
 4. **A verification budget, shared fairly.** Writer signatures, then station signatures for new frames, are checked
    at most 2 000 times a second in all [PROPOSED], round-robin across the keys with packets waiting. A noisy key
    can't starve a quiet one of verification. Control packets are the exception, since they go first: a forged flood
@@ -1119,6 +1133,8 @@ Each case asserts the counters, what `hear` shows and what is pushed:
      seen past its `hello` takes its previous run from its `tick`s; with those lost too, whether runs went by is
      unknown.
    - A run that ends with a hole still open has the hole filled by a refill, with no false loss.
+   - A frame read just before the next run's `hello`, but verified after it, is still the ending run's, and is
+     hidden with that run's items.
 8. **Runs.**
    - Replayed packets of an ended run count as `stale_run`, change nothing, raise no alert, and nothing goes blank.
    - A second writer's packets are `foreign_run`, and the bound run's content still flows (case 27).
@@ -1248,9 +1264,10 @@ Each case asserts the counters, what `hear` shows and what is pushed:
       it would have been shown. Filled with an epoch-2 frame, it is admitted.
     - The same epoch-1 frame in a hole before the first rise is admitted: the writer is trusted for order (§2), and
       the case checks the judgement by position, not the order itself.
-    - With more than 8 rises while a hole is open, a frame placed before the oldest kept rise is judged against the
-      dropped rise's epoch: never admitted where the full history would refuse it. Across a frond-ear restart, the
-      persisted history gives the same verdicts.
+    - With more than 8 rises, a frame placed before the oldest kept rise, in a hole or as a stream's next packet under
+      an earlier seq, is judged against the last dropped rise's epoch: never admitted where the full history would
+      refuse it. A PLUCK, or an item then dropped as superseded, raises the mark like any other frame. Across a
+      frond-ear restart, the persisted history gives the same verdicts.
 27. **Blind states and second writers** (🍃's H2).
     - A second writer with a higher run naming another daemon run never ends the bound run: `two_writers` and
       `foreign_run` are reported, health is `degraded`, and the bound run's items keep flowing. `two_writers` clears
@@ -1269,6 +1286,9 @@ Each case asserts the counters, what `hear` shows and what is pushed:
       writing, bound to the live daemon run, while the current run falls quiet: it never becomes current, nothing of
       it is shown, and the reader stays `ring_blind`. A new run naming the current one becomes current as usual, and
       the reader stays blind until the ended run goes quiet too.
+    - A frond-ear restart during `two_writers` keeps the second writer: the blind state holds, and nothing new of
+      either run is shown during the catch-up. If the host socket reports a new daemon run meanwhile, neither run is
+      bound, and the run rules decide.
     - With a second writer known, the host socket reconnects: no run becomes current until the socket reports a
       daemon run, so the bound run stays current.
     - In each blind state, health never reads `ok`.
@@ -1372,8 +1392,8 @@ Each case asserts the counters, what `hear` shows and what is pushed:
   proof. Open: a kill or a stop timeout during the clean stop's write, header first (§7); power loss, since nothing
   syncs; RAM, stop time and `TimeoutStopSec` at size; the installed ring size after the shadow experiment (1 GiB is a
   candidate, not a decision); and who owns the systemd unit. 🌫 accepts `MemoryMapRing 0` as a candidate on these
-  terms, and selects no installed size.
-- **Q-S4. Answered by 🌫:** lanes (b) and (e) stay as RFC §18.3 has them, for dashboards, on their own instance, and
+  terms; he selects no installed size and grants no rollout.
+- **Q-S4.** Lanes (b) and (e) stay as RFC §18.3 has them, for dashboards, on their own instance. **Answered by 🌫:**
   nothing here conflicts with `bc:spike/silas-seedlink-mapping.md`. That spike is a conceptual UDP mapping from March,
   not a competing ring wire contract: keeping the lossy broadcast first hop and adding a replay tier downstream fits
   it, and its illustrative JSON and heartbeat path aren't requirements.
