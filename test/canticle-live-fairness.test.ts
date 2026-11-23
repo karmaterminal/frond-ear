@@ -3826,6 +3826,40 @@ for (const { keys, name } of ROTATIONS) {
     }
   });
 
+  test(`#119 E2 fresh review (${name}): a stream noted since every push, whose place a record told at the revert leaves under its own key, keeps the key it was noted under if it loses that place and gets one back from a later push`, async () => {
+    const [stale, latest] = keys;
+    const { h, host, shim, sing, pause, free } = await spent();
+    try {
+      // The first push carries s510's record, off air before the pushes are given back.
+      h.timers.advance(
+        status(h).lastPushAt! + 3_600_000 - 9_000 - h.clock.now(),
+      );
+      const station = "s510";
+      host.sing(1, { station, key: stale, epoch: 610, ttlMs: 20_000 });
+      h.timers.advance(10_000);
+      assert.equal(pushes(shim).length, 2, "a record");
+      h.timers.advance(20_000);
+      sing(stale, 2, [...range(256, 509), 0, 1, 2, 510]);
+      free();
+      // Every place past the 256 named taken since, s510's first, owed nothing.
+      pause(true);
+      sing(latest, 3, [...range(0, 255), 510, 511, ...range(256, 509)]);
+      assert.equal(foldedPlace(h, "s510:ops.fleet")?.key, latest, "since");
+      pause(false);
+      shim.close(); // both given back, the earlier first: s2 takes s510's place
+      const next = h.attach("scribe", { sessionId: SESSION });
+      const off = offBut(512, 510);
+      assert.equal(wakesUnder(h, next, stale, off), 0, "the stale key");
+      assert.deepEqual(savedKey(h, "s510:ops.fleet"), {
+        key: latest,
+        owed: true,
+      });
+      assert.equal(wakesUnder(h, next, latest, off), 1, "the latest key");
+    } finally {
+      h.dispose();
+    }
+  });
+
   test(`#119 E2, control (${name}): past 512 streams, a stream that lost its place and is noted again under a later key, with no place, gets one back under that key, not the one it had when it lost it`, async () => {
     const [stale, latest] = keys;
     const { h, shim, sing, pause, free } = await spent();
