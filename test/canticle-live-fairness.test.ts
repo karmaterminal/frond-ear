@@ -1734,3 +1734,34 @@ test("#119 re-review 2: a hear-only flood's refusals can't push an allowlisted d
     h.dispose();
   }
 });
+
+test("#119 re-review 2: a told drop that came back and waits again is not told again if the live set drops it again", async () => {
+  const { h, host } = setup({ mode: "immediate", maxPushesPerHour: 360 });
+  try {
+    const key = (i: number) => (i + 1).toString(16).padStart(16, "0");
+    const station = (name: string, i: number) =>
+      host.sing(1, { station: name, key: key(i), ttlMs: 3_600_000 });
+    host.sing(1, { ttlMs: 3_600_000 });
+    host.sing(2, { ttlMs: 3_600_000 });
+    for (let i = 0; i < MAX_LIVE - 2; i++) station(`s${i}`, i);
+    h.timers.advance(1_000); // no session yet: ops's two wait
+    station("n1", 10_001); // ops holds the most: its oldest, ops/1, goes
+    h.timers.advance(1_000); // told
+    host.pluck(1, { station: "s0", key: key(0) });
+    host.sing(1, { dedup: "resurfaced", ttlMs: 3_600_000 }); // back, and waited on again
+    h.timers.advance(1_000);
+    host.pluck(2);
+    host.sing(3, { ttlMs: 3_600_000 }); // ops/1 is ops's oldest again
+    station("n2", 10_002); // and goes again
+    h.timers.advance(1_000);
+    const shim = h.attach("scribe");
+    for (let t = 0; t < 30; t++) h.timers.advance(1_000);
+    assert.equal(overflowTold(shim, "ops:ops.fleet"), 1, "told once");
+    assert.deepEqual(
+      pushes(shim).flatMap((push) => order(push.content)),
+      ["ops:ops.fleet/3"],
+    );
+  } finally {
+    h.dispose();
+  }
+});
