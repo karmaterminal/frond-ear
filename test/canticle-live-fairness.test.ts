@@ -3012,112 +3012,14 @@ for (const crash of [undefined, "the revert reads", "a pass reads"]) {
   }
 }
 
-/**
- * At one push an hour, an unconfirmed push carries s0's record 1 under `first` (30 s) and
- * spends the hour; s0's record 2, under `later`, goes off air under the spent budget,
- * owed, and so does record 1, before anything is given back. With `pushed`, the note goes
- * out on its own the next hour, unconfirmed too.
- */
-async function carried(
-  [first, later]: readonly [string, string],
-  pushed: boolean,
-) {
-  const { h, host } = setup({ mode: "immediate", maxPushesPerHour: 1 });
-  const shim = h.attach("scribe", { sessionId: SESSION });
-  host.sing(1, { station: "s0", key: first, epoch: 100, ttlMs: 30_000 });
-  h.timers.advance(6_000);
-  assert.deepEqual(order(pushes(shim)[0]!.content), ["s0:ops.fleet/1"]);
-  host.sing(2, { station: "s0", key: later, epoch: 100, ttlMs: 10_000 });
-  h.timers.advance(30_000);
-  assert.equal(pendingNotes(h)["s0:ops.fleet"]?.key, later, "owed since");
-  if (pushed) {
-    h.timers.advance(status(h).lastPushAt! + 3_600_000 + 6_000 - h.clock.now());
-    assert.equal(pushes(shim).length, 2, "the note, on its own");
-  }
-  return { h, host, shim };
-}
-
-for (const pushed of [false, true]) {
+for (const pass of [false, true]) {
   for (const { keys, name } of ROTATIONS) {
-    test(`#119 re-review R3, sibling (${name}; the later note ${pushed ? "in a later unconfirmed push" : "waiting since"}): a record a given-back push carried, off air by then, is told as of that push, so the later note's key is kept`, async () => {
+    test(`#119 re-review R3, control (${name}; a crash, ${pass ? "a pass reads" : "the revert reads"} the saved notes): saved notes since a push the crash left unconfirmed keep their later key when it is given back, named and folded`, async () => {
       const [first, later] = keys;
-      const { h, shim } = await carried(keys, pushed);
-      try {
-        shim.close(); // given back: record 1 is off air, so it is told
-        assert.equal(pendingNotes(h)["s0:ops.fleet"]?.key, later, "kept");
-        assert.equal(pendingNotes(h)["s0:ops.fleet"]?.offAir, 1);
-        const next = h.attach("scribe", { sessionId: SESSION });
-        assert.equal(wakesUnder(h, next, first), 0, "earlier key");
-        assert.equal(wakesUnder(h, next, later), 1, "later key");
-        const push = pushes(next)[0]!.content;
-        assert.equal(offAirTold(push), 1);
-        assert.equal(omissionsTold(push), 1);
-      } finally {
-        h.dispose();
-      }
-    });
-  }
-}
-
-for (const { keys, name } of ROTATIONS) {
-  test(`#119 re-review R3, sibling (${name}): a pushed record the live set evicts while its push is unconfirmed, told as that drop on the pass after the push is given back, is told as of that push, so a note since keeps its later key`, async () => {
-    const [first, later] = keys;
-    const { h, host } = setup({
-      mode: "immediate",
-      maxPushesPerHour: 360,
-      bufferPerStream: 256,
-      maxItems: 10,
-    });
-    try {
-      const shim = h.attach("scribe", { sessionId: SESSION });
-      // 16 full shares, ops:ops.fleet's first: its record 1 under `first`, the rest
-      // hear-only.
-      host.sing(1, { key: first, ttlMs: 300_000 });
-      for (let n = 2; n <= 256; n++) {
-        host.sing(n, { key: STRAY, epoch: 50, ttlMs: 300_000 });
-      }
-      for (let s = 1; s <= 15; s++) {
-        for (let n = 1; n <= 256; n++) {
-          host.sing(n, { station: `stray${s}`, key: STRAY, epoch: s });
-        }
-      }
-      h.timers.advance(6_000);
-      assert.deepEqual(order(pushes(shim)[0]!.content), ["ops:ops.fleet/1"]);
-      // Unconfirmed: the flood's next record evicts record 1, and the full share refuses
-      // ops:ops.fleet's record 2 under `later`, which is told as a drop of its own, owed.
-      host.sing(1, { station: "stray16", key: STRAY, epoch: 16 });
-      host.sing(2, { key: later, epoch: 60, ttlMs: 300_000 });
-      h.timers.advance(1_000);
-      assert.equal(pendingNotes(h)["ops:ops.fleet"]?.key, later, "the drop");
-      shim.close(); // given back: record 1 waits again, marked dropped
-      const next = h.attach("scribe", { sessionId: SESSION });
-      h.timers.advance(1_000); // and is told as the live set's drop
-      const note = pendingNotes(h)["ops:ops.fleet"];
-      assert.equal(withheldSum({ note: note! }, "live_overflow"), 2, "both");
-      assert.equal(note?.key, later, "kept");
-      assert.equal(wakesUnder(h, next, first), 0, "earlier key");
-      assert.equal(wakesUnder(h, next, later), 1, "later key");
-      assert.equal(overflowTold(next, "ops:ops.fleet"), 2);
-    } finally {
-      h.dispose();
-    }
-  });
-}
-
-for (const pushed of [1, 2] as const) {
-  for (const pass of [false, true]) {
-    test(`#119 re-review R3, upgrade (${pushed === 1 ? "a push, then notes since" : "two pushes"}; ${pass ? "a pass reads the saved notes, then the revert" : "the revert reads the saved notes"}): notes an earlier build saved, which say no push they are as of, are as of the push that carried them, so a crash's given-back push can't put its earlier key over a later push's or the notes since`, async () => {
-      const [first, later] = [OPS, ALPHA];
       const directory = mkdtempSync(join(tmpdir(), "frond-ear-rotated-"));
       const path = join(directory, "ear.db");
       try {
-        const { h } = await rotated([first, later], 257, { pushed, path });
-        // As an earlier build saved them: the carried pushes' notes without `asOf`.
-        const name = "canticle.withheld.scribe";
-        const saved = h.store.runtimeState(name)!;
-        assert.match(saved, /"carried":\{"\d+":\{.*"asOf":\d+/u);
-        h.store.setRuntimeState(name, saved.replace(/,"asOf":[\d.]+/gu, ""));
-        assert.doesNotMatch(h.store.runtimeState(name)!, /asOf/u);
+        const { h } = await rotated(keys, 257, { pushed: 1, path });
         const again = crashed(
           h,
           path,
@@ -3134,11 +3036,8 @@ for (const pushed of [1, 2] as const) {
           assert.equal(pendingNotes(again.h)["s0:ops.fleet"]?.key, later);
           again.h.timers.advance(60_000);
           assert.equal(pushes(again.shim).length, 0, "earlier key");
-          assert.equal(
-            wakesUnder(again.h, again.shim, later, offBut(257, 256)),
-            1,
-            "later key",
-          );
+          const stations = offBut(257, 256);
+          assert.equal(wakesUnder(again.h, again.shim, later, stations), 1);
           assert.equal(omissionsTold(pushes(again.shim)[0]!.content), 2 * 257);
         } finally {
           again.h.dispose();
@@ -3148,6 +3047,24 @@ for (const pushed of [1, 2] as const) {
       }
     });
   }
+}
+
+for (const { keys, name } of ROTATIONS) {
+  test(`#119 re-review R3, named later (${name}): a stream folded in an earlier unconfirmed push and named in a later one, both given back: its place keeps the later key`, async () => {
+    const [first, later] = keys;
+    const { h, shim } = await rotated(keys, 257, { again: [256] });
+    try {
+      shim.close(); // both given back, the earlier first
+      assert.equal(pendingNotes(h)["s256:ops.fleet"], undefined, "folded");
+      assert.equal(foldedPlace(h, "s256:ops.fleet")?.key, later);
+      const next = h.attach("scribe", { sessionId: SESSION });
+      assert.equal(wakesUnder(h, next, first, offBut(257, 256)), 0, "earlier");
+      assert.equal(wakesUnder(h, next, later, offBut(257, 256)), 1, "later");
+      assert.equal(omissionsTold(pushes(next)[0]!.content), 257 + 1);
+    } finally {
+      h.dispose();
+    }
+  });
 }
 
 /**
@@ -3293,9 +3210,8 @@ for (const { keys, name } of ROTATIONS) {
   });
 }
 
-// The independent review of the R3 repair (F1, F2): a note carried again by a later push
-// is no later for it, and a push's records are later than the notes it carried, in the
-// order they were heard.
+// The independent review of the R3 repair (F1): a note carried again by a later push is no
+// later for it than a record told since. These hold at 3824a7e and after the fix.
 
 /**
  * At one push an hour, the hour's push spent and confirmed: s0's record 1 under `first`
@@ -3426,42 +3342,8 @@ for (const variant of ["folded", "early"] as const) {
   }
 }
 
-for (const { keys, name } of ROTATIONS) {
-  test(`#119 R3 re-review F2 (${name}): of a given-back push's records of one stream, off air by then, the last heard leaves its key, whatever order their key ids sort in`, async () => {
-    const [first, later] = keys;
-    const { h, host } = setup({ mode: "immediate", maxPushesPerHour: 1 });
-    try {
-      const shim = h.attach("scribe", { sessionId: SESSION });
-      host.sing(1);
-      h.timers.advance(6_000);
-      await confirm(shim);
-      const frees = status(h).lastPushAt! + 3_600_000;
-      host.sing(1, { station: "s0", key: first, epoch: 100, ttlMs: 10_000 });
-      h.timers.advance(12_000); // off air under the spent budget: owed
-      h.timers.advance(frees - 10_000 - h.clock.now());
-      host.sing(2, { station: "s0", key: first, epoch: 100, ttlMs: 20_000 });
-      h.timers.advance(1_000);
-      host.sing(3, { station: "s0", key: later, epoch: 100, ttlMs: 20_000 });
-      h.timers.advance(frees + 1_000 - h.clock.now());
-      assert.equal(pushes(shim).length, 2, "the note and records 2 and 3");
-      assert.equal(order(pushes(shim)[1]!.content).length, 2);
-      h.timers.advance(25_000); // both off air, the push unconfirmed
-      shim.close(); // given back: the note, then records 2 and 3, told off air
-      const note = pendingNotes(h)["s0:ops.fleet"];
-      assert.equal(note?.key, later, "record 3's key, the last heard");
-      assert.equal(note?.offAir, 2);
-      const next = h.attach("scribe", { sessionId: SESSION });
-      assert.equal(wakesUnder(h, next, first), 0, "earlier key");
-      assert.equal(wakesUnder(h, next, later), 1, "later key");
-    } finally {
-      h.dispose();
-    }
-  });
-}
-
-// The confirm pass of the independent review (G1, G2): of one push's records, the last
-// heard leaves its key, whether they are told at the revert or later, and whichever side
-// of a later push they are told on.
+// The confirm pass of the independent review (G1): of a push's two records of one stream,
+// told on either side of a later push, the one told last leaves its key, as at 3824a7e.
 
 /**
  * At one push an hour, the hour's push spent and confirmed: s0's record 1 under `k1` goes
@@ -3470,20 +3352,16 @@ for (const { keys, name } of ROTATIONS) {
  * (under `k2`, heard 10 s later, or with `same` in the same instant, on air for over three
  * minutes). The station plucks both while b is unconfirmed, and b is given back: both wait
  * off view. rX goes off air, and its note goes out again in push c, set off by s1's
- * record; rY goes off air after c went out. With `mirror`, rY (still heard last) goes off
- * air first and goes out in c, and rX after c.
+ * record; rY goes off air after c went out.
  */
 async function split(
   [k1, k2]: readonly [string, string],
   options: {
     folded?: boolean;
     same?: boolean;
-    mirror?: boolean;
     path?: string;
   } = {},
 ) {
-  const [ttlX, ttlY] = options.mirror ? [200_000, 50_000] : [60_000, 200_000];
-  const [before, since] = options.mirror ? [k2, k1] : [k1, k2];
   const { h, host } = setup(
     { mode: "immediate", maxPushesPerHour: 1 },
     {},
@@ -3509,9 +3387,9 @@ async function split(
   host.sing(1, { station: "s0", key: k1, epoch: 100, ttlMs: 10_000 });
   h.timers.advance(12_000); // off air under the spent budget: owed
   h.timers.advance(frees - 20_000 - h.clock.now());
-  host.sing(2, { station: "s0", key: k1, epoch: 100, ttlMs: ttlX }); // rX
+  host.sing(2, { station: "s0", key: k1, epoch: 100, ttlMs: 60_000 }); // rX
   if (!options.same) h.timers.advance(10_000);
-  host.sing(3, { station: "s0", key: k2, epoch: 100, ttlMs: ttlY }); // rY
+  host.sing(3, { station: "s0", key: k2, epoch: 100, ttlMs: 200_000 }); // rY
   h.timers.advance(frees + 1_000 - h.clock.now());
   assert.equal(pushes(shim).length, 2, "b");
   assert.equal(order(pushes(shim)[1]!.content).length, 2, "rX and rY");
@@ -3519,50 +3397,49 @@ async function split(
   host.pluck(3, { station: "s0", key: k2, epoch: 100 });
   shim.close(); // b given back: rX and rY wait off view
   const next = h.attach("scribe", { sessionId: SESSION });
-  h.timers.advance(frees + 45_000 - h.clock.now()); // rX (or rY) goes off air
-  assert.equal(s0Key(h), before, "told before c");
+  h.timers.advance(frees + 45_000 - h.clock.now()); // rX goes off air
+  assert.equal(s0Key(h), k1, "told before c");
   host.sing(1, { station: "s1", key: OPS, epoch: 200, ttlMs: 20_000 });
   h.timers.advance(6_000);
   assert.equal(pushes(next).length, 1, "c");
   assert.equal(offAirTold(pushes(next)[0]!.content), 1, "in c");
-  h.timers.advance(frees + 210_000 - h.clock.now()); // rY (or rX) goes off air
-  assert.equal(pendingNotes(h)["s0:ops.fleet"]?.key, since, "told since c");
+  h.timers.advance(frees + 210_000 - h.clock.now()); // rY goes off air
+  assert.equal(pendingNotes(h)["s0:ops.fleet"]?.key, k2, "told since c");
   return { h, shim: next };
 }
 
-for (const mirror of [false, true]) {
-  for (const crash of [undefined, "the revert reads", "a pass reads"]) {
-    for (const { keys, name } of ROTATIONS) {
-      test(`#119 R3 re-review G1 (${name}; ${mirror ? "the last heard told first, " : ""}${crash === undefined ? "a disconnect" : `a crash, ${crash} the saved notes`}): of a given-back push's two records of one stream, told on either side of a later push, the last heard leaves its key when that push is given back too`, async () => {
-        const [k1, k2] = keys;
-        const directory = mkdtempSync(join(tmpdir(), "frond-ear-split-"));
-        const path = join(directory, "ear.db");
-        try {
-          const { h, shim } = await split(keys, { mirror, path });
-          let ear: { h: Harnessed; shim: Parameters<typeof pushes>[0] };
-          if (crash === undefined) {
-            shim.close(); // c given back
-            ear = { h, shim: h.attach("scribe", { sessionId: SESSION }) };
-          } else {
-            ear = crashed(h, path, crash === "a pass reads", {
-              mode: "immediate",
-              maxPushesPerHour: 1,
-            });
-          }
-          try {
-            assert.equal(pendingNotes(ear.h)["s0:ops.fleet"]?.key, k2, "rY's");
-            assert.equal(wakesUnder(ear.h, ear.shim, k1, othersOff), 0, "k1");
-            assert.equal(wakesUnder(ear.h, ear.shim, k2, othersOff), 1, "k2");
-          } finally {
-            ear.h.dispose();
-          }
-        } finally {
-          rmSync(directory, { recursive: true, force: true });
+for (const crash of [undefined, "the revert reads", "a pass reads"]) {
+  for (const { keys, name } of ROTATIONS) {
+    test(`#119 R3 re-review G1 (${name}; ${crash === undefined ? "a disconnect" : `a crash, ${crash} the saved notes`}): of a given-back push's two records of one stream, told on either side of a later push, the one told last leaves its key when that push is given back too`, async () => {
+      const [k1, k2] = keys;
+      const directory = mkdtempSync(join(tmpdir(), "frond-ear-split-"));
+      const path = join(directory, "ear.db");
+      try {
+        const { h, shim } = await split(keys, { path });
+        let ear: { h: Harnessed; shim: Parameters<typeof pushes>[0] };
+        if (crash === undefined) {
+          shim.close(); // c given back
+          ear = { h, shim: h.attach("scribe", { sessionId: SESSION }) };
+        } else {
+          ear = crashed(h, path, crash === "a pass reads", {
+            mode: "immediate",
+            maxPushesPerHour: 1,
+          });
         }
-      });
-    }
+        try {
+          assert.equal(pendingNotes(ear.h)["s0:ops.fleet"]?.key, k2, "rY's");
+          assert.equal(wakesUnder(ear.h, ear.shim, k1, othersOff), 0, "k1");
+          assert.equal(wakesUnder(ear.h, ear.shim, k2, othersOff), 1, "k2");
+        } finally {
+          ear.h.dispose();
+        }
+      } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    });
   }
 }
+
 for (const variant of ["folded", "same"] as const) {
   for (const { keys, name } of ROTATIONS) {
     test(`#119 R3 re-review G1 (${name}; ${variant === "folded" ? "s0 folded" : "rX and rY heard in the same instant"}): given back on a disconnect, s0 keeps rY's key: ${variant === "folded" ? "folded or named alike" : "a note a push gives back takes no tie from one told since"}`, async () => {
@@ -3574,85 +3451,6 @@ for (const variant of ["folded", "same"] as const) {
         const next = h.attach("scribe", { sessionId: SESSION });
         assert.equal(wakesUnder(h, next, k1, othersOff), 0, "k1");
         assert.equal(wakesUnder(h, next, k2, othersOff), 1, "k2");
-      } finally {
-        h.dispose();
-      }
-    });
-  }
-}
-
-for (const { keys, name } of ROTATIONS) {
-  test(`#119 R3 re-review G2 (${name}): of a given-back push's records of one stream, the last heard leaves its key though it is told at the revert and the other later`, async () => {
-    const [k1, k2] = keys;
-    const { h, host } = setup({ mode: "immediate", maxPushesPerHour: 1 });
-    try {
-      const shim = h.attach("scribe", { sessionId: SESSION });
-      host.sing(1);
-      h.timers.advance(6_000);
-      await confirm(shim);
-      const frees = status(h).lastPushAt! + 3_600_000;
-      host.sing(1, { station: "s0", key: k1, epoch: 100, ttlMs: 10_000 });
-      h.timers.advance(12_000); // off air under the spent budget: owed
-      h.timers.advance(frees - 20_000 - h.clock.now());
-      host.sing(2, { station: "s0", key: k1, epoch: 100, ttlMs: 200_000 });
-      h.timers.advance(10_000);
-      host.sing(3, { station: "s0", key: k2, epoch: 100, ttlMs: 20_000 });
-      h.timers.advance(frees + 1_000 - h.clock.now());
-      assert.equal(pushes(shim).length, 2, "the note and records 2 and 3");
-      host.pluck(2, { station: "s0", key: k1, epoch: 100 });
-      h.timers.advance(frees + 15_000 - h.clock.now()); // record 3 goes off air
-      shim.close(); // given back: record 3 told now, record 2 waits off view
-      assert.equal(pendingNotes(h)["s0:ops.fleet"]?.key, k2, "record 3 told");
-      h.timers.advance(frees + 190_000 - h.clock.now()); // record 2 goes off air
-      assert.equal(pendingNotes(h)["s0:ops.fleet"]?.offAir, 2, "both told");
-      assert.equal(pendingNotes(h)["s0:ops.fleet"]?.key, k2, "record 3's");
-      const next = h.attach("scribe", { sessionId: SESSION });
-      assert.equal(wakesUnder(h, next, k1), 0, "k1");
-      assert.equal(wakesUnder(h, next, k2), 1, "k2");
-    } finally {
-      h.dispose();
-    }
-  });
-}
-
-// The third pass of the independent review (H1): a record a push gave back is no newer for
-// being on view again, as a note carried again is no newer for it.
-
-for (const plucked of [true, false]) {
-  for (const { keys, name } of ROTATIONS) {
-    test(`#119 R3 re-review H1 (${name}; the given-back record ${plucked ? "off view" : "on view again"}): a record a push gave back, still on air, that goes off air later, can't put its key over a later push's note given back with it`, async () => {
-      const [k1, k2] = keys;
-      const { h, host } = setup({ mode: "immediate", maxPushesPerHour: 1 });
-      try {
-        const shim = h.attach("scribe", { sessionId: SESSION });
-        host.sing(1);
-        h.timers.advance(6_000);
-        await confirm(shim);
-        const frees = status(h).lastPushAt! + 3_600_000;
-        h.timers.advance(frees - 10_000 - h.clock.now());
-        // r, heard before push b went, on air past push c.
-        host.sing(1, { station: "s0", key: k1, epoch: 100, ttlMs: 4_200_000 });
-        h.timers.advance(frees + 1_000 - h.clock.now());
-        assert.equal(pushes(shim).length, 2, "b");
-        assert.deepEqual(order(pushes(shim)[1]!.content), ["s0:ops.fleet/1"]);
-        // r2, heard after b, under k2: off air under the spent budget, owed.
-        host.sing(2, { station: "s0", key: k2, epoch: 100, ttlMs: 10_000 });
-        h.timers.advance(12_000);
-        h.timers.advance(
-          status(h).lastPushAt! + 3_600_000 + 6_000 - h.clock.now(),
-        );
-        assert.equal(pushes(shim).length, 3, "c, r2's note on its own");
-        if (plucked) host.pluck(1, { station: "s0", key: k1, epoch: 100 });
-        shim.close(); // b and c given back; no session until r goes off air
-        assert.equal(pendingNotes(h)["s0:ops.fleet"]?.key, k2, "c's note");
-        h.timers.advance(frees + 4_200_000 - h.clock.now()); // r goes off air
-        const note = pendingNotes(h)["s0:ops.fleet"]!;
-        // r2's, and r's: off air unpushed, or withheld (no_session) if on view.
-        assert.equal(note.offAir + withheldSum({ note }), 2, "r told");
-        assert.equal(note.key, k2, "c's key kept");
-        const next = h.attach("scribe", { sessionId: SESSION });
-        assert.equal(wakesUnder(h, next, k1), 0, "k1");
-        assert.equal(wakesUnder(h, next, k2), 1, "k2");
       } finally {
         h.dispose();
       }
