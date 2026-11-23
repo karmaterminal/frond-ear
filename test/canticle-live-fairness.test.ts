@@ -3584,6 +3584,39 @@ const REGAINED = [
 ] as const;
 
 /**
+ * An ear at one push an hour, that push spent and confirmed. `sing` lets a record of each
+ * station go off air, owed a push (under `pause`, nothing), and `free` gives the hour's
+ * push, a note on its own, left unconfirmed.
+ */
+async function spent(options: { path?: string } = {}) {
+  const delivery = { mode: "immediate", maxPushesPerHour: 1 };
+  const { h, host } = setup(delivery, {}, {}, options);
+  const shim = h.attach("scribe", { sessionId: SESSION });
+  host.sing(1);
+  h.timers.advance(6_000);
+  await confirm(shim);
+  return {
+    h,
+    host,
+    shim,
+    sing: (key: string, seq: number, stations: readonly number[]) => {
+      for (const i of stations) {
+        const station = `s${i}`;
+        host.sing(seq, { station, key, epoch: 100 + i, ttlMs: 10_000 });
+      }
+      h.timers.advance(12_000);
+    },
+    pause: (paused: boolean) =>
+      h.daemon.reloadConfig({ ...canticleConfig(delivery), paused }),
+    free: () => {
+      const before = pushes(shim).length;
+      h.timers.advance(status(h).lastPushAt! + 3_606_000 - h.clock.now());
+      assert.equal(pushes(shim).length, before + 1, "a note on its own");
+    },
+  };
+}
+
+/**
  * One of `REGAINED`, with A `latest` and B `stale`, up to the notes since; `total` is
  * every record noted, and `off` turns every station but s`x`'s off.
  */
@@ -3592,24 +3625,12 @@ async function regained(
   [latest, stale]: readonly [string, string],
   options: { path?: string } = {},
 ) {
-  const delivery = { mode: "immediate", maxPushesPerHour: 1 };
-  const { h, host } = setup(delivery, {}, {}, options);
-  const shim = h.attach("scribe", { sessionId: SESSION });
-  host.sing(1);
-  h.timers.advance(6_000);
-  await confirm(shim);
-  const sing = (key: string, seq: number, stations: readonly number[]) => {
-    for (const i of stations) {
-      host.sing(seq, { station: `s${i}`, key, epoch: 100 + i, ttlMs: 10_000 });
-    }
-    h.timers.advance(12_000); // off air, under the spent budget or the pause
-  };
+  const { h, host, shim, sing, pause, free } = await spent(options);
   pushed.forEach((stations, i) => {
     sing(i === pushed.length - 1 ? stale : latest, 1 + i, stations);
-    h.timers.advance(status(h).lastPushAt! + 3_606_000 - h.clock.now());
-    assert.equal(pushes(shim).length, 2 + i, "a note on its own");
+    free();
   });
-  h.daemon.reloadConfig({ ...canticleConfig(delivery), paused: true });
+  pause(true);
   sing(latest, 1 + pushed.length, since);
   const place = foldedPlace(h, `s${x}:ops.fleet`);
   assert.equal(place?.key, latest, "a place, under its latest key");
@@ -3701,4 +3722,71 @@ for (const regain of REGAINED) {
       });
     }
   }
+}
+
+for (const { keys, name } of ROTATIONS) {
+  test(`#119 E2, control (${name}): a stream that loses the place an earlier push gave back, and gets one back from a later push, takes the later push's key`, async () => {
+    const [stale, latest] = keys;
+    const { h, shim, sing, pause, free } = await spent();
+    try {
+      // Every place past the 256 named taken, s511's first, owed nothing but for s0's.
+      pause(true);
+      sing(stale, 1, [...range(1, 256), 511, ...range(257, 510)]);
+      pause(false);
+      sing(stale, 1, [0]);
+      assert.equal(foldedPlace(h, "s511:ops.fleet")?.owed, false);
+      free();
+      // s256, named in the first, is counted together in the second, ahead of s511: it
+      // takes s511's place as the second is given back.
+      sing(latest, 2, [...range(0, 256), 511, ...range(257, 510)]);
+      assert.equal(foldedPlace(h, "s256:ops.fleet")?.owed, true);
+      free();
+      shim.close(); // both given back, the earlier first
+      const next = h.attach("scribe", { sessionId: SESSION });
+      const off = offBut(512, 511);
+      assert.equal(wakesUnder(h, next, stale, off), 0, "the stale key");
+      assert.deepEqual(savedKey(h, "s511:ops.fleet"), {
+        key: latest,
+        owed: true,
+      });
+      assert.equal(wakesUnder(h, next, latest, off), 1, "the latest key");
+      assert.equal(omissionsTold(pushes(next)[0]!.content), 511 + 1 + 512);
+    } finally {
+      h.dispose();
+    }
+  });
+
+  test(`#119 E2, control (${name}): past 512 streams, a stream that lost its place and is noted again under a later key, with no place, gets one back under that key, not the one it had when it lost it`, async () => {
+    const [stale, latest] = keys;
+    const { h, shim, sing, pause, free } = await spent();
+    try {
+      sing(latest, 1, [512]);
+      free(); // s512's note
+      // Every place past the 256 named taken, s512's first, owed nothing; then s513, owed
+      // a push, takes it.
+      pause(true);
+      sing(stale, 2, [...range(1, 256), 512, ...range(257, 511)]);
+      assert.equal(foldedPlace(h, "s512:ops.fleet")?.key, stale);
+      pause(false);
+      sing(stale, 1, [513]);
+      assert.equal(foldedPlace(h, "s513:ops.fleet")?.owed, true);
+      assert.equal(foldedPlace(h, "s512:ops.fleet"), undefined, "lost");
+      pause(true);
+      sing(latest, 3, [512]);
+      assert.equal(foldedPlace(h, "s512:ops.fleet"), undefined, "no place");
+      pause(false);
+      shim.close(); // given back: s512 is owed a push, and gets a place again
+      const next = h.attach("scribe", { sessionId: SESSION });
+      const off = offBut(514, 512);
+      assert.equal(wakesUnder(h, next, stale, off), 0, "the stale key");
+      assert.deepEqual(savedKey(h, "s512:ops.fleet"), {
+        key: latest,
+        owed: true,
+      });
+      assert.equal(wakesUnder(h, next, latest, off), 1, "the latest key");
+      assert.equal(omissionsTold(pushes(next)[0]!.content), 1 + 512 + 1 + 1);
+    } finally {
+      h.dispose();
+    }
+  });
 }

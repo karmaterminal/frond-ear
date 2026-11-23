@@ -765,8 +765,8 @@ boundary. What hasn't been told yet survives a restart (`canticle.withheld.<ear>
 the host never confirmed is told again once that push is given back. Of the notes several unconfirmed pushes give back
 together (a disconnect, a new attach, frond-ear stopping, or the first attach after a crash), a stream keeps the station
 key of the newest push's, named or counted together, whatever order they come back in, and a note since keeps its own.
-The exception is past the 256: a stream counted together and owed nothing can lose its place to one owed a push while the
-notes merge, and its key with it.
+Past the 256, a stream counted together and owed nothing can lose its place to one owed a push while the notes merge. If
+it gets a place back, the key it had still counts as it did. If it gets none, its notes wait for a push that goes anyway.
 
 **Late records.** A record that wasn't heard live just now has a `late:` line under its banner's timing line:
 `late: heard 54s ago (snapshot)`, `late: heard 7s ago (resurfaced)`, or
