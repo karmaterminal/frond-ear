@@ -2526,3 +2526,161 @@ test("#119 second review, re-review 2: a push given back folds again what it had
     h.dispose();
   }
 });
+
+/** A saved note owed nothing: one record that went off air while frond-ear was paused. */
+const pausedNote = (key: string, at: number, count = 1) => ({
+  offAir: 0,
+  dropped: 0,
+  withheld: [["paused", { count, from: at, to: at }]],
+  key,
+  owed: false,
+});
+
+test("#119 second review, re-review 5: the stations FOLDED keeps go to streams owed a push before streams owed nothing, so an owed note past 512 streams still wakes; 255 owed nothing is the control", async () => {
+  const s = manyKey(900);
+  for (const unowed of [256, 255]) {
+    const { h, host } = setup(
+      { mode: "immediate", maxItems: 1, maxPushesPerHour: 1 },
+      { wakeKeys: [ALPHA, s] },
+    );
+    try {
+      const now = h.clock.now();
+      const pending: Record<string, unknown> = {};
+      for (let i = 0; i < 256; i++) {
+        pending[`n${i}:ops.fleet`] = pausedNote(manyKey(i), now - 1_000);
+      }
+      pending["*"] = {
+        ...pausedNote("", now - 1_000, unowed),
+        streams: Array.from({ length: unowed }, (_, i) => ({
+          stream: `f${i}:ops.fleet`,
+          key: manyKey(300 + i),
+          owed: false,
+          withheld: true,
+          missed: false,
+        })),
+      };
+      h.store.setRuntimeState(
+        "canticle.withheld.scribe",
+        JSON.stringify({ pending, carried: {} }),
+      );
+      // The hour's one push went a second ago.
+      h.store.setRuntimeState(
+        "canticle.cursor.scribe",
+        JSON.stringify({
+          report: 0,
+          after: {},
+          streams: {},
+          pushes: [now - 1_000],
+        }),
+      );
+      const shim = h.attach("scribe", { sessionId: SESSION });
+      host.sing(1, { station: "s", key: s, ttlMs: 10_000 }); // owed under the budget
+      h.timers.advance(12_000);
+      h.timers.advance(3_600_000);
+      assert.equal(pushes(shim).length, 1, `s's push of its own (${unowed})`);
+      assert.equal(omissionsTold(pushes(shim)[0]!.content), 256 + unowed + 1);
+    } finally {
+      h.dispose();
+    }
+  }
+});
+
+test("#119 second review, re-review 5: a given-back FOLDED with every station it keeps owed leaves a named note owed a push named, so it keeps that push; with a station free it is folded and keeps it too", async () => {
+  const s = manyKey(900);
+  for (const folded of [256, 255]) {
+    const delivery = { mode: "immediate", maxItems: 1, maxPushesPerHour: 1 };
+    const t = Array.from({ length: 255 }, (_, i) => manyKey(i));
+    const u = Array.from({ length: folded }, (_, i) => manyKey(300 + i));
+    const { h, host } = setup(delivery, { wakeKeys: [ALPHA, s, ...t, ...u] });
+    try {
+      const at = h.clock.now() - 1_000;
+      h.store.setRuntimeState(
+        "canticle.withheld.scribe",
+        JSON.stringify({
+          pending: {
+            "*": {
+              offAir: 0,
+              dropped: 0,
+              withheld: [["push_budget", { count: 1, from: at, to: at }]],
+              key: "",
+              owed: true,
+              streams: [
+                {
+                  stream: "s:ops.fleet",
+                  key: s,
+                  owed: true,
+                  withheld: true,
+                  missed: false,
+                },
+              ],
+            },
+          },
+          carried: {},
+        }),
+      );
+      const shim = h.attach("scribe", { sessionId: SESSION });
+      h.timers.advance(6_000);
+      assert.equal(
+        pushes(shim).length,
+        1,
+        "s's folded note, a push of its own",
+      );
+      // Unconfirmed, the budget spent: s, 255 t's and the u's go off air, owed; s and the
+      // t's are named, the u's folded.
+      host.sing(2, { station: "s", key: s, ttlMs: 10_000 });
+      t.forEach((key, i) =>
+        host.sing(1, { station: `t${i}`, key, ttlMs: 10_000 }),
+      );
+      u.forEach((key, i) =>
+        host.sing(1, { station: `u${i}`, key, ttlMs: 10_000 }),
+      );
+      h.timers.advance(12_000);
+      shim.close(); // given back: the folded s merges in
+      h.daemon.reloadConfig(canticleConfig(delivery, { wakeKeys: [ALPHA, s] }));
+      const next = h.attach("scribe", { sessionId: SESSION });
+      h.timers.advance(60_000);
+      assert.equal(pushes(next).length, 1, `s's push of its own (${folded})`);
+      assert.equal(omissionsTold(pushes(next)[0]!.content), 2 + 255 + folded);
+    } finally {
+      h.dispose();
+    }
+  }
+});
+
+test("#119 second review, re-review 5: a folded count whose streams of one kind are all past the stations it keeps says at least one, never at least 0", async () => {
+  const { h, host } = setup({ mode: "immediate", maxPushesPerHour: 360 });
+  try {
+    const at = h.clock.now() - 60_000;
+    h.store.setRuntimeState(
+      "canticle.withheld.scribe",
+      JSON.stringify({
+        pending: {
+          "*": {
+            ...pausedNote("", at, 256),
+            offAir: 1,
+            streams: Array.from({ length: 256 }, (_, i) => ({
+              stream: `s${i}:ops.fleet`,
+              key: manyKey(i),
+              owed: false,
+              withheld: true,
+              missed: false,
+            })),
+            more: true,
+          },
+        },
+        carried: {},
+      }),
+    );
+    const shim = h.attach("scribe");
+    host.sing(1);
+    h.timers.advance(6_000);
+    const push = pushes(shim)[0]!.content;
+    assert.doesNotMatch(push, /at least 0 /u);
+    assert.match(
+      push,
+      /^and at least 1 more stream past the 256 it names one by one: 1 went off air unpushed\.$/mu,
+    );
+  } finally {
+    h.dispose();
+  }
+});
