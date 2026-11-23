@@ -341,10 +341,13 @@ they only remove, never admit or show.
   - the tune set at the last start, and the `ring_joined_late` and `stream_joined_late` flags (§4.3, rule 7);
   - for each tracked run (§4.3, rule 5): its number and the daemon run it names, its first packet id, the last `seq`
     and control sequence read, its state (current, undecided, or ended and how: its `bye` read, superseded, bound
-    away, retired, tail unknown), and for each tuned stream its last `stream_seq` and missing ranges;
-  - the last 64 ended runs, by number and daemon run, and the highest run ever ended;
+    away, retired, tail unknown), and for each tuned stream its last `stream_seq` and missing ranges, and for each
+    open hole the packet id, pkttime and (run, seq) of the last packet before it, where its refill starts;
+  - the last 64 ended runs, by number and daemon run, each with the ordinal of its ending, and the highest run ever
+    ended;
   - for each key: the (run, seq) at which its epoch mark last rose (§4.3, rule 6);
-  - for each hidden group (one stream and one hole, or one ended run): the hole, the reason and its watermark `W`
+  - for each hidden group (one stream and one hole or pending drop, or one ended run): the hole, the reason and its
+    watermark `W`
     (§4.4), so confirmation carries on after a restart;
   - the socket witness and its eviction counter (§4.4);
   - the latest daemon run and `rec_seq` the writer named;
@@ -420,8 +423,9 @@ they only remove, never admit or show.
      however late it is read.
 
    - **Undecided runs.** No run becomes current while the host socket hasn't reported a daemon run on its current
-     connection. A new run met then can't be decided: the main stream stops at its first packet, persisted, and reads
-     nothing past it until the socket reports one, so at most one run is ever undecided. Nothing is deliverable
+     connection. A new run met then can't be decided: the main stream sends `ENDSTREAM` at its first packet, which is
+     persisted, keeps its 60 s `ID` going, and once the socket reports a daemon run resumes with `READ` of that packet
+     and `STREAM`. So at most one run is ever undecided. Nothing is deliverable
      meanwhile anyway (§5.2). _Nothing is bound_ means the socket has reported the live daemon run and no tracked run
      names it; while the socket hasn't reported one, nothing is decided at all, and `two_writers` isn't raised.
    - **Ended runs stay ended.** A run that was current and has ended (its `bye` read, superseded, or bound away)
@@ -453,16 +457,21 @@ they only remove, never admit or show.
    - For each tuned stream of each tracked run, the reader tracks the `stream_seq`s it is missing, as at most 8
      ranges per stream, and the same for the control sequence.
    - A `stream_seq` at or below its stream's last that isn't missing is a duplicate.
-   - **A hole is refilled by rewinding the main stream.** The reader ends the stream, `READ`s from just after the
-     stream's last processed packet (or from `EarliestPacketID`, if that is later), and `STREAM`s forward. Packets
-     already processed are duplicates; a packet that fills a hole is processed, in an ended run too (rule 5). Holes
-     found during a refill join it, so each hole is re-read once. A `READ` that misses is a failed validation
-     (rule 4). What stays missing is a `ring_gap` for its stream. Drops over a key's queue are not refilled (§4.6).
+   - **A hole is refilled by rewinding the main stream.** Each open hole keeps the packet id, pkttime and (run, seq)
+     of the last packet of its stream before it, or of its run's first packet for a hole at a stream's start (§4.2).
+     The reader ends the stream, `READ`s that packet and validates it as it validates the cursor, then `STREAM`s
+     forward; if the packet is gone or another now holds its id, it starts from `EarliestPacketID` instead. Packets
+     whose (run, `stream_seq`) isn't missing are discarded by their header before queuing (§4.6, step 2), and a
+     packet that fills a hole is processed, in an ended run too (rule 5). Until it passes the position it rewound
+     from, a rewind counts as catching up, so it drops nothing (§4.6). Holes found during a refill join it, so each
+     hole is re-read once. What stays missing is a `ring_gap` for its stream. Drops over a key's queue are not
+     refilled (§4.6).
    - **Writer order, per key.** The listener refuses a frame older than its key's epoch high-water mark, on any of the
      key's streams (`src/canticle/listener.ts:606-611`, after RFC:312). A refill, a lap or a crashed memory-mapped ring
      (E4) can hand it a key's frames out of writer order, so on the ring path the epoch is judged by writer position:
      frond-ear persists, per key, the (run, seq) at which the mark last rose, and admits an older-epoch frame that the
-     writer appended before that point, earlier in that run or in a run that ended before it. The writer is trusted
+     writer appended before that point, earlier in that run or in a run that ended before it, by the ordinal of each
+     run's ending (§4.2). The writer is trusted
      for order (§2), and the daemon admitted those frames in that order. The listener's occupancy quotas
      (`listener.ts:1039-1093`) are unchanged; a refilled frame refused over quota is reported, never dropped silently.
    - **Over the limit, ranges merge; they are never dropped.** A ninth range merges the two oldest into one span, so
@@ -499,22 +508,22 @@ they only remove, never admit or show.
 
 ### 4.4 Gap detection and reporting: never silently skip
 
-| Signal                                                                           | Meaning                                                                                                                                         | Reported as                                                                                                        | Live items                                                           |
-| -------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------- |
-| one stream's `stream_seq` jumps, after a refill                                  | That stream's packets were lost: dropped at the writer (W3), a lap (E2) or a crash (E3, E4), and gone from the ring before the refill read them | `ring_gap` for that stream, `exact` (`at_most` after merged ranges); health `degraded` while anything stays hidden | That stream's items heard before the hole are hidden; no others      |
-| a `tick` head above a stream's last `stream_seq`                                 | That stream's last packets were lost                                                                                                            | Refilled like any hole; then as above                                                                              | As above                                                             |
-| a packet dropped over its key's queue, live                                      | Possibly a lost packet (§4.6)                                                                                                                   | `over_cap`; when the stream's sequence resumes, its gap is graded `at_most`                                        | That stream's items heard before the drop are hidden until confirmed |
-| a hole in the control sequence                                                   | Control packets were lost: a `tick`, or a `hello` or `bye`                                                                                      | `ring_gap` (control); a lost `bye` leaves its run's end unknown                                                    | Unchanged                                                            |
-| a stream first seen in a new run past `stream_seq` 1, after a refill             | That stream's first packets in the run were lost                                                                                                | `ring_gap` for that stream, `exact`                                                                                | As for a run's end                                                   |
-| a run first seen past its `hello`, with no `tick` naming its previous run either | Its first packets were lost                                                                                                                     | Whether whole runs went by is `unknown`                                                                            | As for a run's end                                                   |
-| a run ends: superseded, bound away, or its `bye` read                            | A writer restart, clean (its `bye` read) or not                                                                                                 | `writer_restarted`, or `writer_restarted_without_bye` with `run_tail_unknown`                                      | The ended run's items are hidden until confirmed                     |
-| a `hello` or `tick` names a previous run the reader never saw                    | Whole runs were lost                                                                                                                            | `runs_absent`, count unknown                                                                                       | As for a run's end                                                   |
-| cursor validation fails                                                          | Eviction, rollback or a reset (§4.3)                                                                                                            | `ring_overrun` or `ring_reset`                                                                                     | Only what the re-read's holes hide                                   |
-| packets of an ended run, or of an unbound run at or below the highest ended      | History, rollback leftovers, or a replay                                                                                                        | `stale_run` (a count), unless they fill an open hole                                                               | Unchanged                                                            |
-| a run that isn't current keeps writing (§4.3, rule 5)                            | A second writer                                                                                                                                 | `two_writers` and `foreign_run`; health `degraded`; `ring_blind` if both are bound                                 | Unchanged; nothing new shown if blind                                |
-| a lower run bound to the live daemon run                                         | A regressed writer                                                                                                                              | `run_regressed`                                                                                                    | As for a run's end                                                   |
-| a writer signature fails                                                         | Not from the writer                                                                                                                             | `unauthenticated` (a count)                                                                                        | Unchanged                                                            |
-| no `tick` for three intervals                                                    | The writer is silent, or the ring is unreachable                                                                                                | `writer_silent`: blind, and saying so                                                                              | Kept; expiry carries on                                              |
+| Signal                                                                           | Meaning                                                                                                                                         | Reported as                                                                                                        | Live items                                                                                                       |
+| -------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------- |
+| one stream's `stream_seq` jumps, after a refill                                  | That stream's packets were lost: dropped at the writer (W3), a lap (E2) or a crash (E3, E4), and gone from the ring before the refill read them | `ring_gap` for that stream, `exact` (`at_most` after merged ranges); health `degraded` while anything stays hidden | That stream's items heard before the hole are hidden; no others                                                  |
+| a `tick` head above a stream's last `stream_seq`                                 | That stream's last packets were lost                                                                                                            | Refilled like any hole; then as above                                                                              | As above                                                                                                         |
+| a packet dropped over its key's queue, live                                      | Possibly a lost packet (§4.6)                                                                                                                   | `over_cap`; a pending drop until the stream's sequence settles it, then `exact` if it hid real packets             | That stream's items heard before the drop are hidden until it is settled, and then until confirmed if it hid any |
+| a hole in the control sequence                                                   | Control packets were lost: a `tick`, or a `hello` or `bye`                                                                                      | `ring_gap` (control); a lost `bye` leaves its run's end unknown                                                    | Unchanged                                                                                                        |
+| a stream first seen in a new run past `stream_seq` 1, after a refill             | That stream's first packets in the run were lost                                                                                                | `ring_gap` for that stream, `exact`                                                                                | As for a run's end                                                                                               |
+| a run first seen past its `hello`, with no `tick` naming its previous run either | Its first packets were lost                                                                                                                     | Whether whole runs went by is `unknown`                                                                            | As for a run's end                                                                                               |
+| a run ends: superseded, bound away, or its `bye` read                            | A writer restart, clean (its `bye` read) or not                                                                                                 | `writer_restarted`, or `writer_restarted_without_bye` with `run_tail_unknown`                                      | The ended run's items are hidden until confirmed                                                                 |
+| a `hello` or `tick` names a previous run the reader never saw                    | Whole runs were lost                                                                                                                            | `runs_absent`, count unknown                                                                                       | As for a run's end                                                                                               |
+| cursor validation fails                                                          | Eviction, rollback or a reset (§4.3)                                                                                                            | `ring_overrun` or `ring_reset`                                                                                     | Only what the re-read's holes hide                                                                               |
+| packets of an ended run, or of an unbound run at or below the highest ended      | History, rollback leftovers, or a replay                                                                                                        | `stale_run` (a count), unless they fill an open hole                                                               | Unchanged                                                                                                        |
+| a run that isn't current keeps writing (§4.3, rule 5)                            | A second writer                                                                                                                                 | `two_writers` and `foreign_run`; health `degraded`; `ring_blind` if both are bound                                 | Unchanged; nothing new shown if blind                                                                            |
+| a lower run bound to the live daemon run                                         | A regressed writer                                                                                                                              | `run_regressed`                                                                                                    | As for a run's end                                                                                               |
+| a writer signature fails                                                         | Not from the writer                                                                                                                             | `unauthenticated` (a count)                                                                                        | Unchanged                                                                                                        |
+| no `tick` for three intervals                                                    | The writer is silent, or the ring is unreachable                                                                                                | `writer_silent`: blind, and saying so                                                                              | Kept; expiry carries on                                                                                          |
 
 **Loss counts are graded and scoped** (🌫's crash cut). A report never states a count more precisely than its grade,
 and never adds counts of different scopes:
@@ -554,9 +563,10 @@ lost, and S's `hello` names R but not R's last seq.
 **What confirms a hidden item.** Within one run the daemon appends a surfaced frame only once (an equivocation copy
 aside), so nothing later in that run can confirm a hidden item. Waiting for expiry could hide a stream for up to
 86 400 s, for `finding-ref` (RFC:383). So a hidden item is shown again only when a sound witness confirms it, or it
-leaves at its local expiry. A stream hidden only for a hole that its refill filled completely is shown again at once.
-Otherwise, let `W` be the envelope `rec_seq` of the packet that revealed the hole (the stream's next packet, or the
-`tick`), or of the new run's `hello`. Three things confirm:
+leaves at its local expiry. A stream hidden only for a hole that its refill filled completely, or for a pending drop
+that its sequence settled unbroken (§4.6), is shown again at once. Otherwise, let `W` be the envelope `rec_seq` of the
+packet that revealed the hole (the stream's next packet, or the `tick`), or of the new run's `hello`. Three things
+confirm:
 
 - **The host socket's consumer.** It holds the item (not `carried`) with the same `idem` and `frame.sha256`
   (RFC:2195), has had no `rec_seq` gap on its current connection, and has read up to at least `W`. Every retract the
@@ -629,7 +639,9 @@ don't stop a flood from exhausting the reader. So, in this order, before anythin
    reader sends `MATCH` with exactly those ids and the control id, a regex of up to 1 MiB (`rs:src/dlclient.h:45`).
    ringserver applies it while streaming (`rs:src/ring.c:1133-1137`), so untuned packets never reach the reader.
 2. **A header check before any cryptography.** Each packet's stream id is parsed into its claimed key and stream. An
-   untuned one, should `MATCH` be missing, is dropped and counted as `untuned`.
+   untuned one, should `MATCH` be missing, is dropped and counted as `untuned`. One whose claimed (run, `stream_seq`)
+   is already processed and not missing is discarded as a duplicate: genuine, it adds nothing; forged, it costs
+   nothing. Only a packet that could be new or fill a hole is queued.
 3. **Per-key queues, capped.** Packets wait for verification in a queue per claimed key: at most 256 packets and
    256 KiB per key, and 8 MiB in all [PROPOSED]; the control id counts as one key, and its packets are verified
    first.
@@ -637,17 +649,21 @@ don't stop a flood from exhausting the reader. So, in this order, before anythin
    at most 2 000 times a second in all [PROPOSED], round-robin across the keys with packets waiting. A noisy key
    can't starve a quiet one of verification.
 5. **Catching up never drops; live, only a flooding key loses packets.**
-   - **Catching up,** from each connect until the main stream first reaches the ring's head, the main stream stops
-     reading while the total queue is full. At the budget, 8 MiB drains well inside `NetIOTimeout`. Nothing is
-     dropped, so a backlog of any size, a flood met mid-backlog included, is only delayed.
+   - **Catching up,** from each connect until the main stream passes the `LatestPacketID` that `INFO STATUS` gave at
+     connect, or is lapped, the main stream stops reading while the next packet's key queue, or the total, is full.
+     At the budget, 8 MiB drains well inside `NetIOTimeout`. Nothing is dropped, so a backlog is only delayed; a flood
+     met mid-backlog is read through at the budget's pace, and if it laps the reader meanwhile, the loss shows as
+     `stream_seq` holes.
    - **Live,** from then until the next connect, the main stream keeps reading past a full queue, so one key's
      packets never hold up another key's behind them. A packet that finds its key's queue full is dropped unverified
      and counted as `over_cap`; when the total is full, the packet dropped is one of the key holding the most. A
      quiet key, holding little, never loses one.
-   - **A drop is a possible hole** for the stream its packet claims. That stream's items are hidden, and when its
-     sequence resumes, the gap is reported as `over_cap`, graded `at_most` because the dropped packets may have been
-     forged. Its items are confirmed again by the witnesses (§4.4), not by re-reading the ring, so a flood can't make
-     the reader re-read itself into a loop.
+   - **A drop is a possible hole** for the stream its packet claims: a _pending drop_, whose items are hidden. When
+     the stream's next packet, or a `tick` head, settles its `stream_seq`, the drop either was forged (the sequence
+     runs on unbroken, and the stream is shown again at once) or hid real packets (a gap, which forged packets can't
+     widen, reported as `over_cap`, `exact`). A real gap's items are confirmed again by the witnesses (§4.4) from
+     `W` = the packet or `tick` that settled it, never by re-reading the ring, so a flood can't make the reader
+     re-read itself into a loop.
    - **Only a flooding key overflows.** A legitimate key sends a few packets a second against a 2 000-a-second
      budget shared round-robin, so live, its queue doesn't fill. A flood claiming key K blinds K's streams, never
      another key's.
@@ -1027,7 +1043,8 @@ Each case asserts the counters, what `hear` shows and what is pushed:
    - An unconfirmed item leaves at expiry, counted as `off_air_unpushed` and `hidden_expired`; a confirmed one is
      pushed late.
 6. **Laps and refills.** After a lap (the fake skips forward), the main stream rewinds to each hole and re-reads what
-   the ring still holds; a fully refilled hole reports no loss, and each hole is re-read once. A retry after a
+   the ring still holds; a fully refilled hole reports no loss, each hole is re-read once, and a rewind across a busy
+   key drops nothing. A retry after a
    disconnect that arrives behind later packets fills its missing `stream_seq` rather than being taken as a
    duplicate.
 7. **Writer restarts.**
@@ -1083,7 +1100,7 @@ Each case asserts the counters, what `hear` shows and what is pushed:
       bounded.
     - Drops from `bufferPerStream` are counted.
     - 100 000 authenticated packets from one key over the listener's quota, with the reader's queues set large enough
-      not to skip, are refused as `over-quota`, and memory stays bounded. (The flood is case 22.)
+      not to drop, are refused as `over-quota`, and memory stays bounded. (The flood is case 22.)
     - Hidden rows are evicted before live ones.
 18. **Ring unavailable.** `ring_unavailable`, backoff, and a line in `hear`. Recovery from the cursor; holes from
     writer drops show as `ring_gap`.
@@ -1103,10 +1120,10 @@ Each case asserts the counters, what `hear` shows and what is pushed:
       written, and Q has no gap. Verifications per second stay within the budget, and memory stays bounded. U costs no
       verification: never sent under `MATCH`, counted as `untuned` without it. F's packets over its queue are dropped
       and counted as `over_cap`, F's streams are hidden and reported, and no stream of another key is hidden.
-    - **After the flood stops,** F's gap is reported `at_most`, and F's streams come back as the witnesses confirm
-      their items.
+    - **After the flood stops,** F's next packets settle its pending drops: F's streams come back at once if the
+      flood hid nothing real, and otherwise once the witnesses confirm their items, with the gap reported `exact`.
     - **A restart in mid-flood** catches up through the flood at the budget's pace, dropping nothing; Q's items behind
-      it arrive late, never lost.
+      it arrive late, or, if the flood laps the reader meanwhile, show as Q's `ring_gap`, never as silence.
     - **With less retention,** whether the flood laps the reader depends on timing (E2). Q is never silent: any
       packet of Q's that is lost shows as Q's `ring_gap` by `stream_seq`.
     - **A forged flood under the control id** leaves the ring `writer_silent`, blind and saying so.
@@ -1358,5 +1375,5 @@ What the experiments settle for the design:
 - Write can be gated by `AUTH` from a start with no write, but a failed `AUTH` revokes nothing (E5).
 
 Hence the signed (run, seq) envelope with a per-stream subsequence, validating the cursor by `READ`, treating a hole in
-a signed sequence as the only loss signal, re-reading a key with a hole in order from what the ring still holds,
-ordering by the envelope and never by packet id, and keeping what was read in frond-ear's own store.
+a signed sequence as the only loss signal, rewinding the main stream to each hole to refill it from what the ring
+still holds, ordering by the envelope and never by packet id, and keeping what was read in frond-ear's own store.
