@@ -1032,29 +1032,36 @@ test("#119 review, blocker (ii): tuned and untuned at 2048 each, a new tuned rec
   assert.equal(status.omitted.untuned!.count, 1);
 });
 
-test("#119 review, blocker: records a retune leaves untuned give way first to a tuned arrival, counted as untuned", () => {
+test("#119 review, blocker: records a retune leaves untuned give way first to a tuned arrival, though a tuned share holds more", () => {
   const time = clock();
   const host = new Host(time, ["*:ops.fleet", "*:ops.deploy"]);
   host.start();
-  for (let n = 1; n <= MAX_LIVE; n++) {
+  for (let n = 1; n <= 3_000; n++) host.sing(n, { ttlMs: 3_600_000 });
+  for (let n = 1; n <= MAX_LIVE - 3_000; n++) {
     host.sing(n, { stream: "ops.deploy", ttlMs: 3_600_000 });
   }
   host.tune = ["*:ops.fleet"];
-  host.sing(1, { ttlMs: 3_600_000 });
-  assert.deepEqual(quietSeqs(host), [1]);
+  host.sing(1, { station: "alpha", ttlMs: 3_600_000 });
+  assert.deepEqual(quietSeqs(host, "ops.fleet", "alpha"), [1]);
+  assert.deepEqual(quietSeqs(host), range(1, 3_000), "no tuned record went");
   const c = host.consumer;
   const deploy = c
     .hearView(["*:ops.deploy"], time.now(), true)
     .items.map((item) => Number(item.seq))
     .sort((a, b) => a - b);
-  assert.deepEqual(deploy, range(2, MAX_LIVE), "the oldest of them went");
+  assert.deepEqual(
+    deploy,
+    range(2, MAX_LIVE - 3_000),
+    "the oldest untuned one",
+  );
   const live = c.liveStatus(time.now());
   assert.deepEqual(live.shares, {
-    untuned: MAX_LIVE - 1,
-    "ops:ops.fleet": 1,
+    "ops:ops.fleet": 3_000,
+    untuned: MAX_LIVE - 3_001,
+    "alpha:ops.fleet": 1,
   });
   assert.equal(live.omitted.untuned!.count, 1);
-  assert.equal(live.omitted["ops:ops.deploy"], undefined);
+  assert.equal(live.omitted["ops:ops.fleet"], undefined);
 });
 
 test("#119 review 2: a tuned record finds room only if some tuned share holds two more than its own; a `*:` tune over 4096 stations of one record each refuses a new quiet stream, counts it and degrades receive health", () => {
