@@ -457,7 +457,9 @@ they only remove, never admit or show.
      quiet in a blind state, or retired) never becomes current again, by any path, a blind state's exit included. Its
      packets are `stale_run`, except one that fills a hole still open in that run, which is processed (rule 6). So is
      any unbound run at or below the highest run ever ended: history, rollback leftovers, or a replay. The last 64
-     ended runs are persisted, with the highest ever ended.
+     ended runs are persisted, with the highest ever ended. A run ended longer ago than the last 64 is still at or
+     below that highest, so it is `stale_run` too, and it can't fill a hole: only 16 runs keep open holes (below), and
+     an older one's holes have already become loss.
    - **Two writers.** A run that isn't current _keeps writing_ when its packets carry seqs above its last read,
      arrive while the main stream is caught up with the ring's head, and go on for more than a tick interval. A replay
      of history doesn't: its seqs are old, or it arrives during a catch-up. A run that keeps writing raises
