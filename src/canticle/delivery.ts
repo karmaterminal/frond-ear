@@ -496,8 +496,8 @@ function addNote(
  * A kept `FOLDED` merged back in (a push given back, the saved notes): each stream it
  * names keeps or gets a place here, as when it was folded. One that has an entry of its
  * own here now is folded into that place, so no stream is named and kept both; with no
- * place to be had, its entry stays as it is, keeping its push, and its kept records are
- * counted with the streams the count can't name.
+ * place to be had, its entry stays named, owed if either was, so it keeps its push, and
+ * its kept records are counted with the streams the count can't name.
  */
 function mergeFolded(notes: Map<string, Missed>, from: Missed): void {
   const folded = foldedOf(notes);
@@ -506,7 +506,11 @@ function mergeFolded(notes: Map<string, Missed>, from: Missed): void {
     const named = notes.get(stream);
     const had = folded.streams?.get(stream);
     const mine = had ?? slot(folded, stream, f.owed || named?.owed === true);
-    if (mine === undefined) continue;
+    if (mine === undefined) {
+      // No place: its entry here (with the later key) is owed as the kept one was.
+      if (named !== undefined) named.owed ||= f.owed;
+      continue;
+    }
     if (had === undefined) Object.assign(mine, f);
     else {
       mine.owed ||= f.owed;
