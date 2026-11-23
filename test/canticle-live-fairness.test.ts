@@ -3534,3 +3534,171 @@ test("#119 R3 fresh review: a record told at the revert, between an earlier push
     h.dispose();
   }
 });
+
+// 🍃's review of ede1469 (6025870148), E2: at the bound, a place past the 256 can go to a
+// stream owed a push while given-back notes merge, and its stream get one back. Its key is
+// still its latest then, so with the keys A, B, then A again nothing pushes on its own
+// under B.
+
+/**
+ * Keys A, B, then A again for the stream s`x`: each of `pushed` goes out as a note of its
+ * own, unconfirmed (the last under B, those before it under A), and `since` is noted under
+ * A, owed nothing. `since` leaves s`x` a place past the 256 named, which it loses as the
+ * pushes are given back, and gets back as `where` says.
+ */
+const REGAINED = [
+  {
+    where: "from the push that took its place, 512 streams",
+    x: 300,
+    pushed: [range(0, 511), range(0, 511)],
+    since: [...range(1, 511), 0],
+  },
+  {
+    where: "from the push that took its place, 400 streams",
+    x: 380,
+    pushed: [range(0, 399), range(0, 399)],
+    since: [...range(124, 399), ...range(0, 123)],
+  },
+  {
+    where: "from a later push, 512 streams",
+    x: 511,
+    pushed: [
+      range(0, 300),
+      [...range(0, 255), 511, ...range(256, 510)],
+      [...range(0, 255), 511, ...range(256, 510)],
+    ],
+    since: [...range(1, 256), 511, ...range(257, 510), 0],
+  },
+  {
+    where: "from a later push, as an entry of its own, 512 streams",
+    x: 511,
+    pushed: [range(0, 300), [511, ...range(0, 510)], [511, ...range(0, 510)]],
+    since: [...range(1, 256), 511, ...range(257, 510), 0],
+  },
+  {
+    where: "from a later push's entry of its own, 513 streams",
+    x: 512,
+    pushed: [[...range(1, 256), 0], [512], [512]],
+    since: [...range(1, 256), 512, ...range(257, 511)],
+  },
+] as const;
+
+/**
+ * One of `REGAINED`, with A `latest` and B `stale`, up to the notes since; `total` is
+ * every record noted, and `off` turns every station but s`x`'s off.
+ */
+async function regained(
+  { x, pushed, since }: (typeof REGAINED)[number],
+  [latest, stale]: readonly [string, string],
+  options: { path?: string } = {},
+) {
+  const delivery = { mode: "immediate", maxPushesPerHour: 1 };
+  const { h, host } = setup(delivery, {}, {}, options);
+  const shim = h.attach("scribe", { sessionId: SESSION });
+  host.sing(1);
+  h.timers.advance(6_000);
+  await confirm(shim);
+  const sing = (key: string, seq: number, stations: readonly number[]) => {
+    for (const i of stations) {
+      host.sing(seq, { station: `s${i}`, key, epoch: 100 + i, ttlMs: 10_000 });
+    }
+    h.timers.advance(12_000); // off air, under the spent budget or the pause
+  };
+  pushed.forEach((stations, i) => {
+    sing(i === pushed.length - 1 ? stale : latest, 1 + i, stations);
+    h.timers.advance(status(h).lastPushAt! + 3_606_000 - h.clock.now());
+    assert.equal(pushes(shim).length, 2 + i, "a note on its own");
+  });
+  h.daemon.reloadConfig({ ...canticleConfig(delivery), paused: true });
+  sing(latest, 1 + pushed.length, since);
+  const place = foldedPlace(h, `s${x}:ops.fleet`);
+  assert.equal(place?.key, latest, "a place, under its latest key");
+  assert.equal(place.owed, false, "owed nothing yet");
+  const all: ReadonlyArray<readonly number[]> = [...pushed, since];
+  return {
+    h,
+    host,
+    shim,
+    off: offBut(Math.max(...all.flat()) + 1, x),
+    total: all.flat().length,
+  };
+}
+
+/** A stream's saved key and whether it is owed a push, named or counted together. */
+const savedKey = (h: Harnessed, stream: string) => {
+  const note = pendingNotes(h)[stream] ?? foldedPlace(h, stream);
+  return note && { key: note.key, owed: note.owed };
+};
+
+for (const regain of REGAINED) {
+  for (const { keys, name } of ROTATIONS) {
+    test(`#119 E2 (${regain.where}; ${name}, and back): a stream that loses its place and gets one back as a disconnect gives notes back keeps its latest key: with the stale key alone allowed nothing pushes on its own, and the next push that goes tells the note`, async () => {
+      const [latest, stale] = keys;
+      for (const goes of ["a record's push", "its own, the key allowed"]) {
+        const { h, host, shim, off, total } = await regained(regain, keys);
+        try {
+          shim.close(); // every push given back, the earliest first
+          const next = h.attach("scribe", { sessionId: SESSION });
+          assert.equal(wakesUnder(h, next, stale, off), 0, "the stale key");
+          assert.deepEqual(savedKey(h, `s${regain.x}:ops.fleet`), {
+            key: latest,
+            owed: true,
+          });
+          if (goes === "a record's push") {
+            host.sing(1, { station: "w", key: stale, epoch: 9_000 });
+            h.timers.advance(6_000);
+          } else {
+            assert.equal(wakesUnder(h, next, latest, off), 1, "the latest key");
+          }
+          assert.equal(pushes(next).length, 1, goes);
+          assert.equal(omissionsTold(pushes(next)[0]!.content), total, "told");
+          await confirm(next);
+          h.timers.advance(3_600_000);
+          assert.equal(pushes(next).length, 1, "once");
+        } finally {
+          h.dispose();
+        }
+      }
+    });
+  }
+}
+
+for (const regain of REGAINED) {
+  for (const pass of [false, true]) {
+    for (const { keys, name } of ROTATIONS) {
+      test(`#119 E2 (${regain.where}; ${name}, and back; a crash, ${pass ? "a pass reads" : "the revert reads"} the saved notes): the same notes given back by a fresh process on the saved database keep the latest key`, async () => {
+        const [latest, stale] = keys;
+        const directory = mkdtempSync(join(tmpdir(), "frond-ear-regained-"));
+        const path = join(directory, "ear.db");
+        try {
+          const { h, off, total } = await regained(regain, keys, { path });
+          const again = crashed(
+            h,
+            path,
+            pass,
+            { mode: "immediate", maxPushesPerHour: 1, stations: off },
+            { wakeKeys: [stale] },
+          );
+          try {
+            again.h.timers.advance(60_000);
+            assert.equal(pushes(again.shim).length, 0, "the stale key");
+            assert.deepEqual(savedKey(again.h, `s${regain.x}:ops.fleet`), {
+              key: latest,
+              owed: true,
+            });
+            assert.equal(
+              wakesUnder(again.h, again.shim, latest, off),
+              1,
+              "the latest key",
+            );
+            assert.equal(omissionsTold(pushes(again.shim)[0]!.content), total);
+          } finally {
+            again.h.dispose();
+          }
+        } finally {
+          rmSync(directory, { recursive: true, force: true });
+        }
+      });
+    }
+  }
+}
