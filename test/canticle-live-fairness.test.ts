@@ -2684,3 +2684,67 @@ test("#119 second review, re-review 5: a folded count whose streams of one kind 
     h.dispose();
   }
 });
+
+test("#119 second review, re-review 6: a given-back FOLDED owed for a stream with no place to be had makes that stream's own entry owed, so the push it was owed still comes; with a place free, its place is owed", async () => {
+  const s = manyKey(900);
+  for (const folded of [256, 255]) {
+    const delivery = { mode: "immediate", maxItems: 1, maxPushesPerHour: 1 };
+    const t = Array.from({ length: 255 }, (_, i) => manyKey(i));
+    const u = Array.from({ length: folded }, (_, i) => manyKey(300 + i));
+    const { h, host } = setup(delivery, { wakeKeys: [ALPHA, s, ...t, ...u] });
+    try {
+      const at = h.clock.now() - 1_000;
+      h.store.setRuntimeState(
+        "canticle.withheld.scribe",
+        JSON.stringify({
+          pending: {
+            "*": {
+              offAir: 0,
+              dropped: 0,
+              withheld: [["push_budget", { count: 1, from: at, to: at }]],
+              key: "",
+              owed: true,
+              streams: [
+                {
+                  stream: "s:ops.fleet",
+                  key: s,
+                  owed: true,
+                  withheld: true,
+                  missed: false,
+                },
+              ],
+            },
+          },
+          carried: {},
+        }),
+      );
+      const shim = h.attach("scribe", { sessionId: SESSION });
+      h.timers.advance(6_000);
+      assert.equal(
+        pushes(shim).length,
+        1,
+        "s's folded note, a push of its own",
+      );
+      // Unconfirmed, the budget spent: s's next record leaves the view first (named,
+      // owed nothing); 255 t's (named) and the u's (folded) go off air, owed.
+      host.sing(2, { station: "s", key: s, ttlMs: 10_000 });
+      t.forEach((key, i) =>
+        host.sing(1, { station: `t${i}`, key, ttlMs: 10_000 }),
+      );
+      u.forEach((key, i) =>
+        host.sing(1, { station: `u${i}`, key, ttlMs: 10_000 }),
+      );
+      h.timers.advance(1_000);
+      host.pluck(2, { station: "s", key: s });
+      h.timers.advance(11_000);
+      assert.equal(pendingNotes(h)["s:ops.fleet"]?.owed, false);
+      shim.close(); // given back: the folded s, owed, merges in
+      h.daemon.reloadConfig(canticleConfig(delivery, { wakeKeys: [ALPHA, s] }));
+      const next = h.attach("scribe", { sessionId: SESSION });
+      h.timers.advance(60_000);
+      assert.equal(pushes(next).length, 1, `owed again, and told (${folded})`);
+    } finally {
+      h.dispose();
+    }
+  }
+});
