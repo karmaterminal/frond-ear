@@ -1222,7 +1222,11 @@ test("holds: with no session, while paused and while the host breaker isn't clos
     assert.equal(pushes(shim).length, 3);
     const last = pushes(shim)[2]!.content;
     assert.deepEqual(order(last), ["ops:ops.fleet/3"]);
-    assert.match(last, /^ops:ops\.fleet: 1 went off air unpushed\.$/mu);
+    // Record 4 went off air while the breaker held it: a local omission, with its reason.
+    assert.match(
+      last,
+      /^- ops:ops\.fleet: 1 went off air unpushed while the host receptor's breaker was open \(breaker_open; heard \S+Z to \S+Z\)\.$/mu,
+    );
     assert.equal(status(h).counts.off_air_unpushed, 1);
     assert.equal(status(h).held, null);
   } finally {

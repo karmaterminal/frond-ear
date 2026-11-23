@@ -126,6 +126,30 @@ export interface HearView {
   lastDatagramAt: number | undefined;
   stations: Array<{ name: string; presence: string }>;
   items: LiveItem[];
+  /**
+   * Record v1: what frond-ear's own live set dropped on this ear's tuned streams
+   * (binary-canticle#168 §2.7a local omission, `live_overflow`), one entry per
+   * `station:stream`. Not set by the embedded receptor, whose listener keeps per-key quotas.
+   */
+  omitted?: import("./records.ts").LiveOmission[];
+  /**
+   * Record v1: the live set's drops past the tuned streams it counts one by one (station
+   * and stream empty), when one of this ear's patterns took in a stream they came from.
+   */
+  otherOmitted?: import("./records.ts").LiveOmission;
+  /** Record v1: the untuned share's drops, while any of them would still be on air. */
+  untunedOmitted?: { count: number; from: number; to: number; until: number };
+  /**
+   * Record v1: patterns tuned while the untuned share was dropping records that would still
+   * be on air (`dropped` of them, until `until`): such a stream's records from before `at`
+   * may be missing, how many unknown.
+   */
+  retuned?: Array<{
+    pattern: string;
+    at: number;
+    dropped: number;
+    until: number;
+  }>;
 }
 
 export interface ReceptorOptions {

@@ -1546,14 +1546,15 @@ export class EventStore {
 
   /**
    * Canticle push `batchId` of this ear as custody holds it, with the attach generation it
-   * went out under (its delivery token is keyed by it); `reverted` when a revert gave it
-   * back (its records went out again under new ids); undefined when it is no canticle push
-   * of this ear that frond-ear still knows.
+   * went out under (its delivery token is keyed by it); `empty` for a push that carried a
+   * coverage note and no record, which custody holds no row for; `reverted` when a revert
+   * gave it back (its records went out again under new ids); undefined when it is no
+   * canticle push of this ear that frond-ear still knows.
    */
   public canticlePush(
     ear: string,
     batchId: number,
-  ): { generation: number } | "reverted" | undefined {
+  ): { generation: number; empty?: true } | "reverted" | undefined {
     const row = this.database
       .prepare(
         "SELECT generation FROM canticle_custody WHERE ear = ? AND batch_id = ? LIMIT 1",
@@ -1562,13 +1563,23 @@ export class EventStore {
     if (row !== undefined) {
       return { generation: row.generation };
     }
-    return this.database
+    if (
+      this.database
+        .prepare(
+          "SELECT 1 AS hit FROM canticle_reverted WHERE ear = ? AND batch_id = ?",
+        )
+        .get(ear, batchId) !== undefined
+    ) {
+      return "reverted";
+    }
+    const note = this.database
       .prepare(
-        "SELECT 1 AS hit FROM canticle_reverted WHERE ear = ? AND batch_id = ?",
+        "SELECT attach_generation AS generation FROM batches WHERE id = ? AND ear = ? AND kind = 'canticle'",
       )
-      .get(ear, batchId) !== undefined
-      ? "reverted"
-      : undefined;
+      .get(batchId, ear) as { generation: number } | undefined;
+    return note === undefined
+      ? undefined
+      : { generation: note.generation, empty: true };
   }
 
   /**
@@ -2689,6 +2700,33 @@ export class EventStore {
       )
       .run(this.clock.now(), batchId, ear, attachGeneration);
     return result.changes === 1;
+  }
+
+  /**
+   * What became of canticle push `batchId` of this ear, for notes a restart reloads:
+   * `unconfirmed` (the host never confirmed it, and no revert has given it back yet),
+   * `reverted`, or undefined (confirmed, or no longer known).
+   */
+  public canticleOutcome(
+    ear: string,
+    batchId: number,
+  ): "unconfirmed" | "reverted" | undefined {
+    if (
+      this.database
+        .prepare(
+          "SELECT 1 AS hit FROM canticle_reverted WHERE ear = ? AND batch_id = ?",
+        )
+        .get(ear, batchId) !== undefined
+    ) {
+      return "reverted";
+    }
+    return this.database
+      .prepare(
+        "SELECT 1 AS hit FROM batches WHERE id = ? AND ear = ? AND kind = 'canticle' AND offered_at IS NULL",
+      )
+      .get(batchId, ear) !== undefined
+      ? "unconfirmed"
+      : undefined;
   }
 
   /**

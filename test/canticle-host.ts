@@ -57,19 +57,32 @@ export interface Song {
  * and a rejoin gets the run's state back as a join snapshot (§14.18.3).
  */
 export class Host {
-  readonly consumer = new RecordConsumer();
+  readonly consumer: RecordConsumer;
   listening = true;
   run = "a1b2";
   /** What this run has on air (idem → frame fields), and each station's presence. */
   readonly onAir = new Map<string, R>();
   readonly stations = new Map<string, string>();
-  /** The `station:stream` pairs the ear follows (`canticle.tune`). */
-  tune: string[] = TUNE;
+  #tune: string[];
   #seq = 0;
   readonly #clock: { now(): number };
 
-  constructor(clock: { now(): number }) {
+  /** `tune` is the ear's, and the consumer admits records against it (§2.4 step 2). */
+  constructor(clock: { now(): number }, tune: string[] = TUNE) {
     this.#clock = clock;
+    this.#tune = tune;
+    this.consumer = new RecordConsumer({ tune });
+  }
+
+  /** The `station:stream` pairs the ear follows (`canticle.tune`). */
+  get tune(): string[] {
+    return this.#tune;
+  }
+
+  /** A new tune: the consumer admits against it from now on. */
+  set tune(tune: string[]) {
+    this.#tune = tune;
+    this.consumer.retune(tune, this.now);
   }
 
   get now(): number {
@@ -197,6 +210,24 @@ export class Host {
     });
   }
 
+  /**
+   * A keyed record's successor: the host retracts the record `old` it supersedes (same
+   * key, stream and state_key), then sings `seq`, in the order binary-canticle's host
+   * daemon emits them (its listener reports the supersession before the item).
+   */
+  supersede(old: number, seq: number, o: Song): void {
+    const target = this.fields(old, o);
+    const successor = this.fields(seq, o);
+    this.onAir.delete(target.idem as string);
+    this.#emit("retract", {
+      target: {},
+      idem: target.idem,
+      reason: "superseded",
+      by: { idem: successor.idem },
+    });
+    this.sing(seq, o);
+  }
+
   /** The transport closed without a `bye`: the run is out of reach, not over. */
   drop(): void {
     this.consumer.closed(this.now);
@@ -304,6 +335,7 @@ export interface DeliveryStatus {
   waiting: number;
   nextPushAt: number | null;
   held: string | null;
+  heldUntil?: number | null;
   lastPushAt: number | null;
   pushesLastHour: number;
   maxPushesPerHour: number;

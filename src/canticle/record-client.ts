@@ -33,7 +33,7 @@ export interface RecordClientOptions {
 }
 
 export class RecordClient {
-  readonly consumer = new RecordConsumer();
+  readonly consumer: RecordConsumer;
   readonly #options: RecordClientOptions;
   readonly #clock: Clock;
   readonly #timers: Timers;
@@ -47,6 +47,10 @@ export class RecordClient {
 
   constructor(options: RecordClientOptions) {
     this.#options = options;
+    // Admission counts a record as tuned if any ear tunes it (binary-canticle#168 §2.4).
+    this.consumer = new RecordConsumer({
+      tune: Object.values(options.tune).flat(),
+    });
     this.#clock = options.clock ?? systemClock;
     this.#timers = options.timers ?? systemTimers;
   }
@@ -150,6 +154,8 @@ export class RecordClient {
   }
 
   status(): object {
+    // First: it lets a lapsed `live_overflow_*` reason go before health is read.
+    const liveSet = this.consumer.liveStatus(this.#clock.now());
     return {
       source: "host-daemon",
       state: this.#state,
@@ -169,6 +175,7 @@ export class RecordClient {
       mute: this.consumer.mute,
       breaker: this.consumer.breaker ?? null,
       counts: { ...this.consumer.counts },
+      liveSet,
       stations: Object.fromEntries(this.consumer.presence),
     };
   }

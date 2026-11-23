@@ -30,6 +30,15 @@
 // (complete: replaces the local view; truncated: merge only). Every bootstrap on the
 // host socket reports `joined_late` until a complete snapshot or a new run.
 // Every map here has a fixed bound (§14.18.2 "nothing in the pipe is unbounded").
+// The live set is admitted against the tune (binary-canticle#168 §2.4 step 2, #171 F9):
+// each tuned station:stream is a share of its own, and every untuned one is admitted
+// under one share together. No ear reads an untuned record, so when the set is full the
+// untuned share gives way first; only then does the tuned share holding the most give up a
+// record. A flood, tuned or not, fills only its own share, and a quiet tuned stream gets
+// in within the bound `#makeRoom` states. What the set drops is counted against the share
+// that lost it, degrades receive health while those records would still be on air
+// (`live_overflow_tuned` or `live_overflow_untuned`), and reaches `hear` and the next push
+// as a local omission (§2.7a).
 // Framing: at most 64 KiB per line and nesting depth 8 (§14.18.2 [PROPOSED DEFAULT]).
 // Status outlives a reconnect (frond-ear#59): `hello` clears receive health, so `counts`
 // (the process's life) counts every health reason each time it is raised, and
@@ -45,6 +54,14 @@ export const MAX_DEPTH = 8;
 /** Bounds on what a record stream can grow (§14.18.2). */
 export const MAX_LIVE = 4_096;
 export const MAX_STATIONS = 256;
+/** Tuned streams the live set counts its drops for one by one; past it, they share one count. */
+const MAX_OMITTED_STREAMS = 256;
+/** The share every untuned station:stream is admitted under. No `station:stream` lacks a colon. */
+const UNTUNED = "untuned";
+/** Where a tuned stream's drops are counted past `MAX_OMITTED_STREAMS`. */
+const OTHER_TUNED = "other";
+/** Tuned records the live set dropped that a push could have carried, kept by identity. */
+const MAX_DROPS = MAX_LIVE;
 /** The join-snapshot entry cap (§14.18.3 "Join snapshot", [PROPOSED DEFAULT]). */
 export const MAX_SNAPSHOT_ENTRIES = 511;
 /** …and of entry bytes; an entry is measured as its JSON, which is never above its line. */
@@ -88,6 +105,174 @@ interface LiveRecord {
    * removes it then) but not rendered, since a `retract` may have been missed.
    */
   carried?: boolean;
+}
+
+/** Does a `station:stream` tune (`*` for any station) take in this record's stream? */
+function tunes(
+  patterns: readonly string[],
+  station: string,
+  stream: string,
+): boolean {
+  return patterns.some((p) => {
+    const at = p.indexOf(":");
+    const s = p.slice(0, at);
+    return (s === "*" || s === station) && p.slice(at + 1) === stream;
+  });
+}
+
+/**
+ * The live set, by share: every record under the share it was admitted to, and each
+ * share's records in admission order, so its oldest is first. Bounded by its admitter.
+ */
+class LiveSet {
+  readonly #all = new Map<string, { record: LiveRecord; share: string }>();
+  readonly #shares = new Map<string, Set<string>>();
+  /** No record expires before this (it may be early, never late): `expire` skips till then. */
+  #soonest = Infinity;
+
+  get size(): number {
+    return this.#all.size;
+  }
+
+  has(idem: string): boolean {
+    return this.#all.has(idem);
+  }
+
+  /** In admission order; a record put again keeps its place. */
+  *entries(): IterableIterator<[string, LiveRecord]> {
+    for (const [idem, { record }] of this.#all) yield [idem, record];
+  }
+
+  *values(): IterableIterator<LiveRecord> {
+    for (const { record } of this.#all.values()) yield record;
+  }
+
+  set(record: LiveRecord, share: string): void {
+    const held = this.#all.get(record.idem);
+    if (held !== undefined && held.share !== share) this.#leave(record.idem);
+    this.#all.set(record.idem, { record, share });
+    this.#soonest = Math.min(this.#soonest, record.localExpiryAt);
+    let idems = this.#shares.get(share);
+    if (idems === undefined) {
+      idems = new Set();
+      this.#shares.set(share, idems);
+    }
+    idems.add(record.idem);
+  }
+
+  delete(idem: string): boolean {
+    if (!this.#all.has(idem)) return false;
+    this.#leave(idem);
+    this.#all.delete(idem);
+    return true;
+  }
+
+  clear(): void {
+    this.#all.clear();
+    this.#shares.clear();
+    this.#soonest = Infinity;
+  }
+
+  /** Drops every record past its local expiry; a full set under a flood calls it often. */
+  expire(nowMs: number): void {
+    if (nowMs < this.#soonest) return;
+    let soonest = Infinity;
+    for (const [idem, { record }] of this.#all) {
+      if (record.localExpiryAt <= nowMs) this.delete(idem);
+      else soonest = Math.min(soonest, record.localExpiryAt);
+    }
+    this.#soonest = soonest;
+  }
+
+  count(share: string): number {
+    return this.#shares.get(share)?.size ?? 0;
+  }
+
+  oldest(share: string): LiveRecord | undefined {
+    const idem = this.#shares.get(share)?.values().next().value;
+    return idem === undefined ? undefined : this.#all.get(idem)?.record;
+  }
+
+  /** The tuned share holding the most; the untuned one never competes (`#makeRoom`). */
+  largestTuned(): { share: string; count: number } | undefined {
+    let best: { share: string; count: number } | undefined;
+    for (const [share, idems] of this.#shares) {
+      if (share === UNTUNED) continue;
+      if (best === undefined || idems.size > best.count) {
+        best = { share, count: idems.size };
+      }
+    }
+    return best;
+  }
+
+  /** How many records each share holds. */
+  counts(): Record<string, number> {
+    return Object.fromEntries(
+      [...this.#shares].map(([share, idems]) => [share, idems.size]),
+    );
+  }
+
+  /** The tune changed: every record goes to the share it would be admitted to now. */
+  reshare(shareOf: (record: LiveRecord) => string): void {
+    const all = [...this.#all.values()];
+    this.#shares.clear();
+    for (const held of all) {
+      held.share = shareOf(held.record);
+      this.set(held.record, held.share);
+    }
+  }
+
+  #leave(idem: string): void {
+    const share = this.#all.get(idem)!.share;
+    const idems = this.#shares.get(share)!;
+    idems.delete(idem);
+    if (idems.size === 0) this.#shares.delete(share);
+  }
+}
+
+/** One record the live set dropped: its identity, and `n`, its place in `pushableTotal`. */
+export interface LiveDrop {
+  n: number;
+  /** When the live set dropped it (this host's clock). */
+  at: number;
+  /** Its local expiry: it would be on air until then. */
+  until: number;
+  key: string;
+  epoch: number;
+  stream: string;
+  seq: string;
+}
+
+/**
+ * What the live set dropped from one share (§2.7a local omission, `live_overflow`): the
+ * records of its current window, which would still be on air until `until`, dropped
+ * between `from` and `to` (this host's clock); and `total`, every one since this entry
+ * began (`serial`), which delivery compares with what it has already reported. The
+ * `pushable` counts are those sung at hop 0 and not wake-derived: the only ones a push
+ * could have carried. A dropped record may be one delivery already pushed, dropped, told
+ * of or still waits on (the set held it, then gave it up; or a copy of it came back and was
+ * refused), so `hearView` names the latest pushable drops in `drops`, and delivery counts
+ * only those it never accounted for.
+ */
+export interface LiveOmission {
+  station: string;
+  stream: string;
+  /** The station key of the latest record dropped (delivery's allowlist names keys). */
+  key: string;
+  count: number;
+  from: number;
+  to: number;
+  until: number;
+  total: number;
+  pushable: number;
+  pushableTotal: number;
+  /**
+   * In a `hearView`: the latest of `pushableTotal` still kept, oldest first (`MAX_LIVE`
+   * across every entry, in fair shares); one past the bound is known only by its count.
+   */
+  drops?: LiveDrop[];
+  /** Tells this entry from an earlier one for the same share that was let go. */
+  serial: number;
 }
 
 /** A join-snapshot entry, parsed and held until `snapshot_end`. */
@@ -233,7 +418,33 @@ export class RecordConsumer {
   lastDatagramAt: number | undefined;
   noDatagrams = false;
   readonly presence = new Map<string, string>();
-  readonly #live = new Map<string, LiveRecord>();
+  readonly #live = new LiveSet();
+  /** Every ear's `station:stream` patterns together: what admission counts as tuned. */
+  #tune: readonly string[];
+  /** Per share, what the live set dropped (tuned streams, at most `MAX_OMITTED_STREAMS`). */
+  readonly #omitted = new Map<string, LiveOmission>();
+  #omittedSerial = 0;
+  /**
+   * Tune patterns that take in a stream whose drops went to the shared count, since its
+   * window opened: the ears `hearView` shows that count to.
+   */
+  readonly #otherPatterns = new Set<string>();
+  /** The latest pushable tuned drops, per entry, each oldest first (`#keepDrop`). */
+  readonly #drops = new Map<string, Map<number, LiveDrop>>();
+  #dropCount = 0;
+  /**
+   * Patterns tuned (by `retune`) while the untuned share was dropping records that would
+   * still be on air: until `until`, such a stream's records from before `at` may be missing.
+   */
+  readonly #retuned = new Map<
+    string,
+    { at: number; dropped: number; until: number }
+  >();
+
+  /** `tune`: every ear's `station:stream` patterns; none tunes nothing, so all share one. */
+  constructor(options: { tune?: readonly string[] } = {}) {
+    this.#tune = [...new Set(options.tune ?? [])];
+  }
 
   #count(name: string, n = 1): void {
     this.counts[name] = (this.counts[name] ?? 0) + n;
@@ -294,7 +505,7 @@ export class RecordConsumer {
       if (rec.v.startsWith("canticle-receptor-record/")) {
         this.#versionStopped = true;
         this.#fail("record_version", nowMs);
-        this.#live.clear();
+        this.#dropLive();
       } else this.dropLine("malformed_record", nowMs);
       return;
     }
@@ -389,7 +600,7 @@ export class RecordConsumer {
         // expiry, since no retract for them can follow from this run.
         this.#byeSeen = true;
         this.health = "stopped";
-        this.#live.clear();
+        this.#dropLive();
         this.#landingSeen = false;
         return;
       default:
@@ -420,7 +631,7 @@ export class RecordConsumer {
       // What an earlier connection carried survives only for a snapshot to confirm
       // (or, if truncated, to leave alone); with none coming, a missed `retract`
       // could keep it forever, so it goes now, as before D36.
-      if (this.snapshotState !== "pending") this.#live.clear();
+      if (this.snapshotState !== "pending") this.#dropLive();
       this.#helloSeq = rec.rec_seq;
       this.health = "ok";
       this.healthReasons = [];
@@ -598,7 +809,7 @@ export class RecordConsumer {
       this.#count(reason);
     }
     this.#conn = "lost";
-    this.#live.clear();
+    this.#dropLive();
     this.#landingSeen = false;
     this.#fail("malformed_bootstrap", nowMs);
   }
@@ -643,7 +854,7 @@ export class RecordConsumer {
    */
   #lose(clear = true): void {
     this.#degrade("records_lost");
-    if (clear) this.#live.clear();
+    if (clear) this.#dropLive();
   }
 
   #setPresence(name: string, state: string): void {
@@ -658,16 +869,284 @@ export class RecordConsumer {
     else if (parsed !== undefined) this.#hold(parsed, nowMs);
   }
 
-  /** Put a deliverable record in the live set, within its bound. */
+  /**
+   * Put a deliverable record in the live set, within its bound, under the share the tune
+   * gives it now (§2.4 step 2: tuned or not is decided here, not when an ear reads).
+   */
   #hold(r: LiveRecord, nowMs: number): void {
+    const share = this.#shareOf(r.item);
     if (!this.#live.has(r.idem) && this.#live.size >= MAX_LIVE) {
       this.#prune(nowMs);
-      if (this.#live.size >= MAX_LIVE) {
-        this.#count("live_overflow");
+      if (this.#live.size >= MAX_LIVE && !this.#makeRoom(share, r, nowMs))
         return;
+    }
+    this.#live.set(r, share);
+  }
+
+  /** A tuned record's share is its own `station:stream`; every untuned one shares one. */
+  #shareOf(item: LiveItem): string {
+    return tunes(this.#tune, item.station, item.stream)
+      ? `${item.station}:${item.stream}`
+      : UNTUNED;
+  }
+
+  /**
+   * The set is full, and nothing in it has expired. No ear reads an untuned record
+   * (`hearView` reads through the tune), so the untuned share gives way first: an untuned
+   * newcomer is refused, and a tuned one takes the place of the oldest untuned record while
+   * there is one. Only with none left does the tuned share holding the most give up a
+   * record: if that is the newcomer's own, or holds within one of it, the newcomer is
+   * refused; otherwise that share's oldest record goes. Either way the share that lost a
+   * record counts it.
+   *
+   * So a flood fills only its own share, and with nothing untuned left, a tuned record gets
+   * in only if some tuned share holds at least two more than its own. Each tuned stream can
+   * therefore keep at least ⌈4096/S⌉ − 1 records whatever the others send, S being the
+   * tuned streams holding records, itself included: a stream's first record finds room
+   * unless 4096 tuned streams hold one record each (a `*:` tune over that many stations).
+   *
+   * A share's own records go oldest first, and a full share refuses its newest. Record v1
+   * declares no stream's shape (#168 §2.1's latest-state or ordered events; the stream
+   * descriptor that would carry it is unbuilt), so latest-state streams are kept the same
+   * way. A keyed record still replaces its predecessor: the host daemon retracts a
+   * superseded record before it emits the successor, which then finds the place free.
+   */
+  #makeRoom(share: string, r: LiveRecord, nowMs: number): boolean {
+    if (share === UNTUNED) {
+      this.#drop(UNTUNED, r, nowMs);
+      return false;
+    }
+    const giver =
+      this.#live.count(UNTUNED) > 0
+        ? UNTUNED
+        : this.#live.largestTuned()!.share;
+    if (
+      giver !== UNTUNED &&
+      (giver === share || this.#live.count(giver) - this.#live.count(share) < 2)
+    ) {
+      this.#drop(share, r, nowMs);
+      return false;
+    }
+    const oldest = this.#live.oldest(giver)!;
+    this.#live.delete(oldest.idem);
+    this.#drop(giver, oldest, nowMs);
+    return true;
+  }
+
+  /** The live set dropped `r` from `share`: counted against it, and receive health says so. */
+  #drop(share: string, r: LiveRecord, nowMs: number): void {
+    const tuned = share !== UNTUNED;
+    const at =
+      tuned && !this.#omitted.has(share) ? this.#room(share, nowMs) : share;
+    let o = this.#omitted.get(at);
+    if (o === undefined) {
+      o = {
+        station: tuned && at !== OTHER_TUNED ? r.item.station : "",
+        stream: tuned && at !== OTHER_TUNED ? r.item.stream : "",
+        key: r.item.key,
+        count: 0,
+        from: nowMs,
+        to: nowMs,
+        until: 0,
+        total: 0,
+        pushable: 0,
+        pushableTotal: 0,
+        serial: ++this.#omittedSerial,
+      };
+      this.#omitted.set(at, o);
+      this.#forgetDrops(at); // an earlier entry's, let go
+    }
+    if (o.until <= nowMs) {
+      // The last window's records are all off air by now: a new one opens.
+      o.count = 0;
+      o.pushable = 0;
+      o.from = nowMs;
+      if (at === OTHER_TUNED) this.#otherPatterns.clear();
+    }
+    if (at === OTHER_TUNED) {
+      for (const p of this.#tune) {
+        if (tunes([p], r.item.station, r.item.stream))
+          this.#otherPatterns.add(p);
       }
     }
-    this.#live.set(r.idem, r);
+    o.count += 1;
+    o.to = nowMs;
+    o.until = Math.max(o.until, r.localExpiryAt);
+    o.total += 1;
+    if (r.item.hop === 0 && r.item.wakeDerived === false) {
+      o.pushable += 1;
+      o.pushableTotal += 1;
+      // No ear reads an untuned share's entry, so only a tuned drop is kept by name.
+      if (tuned) {
+        const { key, epoch, stream, seq } = r.item;
+        this.#keepDrop(at, {
+          n: o.pushableTotal,
+          at: nowMs,
+          until: r.localExpiryAt,
+          key,
+          epoch,
+          stream,
+          seq,
+        });
+      }
+    }
+    o.key = r.item.key;
+    this.#count("live_overflow");
+    this.#degrade(tuned ? "live_overflow_tuned" : "live_overflow_untuned");
+  }
+
+  /**
+   * Keeps a tuned drop by name for delivery, within `MAX_DROPS` in all. Past it, the entry
+   * holding the most gives up its oldest, so a flood on one stream can't push out another's.
+   */
+  #keepDrop(entry: string, drop: LiveDrop): void {
+    let kept = this.#drops.get(entry);
+    if (kept === undefined) this.#drops.set(entry, (kept = new Map()));
+    kept.set(drop.n, drop);
+    if (++this.#dropCount <= MAX_DROPS) return;
+    let most = entry;
+    for (const [other, drops] of this.#drops) {
+      if (drops.size > this.#drops.get(most)!.size) most = other;
+    }
+    const drops = this.#drops.get(most)!;
+    drops.delete(drops.keys().next().value!);
+    if (drops.size === 0) this.#drops.delete(most);
+    this.#dropCount -= 1;
+  }
+
+  /** An entry let go: the drops it kept by name go with it. */
+  #forgetDrops(entry: string): void {
+    this.#dropCount -= this.#drops.get(entry)?.size ?? 0;
+    this.#drops.delete(entry);
+  }
+
+  /**
+   * Where a tuned share with no entry yet counts its drops: its own entry, once there is
+   * room for one. A full map first lets go of the entry whose window closed longest ago
+   * (its records are all off air, and delivery, reading every second, has all but surely
+   * counted them); only with every entry open do the drops go to the one shared count.
+   */
+  #room(share: string, nowMs: number): string {
+    const tuned =
+      this.#omitted.size -
+      (this.#omitted.has(UNTUNED) ? 1 : 0) -
+      (this.#omitted.has(OTHER_TUNED) ? 1 : 0);
+    if (tuned < MAX_OMITTED_STREAMS) return share;
+    let lapsed: string | undefined;
+    let at = Infinity;
+    for (const [key, o] of this.#omitted) {
+      if (key === UNTUNED || key === OTHER_TUNED) continue;
+      if (o.until <= nowMs && o.until < at) [lapsed, at] = [key, o.until];
+    }
+    if (lapsed === undefined) return OTHER_TUNED;
+    this.#omitted.delete(lapsed);
+    this.#forgetDrops(lapsed);
+    return share;
+  }
+
+  /**
+   * Everything live goes (a run ended, records were lost, delivery stopped). What the
+   * live set dropped before is moot now: its windows close, and their reasons with them.
+   */
+  #dropLive(): void {
+    this.#live.clear();
+    for (const o of this.#omitted.values()) {
+      o.count = 0;
+      o.pushable = 0;
+      o.until = 0;
+    }
+    this.#retuned.clear();
+    this.#clearReason("live_overflow_tuned");
+    this.#clearReason("live_overflow_untuned");
+  }
+
+  /**
+   * Now, not since: a `live_overflow_*` reason holds while a record it counts would still
+   * be on air, and lapses after. A `hello` that cleared it while one would be raises it again.
+   */
+  #syncOverflow(nowMs: number): void {
+    for (const [reason, untuned] of [
+      ["live_overflow_tuned", false],
+      ["live_overflow_untuned", true],
+    ] as const) {
+      const open = [...this.#omitted].some(
+        ([share, o]) => (share === UNTUNED) === untuned && o.until > nowMs,
+      );
+      if (!open) this.#clearReason(reason);
+      else if (!this.healthReasons.includes(reason)) {
+        if (this.health !== "failed" && this.health !== "stopped")
+          this.health = "degraded";
+        this.#reason(reason);
+      }
+    }
+    for (const [pattern, r] of this.#retuned) {
+      if (r.until <= nowMs) this.#retuned.delete(pattern);
+    }
+  }
+
+  /**
+   * The tune changed (every ear's patterns together). Records already live move to the
+   * shares it gives them, and later ones are admitted against it. A newly tuned pattern
+   * may have lost records while it was untuned: if the untuned share dropped any that
+   * would still be on air, its records from before now may be missing, how many unknown,
+   * and `hear` says so until they would all be off air.
+   */
+  retune(patterns: readonly string[], nowMs: number): void {
+    const before = new Set(this.#tune);
+    this.#tune = [...new Set(patterns)];
+    this.#live.reshare((r) => this.#shareOf(r.item));
+    const untuned = this.#omitted.get(UNTUNED);
+    for (const pattern of this.#tune) {
+      if (before.has(pattern) || untuned === undefined) continue;
+      if (untuned.until > nowMs) {
+        this.#retuned.set(pattern, {
+          at: nowMs,
+          dropped: untuned.count,
+          until: untuned.until,
+        });
+      }
+    }
+    for (const pattern of this.#retuned.keys()) {
+      if (!this.#tune.includes(pattern)) this.#retuned.delete(pattern);
+    }
+  }
+
+  /** How many records are live now, in every share. */
+  get liveSize(): number {
+    return this.#live.size;
+  }
+
+  /**
+   * The live set for `status`: its size and bound, what each share holds, and what it
+   * dropped per share (tuned streams by `station:stream`, every untuned one as `untuned`).
+   */
+  liveStatus(nowMs: number): {
+    size: number;
+    max: number;
+    shares: Record<string, number>;
+    omitted: Record<
+      string,
+      { count: number; total: number; from: number; to: number; until: number }
+    >;
+  } {
+    this.#syncOverflow(nowMs);
+    return {
+      size: this.#live.size,
+      max: MAX_LIVE,
+      shares: this.#live.counts(),
+      omitted: Object.fromEntries(
+        [...this.#omitted].map(([share, o]) => [
+          share,
+          {
+            count: o.until > nowMs ? o.count : 0,
+            total: o.total,
+            from: o.from,
+            to: o.to,
+            until: o.until,
+          },
+        ]),
+      ),
+    };
   }
 
   /**
@@ -816,7 +1295,7 @@ export class RecordConsumer {
    * it (status only: nothing is delivered before it anyway).
    */
   #endRun(): void {
-    this.#live.clear();
+    this.#dropLive();
     this.#landingSeen = false;
     this.presence.clear();
     this.lastDatagramAt = undefined;
@@ -824,9 +1303,7 @@ export class RecordConsumer {
   }
 
   #prune(nowMs: number): void {
-    for (const [idem, r] of this.#live) {
-      if (r.localExpiryAt <= nowMs) this.#live.delete(idem);
-    }
+    this.#live.expire(nowMs);
   }
 
   #degrade(reason: string): void {
@@ -902,23 +1379,47 @@ export class RecordConsumer {
     this.#snapBytes = 0;
   }
 
-  /** What one ear hears now, through its `station:stream` tune. */
+  /**
+   * What one ear hears now, through its `station:stream` tune, and what the live set
+   * dropped that the ear would hear: per tuned stream (each with its `total` and latest
+   * drops, for delivery), the shared count past `MAX_OMITTED_STREAMS` when a pattern of
+   * this ear's took in a stream it counts, the untuned share's open window, and patterns
+   * tuned while it was dropping records.
+   */
   hearView(
     patterns: readonly string[],
     nowMs: number,
     listening: boolean,
   ): HearView {
     const tuned = (station: string, stream: string) =>
-      patterns.some((p) => {
-        const at = p.indexOf(":");
-        const s = p.slice(0, at);
-        return (s === "*" || s === station) && p.slice(at + 1) === stream;
-      });
+      tunes(patterns, station, stream);
+    this.#syncOverflow(nowMs);
+    const view = (share: string, o: LiveOmission): LiveOmission => ({
+      ...o,
+      ...(o.until > nowMs ? {} : { count: 0, pushable: 0 }),
+      drops: [...(this.#drops.get(share)?.values() ?? [])],
+    });
+    const omitted = [...this.#omitted]
+      .filter(
+        ([share, o]) =>
+          share !== UNTUNED &&
+          share !== OTHER_TUNED &&
+          tuned(o.station, o.stream),
+      )
+      .map(([share, o]) => view(share, o));
+    const other = this.#omitted.get(OTHER_TUNED);
+    const otherHeard =
+      other !== undefined &&
+      [...this.#otherPatterns].some((p) => patterns.includes(p));
+    const untuned = this.#omitted.get(UNTUNED);
+    const retuned = [...this.#retuned]
+      .filter(([pattern]) => patterns.includes(pattern))
+      .map(([pattern, r]) => ({ pattern, ...r }));
     const live = this.health !== "failed" && this.health !== "stopped";
     const deliverable =
       listening && live && this.#landingSeen && this.mute === null;
     const items: LiveItem[] = [];
-    for (const [idem, r] of this.#live) {
+    for (const [idem, r] of this.#live.entries()) {
       if (r.localExpiryAt <= nowMs) {
         this.#live.delete(idem);
         continue;
@@ -956,6 +1457,19 @@ export class RecordConsumer {
         presence: blind ? "unknown" : state,
       })),
       items,
+      ...(omitted.length > 0 ? { omitted } : {}),
+      ...(otherHeard ? { otherOmitted: view(OTHER_TUNED, other) } : {}),
+      ...(untuned !== undefined && untuned.until > nowMs
+        ? {
+            untunedOmitted: {
+              count: untuned.count,
+              from: untuned.from,
+              to: untuned.to,
+              until: untuned.until,
+            },
+          }
+        : {}),
+      ...(retuned.length > 0 ? { retuned } : {}),
     };
   }
 }
