@@ -762,7 +762,10 @@ push that goes, and `hear` says it waits (`the next push reports 1 it withheld (
 on its own now, …`; off-air and dropped records are named the same way). Neither the `other tuned streams` line nor
 what the count holds past those 256 more streams asks for a push of its own: no station is known to meet the
 boundary. What hasn't been told yet survives a restart (`canticle.withheld.<ear>` in the store), and a note in a push
-the host never confirmed is told again once that push is given back.
+the host never confirmed is told again once that push is given back. Given back, a note keeps its stream's station key
+as of that push, named or counted together: of several pushes given back at once (a disconnect, or the first attach
+after a crash), the latest one's key stands, whatever order they come back in, and a note since any of them keeps its
+own. So after a station's key changes, a note owed a push wakes under the newer key, not the one an older push carried.
 
 **Late records.** A record that wasn't heard live just now has a `late:` line under its banner's timing line:
 `late: heard 54s ago (snapshot)`, `late: heard 7s ago (resurfaced)`, or

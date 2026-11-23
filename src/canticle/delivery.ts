@@ -50,7 +50,9 @@
 // meet the boundary (the live set's shared count, and what the note counts past the 256
 // more it can keep by station) only ever rides with a push. Notes not yet told survive a
 // restart, and a note in a push the host never confirmed is told again once that push is
-// given back.
+// given back, its stream's station key as of that push: of several pushes given back
+// together (live, or after a crash), the latest one's key stands, whatever order they
+// come back in, and a note since any of them keeps its own.
 //
 // A tombstone is a dedupe claim, not delivery (binary-canticle#161). Each push is a batch:
 // its claim (batch, tombstones, cursor, a custody row per record) is written in one
@@ -232,6 +234,11 @@ interface Waiting {
    * unconfirmed: given back, it is told as that drop unless it is back on view.
    */
   dropped?: number;
+  /**
+   * Given back by an unconfirmed push (its batch id), and not on view since: what it tells
+   * of its stream (its key, should it go unpushed) is as of that push.
+   */
+  asOf?: number;
 }
 
 /** Where pushes left off, per ear; saved with each push's tombstones. */
@@ -309,6 +316,12 @@ interface Missed {
   withheld: Map<string, Span>;
   /** The station key of its latest record: the boundary a push of its own meets. */
   key: string;
+  /**
+   * The push `key` is as of (its batch id), when one carried the note, or the record it
+   * was noted of, and gave it back; none for a key noted since, which is later than any
+   * push's. Notes merged back in keep the later key by it, never by the merge's order.
+   */
+  asOf?: number;
   /** Owed a push of its own: a push said these wait, or the push budget held them. */
   owed: boolean;
   /**
@@ -323,6 +336,8 @@ interface Missed {
 interface Folded {
   /** The station key of its latest record: the boundary a push of its own meets. */
   key: string;
+  /** The push `key` is as of, as a stream's own entry keeps it (`Missed.asOf`). */
+  asOf?: number;
   /** Owed a push of its own, as a stream's own entry would be. */
   owed: boolean;
   /** Its local omissions are in the folded count. */
@@ -377,13 +392,45 @@ function widen(
   span.to = Math.max(span.to, to);
 }
 
-const blankMissed = (key: string): Missed => ({
+const blankMissed = (key: string, asOf?: number): Missed => ({
   offAir: 0,
   dropped: 0,
   withheld: new Map(),
   key,
+  ...(asOf !== undefined ? { asOf } : {}),
   owed: false,
 });
+
+/** A station key, and the push it is as of (`Missed.asOf`). */
+interface Keyed {
+  key: string;
+  asOf?: number;
+}
+
+/**
+ * Whether `note`'s key is at least as late as `than`'s: one noted since every push is the
+ * latest; of two pushes' keys, the later push's (batch ids only grow). A tie goes to
+ * `note`, the one merged in: a record a push carried is told after that push's notes.
+ */
+const asLate = (note: Keyed, than: Keyed) =>
+  (note.asOf ?? Infinity) >= (than.asOf ?? Infinity);
+
+/** `into` takes `from`'s key, and the push it is as of. */
+function takeKey(into: Keyed, from: Keyed): void {
+  into.key = from.key;
+  if (from.asOf === undefined) delete into.asOf;
+  else into.asOf = from.asOf;
+}
+
+/**
+ * `missed` as push `batchId` carries it: every key in it is as of that push. So is a note
+ * given back before and carried again, since that revert gave back every push before it.
+ */
+function carriedBy(missed: Missed, batchId: number): Missed {
+  missed.asOf = batchId;
+  for (const f of missed.streams?.values() ?? []) f.asOf = batchId;
+  return missed;
+}
 
 /** Adds `from`'s counts and spans to `into`, which is owed if either is. */
 function addMissed(into: Missed, from: Missed): void {
@@ -437,20 +484,15 @@ function slot(
 
 /**
  * `FOLDED` takes in `note`, of `stream`: its counts and spans with the rest, and the stream
- * by name (its key, owed, and what of it was noted) if it has or gets a place. With
- * `latest`, or in a new place, `note.key` becomes the stream's.
+ * by name (its key, owed, and what of it was noted) if it has or gets a place. A new place
+ * takes `note.key`; one it had keeps the later key (`asLate`).
  */
-function fold(
-  folded: Missed,
-  stream: string,
-  note: Missed,
-  latest: boolean,
-): void {
+function fold(folded: Missed, stream: string, note: Missed): void {
   addMissed(folded, note);
   const fresh = folded.streams?.has(stream) !== true;
   const f = slot(folded, stream, note.owed);
   if (f === undefined) return;
-  if (fresh || latest) f.key = note.key;
+  if (fresh || asLate(note, f)) takeKey(f, note);
   f.owed ||= note.owed;
   f.withheld ||= note.withheld.size > 0;
   f.missed ||= note.offAir + note.dropped > 0;
@@ -462,14 +504,14 @@ function fold(
  * while fewer than `MAX_CURSOR_STREAMS` streams have one (`OTHER` aside), and past that
  * to `FOLDED`, which counts the rest together and keeps each stream's station, so a
  * folded note owed a push can still wake one. A stream folded stays folded until the
- * notes are told, never named as well. With `latest`, `note.key` (a live note's station
- * key) becomes the stream's; merged back in, the key already here is the later one.
+ * notes are told, never named as well. The stream keeps the later of its key here and
+ * `note`'s (`asLate`): a live note's is the latest, and a push given back, with others or
+ * after a crash, in whatever order, never puts an earlier push's key over a later one's.
  */
 function addNote(
   notes: Map<string, Missed>,
   stream: string,
   note: Missed,
-  latest: boolean,
 ): void {
   if (stream === FOLDED) {
     mergeFolded(notes, note);
@@ -484,20 +526,21 @@ function addNote(
       stream !== OTHER &&
       (folded?.streams?.has(stream) === true || named >= MAX_CURSOR_STREAMS)
     ) {
-      fold(foldedOf(notes), stream, note, latest);
+      fold(foldedOf(notes), stream, note);
       return;
     }
-    notes.set(stream, (entry = blankMissed(note.key)));
-  } else if (latest) entry.key = note.key;
+    notes.set(stream, (entry = blankMissed(note.key, note.asOf)));
+  } else if (asLate(note, entry)) takeKey(entry, note);
   addMissed(entry, note);
 }
 
 /**
  * A kept `FOLDED` merged back in (a push given back, the saved notes): each stream it
- * names keeps or gets a place here, as when it was folded. One that has an entry of its
- * own here now is folded into that place, so no stream is named and kept both; with no
- * place to be had, its entry stays named, owed if either was, so it keeps its push, and
- * its kept records are counted with the streams the count can't name.
+ * names keeps or gets a place here, as when it was folded, with the later key
+ * (`asLate`). One that has an entry of its own here now is folded into that place, so no
+ * stream is named and kept both; with no place to be had, its entry stays named, owed if
+ * either was, with the later key, so it keeps its push, and its kept records are counted
+ * with the streams the count can't name.
  */
 function mergeFolded(notes: Map<string, Missed>, from: Missed): void {
   const folded = foldedOf(notes);
@@ -507,20 +550,24 @@ function mergeFolded(notes: Map<string, Missed>, from: Missed): void {
     const had = folded.streams?.get(stream);
     const mine = had ?? slot(folded, stream, f.owed || named?.owed === true);
     if (mine === undefined) {
-      // No place: its entry here (with the later key) is owed as the kept one was.
-      if (named !== undefined) named.owed ||= f.owed;
+      // No place: its entry here is owed as the kept one was, with the later key.
+      if (named !== undefined) {
+        named.owed ||= f.owed;
+        if (asLate(f, named)) takeKey(named, f);
+      }
       continue;
     }
     if (had === undefined) Object.assign(mine, f);
     else {
+      if (asLate(f, mine)) takeKey(mine, f);
       mine.owed ||= f.owed;
       mine.withheld ||= f.withheld;
       mine.missed ||= f.missed;
     }
     if (named !== undefined) {
-      // The entry here is the later: its key wins.
+      // Folded into its place, which keeps the later key.
       notes.delete(stream);
-      fold(folded, stream, named, true);
+      fold(folded, stream, named);
     }
   }
   if (from.more === true) folded.more = true;
@@ -563,6 +610,7 @@ interface SavedMissed {
   dropped: number;
   withheld: Array<[string, Span]>;
   key: string;
+  asOf?: number;
   owed: boolean;
   streams?: Array<{ stream: string } & Folded>;
   more?: true;
@@ -579,6 +627,7 @@ const saveMissed = (
         dropped: m.dropped,
         withheld: [...m.withheld],
         key: m.key,
+        ...(m.asOf !== undefined ? { asOf: m.asOf } : {}),
         owed: m.owed,
         ...(m.streams !== undefined
           ? {
@@ -649,25 +698,25 @@ function loadMissed(saved: unknown): Map<string, Missed> {
         typeof g.missed === "boolean"
       ) {
         const { key, owed, withheld, missed } = g;
-        streams.set(g.stream, { key, owed, withheld, missed });
+        streams.set(g.stream, {
+          key,
+          ...(isCount(g.asOf) ? { asOf: g.asOf } : {}),
+          owed,
+          withheld,
+          missed,
+        });
       }
     }
-    addNote(
-      missed,
-      stream,
-      {
-        offAir: m.offAir,
-        dropped: m.dropped,
-        withheld,
-        key: m.key,
-        owed: m.owed,
-        ...(stream === FOLDED ? { streams } : {}),
-        ...(stream === FOLDED && m.more === true
-          ? { more: true as const }
-          : {}),
-      },
-      false,
-    );
+    addNote(missed, stream, {
+      offAir: m.offAir,
+      dropped: m.dropped,
+      withheld,
+      key: m.key,
+      ...(isCount(m.asOf) ? { asOf: m.asOf } : {}),
+      owed: m.owed,
+      ...(stream === FOLDED ? { streams } : {}),
+      ...(stream === FOLDED && m.more === true ? { more: true as const } : {}),
+    });
   }
   return missed;
 }
@@ -970,6 +1019,7 @@ export class CanticleDelivery {
       if (waiting) {
         waiting.item = item;
         delete waiting.gone;
+        delete waiting.asOf; // on view again: no longer only what a push gave back
         continue;
       }
       const expiresAt = now + item.expiresInMs;
@@ -1225,7 +1275,7 @@ export class CanticleDelivery {
           same ? Math.max(o.from, before.at) : o.from,
           o.to,
         );
-        addNote(state.missed, OTHER, note, false);
+        addNote(state.missed, OTHER, note);
       } else {
         const mode = modes.of({ key: o.key, station: o.station });
         if (!keys.has(o.key.toLowerCase()) || mode === "off" || mode === "mute")
@@ -1235,7 +1285,7 @@ export class CanticleDelivery {
         // Dropped after the last pass looked: from then, or this window's start if later.
         const from = same ? Math.max(o.from, before.at) : o.from;
         widen(note.withheld, "live_overflow", told, from, o.to);
-        addNote(state.missed, stream, note, true);
+        addNote(state.missed, stream, note);
       }
       for (const d of fresh) {
         this.#report(state, identity(d), d.until + SETTLE_SKEW_MS);
@@ -1253,9 +1303,9 @@ export class CanticleDelivery {
     this.#count(state, "live_overflow");
     this.#report(state, waiting.id, waiting.expiresAt + SETTLE_SKEW_MS);
     state.seen.delete(waiting.id);
-    const note = { ...blankMissed(waiting.item.key), owed: true };
+    const note = { ...blankMissed(waiting.item.key, waiting.asOf), owed: true };
     widen(note.withheld, "live_overflow", 1, at, at);
-    addNote(state.missed, waiting.stream, note, true);
+    addNote(state.missed, waiting.stream, note);
     state.dirty = true;
   }
 
@@ -1573,7 +1623,10 @@ export class CanticleDelivery {
     kept.set(batchId, {
       records: [...records],
       missed: new Map(
-        [...missed].map(([stream, m]) => [stream, copyMissed(m)]),
+        [...missed].map(([stream, m]) => [
+          stream,
+          carriedBy(copyMissed(m), batchId),
+        ]),
       ),
     });
     const oldest = kept.keys().next().value;
@@ -1597,7 +1650,9 @@ export class CanticleDelivery {
    * into them (`revertUnconfirmed`). Cursor and tombstones are read again from the store,
    * and the records wait for the next push, as a push no connection took leaves them,
    * along with what that push said was missed (owed again if it was owed); one already
-   * off air is counted so, never pushed late. The records of a push this
+   * off air is counted so, never pushed late. What a push gives back tells of each stream
+   * as of that push, so of the pushes given back together (oldest first), the latest's
+   * key stands, and a note since any of them keeps its own. The records of a push this
    * process didn't make (a crash left it) or no longer keeps, and those refreshes, are
    * read from the view again on the next pass: a refresh is held back while the record
    * it re-issues waits, so it collapses once that record is pushed, and is news if the
@@ -1622,15 +1677,18 @@ export class CanticleDelivery {
       // Owed as before: a note pushed on its own is owed again; a note that rode with
       // records rides with them again.
       for (const [stream, missed] of push?.missed ?? []) {
-        addNote(state.missed, stream, missed, false);
+        addNote(state.missed, stream, missed);
       }
       for (const id of identities) {
         const waiting = push?.records.find((record) => record.id === id);
         if (waiting === undefined || delivery === undefined) {
           state.seen.delete(id);
-        } else if (state.waiting.has(id)) {
           continue;
-        } else if (waiting.expiresAt <= now) {
+        }
+        if (state.waiting.has(id)) continue;
+        waiting.asOf = batchId; // told of now or later, it tells as of this push
+
+        if (waiting.expiresAt <= now) {
           if (waiting.dropped !== undefined) {
             this.#withhold(state, waiting, waiting.dropped);
           } else this.#miss(state, waiting, "offAir");
@@ -1677,7 +1735,8 @@ export class CanticleDelivery {
   /**
    * What frond-ear withheld and hasn't told yet survives a restart (#168 §2.7a): the
    * notes waiting for the next push, and those a push the host never confirmed carried,
-   * which a revert after a crash gives back. Saved with `#saveWithheld`.
+   * which a revert after a crash gives back, as of that push (in any order, as `reverted`
+   * gives them back). Saved with `#saveWithheld`.
    */
   #loadWithheld(ear: string, state: EarState): void {
     const saved = this.#deps.store.runtimeState(`canticle.withheld.${ear}`);
@@ -1703,11 +1762,12 @@ export class CanticleDelivery {
       if (!Number.isSafeInteger(batchId) || kept.has(batchId)) continue;
       const outcome = this.#deps.store.canticleOutcome(ear, batchId);
       const missed = loadMissed(saved);
+      // As of that push, whatever an earlier build saved of it.
+      for (const m of missed.values()) carriedBy(m, batchId);
       if (outcome === "reverted") {
         // Given back already (the first attach after a crash reverts before this
         // reads): the session never got its notes, so they wait again, owed as before.
-        for (const [stream, m] of missed)
-          addNote(state.missed, stream, m, false);
+        for (const [stream, m] of missed) addNote(state.missed, stream, m);
         state.dirty = true;
       } else if (outcome === "unconfirmed" && kept.size < MAX_UNCONFIRMED) {
         // A revert may still give it back; its notes go with it then.
@@ -1841,7 +1901,7 @@ export class CanticleDelivery {
   ): void {
     this.#count(state, kind === "offAir" ? "off_air_unpushed" : "dropped");
     const note = {
-      ...blankMissed(waiting.item.key),
+      ...blankMissed(waiting.item.key, waiting.asOf),
       owed: waiting.promised === true || reason === "push_budget",
     };
     if (kind === "dropped") {
@@ -1852,7 +1912,7 @@ export class CanticleDelivery {
       const heard = waiting.item.heardAt;
       widen(note.withheld, reason, 1, heard, heard);
     }
-    addNote(state.missed, waiting.stream, note, true);
+    addNote(state.missed, waiting.stream, note);
     state.dirty = true;
   }
 
