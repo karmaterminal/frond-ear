@@ -45,6 +45,9 @@
 // `lastFailure` keeps the latest connection's first failure. `snapshotFrames` counts
 // this connection's join snapshot; `counts.snapshot_frames` adds them up.
 
+import { createHash } from "node:crypto";
+
+import type { HeardProvenance, SourceTuple } from "./exposure.ts";
 import type { HearView, LiveItem } from "./receptor.ts";
 import { MAX_CLAMP_TTL_S } from "./wire.ts";
 
@@ -353,6 +356,126 @@ function rootOf(lineage: Json | undefined): string | undefined {
     return `${r.key_id.slice(0, 16)}:${r.epoch}:${stream}:${r.seq}`;
   }
   return undefined;
+}
+
+/** A record v1 stream id as a number: an integer, or 8 hex digits; null for a name. */
+function streamNumber(v: Json | undefined): number | null {
+  if (int(v)) return v;
+  return str(v) && /^[0-9a-f]{8}$/iu.test(v) ? Number.parseInt(v, 16) : null;
+}
+
+/** A lineage root as #162's tuple: an object, or `key:epoch:stream:seq`; null otherwise. */
+function rootTuple(lineage: Json | undefined): SourceTuple | null {
+  if (!isObj(lineage)) return null;
+  const r = lineage.root;
+  if (
+    isObj(r) &&
+    str(r.key_id) &&
+    int(r.epoch) &&
+    (int(r.seq) || (str(r.seq) && /^\d{1,20}$/u.test(r.seq)))
+  ) {
+    return {
+      key_id: r.key_id,
+      epoch: r.epoch,
+      stream_id: streamNumber(r.stream_id),
+      seq: r.seq,
+    };
+  }
+  const parts = str(r) ? r.split(":") : [];
+  if (
+    parts.length === 4 &&
+    /^\d+$/u.test(parts[1]!) &&
+    /^\d{1,20}$/u.test(parts[3]!)
+  ) {
+    return {
+      key_id: parts[0]!,
+      epoch: Number(parts[1]),
+      stream_id: streamNumber(parts[2]),
+      seq: parts[3]!,
+    };
+  }
+  return null;
+}
+
+/**
+ * A deliverable frame record as the exposure ledger keeps it (#117, binary-canticle#162's
+ * `PayloadSource`): its own fields, as the host daemon sent them, never the rendered text.
+ * Read when a push is fenced, so a join snapshot's entries say so by then.
+ */
+function frameProvenance(
+  rec: Obj,
+  run: string,
+  item: LiveItem,
+  heardAt: number,
+  offset: number,
+): HeardProvenance {
+  const f = rec.frame as Obj;
+  const times = rec.times as Obj;
+  const body = isObj(rec.body) ? rec.body : undefined;
+  const ref = isObj(rec.body_ref) ? rec.body_ref : undefined;
+  const text = body && str(body.text) ? body.text : undefined;
+  const sha = (v: string) =>
+    createHash("sha256").update(v, "utf8").digest("hex");
+  // The body's digest as the record gives it; for a text body its text is the body, so its
+  // digest is that text's. A body with neither is one frond-ear can't vouch for.
+  const bodySha =
+    body && str(body.sha256)
+      ? body.sha256.toLowerCase()
+      : text !== undefined
+        ? sha(text)
+        : undefined;
+  return {
+    item: {
+      key_id: f.key_id as string,
+      epoch: f.epoch as number,
+      stream_id: streamNumber(f.stream_id),
+      seq: f.seq as number | string,
+    },
+    idem: rec.idem as string,
+    root: rootTuple(rec.lineage),
+    hop: rec.hop as number,
+    class: rec.class as string,
+    scope: rec.scope as string,
+    lens: int(rec.lens) ? rec.lens : null,
+    station: item.station,
+    principal: item.principal ?? null,
+    stream: item.stream,
+    stateKey: item.stateKey ?? null,
+    flags: {
+      refresh: item.refresh === true,
+      wake_derived: item.wakeDerived ?? null,
+      exercise: item.exercise === true,
+    },
+    times: {
+      issued_at: times.issued_at as number,
+      expires_at: times.expires_at as number,
+      received_at: int(times.received_at) ? times.received_at : null,
+      heard_at: heardAt,
+      offset_ms: offset,
+      local_expiry_at: times.local_expiry_at as number,
+    },
+    sourceBody:
+      body && bodySha !== undefined
+        ? {
+            ctype: str(body.ctype) || int(body.ctype) ? body.ctype : 1,
+            size: int(body.size)
+              ? body.size
+              : Buffer.byteLength(text ?? "", "utf8"),
+            sha256: bodySha,
+            textSha256: text === undefined ? null : sha(text),
+          }
+        : null,
+    bodyRef:
+      ref && str(ref.url) && str(ref.sha256) && int(ref.size)
+        ? { url: ref.url, sha256: ref.sha256, size: ref.size }
+        : null,
+    receiver: {
+      run,
+      source: item.origin === "snapshot" ? "snapshot" : "live",
+      journalSequence: null,
+      recordSequence: int(rec.rec_seq) ? rec.rec_seq : null,
+    },
+  };
 }
 
 /** The failure `lastFailure` keeps: its reason, when, and the run the binding held. */
@@ -1225,6 +1348,7 @@ export class RecordConsumer {
     const heardAt = int(times.heard_at) ? times.heard_at : nowMs;
     // δ̂ (the local clock minus the station's, §14.18.3 `times`), for when `age_ms` is missing.
     const offset = int(times.offset_ms) ? times.offset_ms : 0;
+    const run = this.run!;
     const item: LiveItem = {
       station: station.name,
       key: f.key_id,
@@ -1278,10 +1402,11 @@ export class RecordConsumer {
         str(rec.state_key) && body && str(body.sha256)
           ? body.sha256.toLowerCase()
           : undefined,
+      provenance: () => frameProvenance(rec, run, item, heardAt, offset),
     };
     return {
       idem: rec.idem,
-      run: this.run!,
+      run,
       item,
       localExpiryAt: Math.min(times.local_expiry_at, nowMs + MAX_LOCAL_LIFE_MS),
     };

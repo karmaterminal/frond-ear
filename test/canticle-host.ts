@@ -49,6 +49,8 @@ export interface Song {
   scope?: string;
   /** Merged over `times`; a field set to `undefined` is left out. */
   times?: R;
+  /** The frame's `stream_id` as a number (§14.18.3); by default the stream's name. */
+  streamId?: number;
 }
 
 /**
@@ -144,7 +146,7 @@ export class Host {
       frame: {
         key_id: key,
         epoch,
-        stream_id: stream,
+        stream_id: o.streamId ?? stream,
         seq,
         kind: "item",
         sha256: "00",

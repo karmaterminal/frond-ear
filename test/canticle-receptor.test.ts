@@ -143,6 +143,7 @@ const config = (over: Partial<CanticleConfig> = {}): CanticleConfig => ({
   delivery: {},
   derivedPublication: false,
   roomPolicy: "observe",
+  exposure: { enabled: false, maxAgeMs: 604_800_000, maxRecords: 10_000 },
   ...over,
 });
 
@@ -283,6 +284,8 @@ test("config: canticle defaults and validation", () => {
     delivery: {},
     derivedPublication: false,
     roomPolicy: "observe",
+    // The exposure ledger (#117) is off unless set.
+    exposure: { enabled: false, maxAgeMs: 604_800_000, maxRecords: 10_000 },
   });
   const bad = (canticle: unknown) => () => parseConfig({ ...base, canticle });
   assert.throws(bad({ enabled: true }), /manifestPath is required/);

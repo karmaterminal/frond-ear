@@ -141,6 +141,57 @@ export interface CanticleConfig {
    * seat should select strict-fresh until the frond's source-use rule is settled.
    */
   roomPolicy: RoomPolicy;
+  /** The exposure ledger (#117): off by default, and off it writes nothing. */
+  exposure: CanticleExposureConfig;
+}
+
+/**
+ * The exposure ledger (frond-ear#117): one `canticle-payload-exposure/1` record per canticle
+ * push that carries records, fenced before the push and kept for a future issuer to read.
+ * frond-ear only records: it holds no key, signs nothing and calls no issuer.
+ */
+export interface CanticleExposureConfig {
+  enabled: boolean;
+  /** Offered or echoed records older than this are evicted, counted. */
+  maxAgeMs: number;
+  /** Per ear; past it the oldest offered or echoed records are evicted, counted. */
+  maxRecords: number;
+}
+
+const EXPOSURE_KEYS = ["enabled", "maxAgeMs", "maxRecords"];
+
+function parseExposure(value: unknown): CanticleExposureConfig {
+  if (value === undefined) {
+    return { enabled: false, maxAgeMs: 7 * 24 * 3_600_000, maxRecords: 10_000 };
+  }
+  if (!isObject(value)) {
+    throw new Error("canticle.exposure must be an object");
+  }
+  for (const key of Object.keys(value)) {
+    if (!EXPOSURE_KEYS.includes(key)) {
+      throw new Error(
+        `canticle.exposure.${key}: unknown key (it takes ${EXPOSURE_KEYS.join(", ")})`,
+      );
+    }
+  }
+  if (value.enabled !== undefined && typeof value.enabled !== "boolean") {
+    throw new Error("canticle.exposure.enabled must be true or false");
+  }
+  return {
+    enabled: value.enabled === true,
+    maxAgeMs: integer(
+      value.maxAgeMs,
+      7 * 24 * 3_600_000,
+      "canticle.exposure.maxAgeMs",
+      0,
+    ),
+    maxRecords: integer(
+      value.maxRecords,
+      10_000,
+      "canticle.exposure.maxRecords",
+      1,
+    ),
+  };
 }
 
 /** `off`: `hear` only. `digest`: a radio report per window. `immediate`: each new record. */
@@ -383,6 +434,7 @@ function parseCanticle(
     delivery,
     derivedPublication: value.derivedPublication === true,
     roomPolicy: roomPolicy as RoomPolicy,
+    exposure: parseExposure(value.exposure),
   };
 }
 

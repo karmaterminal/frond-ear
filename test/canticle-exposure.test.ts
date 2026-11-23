@@ -546,8 +546,8 @@ test("flag off: canticle.exposure is off by default, and off nothing is written 
     } finally {
       db.close();
     }
-    // Custody went on as before.
-    assert.equal(h.store.canticleCustody("scribe", 0).length, 2);
+    // Custody went on as before: push 1 kept, push 2 given back at the close.
+    assert.equal(h.store.canticleCustody("scribe", 0).length, 1);
   } finally {
     h.dispose();
   }
@@ -557,9 +557,11 @@ test("conformance: the stored record satisfies #162's PayloadExposure, structura
   const { h, host } = setup({ mode: "immediate" }, ON);
   try {
     const shim = h.attach("scribe", { sessionId: SESSION });
-    host.sing(1);
-    host.sing(2, { binary: true, stream: "ops.deploy" });
+    // Streams by number, as record v1 carries them (§14.18.3).
+    host.sing(1, { streamId: 1 });
+    host.sing(2, { binary: true, stream: "ops.deploy", streamId: 2 });
     host.sing(3, {
+      streamId: 1,
       stateKey: "fleet.health",
       digest: sha256("deploy.started 3"),
     });
@@ -581,6 +583,16 @@ test("conformance: the stored record satisfies #162's PayloadExposure, structura
     assert.equal(binary.sourceBody, null);
     const keyed = typed.sources.find((s) => s.stateKey === "fleet.health")!;
     assert.equal(keyed.sourceBody?.sha256, sha256("deploy.started 3"));
+    assert.deepEqual(
+      typed.sources.map((s) => s.item.stream_id),
+      [2, 1, 1],
+    );
+    // A stream record v1 named by something other than its number is never made one.
+    host.sing(4);
+    h.timers.advance(6_000);
+    const named = ledger(h).at(-1)!;
+    assert.equal(named.record.sources[0]!.item.stream_id, null);
+    assert.equal(conformant(named.record), null);
   } finally {
     h.dispose();
   }

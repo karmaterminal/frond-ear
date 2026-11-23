@@ -738,12 +738,13 @@ export class Daemon {
           logger: this.logger,
           session: (ear) => {
             const client = this.attached.get(ear);
-            return client
-              ? {
-                  generation: client.attachGeneration,
-                  sessionId: client.sessionId ?? null,
-                }
-              : undefined;
+            if (!client) return undefined;
+            const holder = this.holderIdentity(ear);
+            return {
+              generation: client.attachGeneration,
+              sessionId: client.sessionId ?? null,
+              holder: holder === "detached" ? "unknown" : holder,
+            };
           },
           push: (ear, batchId, notification) =>
             this.pushCanticle(ear, batchId, notification),
@@ -886,6 +887,15 @@ export class Daemon {
         scheduleId: wake.scheduleId,
         wakeId: wake.id,
       });
+    }
+    // The exposure ledger's own bounds (#117): only confirmed records go, counted.
+    const exposure = this.config.canticle?.exposure;
+    if (exposure) {
+      for (const [ear, evicted] of Object.entries(
+        this.store.pruneCanticleExposure(exposure),
+      )) {
+        this.logger.log("info", "canticle.exposure_evicted", { ear, evicted });
+      }
     }
     return this.store.prune(this.config.limits.retentionMs);
   }
@@ -2599,7 +2609,9 @@ export class Daemon {
     }
   }
 
-  private holderIdentity(ear: string): string {
+  private holderIdentity(
+    ear: string,
+  ): "detached" | "in-doubt" | "known" | "unknown" {
     const client = this.attached.get(ear);
     if (!client) {
       return "detached";
@@ -5089,6 +5101,15 @@ export class Daemon {
         const canticleCustody = this.options.canticleHear
           ? this.custodySummary(name)
           : undefined;
+        // The exposure ledger (#117), by phase; read-only, and only where canticle is set.
+        const canticleExposure = this.config.canticle
+          ? {
+              enabled: this.config.canticle.exposure.enabled,
+              ...this.store.canticleExposureCounts(name),
+              evicted:
+                this.store.counters()[`canticle_exposure_evicted.${name}`] ?? 0,
+            }
+          : undefined;
         return {
           name,
           target: ear.target,
@@ -5116,6 +5137,7 @@ export class Daemon {
           hold: this.holdView(name),
           ...(canticleDelivery ? { canticleDelivery } : {}),
           ...(canticleCustody ? { canticleCustody } : {}),
+          ...(canticleExposure ? { canticleExposure } : {}),
           roomEgress: {
             policy: this.config.canticle?.roomPolicy ?? "observe",
             windowMs: CUSTODY_WINDOW_MS,
