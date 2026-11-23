@@ -51,7 +51,8 @@
 // more it can keep by station) only ever rides with a push. Notes not yet told survive a
 // restart, and a note in a push the host never confirmed is told again once that push is
 // given back. Of the notes several pushes give back, in whatever order, a stream keeps the
-// station key of the newest push's, and one noted since they went keeps its own.
+// station key of the newest push's, and one noted since they went keeps its own (unless
+// its place past the 256 goes to a stream owed a push, as places do, while merging).
 //
 // A tombstone is a dedupe claim, not delivery (binary-canticle#161). Each push is a batch:
 // its claim (batch, tombstones, cursor, a custody row per record) is written in one

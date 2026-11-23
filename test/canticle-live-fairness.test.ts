@@ -3499,3 +3499,38 @@ for (const when of ["on view", "plucked", "off air at the revert"] as const) {
     });
   }
 }
+
+test("#119 R3 fresh review: a record told at the revert, between an earlier push's note and a later one's, keeps its key, as at 3824a7e: it is told since every push", async () => {
+  const third = manyKey(900);
+  const delivery = { mode: "immediate", maxPushesPerHour: 2 };
+  const canticle = { wakeKeys: [OPS, ALPHA, third] };
+  const { h, host } = setup(delivery, canticle);
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    host.sing(1);
+    h.timers.advance(6_000);
+    host.sing(2);
+    h.timers.advance(6_000);
+    await confirm(shim);
+    const frees = status(h).lastPushAt! + 3_600_000;
+    h.timers.advance(frees - 60_000 - h.clock.now());
+    host.sing(1, { station: "s0", key: OPS, epoch: 100, ttlMs: 10_000 });
+    h.timers.advance(12_000); // off air under the spent budget
+    h.timers.advance(frees - 9_000 - h.clock.now());
+    host.sing(2, { station: "s0", key: ALPHA, epoch: 100, ttlMs: 20_000 });
+    h.timers.advance(10_000);
+    assert.equal(pushes(shim).length, 3, "b1: OPS's note, ALPHA's record");
+    h.timers.advance(20_000); // the record goes off air, b1 unconfirmed
+    h.daemon.reloadConfig(canticleConfig(delivery, canticle, { paused: true }));
+    host.sing(3, { station: "s0", key: third, epoch: 100, ttlMs: 5_000 });
+    h.timers.advance(8_000);
+    h.daemon.reloadConfig(canticleConfig(delivery, canticle));
+    host.sing(1, { station: "s1", key: OPS, epoch: 200, ttlMs: 60_000 });
+    h.timers.advance(7_000);
+    assert.equal(pushes(shim).length, 4, "b2: the third key's note");
+    shim.close(); // both given back
+    assert.equal(pendingNotes(h)["s0:ops.fleet"]?.key, ALPHA);
+  } finally {
+    h.dispose();
+  }
+});
