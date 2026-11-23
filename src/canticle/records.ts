@@ -929,8 +929,8 @@ export class RecordConsumer {
   /**
    * Where a tuned share with no entry yet counts its drops: its own entry, once there is
    * room for one. A full map first lets go of the entry whose window closed longest ago
-   * (its records are all off air, and delivery has read it); only with every entry open
-   * do the drops go to the one shared count.
+   * (its records are all off air, and delivery, reading every second, has all but surely
+   * counted them); only with every entry open do the drops go to the one shared count.
    */
   #room(share: string, nowMs: number): string {
     const tuned =

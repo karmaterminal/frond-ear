@@ -735,8 +735,11 @@ report a cap cut short says how many records wait, and the next one starts after
 binary-canticle#168 §2.7a), the push ends with a `local omissions` note: per stream and reason, how many and the
 span of times. `push_budget`, `paused`, `no_session`, `breaker_open` and `breaker_half_open` name the hold a record
 went off air under; `expired_waiting` is one that went off air waiting for its push (say, sent on to a report due
-after its expiry); `live_overflow` is what the live set dropped on a stream this ear would push. A record that left
-the view first (plucked, superseded, the link went) isn't frond-ear's doing, and is only counted, as before.
+after its expiry); `live_overflow` is what the live set dropped that this ear would have pushed (an allowlisted
+key, sung at hop 0, not wake-derived). A record that left the view first (plucked, superseded, the link went) isn't
+frond-ear's doing, and is only counted, as before. What hasn't been told yet survives a restart
+(`canticle.withheld.<ear>` in the store), and a note in a push the host never confirmed is told again once that
+push is given back.
 
 **Late records.** A record that wasn't heard live just now has a `late:` line under its banner's timing line:
 `late: heard 54s ago (snapshot)`, `late: heard 7s ago (resurfaced)`, or
@@ -792,7 +795,7 @@ carries them or says they went off air, and a push that spends the hour's last s
 them. If they go off air with nothing else left waiting, or what the budget held goes off air, a push of the
 coverage note alone goes out (a canticle push with no records; naming its `batch_id` echoes nothing), on the
 stations' cadence and inside every hold and the budget, never as an extra push or another wake (binary-canticle#171
-findings 3 and 5). While pushes are held, `hear` says why and until when.
+findings 3 and 5). While records wait under a hold, `hear` says why and until when.
 
 **Check it.** `ear_status` shows `ears[].canticleDelivery`: the `ceiling` and effective `mode`, `style`, any
 `muted` reason, per-station modes (each scope as config or the session names it), the session's `choices`,
@@ -800,8 +803,8 @@ findings 3 and 5). While pushes are held, `hear` says why and until when.
 `windowMs`, `debounceMs`, `maxAgeMs`, `waiting`, `nextPushAt`, `held` (`paused`, `no_session`, `breaker_open`,
 `breaker_half_open` or `push_budget`), `heldUntil` (for `push_budget`, when the hour next has room), `lastPushAt`,
 `pushesLastHour`, `reports`, and `counts`: what was pushed (`pushes`, `reports`, `records_pushed`, and of those
-`records_pushed_late`; `coverage_notes`, pushes of the coverage note alone), what the live set dropped on a stream
-the ear would push (`live_overflow`), sent from `immediate` to a report
+`records_pushed_late`; `coverage_notes`, pushes of the coverage note alone), what the live set dropped that the ear
+would have pushed (`live_overflow`), sent from `immediate` to a report
 for its age (`routed_late`), passed over (`not_allowlisted`, `relayed`, `wake_derived`, `off`, `muted`,
 `refresh_collapsed`), went off air unpushed (`off_air_unpushed`) or was dropped from a full buffer (`dropped`),
 pushes that didn't fit at all (`too_big`), pushes the host never confirmed before they were reverted (`reverted`;

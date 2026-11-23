@@ -31,12 +31,13 @@
 // What frond-ear itself withheld is said, never left silent (binary-canticle#171, findings
 // 3-5; #168 §2.7a "local omission"): a record that goes off air while a hold or the push
 // budget keeps it, or while it waits for its push, and what the record source's live set
-// dropped on a stream the ear would push, go into the next push's coverage note with the
-// reason and the span of times. A push that says records wait for the next one keeps its
-// word: if they go off air instead, and nothing else is waiting to carry the note, a push
-// of its own carries it, as does what the budget held, when the budget next allows a push.
-// It is a push like any other, inside every hold and the budget: no other wake, and never
-// a push beyond the budget.
+// dropped of records the ear would have pushed, go into the next push's coverage note with
+// the reason and the span of times. A push that says records wait for the next one keeps
+// its word: if they go off air instead, and nothing else is waiting to carry the note, a
+// push of its own carries it, as does what the budget held, when the budget next allows a
+// push. It is a push like any other, inside every hold and the budget: no other wake, and
+// never a push beyond the budget. Notes not yet told survive a restart, and a note in a
+// push the host never confirmed is told again once that push is given back.
 //
 // A tombstone is a dedupe claim, not delivery (binary-canticle#161). Each push is a batch:
 // its claim (batch, tombstones, cursor, a custody row per record) is written in one
@@ -856,6 +857,13 @@ export class CanticleDelivery {
     keys: ReadonlySet<string>,
     modes: Modes,
   ): void {
+    // Only streams the view still lists: the source lets go of an entry long off air.
+    const listed = new Set(
+      (view.omitted ?? []).map((o) => `${o.station}:${o.stream}`),
+    );
+    for (const stream of state.overflow.keys()) {
+      if (!listed.has(stream)) state.overflow.delete(stream);
+    }
     for (const o of view.omitted ?? []) {
       const stream = `${o.station}:${o.stream}`;
       const before = state.overflow.get(stream);
@@ -879,6 +887,7 @@ export class CanticleDelivery {
       this.#count(state, "live_overflow", added);
       const missed = this.#missed(state, stream, o.key);
       if (missed === undefined) continue;
+      missed.key = o.key;
       // Dropped after the last pass looked: from then, or this window's start if later.
       const from = same ? Math.max(o.from, before.at) : o.from;
       widen(missed.withheld, "live_overflow", added, from, o.to);
@@ -1283,10 +1292,13 @@ export class CanticleDelivery {
   #loadWithheld(ear: string, state: EarState): void {
     const saved = this.#deps.store.runtimeState(`canticle.withheld.${ear}`);
     if (saved === undefined) return;
-    let parsed: { pending?: unknown; carried?: unknown };
+    let parsed: { pending?: unknown; carried?: unknown } | null;
     try {
       parsed = JSON.parse(saved) as typeof parsed;
     } catch {
+      parsed = null;
+    }
+    if (typeof parsed !== "object" || parsed === null) {
       this.#deps.logger.log("warn", "canticle.withheld_unreadable", { ear });
       return;
     }
@@ -1448,6 +1460,7 @@ export class CanticleDelivery {
     this.#count(state, kind === "offAir" ? "off_air_unpushed" : "dropped");
     const missed = this.#missed(state, waiting.stream, waiting.item.key);
     if (missed === undefined) return;
+    missed.key = waiting.item.key;
     state.dirty = true;
     if (kind === "dropped") missed.dropped += 1;
     else if (reason === undefined) missed.offAir += 1;
@@ -1460,7 +1473,10 @@ export class CanticleDelivery {
     }
   }
 
-  /** A stream's missed records for the next push's lines, up to a bound; counts go on. */
+  /**
+   * A stream's missed records for the next push's lines, up to a bound; counts go on.
+   * `key` is used only for a stream new here: what merges back in keeps the latest.
+   */
   #missed(state: EarState, stream: string, key: string): Missed | undefined {
     let missed = state.missed.get(stream);
     if (missed === undefined) {
@@ -1468,7 +1484,6 @@ export class CanticleDelivery {
       missed = { offAir: 0, dropped: 0, withheld: new Map(), key, owed: false };
       state.missed.set(stream, missed);
     }
-    missed.key = key;
     return missed;
   }
 

@@ -911,3 +911,16 @@ test("review 5: a push given back unconfirmed keeps each note as it was: one tha
     h.dispose();
   }
 });
+
+test("coverage note: saved notes that don't read are dropped with a warning, and delivery goes on", async () => {
+  const { h, host } = setup({ mode: "immediate" });
+  try {
+    h.store.setRuntimeState("canticle.withheld.scribe", "null");
+    const shim = h.attach("scribe");
+    host.sing(1);
+    h.timers.advance(6_000);
+    assert.deepEqual(order(pushes(shim)[0]!.content), ["ops:ops.fleet/1"]);
+  } finally {
+    h.dispose();
+  }
+});
