@@ -16,9 +16,11 @@ import { MAX_LIVE, RECORD_V } from "../src/canticle/records.ts";
 import { StructuredLogger } from "../src/logger.ts";
 import { channelInstructions } from "../src/render.ts";
 import {
+  ALPHA,
   canticleConfig,
   confirm,
   Host,
+  OPS,
   order,
   pushes,
   SESSION,
@@ -1760,6 +1762,463 @@ test("#119 re-review 2: a told drop that came back and waits again is not told a
     assert.deepEqual(
       pushes(shim).flatMap((push) => order(push.content)),
       ["ops:ops.fleet/3"],
+    );
+  } finally {
+    h.dispose();
+  }
+});
+
+// 🌫's second review of #119 (6021431579): an owed note meets the boundary as it is now,
+// not as it was when it was owed (R1); and nothing a note owes is lost at the bound on the
+// streams it names one by one (R2).
+
+type Harnessed = ReturnType<typeof setup>["h"];
+
+interface SavedNote {
+  offAir: number;
+  dropped: number;
+  withheld: Array<[string, { count: number; from: number; to: number }]>;
+  key: string;
+  owed: boolean;
+  streams?: string[];
+  more?: true;
+}
+
+/** The coverage notes not told yet, as `canticle.withheld.<ear>` saves them. */
+const pendingNotes = (h: Harnessed): Record<string, SavedNote> =>
+  (
+    JSON.parse(h.store.runtimeState("canticle.withheld.scribe") ?? "{}") as {
+      pending?: Record<string, SavedNote>;
+    }
+  ).pending ?? {};
+
+/** The records saved notes hold as local omissions, for one reason or all. */
+const withheldSum = (notes: Record<string, SavedNote>, reason?: string) =>
+  Object.values(notes).reduce(
+    (n, note) =>
+      n +
+      note.withheld
+        .filter(([r]) => reason === undefined || r === reason)
+        .reduce((m, [, span]) => m + span.count, 0),
+    0,
+  );
+
+/**
+ * The local omissions a push's coverage note accounts for: each line's count, the count
+ * of the lines it doesn't name, and what it folded past the streams it names one by one.
+ */
+function omissionsTold(content: string): number {
+  let n = 0;
+  for (const line of content.split("\n")) {
+    const named =
+      /^- (?:\S+|other tuned streams): (\d+) (?:went off air unpushed while|dropped by frond-ear's full live set)/u.exec(
+        line,
+      );
+    const rest = /^\(\d+ more local omissions?, (\d+) records?; /u.exec(line);
+    const folded = /^- and (\d+) more across /u.exec(line);
+    n += Number(named?.[1] ?? rest?.[1] ?? folded?.[1] ?? 0);
+  }
+  return n;
+}
+
+const budgetLine =
+  /^- ops:ops\.fleet: 1 went off air unpushed while the hour's push budget was spent \(push_budget; heard \S+Z to \S+Z\)\.$/mu;
+
+/** Pushes record 1, then lets record 2 go off air under the spent budget: an owed note. */
+async function owedNote(h: Harnessed, host: Host) {
+  const shim = h.attach("scribe", { sessionId: SESSION });
+  host.sing(1);
+  h.timers.advance(6_000);
+  await confirm(shim);
+  const pushedAt = status(h).lastPushAt!;
+  host.sing(2, { ttlMs: 10_000 });
+  h.timers.advance(12_000);
+  assert.equal(pendingNotes(h)["ops:ops.fleet"]?.owed, true, "owed");
+  return { shim, pushedAt };
+}
+
+test("#119 second review R1: a note owed before a reload took its key off wakeKeys pushes nothing on its own; it waits, hear says so, and the next push that goes tells it", async () => {
+  const delivery = { mode: "immediate", maxPushesPerHour: 1 };
+  const { h, host } = setup(delivery);
+  try {
+    const { shim, pushedAt } = await owedNote(h, host);
+    h.daemon.reloadConfig(canticleConfig(delivery, { wakeKeys: [] }));
+    h.timers.advance(pushedAt + 3_600_000 + 60_000 - h.clock.now());
+    assert.equal(status(h).wakeKeys, 0);
+    assert.equal(pushes(shim).length, 1, "no push of its own");
+    assert.match(
+      (await h.call(shim, "hear", {})).text,
+      /^canticle delivery: the next push reports 1 it withheld \(local omissions\); nothing pushes it on its own now, so it waits for a push that goes anyway\.$/mu,
+    );
+    assert.equal(withheldSum(pendingNotes(h)), 1, "kept");
+    // Another station's key: still nothing of its own, but that station's push tells it.
+    h.daemon.reloadConfig(canticleConfig(delivery, { wakeKeys: [ALPHA] }));
+    h.timers.advance(60_000);
+    assert.equal(pushes(shim).length, 1);
+    host.sing(1, { station: "alpha" });
+    h.timers.advance(6_000);
+    assert.equal(pushes(shim).length, 2);
+    const push = pushes(shim)[1]!.content;
+    assert.deepEqual(order(push), ["alpha:ops.fleet/1"]);
+    assert.match(push, budgetLine);
+    await confirm(shim);
+    h.timers.advance(2 * 3_600_000);
+    assert.equal(pushes(shim).length, 2, "told once");
+  } finally {
+    h.dispose();
+  }
+});
+
+test("#119 second review R1, control: a note owed while its key is on wakeKeys pushes on its own after a reload that keeps the key, or puts it back", async () => {
+  const delivery = { mode: "immediate", maxPushesPerHour: 1 };
+  for (const off of [false, true]) {
+    const { h, host } = setup(delivery);
+    try {
+      const { shim, pushedAt } = await owedNote(h, host);
+      if (off) {
+        h.daemon.reloadConfig(canticleConfig(delivery, { wakeKeys: [] }));
+        h.timers.advance(10_000);
+      }
+      h.daemon.reloadConfig(canticleConfig(delivery));
+      h.timers.advance(pushedAt + 3_600_000 + 6_000 - h.clock.now());
+      assert.equal(
+        pushes(shim).length,
+        2,
+        `the budget's next push (off ${off})`,
+      );
+      const note = pushes(shim)[1]!.content;
+      assert.deepEqual(order(note), []);
+      assert.match(note, budgetLine);
+      await confirm(shim);
+      h.timers.advance(3_600_000);
+      assert.equal(pushes(shim).length, 2);
+    } finally {
+      h.dispose();
+    }
+  }
+});
+
+test("#119 second review R1, sibling: an off ceiling or a mute for the note's station holds its push of its own the same way; a push that goes tells it", async () => {
+  const delivery = { mode: "immediate", maxPushesPerHour: 1 };
+  for (const hold of ["off", "mute"]) {
+    const { h, host } = setup(delivery);
+    try {
+      const { shim, pushedAt } = await owedNote(h, host);
+      if (hold === "off") {
+        h.daemon.reloadConfig(
+          canticleConfig({ ...delivery, stations: { ops: "off" } }),
+        );
+      } else {
+        await h.call(shim, "set_canticle_delivery", {
+          station: "ops",
+          mode: "mute",
+        });
+      }
+      h.timers.advance(pushedAt + 3_600_000 + 60_000 - h.clock.now());
+      assert.equal(pushes(shim).length, 1, `held by ${hold}`);
+      host.sing(1, { station: "alpha" });
+      h.timers.advance(6_000);
+      assert.equal(pushes(shim).length, 2);
+      assert.match(pushes(shim)[1]!.content, budgetLine);
+    } finally {
+      h.dispose();
+    }
+  }
+});
+
+test("#119 second review R1: a note owed and saved before a restart whose config took its key off wakeKeys pushes nothing on its own after it; restarted with the key on, it does", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "frond-ear-owed-"));
+  const path = join(directory, "ear.db");
+  const delivery = { mode: "immediate", maxPushesPerHour: 1 };
+  try {
+    let pushedAt: number;
+    const first = setup(delivery, {}, {}, { path });
+    try {
+      ({ pushedAt } = await owedNote(first.h, first.host));
+    } finally {
+      first.h.dispose();
+    }
+    const second = setup(delivery, { wakeKeys: [] }, {}, { path });
+    let at: number;
+    try {
+      second.h.clock.value = pushedAt + 3_600_000 + 1_000;
+      const shim = second.h.attach("scribe", { sessionId: SESSION });
+      second.h.timers.advance(6_000);
+      assert.equal(pushes(shim).length, 0, "no push of its own");
+      second.h.timers.advance(3_600_000);
+      assert.equal(pushes(shim).length, 0);
+      assert.match(
+        (await second.h.call(shim, "hear", {})).text,
+        /^canticle delivery: the next push reports 1 it withheld \(local omissions\); nothing pushes it on its own now, so it waits for a push that goes anyway\.$/mu,
+      );
+      assert.equal(withheldSum(pendingNotes(second.h)), 1, "kept");
+      at = second.h.clock.now();
+    } finally {
+      second.h.dispose();
+    }
+    const third = setup(delivery, {}, {}, { path });
+    try {
+      third.h.clock.value = at + 1_000;
+      const shim = third.h.attach("scribe", { sessionId: SESSION });
+      third.h.timers.advance(6_000);
+      assert.equal(
+        pushes(shim).length,
+        1,
+        "the key is back: a push of its own",
+      );
+      assert.deepEqual(order(pushes(shim)[0]!.content), []);
+      assert.match(pushes(shim)[0]!.content, budgetLine);
+      await confirm(shim);
+      third.h.timers.advance(3_600_000);
+      assert.equal(pushes(shim).length, 1, "once");
+    } finally {
+      third.h.dispose();
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+/** Station keys for many allowlisted stations, none of them OPS's or ALPHA's. */
+const manyKey = (i: number) => (i + 1).toString(16).padStart(16, "0");
+
+test("#119 second review R2 (i): with 256 named streams' drops untold, what the live set drops past them is saved and told as the shared count; one station fewer is the control", async () => {
+  const key = (i: number) => i.toString(16).padStart(16, "0");
+  for (const allowed of [256, 255]) {
+    // s0 off the allowlist leaves 255 named entries: the threshold's other side.
+    const wakeKeys = [
+      OPS,
+      ...Array.from({ length: 256 }, (_, i) => key(i)).slice(256 - allowed),
+      key(999),
+    ];
+    const { h, host } = setup(
+      { mode: "immediate", maxPushesPerHour: 360 },
+      { wakeKeys },
+    );
+    try {
+      const shim = h.attach("scribe");
+      overflowEntries(host, "ops.fleet", 3_600_000);
+      for (let n = 1; n <= 20; n++) {
+        host.sing(n, { station: "s999", key: key(999), ttlMs: 3_600_000 });
+      }
+      const omitted = host.consumer.liveStatus(h.clock.now()).omitted;
+      assert.equal(omitted.other!.total, 5);
+      const named = Object.entries(omitted)
+        .filter(([share]) => share.includes(":"))
+        .filter(([share]) => allowed === 256 || share !== "s0:ops.fleet")
+        .reduce((n, [, o]) => n + o.total, 0);
+      h.timers.advance(1_000);
+      const notes = pendingNotes(h);
+      assert.equal(status(h).counts.live_overflow_other, 5);
+      assert.equal(
+        notes[""]?.withheld.find(([r]) => r === "live_overflow")?.[1].count,
+        5,
+        `the shared count is saved (${allowed} allowed)`,
+      );
+      assert.equal(
+        withheldSum(notes, "live_overflow"),
+        named + 5,
+        "every drop saved",
+      );
+      h.timers.advance(5_000);
+      const push = pushes(shim)[0]!.content;
+      assert.match(
+        push,
+        /^- other tuned streams: 5 dropped by frond-ear's full live set \(live_overflow; between \S+Z and \S+Z\), past the 256 streams it names one by one, so which stations, and whether this ear would push them, is unknown\.$/mu,
+      );
+      assert.equal(omissionsTold(push), named + 5, "the push accounts for all");
+      assert.equal(withheldSum(pendingNotes(h)), 0, "and they are told");
+    } finally {
+      h.dispose();
+    }
+  }
+});
+
+/**
+ * One 10 s record on each of `streams` allowlisted stations, `maxItems: 1` and one push an
+ * hour: the first push carries one and promises the rest, which go off air under the
+ * spent budget. Returns the harness at that point, and when the budget frees.
+ */
+async function promised(
+  streams: number,
+  delivery: Record<string, unknown> = {},
+  options: { path?: string } = {},
+) {
+  const wakeKeys = [
+    ALPHA,
+    ...Array.from({ length: streams }, (_, i) => manyKey(i)),
+  ];
+  const { h, host } = setup(
+    { mode: "immediate", maxItems: 1, maxPushesPerHour: 1, ...delivery },
+    { wakeKeys },
+    {},
+    options,
+  );
+  const shim = h.attach("scribe", { sessionId: SESSION });
+  for (let i = 0; i < streams; i++) {
+    host.sing(1, { station: `s${i}`, key: manyKey(i), ttlMs: 10_000 });
+  }
+  h.timers.advance(6_000);
+  assert.equal(pushes(shim).length, 1);
+  assert.match(
+    pushes(shim)[0]!.content,
+    new RegExp(
+      `\\n\\(${streams - 1} more records wait for the next push; the hour's push budget holds them until `,
+      "u",
+    ),
+  );
+  await confirm(shim);
+  const frees = status(h).lastPushAt! + 3_600_000;
+  h.timers.advance(12_000);
+  assert.equal(status(h).counts.off_air_unpushed, streams - 1);
+  return { h, host, shim, frees, wakeKeys };
+}
+
+const foldedLine = (records: number, streams: number) =>
+  new RegExp(
+    `^- and ${records} more across ${streams} streams? past the 256 it names one by one: ${records} went off air unpushed while the hour's push budget was spent \\(push_budget; heard \\S+Z to \\S+Z\\)\\.$`,
+    "mu",
+  );
+
+test("#119 second review R2 (ii): a push that promised 257 records on 257 streams reports all 257 once the budget frees, 256 by name and one folded; 256 promised is the control", async () => {
+  for (const streams of [258, 257]) {
+    const { h, shim, frees } = await promised(streams);
+    try {
+      assert.equal(
+        withheldSum(pendingNotes(h), "push_budget"),
+        streams - 1,
+        `every promised record that went off air is saved (${streams - 1})`,
+      );
+      h.timers.advance(frees + 6_000 - h.clock.now());
+      assert.equal(pushes(shim).length, 2);
+      const note = pushes(shim)[1]!.content;
+      assert.deepEqual(order(note), []);
+      assert.equal(omissionsTold(note), streams - 1, "the note tells them all");
+      if (streams === 257)
+        assert.doesNotMatch(note, /^- and \d+ more across /mu);
+      else assert.match(note, foldedLine(1, 1));
+      assert.equal(withheldSum(pendingNotes(h)), 0, "told, so cleared");
+      await confirm(shim);
+      h.timers.advance(3_600_000);
+      assert.equal(pushes(shim).length, 2, "once");
+    } finally {
+      h.dispose();
+    }
+  }
+});
+
+test("#119 second review R2: what is folded past the 256 named streams survives a restart, and a push given back (live or after a crash) tells it again, owed as before", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "frond-ear-folded-"));
+  const path = join(directory, "ear.db");
+  const delivery = { mode: "immediate", maxItems: 1, maxPushesPerHour: 1 };
+  try {
+    const first = await promised(258, {}, { path });
+    const { frees, wakeKeys } = first;
+    first.h.dispose();
+    const second = setup(delivery, { wakeKeys }, {}, { path });
+    let at: number;
+    try {
+      second.h.clock.value = frees + 1_000;
+      const shim = second.h.attach("scribe", { sessionId: SESSION });
+      second.h.timers.advance(6_000);
+      assert.equal(pushes(shim).length, 1, "told after the restart");
+      assert.equal(omissionsTold(pushes(shim)[0]!.content), 257);
+      assert.match(pushes(shim)[0]!.content, foldedLine(1, 1));
+      shim.close(); // given back, unconfirmed: owed again
+      const next = second.h.attach("scribe", { sessionId: SESSION });
+      second.h.timers.advance(6_000);
+      assert.equal(pushes(next).length, 1, "told again");
+      assert.equal(omissionsTold(pushes(next)[0]!.content), 257);
+      assert.match(pushes(next)[0]!.content, foldedLine(1, 1));
+      at = second.h.clock.now();
+      // The process dies before the host confirms it.
+      second.h.store.close();
+      rmSync(second.h.directory, { recursive: true, force: true });
+    } catch (error) {
+      second.h.dispose();
+      throw error;
+    }
+    const third = setup(delivery, { wakeKeys }, {}, { path });
+    try {
+      third.h.clock.value = at + 10_000;
+      const shim = third.h.attach("scribe", { sessionId: SESSION });
+      third.h.timers.advance(6_000);
+      assert.equal(pushes(shim).length, 1, "given back after the crash");
+      assert.equal(omissionsTold(pushes(shim)[0]!.content), 257);
+      assert.match(pushes(shim)[0]!.content, foldedLine(1, 1));
+      await confirm(shim);
+      third.h.timers.advance(3_600_000);
+      assert.equal(pushes(shim).length, 1, "once confirmed, done");
+    } finally {
+      third.h.dispose();
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("#119 second review R2: the folded count has no station to meet the boundary, so it never asks for a push of its own; a push that goes carries it", async () => {
+  const { h, host, shim, frees } = await promised(258);
+  try {
+    // s1..s256 are named and owed; s257 is the one folded. Only s257's key and alpha's stay.
+    h.daemon.reloadConfig(
+      canticleConfig(
+        { mode: "immediate", maxItems: 1, maxPushesPerHour: 1 },
+        { wakeKeys: [ALPHA, manyKey(257)] },
+      ),
+    );
+    h.timers.advance(frees + 60_000 - h.clock.now());
+    assert.equal(pushes(shim).length, 1, "nothing of its own");
+    host.sing(1, { station: "alpha" });
+    h.timers.advance(6_000);
+    assert.equal(pushes(shim).length, 2);
+    const push = pushes(shim)[1]!.content;
+    assert.deepEqual(order(push), ["alpha:ops.fleet/1"]);
+    assert.equal(omissionsTold(push), 257);
+    assert.match(push, foldedLine(1, 1));
+  } finally {
+    h.dispose();
+  }
+});
+
+test("#119 second review R2: at the bound, a note owed a push takes a named place from one that isn't owed, so the push it is owed still comes", async () => {
+  const wakeKeys = [
+    OPS,
+    ALPHA,
+    ...Array.from({ length: 256 }, (_, i) => manyKey(i)),
+  ];
+  const { h, host } = setup(
+    { mode: "immediate", maxItems: 1, maxPushesPerHour: 1 },
+    { wakeKeys },
+  );
+  try {
+    const shim = h.attach("scribe");
+    host.sing(1, { station: "alpha", ttlMs: 7_200_000 });
+    host.sing(1, { ttlMs: 30_000 }); // ops's: promised, under the spent budget
+    h.timers.advance(6_000);
+    assert.deepEqual(order(pushes(shim)[0]!.content), ["alpha:ops.fleet/1"]);
+    await confirm(shim);
+    const frees = status(h).lastPushAt! + 3_600_000;
+    // 256 streams' records leave the view and then go off air: notes owed nothing.
+    for (let i = 0; i < 256; i++) {
+      host.sing(1, { station: `s${i}`, key: manyKey(i), ttlMs: 5_000 });
+    }
+    h.timers.advance(1_000);
+    for (let i = 0; i < 256; i++) {
+      host.pluck(1, { station: `s${i}`, key: manyKey(i) });
+    }
+    h.timers.advance(6_000);
+    assert.equal(Object.keys(pendingNotes(h)).length, 256);
+    h.timers.advance(30_000); // ops's promised record goes off air: owed
+    assert.equal(pendingNotes(h)["ops:ops.fleet"]?.owed, true, "named, owed");
+    h.timers.advance(frees + 6_000 - h.clock.now());
+    assert.equal(pushes(shim).length, 2, "the push it was owed");
+    const note = pushes(shim)[1]!.content;
+    assert.deepEqual(order(note), []);
+    assert.match(note, budgetLine);
+    assert.match(
+      note,
+      /^and 1 more stream past the 256 it names one by one: 1 went off air unpushed\.$/mu,
     );
   } finally {
     h.dispose();
