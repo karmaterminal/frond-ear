@@ -35,20 +35,22 @@
 // the reason and the span of times, each record once (one the live set drops after it was
 // pushed, passed over, dropped from a full buffer or told of is not told again). What a
 // push said won't come is remembered in memory only, so after a frond-ear restart a copy
-// the live set refuses again is told again: at worst twice, never left out. The note names
-// up to 256 streams one by one; past them it counts the rest together ("and N more across
-// M streams"), saved and given back like the rest, so nothing is lost at the bound. A push
-// that says records wait for the next one keeps its word: if they go off air instead, and
+// the live set refuses again is told again: at worst twice, never left out. The note keeps
+// up to 256 streams by name; past them it counts the rest together ("and N more across
+// M streams"), keeping each of those streams' station, saved and given back like the rest,
+// so nothing is lost at the bound and every record is counted in the push. A push that
+// says records wait for the next one keeps its word: if they go off air instead, and
 // nothing else is waiting to carry the note, a push of its own carries it, as does what
 // the budget held, when the budget next allows a push. It is a push like any other, inside
 // every hold and the budget: no other wake, and never a push beyond the budget. Whether a
-// note may push on its own is decided by the boundary as it is now (its station's key on
-// `canticle.wakeKeys`, a mode that pushes, no mute), not as it was when the note was owed:
-// one a reload or a restart left outside it waits, still owed, for a push that goes anyway,
-// and `hear` says it waits. What has no station to meet the boundary (the live set's shared
-// count, what the note counts together) only ever rides with a push. Notes not yet told
-// survive a restart, and a note in a push the host never confirmed is told again once that
-// push is given back.
+// note may push on its own, named or counted together, is decided by the boundary as it
+// is now (its station's key on `canticle.wakeKeys`, a mode that pushes, no mute), not as
+// it was when the note was owed: one a reload or a restart left outside it waits, still
+// owed, for a push that goes anyway, and `hear` says it waits. What has no station to
+// meet the boundary (the live set's shared count, and what the note counts past the 256
+// more it can keep by station) only ever rides with a push. Notes not yet told survive a
+// restart, and a note in a push the host never confirmed is told again once that push is
+// given back.
 //
 // A tombstone is a dedupe claim, not delivery (binary-canticle#161). Each push is a batch:
 // its claim (batch, tombstones, cursor, a custody row per record) is written in one
@@ -310,11 +312,23 @@ interface Missed {
   /** Owed a push of its own: a push said these wait, or the push budget held them. */
   owed: boolean;
   /**
-   * `FOLDED`'s only: the streams it took in (as many as `MAX_CURSOR_STREAMS`), and whether
+   * `FOLDED`'s only: each stream it took in (as many as `MAX_CURSOR_STREAMS`), and whether
    * it took in more than that.
    */
-  streams?: Set<string>;
+  streams?: Map<string, Folded>;
   more?: true;
+}
+
+/** A stream `FOLDED` took in: what a push of its own needs, and what was noted of it. */
+interface Folded {
+  /** The station key of its latest record: the boundary a push of its own meets. */
+  key: string;
+  /** Owed a push of its own, as a stream's own entry would be. */
+  owed: boolean;
+  /** Its local omissions are in the folded count. */
+  withheld: boolean;
+  /** So are records of it that went off air unpushed or a full buffer dropped. */
+  missed: boolean;
 }
 
 /** How a coverage note says why frond-ear withheld records; reasons unknown here read as-is. */
@@ -336,7 +350,13 @@ const copyMissed = (missed: Missed): Missed => ({
   withheld: new Map(
     [...missed.withheld].map(([reason, span]) => [reason, { ...span }]),
   ),
-  ...(missed.streams !== undefined ? { streams: new Set(missed.streams) } : {}),
+  ...(missed.streams !== undefined
+    ? {
+        streams: new Map(
+          [...missed.streams].map(([stream, f]) => [stream, { ...f }]),
+        ),
+      }
+    : {}),
 });
 
 /** Widens `reason`'s span to take in `count` more records between `from` and `to`. */
@@ -375,81 +395,98 @@ function addMissed(into: Missed, from: Missed): void {
   into.owed ||= from.owed;
 }
 
-/** `FOLDED` took in `stream`: counted among its streams once, while the bound has room. */
-function foldStream(folded: Missed, stream: string): void {
-  const streams = (folded.streams ??= new Set());
-  if (streams.has(stream)) return;
-  if (streams.size < MAX_CURSOR_STREAMS) streams.add(stream);
-  else folded.more = true;
-}
-
-/**
- * The entry a note on `stream` goes into, made if need be, so no note is lost at the bound:
- * the stream's own while fewer than `MAX_CURSOR_STREAMS` streams have one (`OTHER` aside),
- * and past that `FOLDED`, which counts the rest together. A note owed a push first takes
- * the place of a named one that isn't owed, which is folded instead, so the push it is
- * owed can still come: `FOLDED`, like `OTHER`, has no station to meet the boundary, so it
- * rides with a push and never asks for one. `owed` marks the entry owed; with `latest`,
- * `key` (a live note's station key) becomes the entry's.
- */
-function noteFor(
-  notes: Map<string, Missed>,
-  stream: string,
-  key: string,
-  owed: boolean,
-  latest: boolean,
-): Missed {
-  let note = notes.get(stream);
-  if (note === undefined) {
-    const named =
-      notes.size - (notes.has(OTHER) ? 1 : 0) - (notes.has(FOLDED) ? 1 : 0);
-    if (stream === OTHER || named < MAX_CURSOR_STREAMS) {
-      notes.set(stream, (note = blankMissed(key)));
-    } else {
-      let folded = notes.get(FOLDED);
-      if (folded === undefined) notes.set(FOLDED, (folded = blankMissed("")));
-      let rider: string | undefined;
-      if (owed) {
-        for (const [name, m] of notes) {
-          if (name !== OTHER && name !== FOLDED && !m.owed) {
-            rider = name;
-            break;
-          }
-        }
-      }
-      if (rider === undefined) {
-        foldStream(folded, stream);
-        note = folded;
-      } else {
-        addMissed(folded, notes.get(rider)!);
-        foldStream(folded, rider);
-        notes.delete(rider);
-        notes.set(stream, (note = blankMissed(key)));
-      }
-    }
-  }
-  if (latest && notes.get(stream) === note) note.key = key;
-  if (owed) note.owed = true;
-  return note;
-}
-
-/**
- * Notes kept apart (by a push not yet confirmed, or in the store) merged back in, owed as
- * they were; `FOLDED`'s go into `FOLDED`.
- */
-function absorb(
-  notes: Map<string, Missed>,
-  stream: string,
-  from: Missed,
-): void {
-  if (stream !== FOLDED) {
-    addMissed(noteFor(notes, stream, from.key, from.owed, false), from);
-    return;
-  }
+/** `FOLDED`, made if need be. */
+function foldedOf(notes: Map<string, Missed>): Missed {
   let folded = notes.get(FOLDED);
   if (folded === undefined) notes.set(FOLDED, (folded = blankMissed("")));
+  return folded;
+}
+
+/**
+ * `FOLDED` takes in `note`, of `stream`: its counts and spans with the rest, and the stream
+ * by name (its key, owed, and what of it was noted) while the bound has room. With
+ * `latest`, `note.key` becomes the stream's.
+ */
+function fold(
+  folded: Missed,
+  stream: string,
+  note: Missed,
+  latest: boolean,
+): void {
+  addMissed(folded, note);
+  const streams = (folded.streams ??= new Map());
+  let f = streams.get(stream);
+  if (f === undefined) {
+    if (streams.size >= MAX_CURSOR_STREAMS) {
+      folded.more = true;
+      return;
+    }
+    f = { key: note.key, owed: false, withheld: false, missed: false };
+    streams.set(stream, f);
+  } else if (latest) f.key = note.key;
+  f.owed ||= note.owed;
+  f.withheld ||= note.withheld.size > 0;
+  f.missed ||= note.offAir + note.dropped > 0;
+}
+
+/**
+ * Adds `note` (what was just noted of `stream`, or notes kept apart and merged back in) to
+ * what the next push will say, so nothing is lost at the bound: to the stream's own entry
+ * while fewer than `MAX_CURSOR_STREAMS` streams have one (`OTHER` aside), and past that
+ * to `FOLDED`, which counts the rest together and keeps each stream's station, so a
+ * folded note owed a push can still wake one. A stream folded stays folded until the
+ * notes are told, never named as well. With `latest`, `note.key` (a live note's station
+ * key) becomes the stream's; merged back in, the key already here is the later one.
+ */
+function addNote(
+  notes: Map<string, Missed>,
+  stream: string,
+  note: Missed,
+  latest: boolean,
+): void {
+  if (stream === FOLDED) {
+    mergeFolded(notes, note);
+    return;
+  }
+  let entry = notes.get(stream);
+  if (entry === undefined) {
+    const folded = notes.get(FOLDED);
+    const named =
+      notes.size - (notes.has(OTHER) ? 1 : 0) - (folded !== undefined ? 1 : 0);
+    if (
+      stream !== OTHER &&
+      (folded?.streams?.has(stream) === true || named >= MAX_CURSOR_STREAMS)
+    ) {
+      fold(foldedOf(notes), stream, note, latest);
+      return;
+    }
+    notes.set(stream, (entry = blankMissed(note.key)));
+  } else if (latest) entry.key = note.key;
+  addMissed(entry, note);
+}
+
+/**
+ * A kept `FOLDED` merged back in (a push given back, the saved notes). A stream it took
+ * in that has an entry of its own here now is folded too, so no stream is counted twice.
+ */
+function mergeFolded(notes: Map<string, Missed>, from: Missed): void {
+  const folded = foldedOf(notes);
   addMissed(folded, from);
-  for (const name of from.streams ?? []) foldStream(folded, name);
+  for (const [stream, f] of from.streams ?? []) {
+    const named = notes.get(stream);
+    if (named !== undefined) {
+      notes.delete(stream);
+      fold(folded, stream, named, false);
+    }
+    const streams = (folded.streams ??= new Map());
+    const mine = streams.get(stream);
+    if (mine !== undefined) {
+      mine.owed ||= f.owed;
+      mine.withheld ||= f.withheld;
+      mine.missed ||= f.missed;
+    } else if (streams.size < MAX_CURSOR_STREAMS) streams.set(stream, { ...f });
+    else folded.more = true;
+  }
   if (from.more === true) folded.more = true;
 }
 
@@ -491,7 +528,7 @@ interface SavedMissed {
   withheld: Array<[string, Span]>;
   key: string;
   owed: boolean;
-  streams?: string[];
+  streams?: Array<{ stream: string } & Folded>;
   more?: true;
 }
 
@@ -507,7 +544,14 @@ const saveMissed = (
         withheld: [...m.withheld],
         key: m.key,
         owed: m.owed,
-        ...(m.streams !== undefined ? { streams: [...m.streams] } : {}),
+        ...(m.streams !== undefined
+          ? {
+              streams: [...m.streams].map(([stream, f]) => ({
+                stream,
+                ...f,
+              })),
+            }
+          : {}),
         ...(m.more === true ? { more: true as const } : {}),
       },
     ]),
@@ -555,21 +599,39 @@ function loadMissed(saved: unknown): Map<string, Missed> {
         });
       }
     }
-    const streams = Array.isArray(m.streams)
-      ? m.streams.filter(
-          (name): name is string =>
-            typeof name === "string" && name.includes(":"),
-        )
-      : [];
-    absorb(missed, stream, {
-      offAir: m.offAir,
-      dropped: m.dropped,
-      withheld,
-      key: m.key,
-      owed: m.owed,
-      ...(stream === FOLDED ? { streams: new Set(streams) } : {}),
-      ...(stream === FOLDED && m.more === true ? { more: true as const } : {}),
-    });
+    const streams = new Map<string, Folded>();
+    for (const f of Array.isArray(m.streams) ? m.streams : []) {
+      const g = f as Partial<{ stream: string } & Folded> | null;
+      if (
+        typeof g === "object" &&
+        g !== null &&
+        typeof g.stream === "string" &&
+        g.stream.includes(":") &&
+        typeof g.key === "string" &&
+        typeof g.owed === "boolean" &&
+        typeof g.withheld === "boolean" &&
+        typeof g.missed === "boolean"
+      ) {
+        const { key, owed, withheld, missed } = g;
+        streams.set(g.stream, { key, owed, withheld, missed });
+      }
+    }
+    addNote(
+      missed,
+      stream,
+      {
+        offAir: m.offAir,
+        dropped: m.dropped,
+        withheld,
+        key: m.key,
+        owed: m.owed,
+        ...(stream === FOLDED ? { streams } : {}),
+        ...(stream === FOLDED && m.more === true
+          ? { more: true as const }
+          : {}),
+      },
+      false,
+    );
   }
   return missed;
 }
@@ -1119,22 +1181,25 @@ export class CanticleDelivery {
       if (stream === OTHER) {
         if (keys.size === 0 || !modes.pushesAny()) continue;
         this.#count(state, "live_overflow_other", told);
+        const note = blankMissed(o.key);
         widen(
-          noteFor(state.missed, OTHER, o.key, false, false).withheld,
+          note.withheld,
           "live_overflow",
           told,
           same ? Math.max(o.from, before.at) : o.from,
           o.to,
         );
+        addNote(state.missed, OTHER, note, false);
       } else {
         const mode = modes.of({ key: o.key, station: o.station });
         if (!keys.has(o.key.toLowerCase()) || mode === "off" || mode === "mute")
           continue;
         this.#count(state, "live_overflow", told);
-        const missed = noteFor(state.missed, stream, o.key, true, true);
+        const note = { ...blankMissed(o.key), owed: true };
         // Dropped after the last pass looked: from then, or this window's start if later.
         const from = same ? Math.max(o.from, before.at) : o.from;
-        widen(missed.withheld, "live_overflow", told, from, o.to);
+        widen(note.withheld, "live_overflow", told, from, o.to);
+        addNote(state.missed, stream, note, true);
       }
       for (const d of fresh) {
         this.#report(state, identity(d), d.until + SETTLE_SKEW_MS);
@@ -1152,14 +1217,9 @@ export class CanticleDelivery {
     this.#count(state, "live_overflow");
     this.#report(state, waiting.id, waiting.expiresAt + SETTLE_SKEW_MS);
     state.seen.delete(waiting.id);
-    const missed = noteFor(
-      state.missed,
-      waiting.stream,
-      waiting.item.key,
-      true,
-      true,
-    );
-    widen(missed.withheld, "live_overflow", 1, at, at);
+    const note = { ...blankMissed(waiting.item.key), owed: true };
+    widen(note.withheld, "live_overflow", 1, at, at);
+    addNote(state.missed, waiting.stream, note, true);
     state.dirty = true;
   }
 
@@ -1178,19 +1238,29 @@ export class CanticleDelivery {
    * meets the boundary as it is now, not as it was when it was owed: its station's key on
    * `canticle.wakeKeys`, under a mode that pushes. One that doesn't (a reload or a restart
    * took the key off, or turned the station off or muted it) is kept, owed, for a push that
-   * goes anyway, as `OTHER` and `FOLDED` always are: they have no station to meet it.
+   * goes anyway. A folded stream meets it as its own entry would; `OTHER`, and what
+   * `FOLDED` holds past the streams it names, have no station to meet it, and never do.
    */
   #noteCadence(
     state: EarState,
     keys: ReadonlySet<string>,
     modes: Modes,
   ): Cadence | undefined {
-    let cadence: Cadence | undefined;
+    const owed: Array<[string, string]> = [];
     for (const [stream, missed] of state.missed) {
-      if (!missed.owed || stream === OTHER || stream === FOLDED) continue;
-      if (!keys.has(missed.key.toLowerCase())) continue;
+      if (stream === FOLDED) {
+        for (const [name, f] of missed.streams ?? []) {
+          if (f.owed) owed.push([name, f.key]);
+        }
+      } else if (stream !== OTHER && missed.owed) {
+        owed.push([stream, missed.key]);
+      }
+    }
+    let cadence: Cadence | undefined;
+    for (const [stream, key] of owed) {
+      if (!keys.has(key.toLowerCase())) continue;
       const station = stream.slice(0, stream.indexOf(":"));
-      const mode = modes.of({ key: missed.key, station });
+      const mode = modes.of({ key, station });
       if (mode === "immediate") return "immediate";
       if (mode === "digest") cadence = "digest";
     }
@@ -1516,7 +1586,7 @@ export class CanticleDelivery {
       // Owed as before: a note pushed on its own is owed again; a note that rode with
       // records rides with them again.
       for (const [stream, missed] of push?.missed ?? []) {
-        absorb(state.missed, stream, missed);
+        addNote(state.missed, stream, missed, false);
       }
       for (const id of identities) {
         const waiting = push?.records.find((record) => record.id === id);
@@ -1600,7 +1670,8 @@ export class CanticleDelivery {
       if (outcome === "reverted") {
         // Given back already (the first attach after a crash reverts before this
         // reads): the session never got its notes, so they wait again, owed as before.
-        for (const [stream, m] of missed) absorb(state.missed, stream, m);
+        for (const [stream, m] of missed)
+          addNote(state.missed, stream, m, false);
         state.dirty = true;
       } else if (outcome === "unconfirmed" && kept.size < MAX_UNCONFIRMED) {
         // A revert may still give it back; its notes go with it then.
@@ -1733,22 +1804,20 @@ export class CanticleDelivery {
     reason?: string,
   ): void {
     this.#count(state, kind === "offAir" ? "off_air_unpushed" : "dropped");
-    const missed = noteFor(
-      state.missed,
-      waiting.stream,
-      waiting.item.key,
-      waiting.promised === true || reason === "push_budget",
-      true,
-    );
-    state.dirty = true;
+    const note = {
+      ...blankMissed(waiting.item.key),
+      owed: waiting.promised === true || reason === "push_budget",
+    };
     if (kind === "dropped") {
-      missed.dropped += 1;
+      note.dropped = 1;
       this.#report(state, waiting.id, waiting.expiresAt + SETTLE_SKEW_MS);
-    } else if (reason === undefined) missed.offAir += 1;
+    } else if (reason === undefined) note.offAir = 1;
     else {
       const heard = waiting.item.heardAt;
-      widen(missed.withheld, reason, 1, heard, heard);
+      widen(note.withheld, reason, 1, heard, heard);
     }
+    addNote(state.missed, waiting.stream, note, true);
+    state.dirty = true;
   }
 
   #count(state: EarState, name: string, by = 1): void {
@@ -1959,9 +2028,10 @@ export class CanticleDelivery {
 
   /**
    * For `hear` (#168 §2.7a): why this ear's pushes are held now, until when, what waits,
-   * and what frond-ear withheld that the next push will say. With nothing holding pushes,
-   * what it withheld and hasn't told yet, and whether that waits for a push that goes
-   * anyway (no push of its own may carry it now); undefined when there is nothing to say.
+   * and what the next push will say went unpushed (withheld, off air, dropped). With
+   * nothing holding pushes, what it hasn't told yet, and whether that waits for a push
+   * that goes anyway (no push of its own may carry it now); undefined when there is
+   * nothing to say.
    */
   hearNote(ear: string): string | undefined {
     const config = this.#deps.config();
@@ -1969,14 +2039,20 @@ export class CanticleDelivery {
     const delivery = config.canticle!.delivery[ear]!;
     const state = this.#state(ear);
     const now = this.#deps.clock.now();
-    const withheld = [...state.missed.values()].reduce(
-      (sum, missed) =>
-        sum +
-        [...missed.withheld.values()].reduce((n, span) => n + span.count, 0),
-      0,
-    );
+    let [withheld, offAir, dropped] = [0, 0, 0];
+    for (const missed of state.missed.values()) {
+      offAir += missed.offAir;
+      dropped += missed.dropped;
+      for (const span of missed.withheld.values()) withheld += span.count;
+    }
+    const told = withheld + offAir + dropped;
+    const reports = `the next push reports ${[
+      ...(withheld > 0 ? [`${withheld} it withheld (local omissions)`] : []),
+      ...(offAir > 0 ? [`${offAir} that went off air unpushed`] : []),
+      ...(dropped > 0 ? [`${dropped} dropped from a full buffer`] : []),
+    ].join(", ")}`;
     if (state.held === undefined) {
-      if (withheld === 0) return undefined;
+      if (told === 0) return undefined;
       const alone =
         state.waiting.size === 0 &&
         this.#noteCadence(
@@ -1984,8 +2060,8 @@ export class CanticleDelivery {
           new Set(config.canticle!.wakeKeys),
           this.#modes(ear, config, now),
         ) === undefined;
-      const one = withheld === 1;
-      return `canticle delivery: the next push reports ${withheld} it withheld (local omissions)${alone ? `; nothing pushes ${one ? "it on its" : "them on their"} own now, so ${one ? "it waits" : "they wait"} for a push that goes anyway` : ""}.`;
+      const one = told === 1;
+      return `canticle delivery: ${reports}${alone ? `; nothing pushes ${one ? "it on its" : "them on their"} own now, so ${one ? "it waits" : "they wait"} for a push that goes anyway` : ""}.`;
     }
     const max = delivery.maxPushesPerHour;
     const why =
@@ -2006,9 +2082,7 @@ export class CanticleDelivery {
       ...(waiting > 0
         ? [`${plural(waiting, "record")} ${waiting === 1 ? "waits" : "wait"}`]
         : []),
-      ...(withheld > 0
-        ? [`the next push reports ${withheld} it withheld (local omissions)`]
-        : []),
+      ...(told > 0 ? [reports] : []),
     ]
       .join("; ")
       .concat(".");
@@ -2155,9 +2229,17 @@ interface RenderInput {
 
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
 
-/** How many streams `FOLDED` took in: `3 streams`, or `at least 256 streams`. */
-const foldedStreams = (folded: Missed, word = "stream") =>
-  `${folded.more === true ? "at least " : ""}${plural(folded.streams?.size ?? 0, word)}`;
+/** How many of the streams `FOLDED` took in had `kind` noted. */
+const foldedCount = (folded: Missed, kind: "withheld" | "missed") =>
+  [...(folded.streams?.values() ?? [])].filter((f) => f[kind]).length;
+
+/** `3 streams`, or `at least 256 streams` when `FOLDED` took in more than it names. */
+const foldedStreams = (
+  folded: Missed,
+  kind: "withheld" | "missed",
+  word = "stream",
+) =>
+  `${folded.more === true ? "at least " : ""}${plural(foldedCount(folded, kind), word)}`;
 
 /** `epoch/seq`, as the banner's `item=` shows it. */
 const position = (item: LiveItem) => `${item.epoch}/${item.seq}`;
@@ -2253,7 +2335,10 @@ function render(input: RenderInput): {
     const foldedSpans = [...(folded?.withheld ?? [])].sort(([a], [b]) =>
       a < b ? -1 : 1,
     );
-    const foldedCount = foldedSpans.reduce((n, [, span]) => n + span.count, 0);
+    const foldedRecords = foldedSpans.reduce(
+      (n, [, span]) => n + span.count,
+      0,
+    );
     const entries = [...input.missed]
       .filter(([stream]) => stream !== FOLDED)
       .flatMap(([stream, missed]) =>
@@ -2280,7 +2365,8 @@ function render(input: RenderInput): {
       const streams =
         new Set(
           entries.map((e) => e.stream).filter((stream) => stream !== OTHER),
-        ).size + (foldedSpans.length > 0 ? (folded!.streams?.size ?? 0) : 0);
+        ).size +
+        (foldedSpans.length > 0 ? foldedCount(folded!, "withheld") : 0);
       const counted = `${foldedSpans.length > 0 && folded!.more === true ? "at least " : ""}${plural(streams, "stream")}`;
       const where = !entries.some((e) => e.stream === OTHER)
         ? counted
@@ -2288,7 +2374,7 @@ function render(input: RenderInput): {
           ? `${counted} and other tuned streams`
           : "other tuned streams";
       return [
-        `${header} ${plural(records(entries) + foldedCount, "record")} on ${where}; ear_status counts them.`,
+        `${header} ${plural(records(entries) + foldedRecords, "record")} on ${where}; ear_status counts them.`,
       ];
     }
     const why = (reason: string) =>
@@ -2313,7 +2399,7 @@ function render(input: RenderInput): {
         : []),
       ...(foldedSpans.length > 0
         ? [
-            `- and ${foldedCount} more across ${foldedStreams(folded!)} past the ${MAX_CURSOR_STREAMS} it names one by one: ${foldedSpans
+            `- and ${foldedRecords} more across ${foldedStreams(folded!, "withheld")} past the ${MAX_CURSOR_STREAMS} it names one by one: ${foldedSpans
               .map(
                 ([reason, span]) =>
                   `${span.count} ${why(reason)} (${token(reason)}; ${when(reason, span)})`,
@@ -2354,18 +2440,24 @@ function render(input: RenderInput): {
     for (const [stream, missed] of unlined.slice(0, named)) {
       lines.push(`${token(stream)}: ${parts(missed)}.`);
     }
-    // Compact, the streams it folded are counted with the others it doesn't name.
+    // The streams it doesn't name, with their records, so every one is counted; compact,
+    // what it folded is counted with them.
+    const rest = [
+      ...unlined.slice(named).map(([, missed]) => missed),
+      ...(compact && fold !== undefined ? [fold] : []),
+    ];
     const others =
       Math.max(0, unlined.length - named) +
-      (compact && fold !== undefined ? (fold.streams?.size ?? 0) : 0);
-    if (others > 0) {
+      (compact && fold !== undefined ? foldedCount(fold, "missed") : 0);
+    if (rest.length > 0) {
+      const records = rest.reduce((n, m) => n + m.offAir + m.dropped, 0);
       lines.push(
-        `(${compact && fold?.more === true ? "at least " : ""}${plural(others, named > 0 ? "more stream" : "other stream")} missed records too.)`,
+        `(${compact && fold?.more === true ? "at least " : ""}${plural(others, named > 0 ? "more stream" : "other stream")} missed ${plural(records, "record")} too.)`,
       );
     }
     if (!compact && fold !== undefined) {
       lines.push(
-        `and ${foldedStreams(fold, "more stream")} past the ${MAX_CURSOR_STREAMS} it names one by one: ${parts(fold)}.`,
+        `and ${foldedStreams(fold, "missed", "more stream")} past the ${MAX_CURSOR_STREAMS} it names one by one: ${parts(fold)}.`,
       );
     }
     lines.push(...coverage(compact));

@@ -184,7 +184,10 @@ export interface HearOptions {
   stream?: string | undefined;
   limit: number;
   maxChars: number;
-  /** Why delivery holds this ear's pushes now, as `CanticleDelivery.hearNote` says it. */
+  /**
+   * What delivery says of this ear's pushes now (`CanticleDelivery.hearNote`): why they
+   * are held, and what the next push will report that it hasn't told yet.
+   */
   delivery?: string | undefined;
 }
 

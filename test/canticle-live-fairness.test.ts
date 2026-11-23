@@ -2490,3 +2490,39 @@ test("#119 second review R2: what the folded count holds past the streams it nam
     h.dispose();
   }
 });
+
+test("#119 second review, re-review 2: a push given back folds again what it had folded, with that stream's notes since, and it stays folded, so no stream is named and folded both", async () => {
+  const { h, host, shim, frees } = await promised(258);
+  try {
+    h.timers.advance(frees + 6_000 - h.clock.now());
+    assert.equal(pushes(shim).length, 2, "s1..s256 by name, s257 folded");
+    // Unconfirmed: s257's next record leaves the view and goes off air, named now.
+    host.sing(2, { station: "s257", key: manyKey(257), ttlMs: 5_000 });
+    h.timers.advance(1_000);
+    host.pluck(2, { station: "s257", key: manyKey(257) });
+    h.timers.advance(6_000);
+    assert.equal(pendingNotes(h)["s257:ops.fleet"]?.offAir, 1);
+    shim.close(); // given back: s257's own entry folds, and a named place frees
+    // With no session, s257's next record goes off air: folded still, not named again.
+    host.sing(3, { station: "s257", key: manyKey(257), ttlMs: 3_000 });
+    h.timers.advance(5_000);
+    assert.equal(pendingNotes(h)["s257:ops.fleet"], undefined, "folded");
+    const next = h.attach("scribe", { sessionId: SESSION });
+    h.timers.advance(6_000);
+    assert.equal(pushes(next).length, 1, "told again");
+    const note = pushes(next)[0]!.content;
+    assert.equal(omissionsTold(note), 258);
+    assert.equal(offAirTold(note), 1);
+    assert.doesNotMatch(note, /^-? ?s257:ops\.fleet: /mu);
+    assert.match(
+      note,
+      /^and 1 more stream past the 256 it names one by one: 1 went off air unpushed\.$/mu,
+    );
+    assert.match(
+      note,
+      /^- and 3 more across 2 streams past the 256 it names one by one: 1 went off air unpushed while no session held this ear \(no_session; heard \S+Z to \S+Z\); 2 went off air unpushed while the hour's push budget was spent \(push_budget; heard \S+Z to \S+Z\)\.$/mu,
+    );
+  } finally {
+    h.dispose();
+  }
+});
