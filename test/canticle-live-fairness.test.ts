@@ -3614,3 +3614,48 @@ for (const { keys, name } of ROTATIONS) {
     }
   });
 }
+
+// The third pass of the independent review (H1): a record a push gave back is no newer for
+// being on view again, as a note carried again is no newer for it.
+
+for (const plucked of [true, false]) {
+  for (const { keys, name } of ROTATIONS) {
+    test(`#119 R3 re-review H1 (${name}; the given-back record ${plucked ? "off view" : "on view again"}): a record a push gave back, still on air, that goes off air later, can't put its key over a later push's note given back with it`, async () => {
+      const [k1, k2] = keys;
+      const { h, host } = setup({ mode: "immediate", maxPushesPerHour: 1 });
+      try {
+        const shim = h.attach("scribe", { sessionId: SESSION });
+        host.sing(1);
+        h.timers.advance(6_000);
+        await confirm(shim);
+        const frees = status(h).lastPushAt! + 3_600_000;
+        h.timers.advance(frees - 10_000 - h.clock.now());
+        // r, heard before push b went, on air past push c.
+        host.sing(1, { station: "s0", key: k1, epoch: 100, ttlMs: 4_200_000 });
+        h.timers.advance(frees + 1_000 - h.clock.now());
+        assert.equal(pushes(shim).length, 2, "b");
+        assert.deepEqual(order(pushes(shim)[1]!.content), ["s0:ops.fleet/1"]);
+        // r2, heard after b, under k2: off air under the spent budget, owed.
+        host.sing(2, { station: "s0", key: k2, epoch: 100, ttlMs: 10_000 });
+        h.timers.advance(12_000);
+        h.timers.advance(
+          status(h).lastPushAt! + 3_600_000 + 6_000 - h.clock.now(),
+        );
+        assert.equal(pushes(shim).length, 3, "c, r2's note on its own");
+        if (plucked) host.pluck(1, { station: "s0", key: k1, epoch: 100 });
+        shim.close(); // b and c given back; no session until r goes off air
+        assert.equal(pendingNotes(h)["s0:ops.fleet"]?.key, k2, "c's note");
+        h.timers.advance(frees + 4_200_000 - h.clock.now()); // r goes off air
+        const note = pendingNotes(h)["s0:ops.fleet"]!;
+        // r2's, and r's: off air unpushed, or withheld (no_session) if on view.
+        assert.equal(note.offAir + withheldSum({ note }), 2, "r told");
+        assert.equal(note.key, k2, "c's key kept");
+        const next = h.attach("scribe", { sessionId: SESSION });
+        assert.equal(wakesUnder(h, next, k1), 0, "k1");
+        assert.equal(wakesUnder(h, next, k2), 1, "k2");
+      } finally {
+        h.dispose();
+      }
+    });
+  }
+}
