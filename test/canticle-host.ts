@@ -63,16 +63,26 @@ export class Host {
   /** What this run has on air (idem → frame fields), and each station's presence. */
   readonly onAir = new Map<string, R>();
   readonly stations = new Map<string, string>();
-  /** The `station:stream` pairs the ear follows (`canticle.tune`). */
-  tune: string[];
+  #tune: string[];
   #seq = 0;
   readonly #clock: { now(): number };
 
   /** `tune` is the ear's, and the consumer admits records against it (§2.4 step 2). */
   constructor(clock: { now(): number }, tune: string[] = TUNE) {
     this.#clock = clock;
-    this.tune = tune;
+    this.#tune = tune;
     this.consumer = new RecordConsumer({ tune });
+  }
+
+  /** The `station:stream` pairs the ear follows (`canticle.tune`). */
+  get tune(): string[] {
+    return this.#tune;
+  }
+
+  /** A new tune: the consumer admits against it from now on. */
+  set tune(tune: string[]) {
+    this.#tune = tune;
+    this.consumer.retune(tune, this.now);
   }
 
   get now(): number {

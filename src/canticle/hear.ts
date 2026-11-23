@@ -232,8 +232,11 @@ export function omissionLines(
   }
   for (const r of view.retuned ?? []) {
     if (r.until <= now) continue;
+    const at = r.pattern.indexOf(":");
+    const station = r.pattern.slice(0, at);
+    const pattern = `${station === "*" ? "*" : token(station)}:${token(r.pattern.slice(at + 1))}`;
     lines.push(
-      `coverage unknown: ${token(r.pattern)} was tuned at ${iso(r.at)}, while frond-ear's live set was dropping untuned records (${r.dropped} that would be on air until ${iso(r.until)}); its records from before then may be missing, how many unknown (local omission, live_overflow).`,
+      `coverage unknown: ${pattern} was tuned at ${iso(r.at)}, while frond-ear's live set was dropping untuned records (${r.dropped} that would be on air until ${iso(r.until)}); its records from before then may be missing, how many unknown (local omission, live_overflow).`,
     );
   }
   return lines;

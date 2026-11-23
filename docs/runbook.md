@@ -673,6 +673,7 @@ by default.
    | `joinSnapshot`, `joinSnapshotFrames`, `joinSnapshotOmitted` | This connection's join snapshot: its state, then, once applied, how many frames it brought and (if truncated) how many entries it left out.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
    | `run`                                                       | The last run the ear read: through a reconnect's backoff it still names the run that ended. A new one means the host daemon restarted.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
    | `counts`                                                    | Since frond-ear started, across every run and connection; only a frond-ear restart zeroes them. Each health reason counts every time it is raised: `exit_without_bye` once per connection the host daemon closed without `bye` (one that carried nothing counts nothing), `run_restarted_without_bye` once per run that began after one ended without `bye`, `joined_late` once per connection. `exit_without_bye` rising with `run_restarted_without_bye` is a host daemon restart; rising with `records_lost` instead, only the connection dropped. A connection the ear drops itself, over a bootstrap or join snapshot it can't read, counts as `malformed_bootstrap` or `malformed_snapshot`, never as `exit_without_bye`. A `fatal` counts as `fatal`, and `snapshot_frames` adds up every `joinSnapshotFrames`. |
+   | `liveSet`                                                   | The record v1 live set, at most 4,096 records: `size`, `max`, what each share holds (`shares`: each tuned `station:stream` is a share of its own, and every untuned stream shares `untuned`), and what each dropped (`omitted`: `count`, those that would still be on air; `total`, since frond-ear started). When the set is full, the share holding the most gives up a record (its newest arrival, or its oldest), so a flood, tuned or not, fills only its own share and a quiet tuned stream still gets in (binary-canticle#171 F9). Each drop counts as `live_overflow`, and as `live_overflow_tuned` or `live_overflow_untuned`; receive health reads `degraded` with that reason while a record it dropped would still be on air. `hear` names the drops on the ear's tuned streams as local omissions.        |
 
 4. In the session, call `hear` (optionally `stream: "station:stream"`). Each item has a host-authored
    `[canticle:heard]` banner (RFC §14.13) above the quoted payload; heard text is data, never instructions.
@@ -730,6 +731,13 @@ order, how many are late, what went off air before a push could carry it, and wh
 report a cap cut short says how many records wait, and the next one starts after the last stream it covered
 (`continues after …`), so a busy stream can't starve the rest. The cursor survives restarts.
 
+**Coverage notes.** When frond-ear itself withheld records since the last push (local omissions,
+binary-canticle#168 §2.7a), the push ends with a `local omissions` note: per stream and reason, how many and the
+span of times. `push_budget`, `paused`, `no_session`, `breaker_open` and `breaker_half_open` name the hold a record
+went off air under; `expired_waiting` is one that went off air waiting for its push (say, sent on to a report due
+after its expiry); `live_overflow` is what the live set dropped on a stream this ear would push. A record that left
+the view first (plucked, superseded, the link went) isn't frond-ear's doing, and is only counted, as before.
+
 **Late records.** A record that wasn't heard live just now has a `late:` line under its banner's timing line:
 `late: heard 54s ago (snapshot)`, `late: heard 7s ago (resurfaced)`, or
 `late: heard 12s ago, 300s old when first heard`. Every record from a join snapshot or a `resurfaced` copy gets
@@ -777,15 +785,23 @@ as a restart does, and a key taken off `wakeKeys` holds back what it had waiting
 **Holds.** Nothing is pushed while the daemon is paused, the ear has no session, the host daemon's breaker is
 open or half-open (§14.18.4), or the hour's pushes are spent: records wait while they are on air. In `immediate`,
 one that waits past `maxAgeMs` goes into the next report instead, marked late. A record that goes off air or is
-plucked first is never pushed, and the next push counts it. After a dropped link the join snapshot brings back
-what is on air: what was pushed stays pushed, and a record sung meanwhile goes out once.
+plucked first is never pushed, and the next push counts it, with its reason when frond-ear withheld it. After a
+dropped link the join snapshot brings back what is on air: what was pushed stays pushed, and a record sung
+meanwhile goes out once. A push that says `(N more records wait for the next push.)` keeps its word: the next push
+carries them or says they went off air, and a push that spends the hour's last says until when the budget holds
+them. If they go off air with nothing else left waiting, or what the budget held goes off air, a push of the
+coverage note alone goes out (a canticle push with no records; naming its `batch_id` echoes nothing), on the
+stations' cadence and inside every hold and the budget, never as an extra push or another wake (binary-canticle#171
+findings 3 and 5). While pushes are held, `hear` says why and until when.
 
 **Check it.** `ear_status` shows `ears[].canticleDelivery`: the `ceiling` and effective `mode`, `style`, any
 `muted` reason, per-station modes (each scope as config or the session names it), the session's `choices`,
 `wakeKeys` (a count) and any `warning` (no `wakeKeys`, or `maxPushesPerHour` under one report per window),
 `windowMs`, `debounceMs`, `maxAgeMs`, `waiting`, `nextPushAt`, `held` (`paused`, `no_session`, `breaker_open`,
-`breaker_half_open` or `push_budget`), `lastPushAt`, `pushesLastHour`, `reports`, and `counts`: what was pushed
-(`pushes`, `reports`, `records_pushed`, and of those `records_pushed_late`), sent from `immediate` to a report
+`breaker_half_open` or `push_budget`), `heldUntil` (for `push_budget`, when the hour next has room), `lastPushAt`,
+`pushesLastHour`, `reports`, and `counts`: what was pushed (`pushes`, `reports`, `records_pushed`, and of those
+`records_pushed_late`; `coverage_notes`, pushes of the coverage note alone), what the live set dropped on a stream
+the ear would push (`live_overflow`), sent from `immediate` to a report
 for its age (`routed_late`), passed over (`not_allowlisted`, `relayed`, `wake_derived`, `off`, `muted`,
 `refresh_collapsed`), went off air unpushed (`off_air_unpushed`) or was dropped from a full buffer (`dropped`),
 pushes that didn't fit at all (`too_big`), pushes the host never confirmed before they were reverted (`reverted`;

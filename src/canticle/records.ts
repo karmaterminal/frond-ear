@@ -858,10 +858,10 @@ export class RecordConsumer {
    * record. If that is the newcomer's own (or it holds within one of the most), the
    * newcomer is refused; otherwise that share's oldest record goes. So a flood, tuned or
    * not, fills only its own share, and a quiet stream's record always finds room. Either
-   * way the share that lost a record counts it. A tuned record dropped this way may be one
-   * delivery still waits on; it is then counted twice (here, and off air there), never as
-   * delivered, and only once shares are so small (about 16 full ones) that a share's
-   * oldest record can still sit in a per-stream delivery buffer.
+   * way the share that lost a record counts it. Delivery waits on at most a stream's
+   * newest `bufferPerStream` (at most 256), so the oldest of the share holding the most
+   * is one it still waits on only with 16 or more full shares; that one is then counted
+   * twice (here, and off air there), never as delivered.
    */
   #makeRoom(share: string, r: LiveRecord, nowMs: number): boolean {
     const largest = this.#live.largest()!;

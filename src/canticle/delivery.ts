@@ -774,7 +774,8 @@ export class CanticleDelivery {
       const stream = `${o.station}:${o.stream}`;
       const before = state.overflow.get(stream);
       state.overflow.set(stream, { total: o.total, at: o.to });
-      const added = o.total - (before?.total ?? 0);
+      // First seen: only what would still be on air (its window); after, every new drop.
+      const added = before === undefined ? o.count : o.total - before.total;
       if (added <= 0) continue;
       const mode = modes.of({ key: o.key, station: o.station });
       if (!keys.has(o.key.toLowerCase()) || mode === "off" || mode === "mute")
@@ -1091,10 +1092,11 @@ export class CanticleDelivery {
    * into them (`revertUnconfirmed`). Cursor and tombstones are read again from the store,
    * and the records wait for the next push, as a push no connection took leaves them,
    * along with what that push said was missed, owed again since the session never got
-   * it; one already off air is counted so, never pushed late. The records of a push this process didn't make (a crash left it) or no
-   * longer keeps, and those refreshes, are read from the view again on the next pass: a
-   * refresh is held back while the record it re-issues waits, so it collapses once that
-   * record is pushed, and is news if the record goes unpushed.
+   * it; one already off air is counted so, never pushed late. The records of a push this
+   * process didn't make (a crash left it) or no longer keeps, and those refreshes, are
+   * read from the view again on the next pass: a refresh is held back while the record
+   * it re-issues waits, so it collapses once that record is pushed, and is news if the
+   * record goes unpushed.
    */
   reverted(ear: string, released: readonly CanticleReverted[]): void {
     if (released.length === 0) return;

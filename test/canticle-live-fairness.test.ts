@@ -6,13 +6,19 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { iso } from "../src/canticle/hear.ts";
-import { MAX_LIVE } from "../src/canticle/records.ts";
+import { iso, renderHear } from "../src/canticle/hear.ts";
+import type { HearView } from "../src/canticle/receptor.ts";
+import { RecordClient } from "../src/canticle/record-client.ts";
+import { MAX_LIVE, RECORD_V } from "../src/canticle/records.ts";
+import { StructuredLogger } from "../src/logger.ts";
+import { channelInstructions } from "../src/render.ts";
 import {
+  canticleConfig,
   confirm,
   Host,
   order,
   pushes,
+  SESSION,
   setup,
   status,
 } from "./canticle-host.ts";
@@ -405,6 +411,285 @@ test("push budget: while the budget holds records, ear_status and hear name the 
       ),
     );
     await confirm(shim);
+  } finally {
+    h.dispose();
+  }
+  // The session is told what such a note is.
+  assert.match(
+    channelInstructions(canticleConfig({ mode: "immediate" }), "scribe"),
+    /A push may end with a local omissions note: records frond-ear itself withheld[^.]*, each with its reason; one with no records carries only that note\./u,
+  );
+});
+
+test("live set: a stream tuned later gets a share of its own from then on, and hear says its earlier records may be missing", () => {
+  const time = clock();
+  const host = new Host(time, ["*:ops.fleet"]);
+  host.start();
+  for (let n = 1; n <= MAX_LIVE + 50; n++) {
+    host.sing(n, { stream: "ops.chatter", ttlMs: 600_000 });
+  }
+  host.sing(1, { stream: "ops.deploy", ttlMs: 600_000 }); // untuned yet: the full share's own
+  const tune = ["*:ops.fleet", "*:ops.deploy"];
+  const deploy = () =>
+    host.consumer
+      .hearView(tune, time.now(), true)
+      .items.filter((item) => item.stream === "ops.deploy")
+      .map((item) => Number(item.seq));
+  assert.deepEqual(deploy(), [], "refused while untuned");
+  time.value += 1_000;
+  const tunedAt = time.now();
+  host.tune = tune;
+  host.sing(2, { stream: "ops.deploy", ttlMs: 600_000 });
+  assert.deepEqual(deploy(), [2], "admitted once tuned, in a share of its own");
+  const view = host.consumer.hearView(tune, time.now(), true);
+  assert.deepEqual(view.retuned, [
+    {
+      pattern: "*:ops.deploy",
+      at: tunedAt,
+      dropped: 51,
+      until: 1_000_000 + 600_000,
+    },
+  ]);
+  assert.match(
+    renderHear(view, { limit: 1, maxChars: 6_000 }),
+    new RegExp(
+      `^coverage unknown: \\*:ops\\.deploy was tuned at ${iso(tunedAt)}, while frond-ear's live set was dropping untuned records \\(51 that would be on air until ${iso(1_600_000)}\\); its records from before then may be missing, how many unknown \\(local omission, live_overflow\\)\\.$`,
+      "mu",
+    ),
+  );
+  // An ear that doesn't tune the pattern isn't told; once those records would be off
+  // air, nobody is.
+  assert.equal(
+    host.consumer.hearView(["*:ops.fleet"], time.now(), true).retuned,
+    undefined,
+  );
+  time.value = 1_600_001;
+  assert.equal(
+    host.consumer.hearView(tune, time.now(), true).retuned,
+    undefined,
+  );
+});
+
+test("live set: a new run or lost records close what the set dropped before; a rejoin's hello that clears a reason still open raises it again", () => {
+  const time = clock();
+  const host = new Host(time, ["*:ops.fleet"]);
+  host.start();
+  for (let n = 1; n <= MAX_LIVE + 5; n++) {
+    host.sing(n, { stream: "ops.chatter", ttlMs: 600_000 });
+  }
+  const c = host.consumer;
+  assert.ok(c.healthReasons.includes("live_overflow_untuned"));
+  // A rejoin awaiting its join snapshot keeps what it holds, and its bootstrap clears
+  // receive health; the window is still open, so receive health says so again.
+  c.reconnected({ joinSnapshot: true });
+  c.feed(
+    {
+      v: RECORD_V,
+      type: "hello",
+      rec_seq: 1,
+      run: host.run,
+      join_snapshot: true,
+    },
+    time.now(),
+  );
+  assert.ok(!c.healthReasons.includes("live_overflow_untuned"));
+  host.view();
+  assert.ok(c.healthReasons.includes("live_overflow_untuned"), "raised again");
+  assert.equal(c.counts.live_overflow_untuned, 5, "and not counted again");
+
+  const next = new Host(time, ["*:ops.fleet"]);
+  next.start();
+  for (let n = 1; n <= MAX_LIVE + 5; n++) {
+    next.sing(n, { stream: "ops.chatter", ttlMs: 600_000 });
+  }
+  next.start("c3d4"); // a new run: nothing from the old one can surface, drops included
+  const status = next.consumer.liveStatus(time.now());
+  assert.equal(status.omitted.untuned!.count, 0);
+  assert.equal(status.omitted.untuned!.total, 5, "the count since start stays");
+  assert.equal(next.view().untunedOmitted, undefined);
+  assert.ok(!next.consumer.healthReasons.includes("live_overflow_untuned"));
+});
+
+test("live set: ear_status shows the live set, its shares and what each dropped, and receive health with the reason", () => {
+  const time = clock();
+  const client = new RecordClient({
+    socketPath: "/nonexistent/canticle.sock",
+    tune: { scribe: ["*:ops.fleet"], other: ["*:ops.deploy"] },
+    logger: new StructuredLogger(() => {}),
+    clock: time,
+  });
+  const host = new Host(time);
+  // Feed the client's own consumer, as its socket would.
+  const feed = (type: string, extra: Record<string, unknown>, seq: number) =>
+    client.consumer.feed(
+      { v: RECORD_V, type, rec_seq: seq, run: "a1b2", ...extra },
+      time.now(),
+    );
+  let seq = 0;
+  feed("hello", {}, ++seq);
+  feed("landing_state", { mute: null, breaker: "closed" }, ++seq);
+  for (let n = 1; n <= MAX_LIVE + 3; n++) {
+    feed(
+      "frame",
+      host.fields(n, { station: "stray", stream: "ops.deploy" }),
+      ++seq,
+    );
+  }
+  feed("frame", host.fields(1), ++seq);
+  const s = client.status() as {
+    receiveHealth: string;
+    reasons: string[];
+    liveSet: {
+      size: number;
+      max: number;
+      shares: Record<string, number>;
+      omitted: Record<string, { count: number; total: number }>;
+    };
+  };
+  assert.equal(s.receiveHealth, "degraded");
+  assert.deepEqual(s.reasons, ["live_overflow_tuned"]);
+  assert.equal(s.liveSet.size, MAX_LIVE);
+  assert.equal(s.liveSet.max, MAX_LIVE);
+  assert.deepEqual(s.liveSet.shares, {
+    "stray:ops.deploy": MAX_LIVE - 1,
+    "ops:ops.fleet": 1,
+  });
+  assert.equal(s.liveSet.omitted["stray:ops.deploy"]!.total, 4);
+  assert.equal(s.liveSet.omitted["stray:ops.deploy"]!.count, 4);
+});
+
+test("hear: local omissions name at most five streams and count the rest; a stream filter narrows them", () => {
+  const now = 2_000_000;
+  const omitted = Array.from({ length: 7 }, (_, i) => ({
+    station: "ops",
+    stream: `s${i}`,
+    key: "f6eecf2f43082a97",
+    count: i + 1,
+    total: i + 1,
+    from: now - 10_000,
+    to: now - 1_000,
+    until: now + 60_000,
+  }));
+  const view: HearView = {
+    now,
+    tuned: true,
+    listening: true,
+    blind: false,
+    lastDatagramAt: now - 1_000,
+    stations: [],
+    items: [],
+    omitted: [
+      ...omitted,
+      { ...omitted[0]!, stream: "lapsed", until: now - 1, count: 3 },
+    ],
+  };
+  const out = renderHear(view, { limit: 10, maxChars: 6_000 });
+  assert.equal(out.match(/^local omission \(live_overflow\): /gmu)?.length, 5);
+  assert.match(
+    out,
+    /^\(2 more tuned streams lost records to frond-ear's full live set; ear_status counts them\.\)$/mu,
+  );
+  assert.doesNotMatch(
+    out,
+    /lapsed/u,
+    "one whose records are all off air is done",
+  );
+  const one = renderHear(view, { stream: "*:s3", limit: 10, maxChars: 6_000 });
+  assert.match(
+    one,
+    new RegExp(
+      `^local omission \\(live_overflow\\): ops:s3: 4 records dropped by frond-ear's full live set between ${iso(now - 10_000)} and ${iso(now - 1_000)}; they would be on air until ${iso(now + 60_000)}\\.$`,
+      "mu",
+    ),
+  );
+  assert.equal(one.match(/^local omission/gmu)?.length, 1);
+  assert.ok(
+    renderHear(view, { limit: 10, maxChars: 300 }).length <= 300,
+    "within the cap",
+  );
+});
+
+test("coverage note: a push of the note alone is a canticle batch; naming it echoes nothing and marks no Discord event seen; given back unconfirmed, the note is owed again", async () => {
+  const { h, host } = setup({ mode: "immediate", maxPushesPerHour: 1 });
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    host.sing(1);
+    h.timers.advance(6_000);
+    await confirm(shim);
+    const pushedAt = status(h).lastPushAt!;
+    host.sing(2, { ttlMs: 60_000 });
+    h.timers.advance(pushedAt + 3_600_000 + 6_000 - h.clock.now());
+    assert.equal(pushes(shim).length, 2);
+    const note = pushes(shim)[1]!;
+    const line =
+      /^- ops:ops\.fleet: 1 went off air unpushed while the hour's push budget was spent \(push_budget; heard \S+Z to \S+Z\)\.$/mu;
+    assert.match(note.content, line);
+    const acked = await h.call(shim, "ack", { batch_id: note.meta.batch_id });
+    assert.equal(
+      acked.text,
+      "0 canticle records echoed: that push was a coverage note and carried no record",
+    );
+    // The shim goes before saying it wrote the note: frond-ear gives it back.
+    shim.close();
+    assert.equal(status(h).pushesLastHour, 0, "the budget's push with it");
+    const next = h.attach("scribe", { sessionId: SESSION });
+    h.timers.advance(6_000);
+    assert.equal(pushes(next).length, 1);
+    assert.match(pushes(next)[0]!.content, line, "owed again, and told");
+    await confirm(next);
+    h.timers.advance(3_600_000);
+    assert.equal(pushes(next).length, 1, "once");
+    assert.equal(status(h).counts.coverage_notes, 2);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("coverage note: what the live set dropped before the ear delivered, and is off air by now, isn't reported once it does", async () => {
+  const { h, host } = setup(undefined);
+  try {
+    const shim = h.attach("scribe");
+    for (let n = 1; n <= MAX_LIVE + 20; n++) {
+      host.sing(n, { stream: "ops.deploy", ttlMs: 30_000 });
+    }
+    h.timers.advance(31_000); // every dropped record is off air
+    h.daemon.reloadConfig(
+      canticleConfig({ mode: "immediate", maxPushesPerHour: 360 }),
+    );
+    host.sing(1);
+    h.timers.advance(6_000);
+    assert.equal(pushes(shim).length, 1);
+    assert.doesNotMatch(pushes(shim)[0]!.content, /live_overflow/u);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("coverage note: what went off air while no session held the ear or frond-ear was paused is named with that reason in the next push", async () => {
+  const { h, host } = setup({ mode: "immediate" });
+  try {
+    host.sing(1, { ttlMs: 10_000 });
+    h.timers.advance(15_000);
+    h.daemon.reloadConfig(
+      canticleConfig({ mode: "immediate" }, {}, { paused: true }),
+    );
+    const shim = h.attach("scribe");
+    host.sing(2, { ttlMs: 10_000 });
+    h.timers.advance(15_000);
+    h.daemon.reloadConfig(canticleConfig({ mode: "immediate" }));
+    host.sing(3);
+    h.timers.advance(6_000);
+    assert.equal(pushes(shim).length, 1);
+    const push = pushes(shim)[0]!.content;
+    assert.deepEqual(order(push), ["ops:ops.fleet/3"]);
+    assert.match(
+      push,
+      /^- ops:ops\.fleet: 1 went off air unpushed while no session held this ear \(no_session; heard \S+Z to \S+Z\)\.$/mu,
+    );
+    assert.match(
+      push,
+      /^- ops:ops\.fleet: 1 went off air unpushed while frond-ear was paused \(paused; heard \S+Z to \S+Z\)\.$/mu,
+    );
   } finally {
     h.dispose();
   }
