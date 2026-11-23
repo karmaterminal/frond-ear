@@ -2778,24 +2778,19 @@ const foldedPlace = (h: Harnessed, stream: string) =>
   pendingNotes(h)["*"]?.streams?.find((f) => f.stream === stream);
 
 /**
- * Reloads with `key` alone on wakeKeys and every s<i> station but `but`'s off, then gives
- * the ear a minute: how many pushes it brought.
+ * Reloads with `key` alone on wakeKeys (and `stations`' ceilings), then gives the ear a
+ * minute: how many pushes it brought.
  */
 function wakesUnder(
   h: Harnessed,
   shim: Parameters<typeof pushes>[0],
   key: string,
-  streams: number,
-  but: number,
+  stations: Record<string, string> = {},
 ): number {
   const before = pushes(shim).length;
   h.daemon.reloadConfig(
     canticleConfig(
-      {
-        mode: "immediate",
-        maxPushesPerHour: 1,
-        stations: offBut(streams, but),
-      },
+      { mode: "immediate", maxPushesPerHour: 1, stations },
       { wakeKeys: [key] },
     ),
   );
@@ -2881,8 +2876,16 @@ for (const { keys, name } of ROTATIONS) {
         "a named one's",
       );
       const next = h.attach("scribe", { sessionId: SESSION });
-      assert.equal(wakesUnder(h, next, first, 257, 256), 0, "earlier key");
-      assert.equal(wakesUnder(h, next, later, 257, 256), 1, "later key");
+      assert.equal(
+        wakesUnder(h, next, first, offBut(257, 256)),
+        0,
+        "earlier key",
+      );
+      assert.equal(
+        wakesUnder(h, next, later, offBut(257, 256)),
+        1,
+        "later key",
+      );
       assert.equal(omissionsTold(pushes(next)[0]!.content), 2 * 257);
       await confirm(next);
       h.timers.advance(3_600_000);
@@ -2920,7 +2923,7 @@ for (const pass of [false, true]) {
           again.h.timers.advance(60_000);
           assert.equal(pushes(again.shim).length, 0, "earlier key");
           assert.equal(
-            wakesUnder(again.h, again.shim, later, 257, 256),
+            wakesUnder(again.h, again.shim, later, offBut(257, 256)),
             1,
             "later key",
           );
@@ -2954,8 +2957,16 @@ for (const again of [range(0, 256), [256]]) {
           assert.equal(pendingNotes(h)["s0:ops.fleet"]?.key, later);
         }
         const next = h.attach("scribe", { sessionId: SESSION });
-        assert.equal(wakesUnder(h, next, first, 257, 256), 0, "earlier key");
-        assert.equal(wakesUnder(h, next, later, 257, 256), 1, "later key");
+        assert.equal(
+          wakesUnder(h, next, first, offBut(257, 256)),
+          0,
+          "earlier key",
+        );
+        assert.equal(
+          wakesUnder(h, next, later, offBut(257, 256)),
+          1,
+          "later key",
+        );
         assert.equal(
           omissionsTold(pushes(next)[0]!.content),
           257 + again.length,
@@ -2988,8 +2999,8 @@ for (const crash of [undefined, "the revert reads", "a pass reads"]) {
         try {
           assert.equal(pendingNotes(ear.h)["s0:ops.fleet"]?.key, later);
           assert.equal(pendingNotes(ear.h)["s0:ops.fleet"]?.owed, true);
-          assert.equal(wakesUnder(ear.h, ear.shim, first, 1, 0), 0, "earlier");
-          assert.equal(wakesUnder(ear.h, ear.shim, later, 1, 0), 1, "later");
+          assert.equal(wakesUnder(ear.h, ear.shim, first), 0, "earlier");
+          assert.equal(wakesUnder(ear.h, ear.shim, later), 1, "later");
           assert.equal(omissionsTold(pushes(ear.shim)[0]!.content), 2);
         } finally {
           ear.h.dispose();
@@ -3036,8 +3047,8 @@ for (const pushed of [false, true]) {
         assert.equal(pendingNotes(h)["s0:ops.fleet"]?.key, later, "kept");
         assert.equal(pendingNotes(h)["s0:ops.fleet"]?.offAir, 1);
         const next = h.attach("scribe", { sessionId: SESSION });
-        assert.equal(wakesUnder(h, next, first, 1, 0), 0, "earlier key");
-        assert.equal(wakesUnder(h, next, later, 1, 0), 1, "later key");
+        assert.equal(wakesUnder(h, next, first), 0, "earlier key");
+        assert.equal(wakesUnder(h, next, later), 1, "later key");
         const push = pushes(next)[0]!.content;
         assert.equal(offAirTold(push), 1);
         assert.equal(omissionsTold(push), 1);
@@ -3084,8 +3095,8 @@ for (const { keys, name } of ROTATIONS) {
       const note = pendingNotes(h)["ops:ops.fleet"];
       assert.equal(withheldSum({ note: note! }, "live_overflow"), 2, "both");
       assert.equal(note?.key, later, "kept");
-      assert.equal(wakesUnder(h, next, first, 1, 0), 0, "earlier key");
-      assert.equal(wakesUnder(h, next, later, 1, 0), 1, "later key");
+      assert.equal(wakesUnder(h, next, first), 0, "earlier key");
+      assert.equal(wakesUnder(h, next, later), 1, "later key");
       assert.equal(overflowTold(next, "ops:ops.fleet"), 2);
     } finally {
       h.dispose();
@@ -3119,7 +3130,7 @@ for (const pass of [false, true]) {
         again.h.timers.advance(60_000);
         assert.equal(pushes(again.shim).length, 0, "earlier key");
         assert.equal(
-          wakesUnder(again.h, again.shim, later, 257, 256),
+          wakesUnder(again.h, again.shim, later, offBut(257, 256)),
           1,
           "later key",
         );
@@ -3131,4 +3142,80 @@ for (const pass of [false, true]) {
       rmSync(directory, { recursive: true, force: true });
     }
   });
+}
+
+/**
+ * At one push an hour, that push spent and confirmed: stations s0, s1, … (`earlier` of
+ * them) go off air under `first`, owed, and their note goes out on its own, unconfirmed;
+ * then t0 to t255 and s0 go off air under `later`, in that order, so s0 is folded behind
+ * the t's, and that note goes out the next hour, unconfirmed too.
+ */
+async function refolded(
+  [first, later]: readonly [string, string],
+  earlier: number,
+) {
+  const { h, host } = setup({ mode: "immediate", maxPushesPerHour: 1 });
+  const shim = h.attach("scribe", { sessionId: SESSION });
+  host.sing(1);
+  h.timers.advance(6_000);
+  await confirm(shim);
+  const free = () =>
+    h.timers.advance(status(h).lastPushAt! + 3_600_000 + 6_000 - h.clock.now());
+  for (let i = 0; i < earlier; i++) {
+    host.sing(1, {
+      station: `s${i}`,
+      key: first,
+      epoch: 100 + i,
+      ttlMs: 10_000,
+    });
+  }
+  h.timers.advance(12_000);
+  free();
+  assert.equal(pushes(shim).length, 2, "the first note, on its own");
+  for (let i = 0; i < 256; i++) {
+    host.sing(1, {
+      station: `t${i}`,
+      key: later,
+      epoch: 1_000 + i,
+      ttlMs: 10_000,
+    });
+  }
+  host.sing(2, { station: "s0", key: later, epoch: 100, ttlMs: 10_000 });
+  h.timers.advance(12_000);
+  assert.equal(pendingNotes(h)["s0:ops.fleet"], undefined, "s0 folded");
+  free();
+  assert.equal(pushes(shim).length, 3, "the later note, on its own");
+  return { h, shim };
+}
+
+for (const earlier of [1, 512]) {
+  for (const { keys, name } of ROTATIONS) {
+    test(`#119 re-review R3, folded later (${name}; ${earlier === 1 ? "a place free" : "no place to be had"}): a stream named in an earlier unconfirmed push and folded in a later one, both given back: folded into its place, or left named, it keeps the later key`, async () => {
+      const [first, later] = keys;
+      const { h, shim } = await refolded(keys, earlier);
+      try {
+        shim.close(); // both given back, the earlier first
+        const named = pendingNotes(h)["s0:ops.fleet"];
+        if (earlier === 1) {
+          assert.equal(named, undefined, "folded into its place");
+          assert.equal(foldedPlace(h, "s0:ops.fleet")?.key, later, "its key");
+          assert.equal(foldedPlace(h, "s0:ops.fleet")?.owed, true);
+        } else {
+          assert.equal(foldedPlace(h, "s0:ops.fleet"), undefined, "no place");
+          assert.equal(named?.key, later, "its entry's key");
+          assert.equal(named?.owed, true);
+        }
+        const stations = Object.fromEntries([
+          ...range(1, earlier - 1).map((i) => [`s${i}`, "off"]),
+          ...range(0, 255).map((i) => [`t${i}`, "off"]),
+        ]);
+        const next = h.attach("scribe", { sessionId: SESSION });
+        assert.equal(wakesUnder(h, next, first, stations), 0, "earlier key");
+        assert.equal(wakesUnder(h, next, later, stations), 1, "later key");
+        assert.equal(omissionsTold(pushes(next)[0]!.content), earlier + 257);
+      } finally {
+        h.dispose();
+      }
+    });
+  }
 }
