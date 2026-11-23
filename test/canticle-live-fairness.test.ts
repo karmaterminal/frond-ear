@@ -3659,3 +3659,45 @@ for (const plucked of [true, false]) {
     });
   }
 }
+
+// The last pass of the independent review (I1): records a push gives back are told when
+// they are told, as at 3824a7e. Only notes are ordered by the pushes that carried them.
+
+for (const when of ["on view", "plucked", "off air at the revert"] as const) {
+  for (const { keys, name } of ROTATIONS) {
+    test(`#119 R3 re-review I1 (${name}; the given-back record ${when}): one push given back, whose record was heard and is told after an older record's note, leaves that record's key`, async () => {
+      const [k1, k2] = keys;
+      const { h, host } = setup({ mode: "immediate", maxPushesPerHour: 1 });
+      try {
+        const shim = h.attach("scribe", { sessionId: SESSION });
+        host.sing(1);
+        h.timers.advance(6_000);
+        await confirm(shim);
+        const frees = status(h).lastPushAt! + 3_600_000;
+        h.timers.advance(frees - 45_000 - h.clock.now());
+        // Heard first, too old for immediate by then: push b leaves it waiting, promised.
+        host.sing(1, { station: "s0", key: k1, epoch: 100, ttlMs: 105_000 });
+        h.timers.advance(35_000);
+        host.sing(2, { station: "s0", key: k2, epoch: 100, ttlMs: 130_000 });
+        h.timers.advance(frees + 1_000 - h.clock.now());
+        assert.equal(pushes(shim).length, 2, "b");
+        assert.deepEqual(order(pushes(shim)[1]!.content), ["s0:ops.fleet/2"]);
+        if (when === "plucked") {
+          host.pluck(2, { station: "s0", key: k2, epoch: 100 });
+        }
+        if (when !== "off air at the revert") shim.close(); // b given back
+        h.timers.advance(frees + 65_000 - h.clock.now());
+        assert.equal(pendingNotes(h)["s0:ops.fleet"]?.key, k1, "record 1 told");
+        assert.equal(pendingNotes(h)["s0:ops.fleet"]?.owed, true, "promised");
+        h.timers.advance(frees + 130_000 - h.clock.now()); // record 2 off air
+        if (when === "off air at the revert") shim.close();
+        assert.equal(pendingNotes(h)["s0:ops.fleet"]?.key, k2, "record 2's");
+        const next = h.attach("scribe", { sessionId: SESSION });
+        assert.equal(wakesUnder(h, next, k1), 0, "k1");
+        assert.equal(wakesUnder(h, next, k2), 1, "k2");
+      } finally {
+        h.dispose();
+      }
+    });
+  }
+}
