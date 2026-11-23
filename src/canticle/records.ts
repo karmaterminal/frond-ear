@@ -232,8 +232,10 @@ class LiveSet {
 /**
  * What the live set dropped from one share (§2.7a local omission, `live_overflow`): the
  * records of its current window, which would still be on air until `until`, dropped
- * between `from` and `to` (this host's clock); and `total`, every one since frond-ear
- * started, which delivery compares with what it has already reported.
+ * between `from` and `to` (this host's clock); and `total`, every one since this entry
+ * began (`serial`), which delivery compares with what it has already reported. The
+ * `pushable` counts are those sung at hop 0 and not wake-derived: the only ones a push
+ * could have carried.
  */
 export interface LiveOmission {
   station: string;
@@ -245,6 +247,10 @@ export interface LiveOmission {
   to: number;
   until: number;
   total: number;
+  pushable: number;
+  pushableTotal: number;
+  /** Tells this entry from an earlier one for the same share that was let go. */
+  serial: number;
 }
 
 /** A join-snapshot entry, parsed and held until `snapshot_end`. */
@@ -395,6 +401,7 @@ export class RecordConsumer {
   #tune: readonly string[];
   /** Per share, what the live set dropped (tuned streams, at most `MAX_OMITTED_STREAMS`). */
   readonly #omitted = new Map<string, LiveOmission>();
+  #omittedSerial = 0;
   /**
    * Patterns tuned (by `retune`) while the untuned share was dropping records that would
    * still be on air: until `until`, such a stream's records from before `at` may be missing.
@@ -882,11 +889,7 @@ export class RecordConsumer {
   #drop(share: string, r: LiveRecord, nowMs: number): void {
     const tuned = share !== UNTUNED;
     const at =
-      tuned &&
-      !this.#omitted.has(share) &&
-      this.#omitted.size >= MAX_OMITTED_STREAMS
-        ? OTHER_TUNED
-        : share;
+      tuned && !this.#omitted.has(share) ? this.#room(share, nowMs) : share;
     let o = this.#omitted.get(at);
     if (o === undefined) {
       o = {
@@ -898,21 +901,52 @@ export class RecordConsumer {
         to: nowMs,
         until: 0,
         total: 0,
+        pushable: 0,
+        pushableTotal: 0,
+        serial: ++this.#omittedSerial,
       };
       this.#omitted.set(at, o);
     }
     if (o.until <= nowMs) {
       // The last window's records are all off air by now: a new one opens.
       o.count = 0;
+      o.pushable = 0;
       o.from = nowMs;
     }
     o.count += 1;
     o.to = nowMs;
     o.until = Math.max(o.until, r.localExpiryAt);
     o.total += 1;
+    if (r.item.hop === 0 && r.item.wakeDerived === false) {
+      o.pushable += 1;
+      o.pushableTotal += 1;
+    }
     o.key = r.item.key;
     this.#count("live_overflow");
     this.#degrade(tuned ? "live_overflow_tuned" : "live_overflow_untuned");
+  }
+
+  /**
+   * Where a tuned share with no entry yet counts its drops: its own entry, once there is
+   * room for one. A full map first lets go of the entry whose window closed longest ago
+   * (its records are all off air, and delivery has read it); only with every entry open
+   * do the drops go to the one shared count.
+   */
+  #room(share: string, nowMs: number): string {
+    const tuned =
+      this.#omitted.size -
+      (this.#omitted.has(UNTUNED) ? 1 : 0) -
+      (this.#omitted.has(OTHER_TUNED) ? 1 : 0);
+    if (tuned < MAX_OMITTED_STREAMS) return share;
+    let lapsed: string | undefined;
+    let at = Infinity;
+    for (const [key, o] of this.#omitted) {
+      if (key === UNTUNED || key === OTHER_TUNED) continue;
+      if (o.until <= nowMs && o.until < at) [lapsed, at] = [key, o.until];
+    }
+    if (lapsed === undefined) return OTHER_TUNED;
+    this.#omitted.delete(lapsed);
+    return share;
   }
 
   /**
@@ -923,6 +957,7 @@ export class RecordConsumer {
     this.#live.clear();
     for (const o of this.#omitted.values()) {
       o.count = 0;
+      o.pushable = 0;
       o.until = 0;
     }
     this.#retuned.clear();
@@ -1269,7 +1304,9 @@ export class RecordConsumer {
           share !== OTHER_TUNED &&
           tuned(o.station, o.stream),
       )
-      .map(([, o]) => ({ ...o, count: o.until > nowMs ? o.count : 0 }));
+      .map(([, o]) =>
+        o.until > nowMs ? { ...o } : { ...o, count: 0, pushable: 0 },
+      );
     const untuned = this.#omitted.get(UNTUNED);
     const retuned = [...this.#retuned]
       .filter(([pattern]) => patterns.includes(pattern))

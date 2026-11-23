@@ -333,12 +333,91 @@ interface EarState {
   held: string | undefined;
   missed: Map<string, Missed>;
   /**
-   * Per `station:stream`, what the record source's live set had dropped (its `total`, and
-   * when it last did) as of the last pass, so each drop is told once.
+   * Per `station:stream`, what the record source's live set had dropped of what a push
+   * could carry (its entry, that entry's total, and when it last dropped one) as of the
+   * last pass, so each drop is told once.
    */
-  overflow: Map<string, { total: number; at: number }>;
+  overflow: Map<string, { serial: number; total: number; at: number }>;
   counts: Record<string, number>;
   cursor: Cursor;
+  /** `missed` (or what an unconfirmed push carried) changed since it was last saved. */
+  dirty: boolean;
+}
+
+/** One stream's missed records as `canticle.withheld.<ear>` saves them. */
+interface SavedMissed {
+  offAir: number;
+  dropped: number;
+  withheld: Array<[string, Span]>;
+  key: string;
+  owed: boolean;
+}
+
+const saveMissed = (
+  missed: ReadonlyMap<string, Missed>,
+): Record<string, SavedMissed> =>
+  Object.fromEntries(
+    [...missed].map(([stream, m]) => [
+      stream,
+      {
+        offAir: m.offAir,
+        dropped: m.dropped,
+        withheld: [...m.withheld],
+        key: m.key,
+        owed: m.owed,
+      },
+    ]),
+  );
+
+const isCount = (value: unknown): value is number =>
+  Number.isSafeInteger(value) && (value as number) >= 0;
+
+/** Saved missed records back, dropping what doesn't read, within the stream bound. */
+function loadMissed(saved: unknown): Map<string, Missed> {
+  const missed = new Map<string, Missed>();
+  if (typeof saved !== "object" || saved === null) return missed;
+  for (const [stream, value] of Object.entries(saved)) {
+    if (missed.size >= MAX_CURSOR_STREAMS) break;
+    const m = value as Partial<SavedMissed> | null;
+    if (
+      !stream.includes(":") ||
+      typeof m !== "object" ||
+      m === null ||
+      !isCount(m.offAir) ||
+      !isCount(m.dropped) ||
+      typeof m.key !== "string" ||
+      typeof m.owed !== "boolean" ||
+      !Array.isArray(m.withheld)
+    ) {
+      continue;
+    }
+    const withheld = new Map<string, Span>();
+    for (const entry of m.withheld) {
+      const [reason, span] = Array.isArray(entry) ? entry : [];
+      if (
+        typeof reason === "string" &&
+        typeof span === "object" &&
+        span !== null &&
+        isCount(span.count) &&
+        Number.isSafeInteger(span.from) &&
+        Number.isSafeInteger(span.to)
+      ) {
+        withheld.set(reason, {
+          count: span.count,
+          from: span.from,
+          to: span.to,
+        });
+      }
+    }
+    missed.set(stream, {
+      offAir: m.offAir,
+      dropped: m.dropped,
+      withheld,
+      key: m.key,
+      owed: m.owed,
+    });
+  }
+  return missed;
 }
 
 /**
@@ -707,7 +786,9 @@ export class CanticleDelivery {
     // streams' stations push on, inside every hold and the budget like any push.
     const note =
       state.waiting.size === 0 ? this.#noteCadence(state, modes) : undefined;
-    state.held = undefined;
+    // Named as soon as anything waits under it, not only once a push falls due.
+    state.held =
+      state.waiting.size > 0 || note !== undefined ? hold : undefined;
     for (const cadence of CADENCES) {
       const group = [...state.waiting.values()].filter(
         (waiting) =>
@@ -740,6 +821,11 @@ export class CanticleDelivery {
       if (left > 0) state.due[cadence] = now + interval;
       else delete state.due[cadence];
     }
+    // A push this pass may have spent the hour's last, with records still waiting.
+    if (state.held === undefined && state.waiting.size > 0) {
+      state.held = this.#hold(ear, view, delivery, state, now);
+    }
+    if (state.dirty) this.#saveWithheld(ear, state);
   }
 
   /** Why a record is never pushed to this ear, or undefined when it may be. */
@@ -758,11 +844,11 @@ export class CanticleDelivery {
   }
 
   /**
-   * What the record source's live set dropped since the last pass, on a tuned stream whose
-   * station this ear could be pushed (allowlisted key, a mode that pushes), goes into the
-   * next push's coverage note as `live_overflow`, owed. The view says only how many and
-   * when, not whether each was sung at hop 0: the note may count one no push would carry,
-   * never leave one out.
+   * What the record source's live set dropped since the last pass, of records a push could
+   * have carried (sung at hop 0, not wake-derived) on a tuned stream whose station this
+   * ear could be pushed (allowlisted key, a mode that pushes), goes into the next push's
+   * coverage note as `live_overflow`, owed. A drop no push would ever have carried wakes
+   * nobody; `hear` still names it.
    */
   #overflow(
     state: EarState,
@@ -773,9 +859,19 @@ export class CanticleDelivery {
     for (const o of view.omitted ?? []) {
       const stream = `${o.station}:${o.stream}`;
       const before = state.overflow.get(stream);
-      state.overflow.set(stream, { total: o.total, at: o.to });
+      const same = before !== undefined && before.serial === o.serial;
+      state.overflow.set(stream, {
+        serial: o.serial,
+        total: o.pushableTotal,
+        at: o.to,
+      });
       // First seen: only what would still be on air (its window); after, every new drop.
-      const added = before === undefined ? o.count : o.total - before.total;
+      // A new entry for the stream (the old one was let go) is new drops from its start.
+      const added = same
+        ? o.pushableTotal - before.total
+        : before === undefined
+          ? o.pushable
+          : o.pushableTotal;
       if (added <= 0) continue;
       const mode = modes.of({ key: o.key, station: o.station });
       if (!keys.has(o.key.toLowerCase()) || mode === "off" || mode === "mute")
@@ -784,9 +880,10 @@ export class CanticleDelivery {
       const missed = this.#missed(state, stream, o.key);
       if (missed === undefined) continue;
       // Dropped after the last pass looked: from then, or this window's start if later.
-      const from = before === undefined ? o.from : Math.max(o.from, before.at);
+      const from = same ? Math.max(o.from, before.at) : o.from;
       widen(missed.withheld, "live_overflow", added, from, o.to);
       missed.owed = true;
+      state.dirty = true;
     }
   }
 
@@ -968,6 +1065,7 @@ export class CanticleDelivery {
     }
     this.#keepUnconfirmed(ear, claimed.batchId, rendered.pushed, state.missed);
     state.missed.clear();
+    state.dirty = true;
     state.lastPushAt = now;
     this.#count(state, cadence === "digest" ? "reports" : "pushes");
     if (rendered.pushed.length === 0) this.#count(state, "coverage_notes");
@@ -1083,7 +1181,11 @@ export class CanticleDelivery {
 
   /** The host confirmed canticle push `batchId` (its `offered`): no revert can take it back. */
   confirmed(ear: string, batchId: number): void {
-    this.#unconfirmed.get(ear)?.delete(batchId);
+    const kept = this.#unconfirmed.get(ear);
+    const push = kept?.get(batchId);
+    if (push === undefined) return;
+    kept!.delete(batchId);
+    if (push.missed.size > 0) this.#saveWithheld(ear, this.#state(ear));
   }
 
   /**
@@ -1091,8 +1193,8 @@ export class CanticleDelivery {
    * claims, the cursor from before them, and the tombstones of refreshes that collapsed
    * into them (`revertUnconfirmed`). Cursor and tombstones are read again from the store,
    * and the records wait for the next push, as a push no connection took leaves them,
-   * along with what that push said was missed, owed again since the session never got
-   * it; one already off air is counted so, never pushed late. The records of a push this
+   * along with what that push said was missed (owed again if it was owed); one already
+   * off air is counted so, never pushed late. The records of a push this
    * process didn't make (a crash left it) or no longer keeps, and those refreshes, are
    * read from the view again on the next pass: a refresh is held back while the record
    * it re-issues waits, so it collapses once that record is pushed, and is news if the
@@ -1122,7 +1224,9 @@ export class CanticleDelivery {
         for (const [reason, span] of missed.withheld) {
           widen(merged.withheld, reason, span.count, span.from, span.to);
         }
-        merged.owed = true;
+        // Owed as before: a note pushed on its own is owed again; a note that rode with
+        // records rides with them again.
+        merged.owed ||= missed.owed;
       }
       for (const id of identities) {
         const waiting = push?.records.find((record) => record.id === id);
@@ -1139,6 +1243,7 @@ export class CanticleDelivery {
       for (const id of collapsed) state.seen.delete(id);
     }
     this.#count(state, "reverted", released.length);
+    this.#saveWithheld(ear, state);
     this.#deps.logger.log("info", "canticle.push_reverted", {
       ear,
       pushes: released.length,
@@ -1162,10 +1267,82 @@ export class CanticleDelivery {
         overflow: new Map(),
         counts: {},
         cursor,
+        dirty: false,
       };
       this.#ears.set(ear, state);
+      this.#loadWithheld(ear, state);
     }
     return state;
+  }
+
+  /**
+   * What frond-ear withheld and hasn't told yet survives a restart (#168 §2.7a): the
+   * notes waiting for the next push, and those a push the host never confirmed carried,
+   * which a revert after a crash gives back. Saved with `#saveWithheld`.
+   */
+  #loadWithheld(ear: string, state: EarState): void {
+    const saved = this.#deps.store.runtimeState(`canticle.withheld.${ear}`);
+    if (saved === undefined) return;
+    let parsed: { pending?: unknown; carried?: unknown };
+    try {
+      parsed = JSON.parse(saved) as typeof parsed;
+    } catch {
+      this.#deps.logger.log("warn", "canticle.withheld_unreadable", { ear });
+      return;
+    }
+    state.missed = loadMissed(parsed.pending);
+    if (typeof parsed.carried !== "object" || parsed.carried === null) return;
+    const kept =
+      this.#unconfirmed.get(ear) ??
+      new Map<number, { records: Waiting[]; missed: Map<string, Missed> }>();
+    this.#unconfirmed.set(ear, kept);
+    for (const [id, saved] of Object.entries(parsed.carried)) {
+      const batchId = Number(id);
+      if (!Number.isSafeInteger(batchId) || kept.has(batchId)) continue;
+      const outcome = this.#deps.store.canticleOutcome(ear, batchId);
+      const missed = loadMissed(saved);
+      if (outcome === "reverted") {
+        // Given back already (the first attach after a crash reverts before this
+        // reads): the session never got its notes, so they wait again, owed as before.
+        for (const [stream, m] of missed) {
+          const merged = this.#missed(state, stream, m.key);
+          if (merged === undefined) continue;
+          merged.offAir += m.offAir;
+          merged.dropped += m.dropped;
+          for (const [reason, span] of m.withheld) {
+            widen(merged.withheld, reason, span.count, span.from, span.to);
+          }
+          merged.owed ||= m.owed;
+        }
+        state.dirty = true;
+      } else if (outcome === "unconfirmed" && kept.size < MAX_UNCONFIRMED) {
+        // A revert may still give it back; its notes go with it then.
+        kept.set(batchId, { records: [], missed });
+      }
+      // Confirmed: the session got them.
+    }
+  }
+
+  #saveWithheld(ear: string, state: EarState): void {
+    state.dirty = false;
+    const carried = Object.fromEntries(
+      [...(this.#unconfirmed.get(ear) ?? [])]
+        .filter(([, push]) => push.missed.size > 0)
+        .map(([batchId, push]) => [batchId, saveMissed(push.missed)]),
+    );
+    try {
+      this.#deps.store.setRuntimeState(
+        `canticle.withheld.${ear}`,
+        JSON.stringify({ pending: saveMissed(state.missed), carried }),
+      );
+    } catch (error) {
+      // Kept in memory and saved again on the next change; a restart before then loses it.
+      state.dirty = true;
+      this.#deps.logger.log("warn", "canticle.withheld_unsaved", {
+        ear,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   #loadCursor(ear: string): Cursor {
@@ -1271,6 +1448,7 @@ export class CanticleDelivery {
     this.#count(state, kind === "offAir" ? "off_air_unpushed" : "dropped");
     const missed = this.#missed(state, waiting.stream, waiting.item.key);
     if (missed === undefined) return;
+    state.dirty = true;
     if (kind === "dropped") missed.dropped += 1;
     else if (reason === undefined) missed.offAir += 1;
     else {

@@ -4,6 +4,9 @@
 // budget's hold is visible, and what it held until it went off air is reported by the
 // next push the budget allows, never by a push beyond it.
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import { iso, renderHear } from "../src/canticle/hear.ts";
@@ -497,6 +500,21 @@ test("live set: a new run or lost records close what the set dropped before; a r
   assert.ok(c.healthReasons.includes("live_overflow_untuned"), "raised again");
   assert.equal(c.counts.live_overflow_untuned, 5, "and not counted again");
 
+  // A rec_seq gap: everything heard before it goes, and with it what the set dropped.
+  const gap = new Host(time, ["*:ops.fleet"]);
+  gap.start();
+  for (let n = 1; n <= MAX_LIVE + 5; n++) {
+    gap.sing(n, { stream: "ops.chatter", ttlMs: 600_000 });
+  }
+  gap.consumer.feed(
+    { v: RECORD_V, type: "health", rec_seq: 1_000_000, run: gap.run },
+    time.now(),
+  );
+  assert.ok(gap.consumer.healthReasons.includes("records_lost"));
+  assert.ok(!gap.consumer.healthReasons.includes("live_overflow_untuned"));
+  assert.equal(gap.consumer.liveStatus(time.now()).omitted.untuned!.count, 0);
+  assert.equal(gap.consumer.liveSize, 0);
+
   const next = new Host(time, ["*:ops.fleet"]);
   next.start();
   for (let n = 1; n <= MAX_LIVE + 5; n++) {
@@ -566,6 +584,9 @@ test("hear: local omissions name at most five streams and count the rest; a stre
     key: "f6eecf2f43082a97",
     count: i + 1,
     total: i + 1,
+    pushable: i + 1,
+    pushableTotal: i + 1,
+    serial: i + 1,
     from: now - 10_000,
     to: now - 1_000,
     until: now + 60_000,
@@ -690,6 +711,202 @@ test("coverage note: what went off air while no session held the ear or frond-ea
       push,
       /^- ops:ops\.fleet: 1 went off air unpushed while frond-ear was paused \(paused; heard \S+Z to \S+Z\)\.$/mu,
     );
+  } finally {
+    h.dispose();
+  }
+});
+
+test("review 1: what the live set drops of relayed or wake-derived records wakes nobody: no note of its own, nothing in a push; hear still names it", async () => {
+  const { h, host } = setup({ mode: "immediate", maxPushesPerHour: 360 });
+  try {
+    const shim = h.attach("scribe");
+    for (let n = 1; n <= MAX_LIVE + 20; n++) {
+      host.sing(n, {
+        stream: "ops.deploy",
+        ttlMs: 3_600_000,
+        ...(n % 2 === 0 ? { hop: 1 } : { flags: { wake_derived: true } }),
+      });
+    }
+    h.timers.advance(60_000);
+    assert.equal(
+      pushes(shim).length,
+      0,
+      "nothing a push could carry, so no push",
+    );
+    assert.equal(status(h).counts.live_overflow, undefined);
+    assert.match(
+      (await h.call(shim, "hear", {})).text,
+      /^local omission \(live_overflow\): ops:ops\.deploy: 20 records dropped by frond-ear's full live set /mu,
+    );
+    host.sing(1);
+    h.timers.advance(6_000);
+    assert.equal(pushes(shim).length, 1);
+    assert.doesNotMatch(pushes(shim)[0]!.content, /live_overflow/u);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("review 2: what the budget held until it went off air is still told after frond-ear restarts, and a note a crash left unconfirmed is told again", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "frond-ear-withheld-"));
+  const path = join(directory, "ear.db");
+  const delivery = { mode: "immediate", maxPushesPerHour: 1 };
+  const line =
+    /^- ops:ops\.fleet: 1 went off air unpushed while the hour's push budget was spent \(push_budget; heard \S+Z to \S+Z\)\.$/mu;
+  try {
+    // A restart during the hold: the owed note is saved, and the hour too.
+    const first = setup(delivery, {}, {}, { path });
+    let pushedAt: number;
+    try {
+      const shim = first.h.attach("scribe", { sessionId: SESSION });
+      first.host.sing(1);
+      first.h.timers.advance(6_000);
+      await confirm(shim);
+      pushedAt = status(first.h).lastPushAt!;
+      first.host.sing(2, { ttlMs: 60_000 });
+      first.h.timers.advance(120_000);
+      assert.equal(status(first.h).counts.off_air_unpushed, 1);
+    } finally {
+      first.h.dispose();
+    }
+    const second = setup(delivery, {}, {}, { path });
+    let at: number;
+    try {
+      second.h.clock.value = pushedAt + 3_600_000 + 1_000;
+      const shim = second.h.attach("scribe", { sessionId: SESSION });
+      second.h.timers.advance(6_000);
+      assert.equal(pushes(shim).length, 1, "told after the restart");
+      assert.match(pushes(shim)[0]!.content, line);
+      at = second.h.clock.now();
+      // The process dies before the host confirms that note.
+      second.h.store.close();
+      rmSync(second.h.directory, { recursive: true, force: true });
+    } catch (error) {
+      second.h.dispose();
+      throw error;
+    }
+    const third = setup(delivery, {}, {}, { path });
+    try {
+      third.h.clock.value = at + 10_000;
+      const shim = third.h.attach("scribe", { sessionId: SESSION });
+      third.h.timers.advance(6_000);
+      assert.equal(pushes(shim).length, 1, "given back, and told again");
+      assert.match(pushes(shim)[0]!.content, line);
+      await confirm(shim);
+      third.h.timers.advance(3_600_000);
+      assert.equal(pushes(shim).length, 1, "once confirmed, done");
+    } finally {
+      third.h.dispose();
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("review 3: the budget's hold is named the moment a push spends the hour and leaves records waiting, not only once the next push falls due", async () => {
+  const { h, host } = setup({
+    mode: "immediate",
+    maxItems: 1,
+    maxPushesPerHour: 1,
+  });
+  try {
+    const shim = h.attach("scribe");
+    host.sing(1);
+    host.sing(2, { ttlMs: 7_200_000 });
+    h.timers.advance(6_000);
+    assert.equal(pushes(shim).length, 1);
+    assert.equal(status(h).held, "push_budget", "on the pass that spent it");
+    assert.equal(status(h).heldUntil, status(h).lastPushAt! + 3_600_000);
+    assert.match(
+      (await h.call(shim, "hear", {})).text,
+      /^canticle delivery: held \(push_budget\): the hour's 1 push is spent until \S+Z; 1 record waits\.$/mu,
+    );
+  } finally {
+    h.dispose();
+  }
+});
+
+test("review 4: past 256 tuned streams with drops, an entry whose records are all off air makes room; only with every entry open do the rest share one count", () => {
+  const time = clock();
+  const host = new Host(time, ["*:x"]);
+  host.start();
+  const key = (i: number) => i.toString(16).padStart(16, "0");
+  const fill = (from: number) => {
+    // 256 stations, 16 records each: the set exactly full, every share equal.
+    for (let i = from; i < from + 256; i++) {
+      for (let n = 1; n <= 16; n++) {
+        host.sing(n, {
+          station: `s${i}`,
+          key: key(i),
+          stream: "x",
+          ttlMs: 10_000,
+        });
+      }
+    }
+    // One more each: every share holds as many as the most, so each refuses its own.
+    for (let i = from; i < from + 256; i++) {
+      host.sing(17, {
+        station: `s${i}`,
+        key: key(i),
+        stream: "x",
+        ttlMs: 10_000,
+      });
+    }
+  };
+  fill(0);
+  let omitted = host.consumer.liveStatus(time.now()).omitted;
+  assert.equal(Object.keys(omitted).length, 256);
+  // A 257th stream loses records while every entry is open: the shared count.
+  for (let n = 1; n <= 20; n++) {
+    host.sing(n, {
+      station: "s999",
+      key: key(999),
+      stream: "x",
+      ttlMs: 10_000,
+    });
+  }
+  omitted = host.consumer.liveStatus(time.now()).omitted;
+  assert.ok(omitted.other!.total > 0, JSON.stringify(Object.keys(omitted)));
+  assert.equal(omitted["s999:x"], undefined);
+  // Once those records are all off air, new streams get entries of their own again.
+  time.value += 11_000;
+  fill(256);
+  omitted = host.consumer.liveStatus(time.now()).omitted;
+  for (let i = 256; i < 512; i++) assert.ok(omitted[`s${i}:x`], `s${i}:x`);
+  const tuned = Object.keys(omitted).filter((key) => key.includes(":"));
+  assert.ok(tuned.length <= 256, `${tuned.length} entries`);
+  const view = host.consumer.hearView(["*:x"], time.now(), true);
+  assert.equal(view.omitted!.filter((o) => o.count > 0).length, 256);
+});
+
+test("review 5: a push given back unconfirmed keeps each note as it was: one that rode with records rides with the next push, never on a push of its own", async () => {
+  const { h, host } = setup({ mode: "immediate" });
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    host.sing(1, { ttlMs: 20_000 });
+    host.sing(2, { ttlMs: 3_000 }); // off air before the debounce closes
+    h.timers.advance(6_000);
+    assert.equal(pushes(shim).length, 1);
+    assert.match(pushes(shim)[0]!.content, /\(expired_waiting; heard/u);
+    h.timers.advance(20_000); // record 1 goes off air too, still unconfirmed
+    shim.close();
+    const next = h.attach("scribe", { sessionId: SESSION });
+    h.timers.advance(60_000);
+    assert.equal(
+      pushes(next).length,
+      0,
+      "no push of its own for a note that rode",
+    );
+    host.sing(3);
+    h.timers.advance(6_000);
+    assert.equal(pushes(next).length, 1);
+    const push = pushes(next)[0]!.content;
+    assert.deepEqual(order(push), ["ops:ops.fleet/3"]);
+    assert.match(
+      push,
+      /^- ops:ops\.fleet: 1 went off air unpushed while waiting for a push \(expired_waiting; heard \S+Z to \S+Z\)\.$/mu,
+    );
+    assert.match(push, /^ops:ops\.fleet: 1 went off air unpushed\.$/mu);
   } finally {
     h.dispose();
   }

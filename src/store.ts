@@ -2703,6 +2703,33 @@ export class EventStore {
   }
 
   /**
+   * What became of canticle push `batchId` of this ear, for notes a restart reloads:
+   * `unconfirmed` (the host never confirmed it, and no revert has given it back yet),
+   * `reverted`, or undefined (confirmed, or no longer known).
+   */
+  public canticleOutcome(
+    ear: string,
+    batchId: number,
+  ): "unconfirmed" | "reverted" | undefined {
+    if (
+      this.database
+        .prepare(
+          "SELECT 1 AS hit FROM canticle_reverted WHERE ear = ? AND batch_id = ?",
+        )
+        .get(ear, batchId) !== undefined
+    ) {
+      return "reverted";
+    }
+    return this.database
+      .prepare(
+        "SELECT 1 AS hit FROM batches WHERE id = ? AND ear = ? AND kind = 'canticle' AND offered_at IS NULL",
+      )
+      .get(batchId, ear) !== undefined
+      ? "unconfirmed"
+      : undefined;
+  }
+
+  /**
    * Gives back every batch of the ear the host never confirmed, in one transaction. A
    * Discord batch's events are queued again. A canticle push's claim goes whole, as a
    * push no connection took gives it back (#161): its custody rows and tombstones go, the
