@@ -76,7 +76,8 @@
       }
     },
     "derivedPublication": false,
-    "roomPolicy": "observe"
+    "roomPolicy": "observe",
+    "exposure": { "enabled": false }
   },
   "github": {
     "enabled": false,
