@@ -22,29 +22,29 @@ amendments, which bind this design as acceptance criteria.
 
 ## Decisions at a glance
 
-| #     | Question                    | Decision                                                                                                                                                                                                                                                                                                                                                                                         |
-| ----- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| 1     | Who writes                  | The host daemon, after it has verified a frame and saved the state that frame implies. It appends each frame its receptor surfaces, and mirrors each retraction. Stations never write the canticle lane.                                                                                                                                                                                         |
-| 1     | What a reader may assume    | Only that something with write access appended these bytes. The reader re-verifies each station signature against its own manifest and checks expiry on its own clock. It trusts order, completeness and retractions only when the writer's signature on the envelope verifies, under a writer key the owner-signed manifest names.                                                              |
-| 1     | Which ring                  | A ringserver instance of the canticle lane's own, one per retention class. It listens on IPv4, accepts only loopback peers, and grants no address write or trusted access. Write is granted by `AUTH` to the daemon alone and revoked only by disconnecting. No host firewall.                                                                                                                   |
-| 1     | Stream axes                 | Every lane declares #116's three axes. The canticle lane is shape per stream, time `replay`, loss `tolerated`: the station → daemon hop is lossy, and the ring detects loss only from the writer on. Recovered streams need a spool binding, not this lane.                                                                                                                                      |
-| 2     | Packet                      | One ring packet per surfaced frame per writer run, plus one per retraction and a few control packets. Each packet is a 48-byte envelope, a body (for a frame, the station's canonical frame byte for byte) and a 64-byte Ed25519 writer signature, under `BC_<key_id>_<stream_id>/CANTICLE`.                                                                                                     |
-| 2     | Identity                    | A record is identified by its frame tuple, as today. A position in the ring is identified by the signed pair (writer run, writer seq). Completeness is judged per station key, by a signed per-key subsequence. ringserver's packet id only locates a packet; the same id can later name a different packet.                                                                                     |
-| 3     | Cursor                      | Kept in frond-ear's SQLite store, in the same transaction as the listener's safety state. The live frames and the hidden items' watermarks are kept there too, so a restart needs nothing from the ring. On resume the reader reads the cursor's packet back and checks that it is the one recorded.                                                                                             |
-| 3     | Gaps                        | A hole in one key's subsequence is loss for that key alone, and it is reported. The reader first re-reads what the ring still holds to fill it. Whatever stays missing hides that key's items heard before it, until a sound witness confirms each or it expires. Other keys keep flowing.                                                                                                       |
-| 3     | Loss counts                 | Graded: exact, at least, at most, or unknown. A run whose tail went missing with no `bye` read (a ringserver crash and a writer restart, say) is reported as an unknown tail, bounded where a witness allows, never as an exact count.                                                                                                                                                           |
-| 3     | Runs                        | Monotonic: a lower run is refused, unless its `hello` or a `tick` names the daemon run that the live host socket reports, which binds it to the current daemon incarnation. A ring that can deliver nothing new, for want of a bound run or with two writers bound, is health `degraded` (`ring_blind`) with an exit path.                                                                       |
-| 3     | Receiver caps               | `tune` maps to DataLink `MATCH`, so untuned packets never reach the reader. Per-key queue and byte caps and a fair verification budget bound the reader's memory and work before anything reaches admission, long before delivery's token budget. A key over its caps has packets skipped, counted and refilled later from the ring, which affects that key alone. The flood test is acceptance. |
-| 3     | Backpressure                | The reader never waits for the session. The cursor advances as packets are processed. Keeping pace with the session stays delivery's job: digests, and drops that are counted.                                                                                                                                                                                                                   |
-| 4     | Expiry                      | Checked at read time on the reader's clock. The clock offset may only move expiry earlier. A retained packet that has expired is never pushed, live or late; it is counted.                                                                                                                                                                                                                      |
-| 4     | Landing                     | Ring items are shown and pushed only while the host socket's state is deliverable (connected, holding the writer's daemon run's `landing_state`, no MUTE), and only once the socket has caught up to the record each ring packet mirrors. The ring never runs ahead of the socket.                                                                                                               |
-| 4     | Custody                     | Unchanged: the same identities, tombstones, offered and echoed rows, and compaction-boundary stamps. Rows gain an origin and a ring position.                                                                                                                                                                                                                                                    |
-| 5     | Volume                      | The ring buys reliability and replay, not throughput. The carousel's budgets cap what comes in and the session caps what goes out. Anything bigger than one frame, or continuous, goes by reference. Ring sizes here are experiment candidates, not an install decision.                                                                                                                         |
-| 6     | ringserver down             | Report it. Never fall back to the socket for content automatically.                                                                                                                                                                                                                                                                                                                              |
-| 6     | Wrap, reset, crash          | Ring acceptance isn't durable: ringserver saves its header and stream index only at clean shutdown. Version 1 runs `MemoryMapRing 0`, which comes back as the last clean shutdown left it; a memory-mapped ring comes back with packet ids out of order. The reader validates the envelope at the cursor and assumes no id order.                                                                |
-| 6     | Station with a skewed clock | Fail closed: items may expire early, never late.                                                                                                                                                                                                                                                                                                                                                 |
-| 7     | Migration                   | `canticle.ring.mode`: `off` (the default), then `shadow` (compare only, in a bounded time window), then `primary` (content comes from the ring; control still comes from the host socket). It needs the daemon's manifest, which also names the writer key.                                                                                                                                      |
-| Scope | Where it runs               | Version 1 is same-host: the ringserver runs on the daemon's host, and the reader runs beside the record v1 socket. Readers on other hosts are an open question.                                                                                                                                                                                                                                  |
+| #     | Question                    | Decision                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| ----- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1     | Who writes                  | The host daemon, after it has verified a frame and saved the state that frame implies. It appends each frame its receptor surfaces, and mirrors each retraction. Stations never write the canticle lane.                                                                                                                                                                                                                  |
+| 1     | What a reader may assume    | Only that something with write access appended these bytes. The reader re-verifies each station signature against its own manifest and checks expiry on its own clock. It trusts order, completeness and retractions only when the writer's signature on the envelope verifies, under a writer key the owner-signed manifest names.                                                                                       |
+| 1     | Which ring                  | A ringserver instance of the canticle lane's own, one per retention class. It listens on IPv4, accepts only loopback peers, and grants no address write or trusted access. Write is granted by `AUTH` to the daemon alone and revoked only by disconnecting. No host firewall.                                                                                                                                            |
+| 1     | Stream axes                 | Every lane declares #116's three axes. The canticle lane is shape per stream, time `replay`, loss `tolerated`: the station → daemon hop is lossy, and the ring detects loss only from the writer on. Recovered streams need a spool binding, not this lane.                                                                                                                                                               |
+| 2     | Packet                      | One ring packet per surfaced frame per writer run, plus one per retraction and a few control packets. Each packet is a 48-byte envelope, a body (for a frame, the station's canonical frame byte for byte) and a 64-byte Ed25519 writer signature, under `BC_<key_id>_<stream_id>/CANTICLE`.                                                                                                                              |
+| 2     | Identity                    | A record is identified by its frame tuple, as today. A position in the ring is identified by the signed pair (writer run, writer seq). Completeness is judged per ring stream (station key and stream), by a signed per-stream subsequence. ringserver's packet id only locates a packet; the same id can later name a different packet.                                                                                  |
+| 3     | Cursor                      | Kept in frond-ear's SQLite store, in the same transaction as the listener's safety state. The live frames and the hidden items' watermarks are kept there too, so a restart needs nothing from the ring. On resume the reader reads the cursor's packet back and checks that it is the one recorded.                                                                                                                      |
+| 3     | Gaps                        | A hole in one stream's subsequence is loss for that stream alone, and it is reported. The reader first refills it, on a second connection, from what the ring still holds. Whatever stays missing hides that stream's items heard before it, until a sound witness confirms each or it expires. Other streams keep flowing.                                                                                               |
+| 3     | Loss counts                 | Graded (exact, at least, at most or unknown) and scoped (one stream, or all streams). A run whose tail went missing with no `bye` read (a ringserver crash and a writer restart, say) is reported as an unknown tail, bounded where a witness allows, never as an exact count.                                                                                                                                            |
+| 3     | Runs                        | The current run is the one bound to the live daemon run: its `hello` or `tick` names the daemon run the live host socket reports. An unbound run never ends a bound one, a lower run becomes current only by that binding, and ended runs stay ended. A ring that can deliver nothing new is health `degraded` (`ring_blind`) with an exit path.                                                                          |
+| 3     | Receiver caps               | `tune` maps to DataLink `MATCH`, so untuned packets never reach the reader. Per-key queue and byte caps and a fair verification budget bound the reader's memory and work before anything reaches admission, long before delivery's token budget. A key over its queue has packets skipped and refilled from the ring; its streams are hidden meanwhile, and no other key's. The flood test is acceptance.                |
+| 3     | Backpressure                | The reader never waits for the session. The cursor advances as packets are processed. Keeping pace with the session stays delivery's job: digests, and drops that are counted.                                                                                                                                                                                                                                            |
+| 4     | Expiry                      | Checked at read time on the reader's clock. The clock offset may only move expiry earlier. A retained packet that has expired is never pushed, live or late; it is counted.                                                                                                                                                                                                                                               |
+| 4     | Landing                     | Ring items are shown and pushed only while the host socket's state is deliverable (connected, holding the writer's daemon run's `landing_state`, no MUTE), and only once the socket has caught up to the record each ring packet mirrors. The ring never runs ahead of the socket.                                                                                                                                        |
+| 4     | Custody                     | Unchanged: the same identities, tombstones, offered and echoed rows, and compaction-boundary stamps. Rows gain an origin and a ring position.                                                                                                                                                                                                                                                                             |
+| 5     | Volume                      | The ring buys reliability and replay, not throughput. The carousel's budgets cap what comes in and the session caps what goes out. Anything bigger than one frame, or continuous, goes by reference. Ring sizes here are experiment candidates, not an install decision.                                                                                                                                                  |
+| 6     | ringserver down             | Report it. Never fall back to the socket for content automatically.                                                                                                                                                                                                                                                                                                                                                       |
+| 6     | Wrap, reset, crash          | Ring acceptance isn't durable: ringserver saves its header and stream index only at clean shutdown. Version 1 runs `MemoryMapRing 0`, which came back as the last clean shutdown left it after every `kill -9` tried; a kill during its own shutdown write is unproven. A memory-mapped ring comes back with packet ids reused and out of order. The reader validates the envelope at the cursor and assumes no id order. |
+| 6     | Station with a skewed clock | Fail closed: items may expire early, never late.                                                                                                                                                                                                                                                                                                                                                                          |
+| 7     | Migration                   | `canticle.ring.mode`: `off` (the default), then `shadow` (compare only, in a bounded time window), then `primary` (content comes from the ring; control still comes from the host socket). It needs the daemon's manifest, which also names the writer key.                                                                                                                                                               |
+| Scope | Where it runs               | Version 1 is same-host: the ringserver runs on the daemon's host, and the reader runs beside the record v1 socket. Readers on other hosts are an open question.                                                                                                                                                                                                                                                           |
 
 ## 1. What the ring changes
 
@@ -65,9 +65,9 @@ A ring adds:
 
 - **Pull at the reader's pace.** Nothing is dropped on the producer's side for a slow reader until the ring wraps,
   and retention is bounded by bytes, not by TTL.
-- **Resume by cursor** across a restart of either side. Loss after the daemon's writer is detected and reported:
-  exactly within a run, and as a bound or an explicit unknown across crashes (§4.4). Loss before the writer, on the
-  station's UDP hop, stays invisible to the ring (§1.1).
+- **Resume by cursor** across a restart of either side. Loss after the daemon's writer is detected and reported,
+  each count graded: exact for one stream where it can be, and otherwise a bound or an explicit unknown (§4.4). Loss
+  before the writer, on the station's UDP hop, stays invisible to the ring (§1.1).
 - **Many readers on one append.** frond-ear, an OpenClaw binding, bc#130's tool and dashboards each keep their own
   cursor, with no per-peer queue in the daemon.
 - **It is the RFC's chosen tier.** Binding (d) (RFC:1178), decision D10 ("Clean-path snapshots, replay, dashboards"
@@ -143,23 +143,23 @@ axes the manifest declares for it (Q-B9).
 | --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | W1  | **What to append.** Append an ITEM when the receptor first emits a deliverable `frame` record for it (`verified` and `surface`, RFC:2213); for an item held in warm-up, that is its release (RFC:2215). Also append a `resurfaced` re-hearing after a daemon restart (flag bit 0), each PLUCK the receptor admits, the second byte string of an equivocation once, and **a `retract` packet for every record v1 `retract`** except reason `expired` (RFC:2182). Retractions cover what never surfaces but still changes state: a plucked item that moves a supersession mark (RFC:579), a held item retracted before release (RFC:2216), a quarantine (RFC:2232). Append nothing else: no control-class items (class 8), no refusals, no benign repeats, nothing `ringbuffer_only`, no BEACONs (§4.1). |
 | W2  | **After the save.** Append only after the daemon's write-ahead save for that datagram (`bc:prototype/canticle-station/canticle/daemon.py:32-33`), and after the record v1 record the packet mirrors has been emitted, so no ring packet ever precedes the guard or the record it implies.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| W3  | **Never block, and bound the queue.** Keep a first-in, first-out writer queue capped by count, bytes and age: 4 096 packets, 4 MiB and 5 s [PROPOSED]. Assign `seq` and `key_seq` when a packet is queued, and never reuse them. A packet dropped at the writer, because the queue is full or because it waited too long, leaves a hole, as record v1's `rec_seq` does (RFC:2161), and `tick` counts it by reason. A dropped packet is never counted as accepted.                                                                                                                                                                                                                                                                                                                                      |
-| W4  | **Retry in order, with the same bytes.** Every `WRITE` error disconnects (`rs:src/dlclient.c:120-124`). After a disconnect, resend in order from the first unacked packet, with the same run, seq, `key_seq` and bytes, so the reader can recognise the retries as duplicates (ringserver doesn't deduplicate). A deterministic error, such as an oversize write (E1), is a dropped packet; don't retry it. An `OK` proves ring acceptance only: a ringserver crash can take back packets it acknowledged (E3, E4).                                                                                                                                                                                                                                                                                    |
-| W5  | **Runs only grow, and leave a bound.** `run` is persisted and strictly increasing: `max(previous + 1, unix ms at start)`, written durably before the first packet. This is RFC §5.2's epoch rule (RFC:312). The writer also persists a sequence reservation: before it assigns a `seq` past the reserved bound, it durably raises the bound by a block of 4 096 [PROPOSED], one `fsync` per block. `hello` names the previous run and that run's last reserved bound (`prev_run`, `prev_reserved_through`), an upper bound on how many packets the previous run wrote.                                                                                                                                                                                                                                 |
-| W6  | **Control packets.** Write `hello` at run start (seq 1), `bye` on clean stop (its seq is the run's last), and `tick` every 10 s. `hello` and every `tick` carry the daemon's record v1 `run` (random hex per daemon start, RFC:2176), the manifest SHA-256 its own `hello` reports (RFC:2180) and the tick interval. `tick` also carries the counts accepted and dropped (by reason), the queue depth, and **per-key heads**: the latest `key_seq` of up to 48 keys, in rotation, so that every key active in the run comes round.                                                                                                                                                                                                                                                                     |
+| W3  | **Never block, and bound the queue.** Keep a first-in, first-out writer queue capped by count, bytes and age: 4 096 packets, 4 MiB and 5 s [PROPOSED]. Assign `seq` and `stream_seq` when a packet is queued, and never reuse them. A packet dropped at the writer, because the queue is full or because it waited too long, leaves a hole, as record v1's `rec_seq` does (RFC:2161), and `tick` counts it by reason. A dropped packet is never counted as accepted.                                                                                                                                                                                                                                                                                                                                   |
+| W4  | **Retry in order, with the same bytes.** Every `WRITE` error disconnects (`rs:src/dlclient.c:120-124`). After a disconnect, resend in order from the first unacked packet, with the same run, seq, `stream_seq` and bytes, so the reader can recognise the retries as duplicates (ringserver doesn't deduplicate). A deterministic error, such as an oversize write (E1), is a dropped packet; don't retry it. An `OK` proves ring acceptance only: a ringserver crash can take back packets it acknowledged (E3, E4).                                                                                                                                                                                                                                                                                 |
+| W5  | **Runs only grow, and leave a bound.** `run` is persisted and strictly increasing: `max(previous + 1, unix ms at start)`, written durably before the first packet. This is RFC §5.2's epoch rule (RFC:312). The writer also persists a sequence reservation: before it assigns a `seq` past the reserved bound, it durably raises the bound by a block of 4 096 [PROPOSED], one `fsync` per block. `hello` names the previous run and that run's last reserved bound (`prev_run`, `prev_reserved_through`), an upper bound on the previous run's packets. A writer that lost its saved state sends both as null, and the previous run's tail is then unknown.                                                                                                                                          |
+| W6  | **Control packets.** Write `hello` at run start (seq 1), `bye` on clean stop (its seq is the run's last), and `tick` every 10 s. `hello` and every `tick` carry the daemon's record v1 `run` (random hex per daemon start, RFC:2176), the manifest SHA-256 its own `hello` reports (RFC:2180) and the tick interval. `tick` also carries the counts accepted and dropped (by reason), the queue depth, and **per-stream heads**: the latest `stream_seq` of up to 48 streams, rotating through the streams with a packet within the longest class TTL. A quiet stream's lost tail then shows within ⌈active streams / 48⌉ tick intervals: 10 s for up to 48 active streams.                                                                                                                            |
 | W7  | **Sign.** Sign each packet with a dedicated Ed25519 writer key. Never use a station key: a canticle key "MUST NOT be used to sign anything outside this protocol" (RFC:784). The owner-signed manifest names the writer's public keys by epoch, and envelope byte 7 says which one signed the packet (Q-B5).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | W8  | **Header times.** Set the DataLink header's datastart to `issued_at` and dataend to the effective expiry, in µs. This serves dashboards and `POSITION AFTER`. Readers never trust these times.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| W9  | **Per-key subsequence.** Number each packet a second time, per station key within the run: `key_seq`, from 1. A packet's key is the key whose items it can change: a frame's own key, a retract's target key. Control packets have a sequence of their own, under key zero. A reader that takes some keys only (§4.6) can then judge each key's completeness on its own.                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| W9  | **Per-stream subsequence.** Number each packet a second time, per ring stream id (station key and stream) within the run: `stream_seq`, from 1. A packet's stream is that of the item it can change: a frame's own, a retract's target's. Every effect on an item stays within its stream: a PLUCK names its target's stream (RFC:839), supersession is per (key, stream, state key) (RFC:398, RFC:570), and an effect that spans a key's streams, such as a quarantine, reaches each item as a retract under the item's own stream (RFC:2182). Control packets have a sequence of their own under the all-zero id. A reader that tunes some streams only (§4.6) can then judge each stream's completeness on its own.                                                                                 |
 
 **What a reader may assume about a ring packet.** Only what it checks itself:
 
-| Property                                        | What the reader trusts on the ring path                                                              | Why it is checked again                                                                                                                                                                                  |
-| ----------------------------------------------- | ---------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Content and author                              | The station's signature, resolved through the reader's own manifest (`src/canticle/wire.ts:445-560`) | ringserver accepts any bytes from any client allowed to write. A revocation applies to retained packets once frond-ear has loaded the manifest that makes it (§7).                                       |
-| Freshness                                       | The signed `expires_at`, read on the reader's clock (§5.1)                                           | The ring evicts by size, not by TTL (RFC:2752), so retained packets outlive their items.                                                                                                                 |
-| Identity                                        | The frame's own tuple, never the ring stream id or the packet id                                     | Stream ids are text the writer chooses. Packet ids are handed out again after a crash (Appendix A, E3 and E4).                                                                                           |
-| Order and completeness                          | The (run, seq) and `key_seq` under the writer's signature                                            | A lapped reader is skipped forward without notice (E2), crash recovery reuses ids and can serve them out of order (E3, E4), and any client allowed to write can plant ids (`rs:src/dlclient.c:916-933`). |
-| Admission (dedup, plucks, supersession, quotas) | The reader's own listener, plus the writer's signed retractions                                      | The daemon's decisions are not carried in the ring; only its frames and its retractions are.                                                                                                             |
+| Property                                        | What the reader trusts on the ring path                                                              | Why it is checked again                                                                                                                                                                                           |
+| ----------------------------------------------- | ---------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Content and author                              | The station's signature, resolved through the reader's own manifest (`src/canticle/wire.ts:445-560`) | ringserver accepts any bytes from any client allowed to write. A revocation applies to retained packets once frond-ear has loaded the manifest that makes it (§7).                                                |
+| Freshness                                       | The signed `expires_at`, read on the reader's clock (§5.1)                                           | The ring evicts by size, not by TTL (RFC:2752), so retained packets outlive their items.                                                                                                                          |
+| Identity                                        | The frame's own tuple, never the ring stream id or the packet id                                     | Stream ids are text the writer chooses. Packet ids are handed out again after a crash (Appendix A, E3 and E4).                                                                                                    |
+| Order and completeness                          | The (run, seq) and `stream_seq` under the writer's signature                                         | A lapped reader is skipped forward without notice (E2), crash recovery reuses ids in place and can serve them out of order (E3, E4), and any client allowed to write can plant ids (`rs:src/dlclient.c:916-933`). |
+| Admission (dedup, plucks, supersession, quotas) | The reader's own listener, plus the writer's signed retractions                                      | The daemon's decisions are not carried in the ring; only its frames and its retractions are.                                                                                                                      |
 
 **Why verify again when the writer already did.** It costs one Ed25519 verification per new frame, not per loop
 copy, at a few frames a second at most (§6). In return, the ringserver process, its ACLs, its other writers and the
@@ -225,8 +225,8 @@ ring file all drop out of what must be trusted for content.
 
 The stream id is `BC_<key_id, 16 hex>_<stream_id, 8 hex>/CANTICLE`: 37 bytes, under ringserver's limit of 63
 (`rs:src/ring.h:58`; a longer id gets `ERROR` and a disconnect, `rs:src/dlclient.c:876-884`). A retract packet goes
-under its target item's stream id, so `MATCH` selects it with its item (§4.6). Writer control packets use the
-all-zero id `BC_0000000000000000_00000000/CANTICLE`.
+under its target item's stream id, so `MATCH` selects it with its item, and its `stream_seq` counts in that stream
+(§4.6, W9). Writer control packets use the all-zero id `BC_0000000000000000_00000000/CANTICLE`.
 
 This departs from RFC §18.3 lane (c), which names the stream `<NET>_<STA>_<stream>/CANTICLE` (RFC:2744). A stream name
 alone can be 64 bytes (RFC:327), so that form can exceed the limit, and it needs §18.5's NET/STA table
@@ -246,14 +246,14 @@ alone can be 64 bytes (RFC:327), so that form can exceed the limit, and it needs
 | 24     | 8    | `heard_at`: ms since the epoch; the daemon's receive time for a frame, its send time otherwise                                                                                                                                                               |
 | 32     | 8    | `rec_seq`: the daemon's record v1 `rec_seq` of the `frame` or `retract` record this packet mirrors; for a control packet, the last `rec_seq` emitted when it was written                                                                                     |
 | 40     | 4    | `offset_ms`: signed; the daemon's δ̂ (its clock minus the station's) for this frame's key when it heard this frame; zero otherwise                                                                                                                            |
-| 44     | 4    | `key_seq`: within the run and the packet's key (W9), starts at 1. Control packets count under key zero                                                                                                                                                       |
+| 44     | 4    | `stream_seq`: within the run and the packet's ring stream id (W9), starts at 1. Control packets count under the all-zero id                                                                                                                                  |
 | 48     | n    | body. For a frame, the canonical frame byte for byte (at most 1 100 B, RFC:750). For a retract, a deterministic CBOR map `{idem, reason, by}` as record v1 carries them (RFC:2182). For a control packet, a deterministic CBOR map with W5's and W6's fields |
 | 48 + n | 64   | Ed25519 signature by the writer key over `"binary-canticle/ring/v1" ‖ 0x00 ‖ bytes 0 to 48 + n`                                                                                                                                                              |
 
 The largest packet is 1 212 B. Use `MaxPacketSize 1280`. Every slot then costs 1 400 B: `MaxPacketSize` plus the
 120-byte `RingPacket` header (`rs:src/ring.h:87-98`, `rs:src/ringserver.c:106`). The server logs it as
-`pktsize: 1400 (1280 payload)` (Appendix A). A `tick`'s 48 per-key heads (W6) are sized to fit a control body within
-that limit.
+`pktsize: 1400 (1280 payload)` (Appendix A). A `tick`'s 48 per-stream heads (W6) are sized to fit a control body
+within that limit.
 
 ### 3.3 Ordering and identity across reconnects
 
@@ -261,9 +261,9 @@ that limit.
   (`rs:src/ring.c:709-742`), except after a crash of a memory-mapped ring (E4). With one writer, packet id order is
   seq order. Across stations the order is the daemon's, and with the retract packets, plucks, supersessions and
   retractions apply on the ring path as the daemon applied them.
-- **Completeness.** frond-ear streams only the keys it tunes (§4.6), so `seq` has holes for it by design. It judges
-  completeness per key by `key_seq`, and for control packets by their own sequence. `seq` stays the run's total, for
-  the writer's tail bound (W5) and for readers that take every packet.
+- **Completeness.** frond-ear streams only the stream ids it tunes (§4.6), so `seq` has holes for it by design. It
+  judges completeness per stream by `stream_seq`, and for control packets by their own sequence. `seq` stays the
+  run's total, for the writer's tail bound (W5) and for readers that take every packet.
 - **Order against the socket.** Each packet's `rec_seq` places it in the daemon's record v1 stream. §5.2 uses this to
   keep the ring from running ahead of the socket.
 - **Record identity.** The tuple (key_id, epoch, stream_id, seq) is record v1's `idem` (RFC:2196) and delivery's
@@ -272,7 +272,7 @@ that limit.
 - **Byte identity.** The SHA-256 of the frame is record v1's `frame.sha256` (RFC:2195). Shadow mode and the witness
   compare the paths with it (§4.4, §8).
 - **Position.** A position is (run, seq). A packet id locates it within one ring generation and nothing more. Packet
-  ids are handed out again after a `kill -9`, can come back out of order after a crash of a memory-mapped ring,
+  ids are handed out again after a `kill -9`, in place and out of order after a crash of a memory-mapped ring,
   restart at 1 after a reset or with a volatile ring, and keep their number with a new pkttime after a resize
   (Appendix A, E3 and E4). ringserver has no generation marker to tell these apart: its saved header holds only
   format, sizes and offsets (`rs:src/ring.h:70-81`).
@@ -290,12 +290,13 @@ A third `CanticleSource` (`src/canticle/source.ts:19-24`), `RingSource`, combine
 - **The existing `RecordClient` on the host socket.** It supplies `landing_state` (and with it the breaker that
   delivery holds on, `delivery.ts:676-677`), presence and health, and the live daemon run that ring runs are bound to
   (§4.3). It is also the witness that confirms hidden items (§4.4). In `shadow` mode it is the comparison too.
-- **A `RingReader`.** It keeps one DataLink TCP connection (`node:net`, no dependencies) and selects the tuned keys
-  with `MATCH`. It applies the receiver caps before any cryptography (§4.6), checks each packet's writer signature,
-  and feeds each frame into the existing `Listener` (`src/canticle/listener.ts`), with `warmup: false`
-  (`listener.ts:337`) and no beacons. Reusing the listener brings the verification, dedup, plucks, supersession,
-  quotas and journaled guards that the embedded path already proves (`src/canticle/receptor.ts:335-376`). The ring
-  path then adds transport, a cursor and the retract packets, not a second admission implementation.
+- **A `RingReader`.** It keeps a main DataLink TCP connection (`node:net`, no dependencies) that selects the tuned
+  streams with `MATCH`, and a second for refills (§4.3, rule 6). It applies the receiver caps before admission
+  (§4.6), checks each packet's writer signature, and feeds each frame into the existing `Listener`
+  (`src/canticle/listener.ts`), with `warmup: false` (`listener.ts:337`) and no beacons. Reusing the listener brings
+  the verification, dedup, plucks, supersession, quotas and journaled guards that the embedded path already proves
+  (`src/canticle/receptor.ts:335-376`). The ring path then adds transport, a cursor and the retract packets, not a
+  second admission implementation.
 
 **Feeding at hearing time.** Each frame is fed at `h = min(envelope heard_at, now)`, with that frame's clamped
 offset (§5.1) in place of the listener's beacon samples (which it reduces to their minimum, `listener.ts:140-141`).
@@ -307,8 +308,10 @@ This matters when one key's items have different TTLs: after a restart, a supers
 block its predecessor that hasn't. The listener has so far seen only forward-moving time, so the code must run
 `tick(now)` after each `hear(…, h)` and test that purges still hold (§9, case 2).
 
-**Retract packets** remove their item from the live set and from hidden items, by identity. They are failsafe: they
-only remove, never admit or show.
+**Retract packets** remove their item from the live set and from hidden items, by identity, and journal that
+identity as a **retract guard** until the item's local expiry. A later read of the item's frame (a refill, a merged
+range, a rewind) then can't bring it back, which matters for the effects the listener can't reproduce on its own,
+such as a quarantine or a revocation. Retract packets are failsafe: they only remove, never admit or show.
 
 **Warm-up off, no beacons.**
 
@@ -322,24 +325,25 @@ only remove, never admit or show.
   `#warm` needs a beacon (`listener.ts:1123-1130`).
 - **No beacons in the ring** (🍃's pick on Q-B6). Beacons loop at the station's cadence and each is a new identity,
   so at cue rates they would fill most of the ring. What they carry is live-only: presence comes from the host
-  socket, and δ̂ travels in the envelope. The sequence heads a beacon would give come from `tick`'s per-key heads
+  socket, and δ̂ travels in the envelope. The sequence heads a beacon would give come from `tick`'s per-stream heads
   instead (W6).
 
 ### 4.2 Persistence
 
 - **The cursor and safety state.** These live in frond-ear's SQLite store, as one `runtime_state` value named
   `canticle.ring`. It holds:
-  - the listener's `SafetyState`;
+  - the listener's `SafetyState`, and the retract guards (§4.1);
   - the cursor `{pktid, pkttime, run, seq, digest}`: the packet below which every packet has been processed, or
-    dropped and counted (§4.6);
-  - for each run tracked (§4.3): the daemon run it names, its `hello`'s packet id, the last `seq` and control
-    sequence read, and how it ended (its `bye` read, retired, or tail unknown);
-  - for each key in the current run: its last `key_seq`, its missing ranges, and the packet ids skipped over its
-    caps and not yet refilled (§4.6);
-  - for each hidden group (one key and one hole, or one ended run): the hole, the reason and its watermark `W`
+    skipped and recorded for refill (§4.6);
+  - the tune set at the last start, and the `ring_joined_late` and `stream_joined_late` flags (§4.3, rule 7);
+  - for each run with open holes or hidden items: the daemon run it names, its `hello`'s packet id, the last `seq`
+    and control sequence read, and how it ended (its `bye` read, superseded, retired, or tail unknown);
+  - the last 64 ended runs (§4.3, rule 5);
+  - for each tracked stream in the current run: its last `stream_seq`, its missing ranges, and the packet ids skipped
+    over its key's queue and not yet refilled (§4.6);
+  - for each hidden group (one stream and one hole, or one ended run): the hole, the reason and its watermark `W`
     (§4.4), so confirmation carries on after a restart;
-  - the socket witness: for each daemon run, the `rec_seq`s of records W1 mirrors that the socket has shown and the
-    ring hasn't yet delivered, at most 1 024 (§4.4);
+  - the socket witness and its eviction counter (§4.4);
   - the latest daemon run and `rec_seq` the writer named;
   - the counters.
 - **The live frames.** These live in a table of their own: one row per live or hidden item, holding the whole signed
@@ -352,8 +356,8 @@ only remove, never admit or show.
   one transaction (`src/store.ts:1058-1065`).
 - **Invariant: the checkpointed cursor never runs ahead of the state it implies.** After a crash the reader re-reads
   from that cursor. Packets whose guards are already in the journal are applied again harmlessly: guards only grow
-  (epoch maxima, marks, plucks), live rows are keyed by identity, and pushed items deduplicate at delivery through
-  identity tombstones (`docs/runbook.md:757-775`).
+  (epoch maxima, marks, plucks, retract guards), live rows are keyed by identity, and pushed items deduplicate at
+  delivery through identity tombstones (`docs/runbook.md:757-775`).
 - **If the store fails,** the reader keeps reading so its connection holds, but surfaces nothing and moves no
   checkpoint (the receptor's `state_not_durable` rule, `src/canticle/receptor.ts:439-441`). The first checkpoint after
   recovery rewrites every in-memory live row in the same transaction, so no row the outage failed to write is lost
@@ -384,35 +388,42 @@ only remove, never admit or show.
    an evicted cursor packet whose successors survive loses nothing.
    - Report `ring_overrun` if the cursor is below `EarliestPacketID`. Report `ring_reset` if it is above
      `LatestPacketID`, if another packet now holds it, or whenever `EarliestPacketID` exceeds `LatestPacketID`, as a
-     crashed memory-mapped ring shows (E4).
+     crashed memory-mapped ring that was full shows (E4). These labels are hints, not a diagnosis: a crashed ring that
+     wasn't full can come back above the cursor too, and the re-read is the same either way.
    - Then `READ <EarliestPacketID>` and process the packet it returns. If that `READ` misses (the earliest packet can
      be evicted in between), query `INFO STATUS` again and retry.
    - Then `STREAM`, and read everything the ring holds. Loss is counted, and items hidden, only from the holes and run
      boundaries this re-read shows.
-   - **After a crash, packet ids say nothing about order.** A memory-mapped ring can still serve packets the crash
-     lost, then hand their ids to new packets. A `STREAM` from its earliest packet can wait for the next write and
-     then deliver ids out of order (E4). The reader validates by (run, seq, digest) and orders by (run, seq) and
-     `key_seq`, never by packet id.
+   - **After a crash, packet ids say nothing about order.** A memory-mapped ring that was full still serves packets
+     the crash lost, then hands their ids to new packets in the same slots. A connection that has just read such a
+     packet then misses the new one written into that slot, and a fresh `STREAM` can deliver ids out of order (E4).
+     The signed sequences show the miss as a hole, which the refill fills. The reader validates by (run, seq,
+     digest), orders by (run, seq) and `stream_seq`, and never by packet id.
 5. **Runs.** These rules answer 🌫's replay cut and 🍃's H2.
-   - **A run is bound to a daemon incarnation.** Its `hello` and `tick`s name the daemon's record v1 `run`, which is
-     random hex chosen at each daemon start (RFC:2176). The host socket's latest `hello` gives the live one.
-   - **Monotonic by default.** The highest run seen is the current one. A higher run ends every lower run: a writer
-     restart, which must start with its `hello`, control packet 1. Each key first seen in it past `key_seq` 1 lost
-     exactly that many of its packets, a `ring_gap` for that key. If the `hello` itself was lost, whether whole runs
-     went by in between is unknown, and is reported so. Packets of a lower run are skipped and counted as
-     `stale_run`: already-processed history, the leftovers of a rollback, or a replay.
-   - **The only exception is a recovery binding.** A lower run becomes current only when its `hello` or a `tick`
-     names the daemon run the live host socket reports, and the current run's latest names another. That is a writer
-     that lost its saved run with its clock behind, reported as `run_regressed`.
-     - **Nothing depends on freshness.** A replayed `hello` or `tick` names an earlier incarnation and is refused
-       however recent it is: two writer starts 10 s apart give the first `hello` no window after the second. A
-       genuine regressed run is accepted however late it is read.
-     - **Nothing binds while the host socket is down.** The reader remembers the lower run's `hello` packet id.
-       Once the socket reports its daemon run, it rewinds there and decides.
-   - **Two writers.** A lower run's packets still arriving after a higher run began, or two runs that name the same
-     live daemon run, raise `two_writers`, an alert in `ear_status`. If exactly one of them is bound to the live
-     daemon run, it is current and the other is skipped as `foreign_run`. If both are, neither run's new items are
-     shown (next point).
+   - **A run is bound to a daemon incarnation.** Its `hello` and `tick`s name the daemon's record v1 `run`, random hex
+     chosen at each daemon start (RFC:2176). The host socket's latest `hello` gives the live one. A run is _bound_
+     while it names the live daemon run.
+   - **Which run is current.** Reading in ring order:
+     - A run whose `hello` names the current run as its previous one ends it and becomes current. That covers every
+       ordinary restart, including a writer restarting within one daemon incarnation.
+     - Otherwise a higher run ends the current run only if the current run isn't bound. So history, where no run is
+       bound, is read in run order, and an unbound higher run never ends a bound one.
+     - A lower run becomes current only by a **recovery binding**: it is bound and the current run isn't. That is a
+       writer that lost its saved run with its clock behind, reported as `run_regressed`. Nothing depends on
+       freshness: a replayed `hello` or `tick` names an earlier incarnation and is refused however recent it is, and
+       a genuine regressed run is accepted however late it is read.
+     - While the host socket is down nothing is bound, so the run order applies, and nothing is deliverable meanwhile
+       (§5.2). The reader keeps each run's `hello` packet id, so when the socket returns and binds a run it passed
+       over, it rewinds the main stream there, the one case in which it does.
+   - **Ended runs stay ended.** A run that was current and has ended (its `bye` read, superseded, or bound away)
+     stays ended, and its packets are `stale_run` whatever their number: history re-read after a rewind, a reset or a
+     restart, rollback leftovers, or a replay. The last 64 ended runs are persisted; an older run that isn't bound is
+     history too.
+   - **Two writers.** A run that is neither current nor ended, and keeps writing new packets with `tick`s heard
+     within the last three intervals, is a second writer: `two_writers`, health `degraded`, and its packets are
+     skipped as `foreign_run`. A replay of history carries old `tick`s, stays `stale_run` and raises nothing. If the
+     second run is bound too, two runs name the live daemon run and neither names the other as its previous one, and
+     nothing new from either is shown (next point).
    - **Blind states have health and an exit.** The reader can be connected and reading, yet able to show nothing
      new:
      - `run_unbound`: the current run hasn't named the live daemon run for three tick intervals while the socket is
@@ -421,98 +432,113 @@ only remove, never admit or show.
      - `manifest_mismatch`, in `primary` (§8).
 
      Each makes health `degraded` with reason `ring_blind`, adds a header line to `hear`, and logs once. They clear,
-     respectively: when a run bound to the live daemon run appears (by the exception above, or a writer restart);
-     when one writer has sent nothing for three tick intervals; and at a frond-ear restart with the daemon's
-     manifest. A counter is never the only signal.
+     respectively: when a run bound to the live daemon run appears (a writer restart, or a recovery binding); when one
+     of the two has sent nothing for three tick intervals; and at a frond-ear restart with the daemon's manifest. A
+     counter is never the only signal.
 
-   - **At most 16 runs are tracked.** Beyond that the oldest is retired. Its tail is reported as unknown if no `bye`
-     was read (§4.4), its items stay hidden until confirmed or expired, and its later packets are `stale_run`.
+   - **At most 16 runs with open holes or hidden items are tracked.** Beyond that the oldest is retired: its tail is
+     reported as unknown if no `bye` was read (§4.4), its items stay hidden until confirmed or expired, and it joins
+     the ended runs.
 
-6. **Holes and refills, per key.** This rule answers 🍃's H1.
-   - For each key in the current run, the reader tracks the `key_seq`s it is missing, as at most 8 ranges per key,
-     and the same for the control sequence. A packet that fills one is processed: canticle admission is built for
-     packets arriving in any order, since UDP reorders.
-   - A `key_seq` at or below its key's last that isn't missing is a duplicate.
+6. **Holes and refills, per stream.** This rule answers 🍃's H1.
+   - For each tuned stream in the current run, the reader tracks the `stream_seq`s it is missing, as at most 8
+     ranges per stream, and the same for the control sequence. A packet that fills one is processed: canticle
+     admission is built for packets arriving in any order, since UDP reorders.
+   - A `stream_seq` at or below its stream's last that isn't missing is a duplicate.
    - **Over the limit, ranges merge; they are never dropped.** A ninth range merges the two oldest into one span, so
-     a late fill is still processed, and a packet inside the span that was already processed is processed again
-     harmlessly (§4.2's invariant). The key's loss count is then graded `at_most` (§4.4).
-   - **A quiet key's lost tail** shows when a `tick` carries a head above the key's last `key_seq` (W6). It is a hole
-     for that key from then on.
-   - On a hole, the reader first rewinds to fill it from whatever the ring still holds. It ends the stream, sends
-     `READ <max(last processed pktid + 1, EarliestPacketID)>` and streams forward from there. Packets already
-     processed are skipped as duplicates by their `key_seq` (§4.5).
+     a late fill is still processed. A packet inside the span that was already processed is processed again
+     harmlessly: guards only grow, and a retract guard keeps a retracted item out (§4.1). The stream's loss count is
+     then graded `at_most` (§4.4).
+   - **A quiet stream's lost tail** shows when a `tick` carries a head above the stream's last `stream_seq` (W6). It
+     is a hole for that stream from then on.
+   - **Refills run on the second connection,** never by rewinding the main stream. Its `MATCH` names only the
+     streams with holes or skipped packets (§4.6). It reads from the earliest packet id that may hold one (the
+     stream's last processed packet id + 1, or its first skip), or `EarliestPacketID` if that is later, by a `READ`
+     and then `STREAM`, up to the main connection's position. Packets already processed are skipped as duplicates by
+     their `stream_seq` (§4.5).
    - **A lap is silent.** When the next slot is newer than the latest packet, ringserver moves the reader to the
      earliest packet without a word (`rs:src/ring.c:1072-1075`, `1090-1109`). A slot overwritten while it is being
      copied is dropped after the position has moved past it (`rs:src/ring.c:1113-1116`, `1179-1183`). A lap
      typically leaves retained packets behind the jump (E2: 20068 to 20736). A hole filled completely is no loss.
-     What stays missing is a `ring_gap` for its key, and the hiding below applies to that key.
-   - **At most 4 096 keys are tracked** [PROPOSED]. A key with no live or hidden items is forgotten first; if it
-     comes back, it is joined where it starts, with nothing of it to hide.
+     What stays missing is a `ring_gap` for its stream, and the hiding below applies to that stream.
+   - **At most 4 096 streams are tracked** [PROPOSED]. A stream with no live or hidden items is forgotten first, and
+     if it comes back it is joined where it starts, with nothing of it to hide. If every tracked stream holds items,
+     a new stream's packets are processed but its completeness can't be judged, so its items are hidden and reported
+     as `untracked_stream`.
 7. **Cold start.** This means no saved state at all: the first enable, or state an operator cleared.
    - The reader starts with `READ <EarliestPacketID>` and reads everything the ring holds.
-   - The first run it meets is joined wherever it starts, and each key wherever it first appears.
+   - The first run it meets is joined wherever it starts, and each stream wherever it first appears.
    - Live items whose packets were already evicted are missing, so the reader reports `ring_joined_late`, blind and
      saying so, as `joined_late` does. It clears that when a complete join snapshot (§4.4) lists nothing the ring path
      lacks, or once the ring holds a full longest class TTL of history.
    - The retained part is internally complete. The ring is first-in, first-out, and every PLUCK, superseder or
      retract the daemon applied to a retained frame came after it.
-   - A key tuned since the last start is joined the same way: `key_joined_late` for that key until a complete
-     snapshot lists nothing of it that the ring path lacks.
+   - A stream tuned since the last start (the persisted tune set says which) is joined the same way:
+     `stream_joined_late` until a complete snapshot lists nothing of it that the ring path lacks. A tuned stream that
+     has simply been silent is not joined late.
 8. **While streaming,** a packet whose writer signature fails is dropped and changes no state. A jump in packet ids
-   is not loss on its own, and with `MATCH` it is routine; only a hole in a `key_seq` or in the control sequence is.
+   is not loss on its own, and with `MATCH` it is routine; only a hole in a `stream_seq` or in the control sequence
+   is.
 
 ### 4.4 Gap detection and reporting: never silently skip
 
-| Signal                                                                                   | Meaning                                                                                                                                         | Reported as                                                                                        | Live items                                                   |
-| ---------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ |
-| one key's `key_seq` jumps, after a refill                                                | That key's packets were lost: dropped at the writer (W3), skipped over a reader cap and not yet refilled (§4.6), a lap (E2) or a crash (E3, E4) | `ring_gap` for that key, `exact`; health `degraded` while anything stays hidden                    | That key's items heard before the hole are hidden; no others |
-| a `tick` head above a key's last `key_seq`                                               | That key's last packets were lost                                                                                                               | `ring_gap` for that key, `exact`                                                                   | As above                                                     |
-| a hole in the control sequence                                                           | Control packets were lost: a `tick`, or a `hello` or `bye`                                                                                      | `ring_gap` (control); a lost `bye` leaves its run's end unknown                                    | Unchanged                                                    |
-| a higher run's key first seen past `key_seq` 1; a higher run first seen past its `hello` | That key's first packets in the run were lost; the `hello` was lost                                                                             | `ring_gap` for that key, `exact`; if the `hello` was lost, whether whole runs went by is `unknown` | As for a run's end                                           |
-| a run ends: a higher run begins, or a bound lower run                                    | A writer restart, clean (its `bye` read) or not                                                                                                 | `writer_restarted`, or `writer_restarted_without_bye` with `run_tail_unknown`                      | The ended run's items are hidden until confirmed             |
-| a `hello` names a previous run the reader never saw                                      | Whole runs were lost                                                                                                                            | `runs_absent`, count unknown                                                                       | As for a run's end                                           |
-| cursor validation fails                                                                  | Eviction, rollback or a reset (§4.3)                                                                                                            | `ring_overrun` or `ring_reset`                                                                     | Only what the re-read's holes hide                           |
-| a lower run; interleaved runs                                                            | History, rollback leftovers, a replay, or two writers                                                                                           | `stale_run`; `two_writers` and `foreign_run`                                                       | Unchanged; a blind state if nothing is bound (§4.3, rule 5)  |
-| a lower run bound to the live daemon run                                                 | A regressed writer                                                                                                                              | `run_regressed`                                                                                    | As for a run's end                                           |
-| a writer signature fails                                                                 | Not from the writer                                                                                                                             | `unauthenticated` (a count)                                                                        | Unchanged                                                    |
-| a packet over its key's cap                                                              | §4.6                                                                                                                                            | `over_cap` for that key                                                                            | As for that key's hole                                       |
-| no `tick` for three intervals                                                            | The writer is silent, or the ring is unreachable                                                                                                | `writer_silent`: blind, and saying so                                                              | Kept; expiry carries on                                      |
+| Signal                                                                                  | Meaning                                                                                                                                              | Reported as                                                                                           | Live items                                                                 |
+| --------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| one stream's `stream_seq` jumps, after a refill                                         | That stream's packets were lost: dropped at the writer (W3), a lap (E2), a crash (E3, E4), or skipped and evicted before the refill read them (§4.6) | `ring_gap` for that stream, `exact`; health `degraded` while anything stays hidden                    | That stream's items heard before the hole are hidden; no others            |
+| a `tick` head above a stream's last `stream_seq`                                        | That stream's last packets were lost                                                                                                                 | `ring_gap` for that stream, `exact`                                                                   | As above                                                                   |
+| a packet skipped over its key's queue                                                   | §4.6                                                                                                                                                 | `over_cap`; the stream is `refill_pending`, not lost                                                  | That stream's earlier items are hidden until the refill has read the skips |
+| a hole in the control sequence                                                          | Control packets were lost: a `tick`, or a `hello` or `bye`                                                                                           | `ring_gap` (control); a lost `bye` leaves its run's end unknown                                       | Unchanged                                                                  |
+| a stream first seen in a new run past `stream_seq` 1; a run first seen past its `hello` | That stream's first packets in the run were lost; the `hello` was lost                                                                               | `ring_gap` for that stream, `exact`; if the `hello` was lost, whether whole runs went by is `unknown` | As for a run's end                                                         |
+| a run ends: superseded, bound away, or its `bye` read                                   | A writer restart, clean (its `bye` read) or not                                                                                                      | `writer_restarted`, or `writer_restarted_without_bye` with `run_tail_unknown`                         | The ended run's items are hidden until confirmed                           |
+| a `hello` names a previous run the reader never saw                                     | Whole runs were lost                                                                                                                                 | `runs_absent`, count unknown                                                                          | As for a run's end                                                         |
+| cursor validation fails                                                                 | Eviction, rollback or a reset (§4.3)                                                                                                                 | `ring_overrun` or `ring_reset`                                                                        | Only what the re-read's holes hide                                         |
+| packets of an ended or unknown older run                                                | History, rollback leftovers, or a replay                                                                                                             | `stale_run` (a count)                                                                                 | Unchanged                                                                  |
+| new packets of a run neither current nor ended, with fresh `tick`s                      | A second writer                                                                                                                                      | `two_writers` and `foreign_run`; health `degraded`; `ring_blind` if both are bound                    | Unchanged; nothing new shown if blind (§4.3, rule 5)                       |
+| a lower run bound to the live daemon run                                                | A regressed writer                                                                                                                                   | `run_regressed`                                                                                       | As for a run's end                                                         |
+| a writer signature fails                                                                | Not from the writer                                                                                                                                  | `unauthenticated` (a count)                                                                           | Unchanged                                                                  |
+| no `tick` for three intervals                                                           | The writer is silent, or the ring is unreachable                                                                                                     | `writer_silent`: blind, and saying so                                                                 | Kept; expiry carries on                                                    |
 
-**Loss counts are graded** (🌫's crash cut). A report never states a count more precisely than its grade:
+**Loss counts are graded and scoped** (🌫's crash cut). A report never states a count more precisely than its grade,
+and never adds counts of different scopes:
 
-- `exact`: a hole with a packet of the same key, or a `tick` head, above it in the same run;
-- `at_least`: the socket witness below;
-- `at_most`: merged ranges (§4.3, rule 6), or a tail bounded by the next `hello`'s `prev_reserved_through` (W5);
-- `unknown`: anything else, such as whole runs absent.
+- `exact`: one stream's packets, a hole with a packet of that stream, or a `tick` head, above it in the same run;
+- `at_least`: one stream's packets, from the socket witness below;
+- `at_most`: one stream's packets after merged ranges (§4.3, rule 6); or a run's packets across all streams, tuned or
+  not, bounded by the next `hello`'s `prev_reserved_through` (W5);
+- `unknown`: anything else, such as whole runs absent, or a tail whose writer lost its state.
 
 **Unknown tails.** Say the reader has read run R up to seq 10, a ringserver crash takes R's 11 to 20 before the
 reader reads them, and the writer restarts as run S. S starts at 1, so no hole in any sequence shows that anything was
 lost, and S's `hello` names R but not R's last seq.
 
 - A run that ends without the reader having read its `bye` gets `run_tail_unknown`, with the last seq read.
-- It is bounded where a witness allows. Above, by S's `hello`'s `prev_reserved_through` (W5). Below, by the
-  **socket witness**: the record v1 consumer keeps, for each daemon run, the `rec_seq`s of records W1 mirrors that
-  the socket has shown and the ring hasn't yet delivered (at most 1 024, persisted, §4.2). When a run's tail is
-  unknown, those above the last packet read were lost to the ring path, at least. The socket drops records too
-  (`records_lost`), so it never makes a count exact.
+- It is bounded where a witness allows:
+  - **Above,** by S's `hello`'s `prev_reserved_through` (W5): at most that many of R's packets, across all streams.
+    It is null if the writer lost its state.
+  - **Below,** by the **socket witness.** For each daemon run, the record v1 consumer keeps the `rec_seq`s of records
+    on tuned streams that W1 would mirror, which the socket has shown and the ring hasn't yet delivered: at most
+    1 024, the oldest evicted first and counted. When a run's tail is unknown, those above the last packet read on
+    their stream were lost to the ring path: at least that many, per stream. Eviction only lowers the bound, and the
+    socket's own drops (`records_lost`) mean it never makes a count exact.
 - `tick` heads (W6) don't help here: the ticks in 11 to 20 went with the packets. They witness tails lost at the
   writer or in transit, not tails lost in a ring rollback.
 - R's items are hidden until confirmed (below), as for any run's end.
 
 **Why hide.**
 
-- **Gaps.** A lost packet may have been a PLUCK or a retract for its key. `records.ts` clears its whole live set on
-  any gap (`:644-647`). The ring reader hides only that key's items, since a packet's effects stay within its key
-  (W9). Hidden items are absent from `hear` and from delivery's view, but they keep their rows. One burst for one key
-  no longer blinds every quiet tuned stream.
+- **Gaps.** A lost packet may have been a PLUCK or a retract for its stream. `records.ts` clears its whole live set on
+  any gap (`:644-647`). The ring reader hides only that stream's items, since a packet's effects stay within its
+  stream (W9). Hidden items are absent from `hear` and from delivery's view, but they keep their rows. A burst on one
+  stream no longer blinds every quiet tuned stream.
 - **Writer restarts.** Record v1 drops a run's items at `bye` and at a new run, because nothing from that run can
   retract them any more (`src/canticle/records.ts:387-394`, `:818-824`). The ring path hides them for the same reason.
 
 **What confirms a hidden item.** Within one run the daemon appends a surfaced frame only once (an equivocation copy
-aside), so nothing later in that run can confirm a hidden item. Waiting for expiry could hide a key for up to
+aside), so nothing later in that run can confirm a hidden item. Waiting for expiry could hide a stream for up to
 86 400 s, for `finding-ref` (RFC:383). So a hidden item is shown again only when a sound witness confirms it, or it
-leaves at its local expiry. Let `W` be the envelope `rec_seq` of the packet that revealed the hole (the key's next
-packet, or the `tick`), or of the new run's `hello`. Three things confirm:
+leaves at its local expiry. A stream hidden only as `refill_pending` is shown again as soon as the refill has read its
+skips and found no hole. Otherwise, let `W` be the envelope `rec_seq` of the packet that revealed the hole (the
+stream's next packet, or the `tick`), or of the new run's `hello`. Three things confirm:
 
 - **The host socket's consumer.** It holds the item (not `carried`) with the same `idem` and `frame.sha256`
   (RFC:2195), has had no `rec_seq` gap on its current connection, and has read up to at least `W`. Every retract the
@@ -532,8 +558,8 @@ watermark of at least `W`, which is not a `retract` and settles no custody (RFC:
 
 **Socket retracts remove too.** A ring item isn't shown while the host socket's consumer holds a `retract` for its
 `idem` from the same daemon run. Within a run a retraction is final (plucks stick, supersession holds), and the
-consumer keeps its latest 4 096 retracts by `idem` for this. Removing
-is always safe, and it covers a retract the ring lost but the socket didn't, before a `tick` reveals the hole.
+consumer keeps its latest 4 096 retracts by `idem` for this. Removing is always safe, and it covers a retract the ring
+lost but the socket didn't, before a `tick` reveals the hole.
 
 **Hidden items and delivery.** Delivery already treats a record that leaves the view like one whose link is down: it
 "waits for its return or its local expiry, and is never pushed from memory" (`src/canticle/delivery.ts:703-704`). So:
@@ -543,14 +569,15 @@ is always safe, and it covers a retract the ring lost but the socket didn't, bef
   `maxAgeMs`;
 - delivery's `seen` map is unaffected.
 
-Every one of these signals is reported, each count with its grade: in `ear_status` (`canticle.ring`), in a header
-line in `hear` (as `joinedLate` does, `src/canticle/hear.ts:324-334`), in a footer line on the next report ("ring: N
-records lost since the last report", or "an unknown number"), and in a log line carrying counts, never payload.
+Every one of these signals is reported, each count with its grade and scope: in `ear_status` (`canticle.ring`), in a
+header line in `hear` (as `joinedLate` does, `src/canticle/hear.ts:324-334`), in a footer line on the next report
+("ring: N records lost on S streams since the last report", with any unknown tail named separately), and in a log line
+carrying counts, never payload.
 
 ### 4.5 Duplicates and idempotence
 
-- **The same (run, seq) twice** comes from a writer retry after a disconnect (W4), or from re-reading. A `key_seq`
-  that is neither missing nor new for its key is skipped and counted as `ring_duplicate`. Bytes are compared only
+- **The same (run, seq) twice** comes from a writer retry after a disconnect (W4), or from re-reading. A `stream_seq`
+  that is neither missing nor new for its stream is skipped and counted as `ring_duplicate`. Bytes are compared only
   for the cursor's own packet, at validation.
 - **The same frame identity in another packet** comes from a `resurfaced` re-append in a later run. Identical bytes
   are a harmless repeat (RFC:481); different bytes are an equivocation.
@@ -573,57 +600,62 @@ Why not hold the cursor until the session catches up:
   faster than delivery shows them, so holding the ring gains it nothing.
 - An item held past its expiry is worth nothing (§5.1).
 
-The reader judges no content. Every authenticated packet of a tuned key goes through the listener so that the guards
-stay complete.
+The reader judges no content. Every authenticated packet of a tuned stream goes through the listener so that the
+guards stay complete.
 
 **Receiver caps come before the token budget** (#116 amendment 4 §2). Delivery's budgets keep context small; they
 don't stop a flood from exhausting the reader. So, in this order, before anything reaches the listener:
 
-1. **Selection at the server.** `tune` names station:stream pairs, which the manifest turns into (key, stream) pairs.
-   The reader sends `MATCH` with exactly their stream ids and the control id, a regex of up to 1 MiB
-   (`rs:src/dlclient.h:45`). ringserver applies it while streaming (`rs:src/ring.c:1133-1137`), so untuned packets
-   never reach the reader.
+1. **Selection at the server.** `tune` names station:stream pairs, which the manifest turns into ring stream ids. The
+   reader sends `MATCH` with exactly those ids and the control id, a regex of up to 1 MiB (`rs:src/dlclient.h:45`).
+   ringserver applies it while streaming (`rs:src/ring.c:1133-1137`), so untuned packets never reach the reader.
 2. **A header check before any cryptography.** Each packet's stream id is parsed into its claimed key and stream. An
    untuned one, should `MATCH` be missing, is dropped and counted as `untuned`.
 3. **Per-key queues, capped.** Packets wait for verification in a queue per claimed key: at most 256 packets and
-   256 KiB per key, and 8 MiB in all [PROPOSED]. The reader keeps reading past a full queue, so one key's backlog
-   never holds up another's packets behind it in the stream.
+   256 KiB per key, and 8 MiB in all [PROPOSED]. The reader keeps reading past a full queue, so one key's packets
+   never hold up another key's behind them in the stream.
 4. **A verification budget, shared fairly.** Writer signatures, then station signatures for new frames, are checked
    at most 2 000 times a second in all [PROPOSED], round-robin across the keys with packets waiting. A noisy key
    can't starve a quiet one of verification.
-5. **Over the caps, skip and refill.** A packet that finds its key's queue full (or the total full, charged to the
-   key holding the most) is skipped unverified and counted as `over_cap` for that key. The reader can't tell a real
-   packet from a forged one without verifying it, so the skip is a hole for that key (§4.4), and its earlier items
-   are hidden until confirmed. The reader keeps the skipped packet ids per key, and refills them from the ring as the
-   queue drains, on a second connection whose `MATCH` names that key alone. What the ring evicts first is lost for
-   that key. A flood claiming key K keeps K's queue full and so blinds K, never another key; a legitimate backlog
-   (a catch-up after an outage) is only delayed.
+5. **Over a queue, skip and refill.** A packet that finds its key's queue full (or the total full, charged to the key
+   holding the most) is skipped unverified and counted as `over_cap`, and its packet id is recorded for its claimed
+   stream: at most 64 id ranges per stream, merged beyond. The stream is then `refill_pending`. Its items heard before
+   the skip are hidden, since the skipped packet could be a retract, but nothing is reported as lost. The second
+   connection refills the skips (§4.3, rule 6); whatever they turn out to hold is judged by `stream_seq`, and only
+   what the ring evicted first is loss. A flood claiming key K keeps K's streams hidden for as long as it lasts, never
+   another key's; a legitimate backlog, such as a catch-up after an outage, only waits for its refill.
 6. **Then admission:** the listener's per-key quotas (RFC:484-493), the live caps below, and only then delivery's
    budgets.
 
 The cursor is the newest packet id below which every packet has been processed, or skipped and recorded for refill.
-No rate is capped per second: the reader pulls, so a legitimate backlog arrives as fast as it reads, and a
-per-second cap would cut it.
+No arrival rate is capped: the reader pulls, so a legitimate backlog arrives as fast as it can be read. Only
+verification work has a rate, and the queues bound what waits for it.
 
-**This is defence in depth in version 1.** Only the daemon can write (§2), and it admits each station only within
-its per-key quotas, so no station can push the ring past its carousel budget (§6). A line-rate flood needs write
-access. The caps are there for when that fails, and the flood test proves them.
+**The caps protect the reader, not retention.** Untuned packets cost the reader nothing, but they still take ring
+slots and evict older packets. Under `MATCH`, a streaming connection with nothing to match waits up to 1 s between
+polls (`rs:src/clients.c:48`, `382-385`), so a flood that laps the ring within a second skips the reader silently
+(E2); the `stream_seq` holes then show what was lost. What protects retention is the write gate (§2) and the daemon's
+per-key quotas: only the daemon writes, and it admits each station within its carousel budget (§6). So in version 1
+a line-rate flood needs write access, and the caps are defence in depth.
 
-**The flood test is acceptance** (#116 amendment 4 §2; §9, case 22). Under an untuned flood at line rate and a forged
-flood under one tuned key's stream id, a quiet tuned key's items are admitted on time, verification stays within its
-budget, memory stays bounded, and only the forged key is hidden, and reported.
+**The flood test is acceptance** (#116 amendment 4 §2; §9, case 22). Under an untuned flood and a forged flood under
+one tuned stream's id, each at a stated rate, a quiet tuned stream's items are admitted on time, verification stays
+within its budget, memory stays bounded, and only the forged key's streams are hidden, and reported.
 
-| Where                 | Bound                                                                                                                                                                                                                                                         |
-| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| The connection        | One DataLink connection with TCP flow control. ringserver keeps no per-client queue; a send stalled for `NetIOTimeout` (10 s) disconnects (`rs:src/clients.c:823-899`).                                                                                       |
-| Selection             | `MATCH` on the tuned keys and the control id                                                                                                                                                                                                                  |
-| Queues                | 256 packets and 256 KiB per key, 8 MiB in all [PROPOSED]; over them, skipped and refilled                                                                                                                                                                     |
-| Verification          | 2 000 a second in all, round-robin by key [PROPOSED]                                                                                                                                                                                                          |
-| The listener          | Per-key dedup and mark quotas (RFC:484-493)                                                                                                                                                                                                                   |
-| Live and hidden items | `MAX_LIVE` 4 096 rows, as in `records.ts:46`, and at most 512 per key. Hidden rows are evicted first. When only live rows are left, a new item is refused and counted as `live_overflow`, as `records.ts:663-668` does, and health reports `live_table_full`. |
-| Runs, keys and holes  | 16 runs; 4 096 keys; 8 missing ranges per key, merged beyond                                                                                                                                                                                                  |
-| Snapshot requests     | One extra host-socket connection at a time, one per hidden group, at most one every 30 s                                                                                                                                                                      |
-| Delivery              | `MAX_WAITING` 4 096 (`src/canticle/delivery.ts:74`), and `bufferPerStream` up to 256 (`src/config.ts:464`)                                                                                                                                                    |
+| Where                   | Bound                                                                                                                                                                                                                                                         |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| The connections         | A main DataLink connection and one for refills, each with TCP flow control. ringserver keeps no per-client queue; a send stalled for `NetIOTimeout` (10 s) disconnects (`rs:src/clients.c:823-899`).                                                          |
+| Selection               | `MATCH` on the tuned stream ids and the control id                                                                                                                                                                                                            |
+| Queues                  | 256 packets and 256 KiB per key, 8 MiB in all [PROPOSED]; over them, skipped and refilled                                                                                                                                                                     |
+| Skips awaiting refill   | 64 packet id ranges per stream, merged beyond                                                                                                                                                                                                                 |
+| Verification            | 2 000 a second in all, round-robin by key [PROPOSED]                                                                                                                                                                                                          |
+| The listener            | Per-key dedup and mark quotas (RFC:484-493)                                                                                                                                                                                                                   |
+| Live and hidden items   | `MAX_LIVE` 4 096 rows, as in `records.ts:46`, and at most 512 per key. Hidden rows are evicted first. When only live rows are left, a new item is refused and counted as `live_overflow`, as `records.ts:663-668` does, and health reports `live_table_full`. |
+| Runs, streams and holes | 16 runs with open holes or hidden items, 64 ended runs remembered; 4 096 streams; 8 missing ranges per stream, merged beyond                                                                                                                                  |
+| Retract guards          | One per retracted identity, until its local expiry                                                                                                                                                                                                            |
+| Socket witness          | 1 024 `rec_seq`s, oldest evicted first and counted                                                                                                                                                                                                            |
+| Snapshot requests       | One extra host-socket connection at a time, one per hidden group, at most one every 30 s                                                                                                                                                                      |
+| Delivery                | `MAX_WAITING` 4 096 (`src/canticle/delivery.ts:74`), and `bufferPerStream` up to 256 (`src/config.ts:464`)                                                                                                                                                    |
 
 **Lag.** The reader reports `lag_packets` (`LatestPacketID` minus the cursor, from `INFO STATUS`, which ringserver
 answers mid-stream) and `lag_ms` (now minus the last frame's `heard_at`). It warns `ring_lag_high` when the lag passes
@@ -633,10 +665,10 @@ the ids are out of order, and `lag_packets` is reported as unknown until they ar
 ### 4.7 Restart rebuild
 
 On start, the reader loads the checkpoint, replays the journal, and reloads the live and hidden rows from the store,
-with the hidden groups' watermarks, so confirmation carries on (§4.4). It checks each row's writer and station
-signatures again; items that expired meanwhile are dropped and counted, and so are items whose key the manifest no
-longer lists. Restored items surface with `origin: "replay"`, and tombstones stop them being pushed again. Then the
-reader resumes from the cursor (§4.3).
+with the hidden groups' watermarks and the skips awaiting refill, so confirmation and refills carry on (§4.4). It
+checks each row's writer and station signatures again; items that expired meanwhile are dropped and counted, and so
+are items whose key the manifest no longer lists. Restored items surface with `origin: "replay"`, and tombstones stop
+them being pushed again. Then the reader resumes from the cursor (§4.3).
 
 The rebuild reads nothing from the ring, so it survives a wrap, a ringserver crash or a reset. A list of packet ids to
 re-read would not: a crash can roll the ring back by days (§7), and a single `finding-ref` item lives up to
@@ -761,7 +793,7 @@ Retention shorter than the longest TTL in use only matters at a cold start (§4.
 
 **These sizes are candidates for the shadow experiment, not an install decision** (🌫's S3). With `MemoryMapRing 0`
 (§7) the whole ring lives in memory (`rs:src/ring.c:278`) and is rewritten at every clean stop
-(`rs:src/ring.c:637`), so its size costs RAM and stop time as well as disk. 🌫 sets the installed size after
+(`rs:src/ring.c:631-641`), so its size costs RAM and stop time as well as disk. 🌫 sets the installed size after
 measuring.
 
 **Demand is capped by the session.**
@@ -799,28 +831,29 @@ measuring.
 
 ## 7. Failure modes
 
-| Failure                                           | Detected by                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | Behaviour                                                                                                                                                                                                                                                                                     |
-| ------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| ringserver down or unreachable                    | A connect error, a send timeout, or no `tick` for three intervals                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | Back off as the receptor does (1 s·2ⁿ up to 30 s, plus jitter, `receptor.ts:309-318`). Health `degraded`, reason `ring_unavailable`. `hear` says content since T may be missing, and live items keep expiring. Resume from the cursor afterwards; holes from writer drops show as `ring_gap`. |
-| Ring wrap while the reader is stopped             | Cursor validation: below `EarliestPacketID`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | `ring_overrun`. The re-read counts holes exactly within a run and key, and at least otherwise.                                                                                                                                                                                                |
-| Lap while streaming                               | A `key_seq` hole, or a `tick` head ahead of what was read (E2)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | A refill from what the ring still holds, then `ring_gap` for what stays missing, with hiding for each key affected.                                                                                                                                                                           |
-| Clean ringserver restart, persistent ring         | `READ` at the cursor validates                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | Nothing to report.                                                                                                                                                                                                                                                                            |
-| ringserver crash (`kill -9`)                      | Validation fails: the packet id is above `LatestPacketID`, another packet now holds it, or `EarliestPacketID` exceeds `LatestPacketID`. ringserver saves its header and its stream index only at clean shutdown (`rs:src/ring.c:544-580`, `595-606`), and nothing in `ring.c` calls `msync` or `fsync`. With `MemoryMapRing 0`, version 1's choice, the ring comes back exactly as the last clean shutdown left it (E3, E4). A memory-mapped ring keeps its newer slot bytes behind the old header: startup checks only the boundary slots (`rs:src/ring.c:432-474`), packets the crash lost stay readable, their ids then go to new packets in place (`rs:src/ring.c:725-736`), and a ring that was full serves ids out of order (E4). | `ring_reset`. The re-read counts the holes, graded. Only packets frond-ear hadn't read yet are lost to it; what it read is in its store. If the writer restarted too, the lost tail is reported as unknown, with whatever bounds the witnesses give (§4.4).                                   |
-| Power loss                                        | Untested. Neither mode syncs: the unmapped ring's file is written at clean stop with no `fsync` (`rs:src/ring.c:637`), and a mapped ring's pages reach disk when the kernel writes them back                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | Whatever comes back is validated as a reset. A torn slot fails the writer signature and counts as `unauthenticated`, expected after a reset rather than an alarm. Proving this is Q-S3's.                                                                                                     |
-| Ring reset, volatile restart, or corrupt files    | `LatestPacketID` below the cursor, or another packet at the cursor's id (ids start again at 1). Not `StartTime`, which changes on every restart.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | `ring_reset`, and the counts come from the holes. With `AutoRecovery 1` (the default) corrupt files are set aside and the ring starts empty.                                                                                                                                                  |
-| Ring resized                                      | Packet ids are kept but their pkttimes are reset (E3)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | Envelope validation passes. Never rely on pkttime alone.                                                                                                                                                                                                                                      |
-| Writer (daemon) restart                           | A higher run                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | The previous run's items are hidden until a `resurfaced` re-append or the witness confirms them. Without its `bye` read, its tail is unknown (§4.4). A key first seen in it past `key_seq` 1 is a `ring_gap` for that key.                                                                    |
-| Writer lost its run state, clock behind           | A lower run whose `hello` or `tick` names the live daemon run                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | Accepted and reported as `run_regressed`, however late it is read: it is bound to the daemon incarnation, not to a freshness window (§4.3, rule 5).                                                                                                                                           |
-| A replayed `hello` or `tick`                      | It names an earlier daemon run                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | `stale_run`; it changes nothing, however recent it is.                                                                                                                                                                                                                                        |
-| Two writers on one ring                           | Interleaved runs, or two runs naming the live daemon run                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | A `two_writers` alert. If exactly one is bound to the live daemon run, it stays current and the other is `foreign_run`. If both are, `ring_blind` (health `degraded`) until one has sent nothing for three tick intervals.                                                                    |
-| Station clock ahead                               | The daemon's negative δ̂ travels in `offset_ms`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | Heard as on the socket path, up to 65 s ahead. Beyond that, frames are refused as `not-yet-valid` on the ring path only, and the daemon's `health` reports `clock_skew` (RFC:2185).                                                                                                           |
-| Station clock behind                              | `expired_on_read` for that key; `expiry_delta` in shadow mode                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | Items expire early by the skew, on the ring path only. Fail closed.                                                                                                                                                                                                                           |
-| Unauthenticated packets                           | The writer signature                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | Dropped and counted. They never move the seq accounting.                                                                                                                                                                                                                                      |
-| A flood, untuned or forged                        | `MATCH`, then the per-key queues and the verification budget (§4.6)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | Untuned packets cost nothing. Packets over their key's queue are skipped unverified, counted as `over_cap` and refilled later; the key they claim is hidden and reported meanwhile, and no other key is touched.                                                                              |
-| Manifest change or mismatch                       | The manifest SHA-256 in `hello` and `tick`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | A mismatch is reported (`manifest_mismatch`), and `primary` shows nothing from the ring until the manifests match (`ring_blind`, §8). frond-ear reads its manifest once at start, so a change on the daemon's side silences `primary` until frond-ear restarts with the new file.             |
-| A key revoked in the manifest                     | frond-ear's own manifest, at its next start                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | Until frond-ear restarts with the new file, the key's retained packets are still accepted on the ring path, while the daemon's `manifest_mismatch` blanks `primary`. At the restart, its packets and live rows are refused (§4.7).                                                            |
-| A local `AUTH` against a helper without arguments | Any local client sending `AUTH` when `AuthCommand` was configured with none (the pinned ref)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | The server crashes with SIGSEGV: `posix_spawn` gets a null argument vector (`rs:src/auth.c:483`; `rs:src/config.c:3428` builds one only when there are arguments; E5). Configure the helper with an argument (§2). Should it happen anyway, it is a crash as above.                           |
-| Local connection exhaustion                       | Any local process can hold connections up to `MaxClients` (600); `MaxClientsPerIP` exempts only `WriteIP` addresses, which here are none (`rs:src/ringserver.c:1165-1192`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | Availability only: `ring_unavailable` for the reader, and the writer's drops show as holes. Q-S1.                                                                                                                                                                                             |
+| Failure                                                      | Detected by                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | Behaviour                                                                                                                                                                                                                                                                                                                                               |
+| ------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ringserver down or unreachable                               | A connect error, a send timeout, or no `tick` for three intervals                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | Back off as the receptor does (1 s·2ⁿ up to 30 s, plus jitter, `receptor.ts:309-318`). Health `degraded`, reason `ring_unavailable`. `hear` says content since T may be missing, and live items keep expiring. Resume from the cursor afterwards; holes from writer drops show as `ring_gap`.                                                           |
+| Ring wrap while the reader is stopped                        | Cursor validation: below `EarliestPacketID`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | `ring_overrun`. The re-read counts holes per stream, graded (§4.4).                                                                                                                                                                                                                                                                                     |
+| Lap while streaming                                          | A `stream_seq` hole, or a `tick` head ahead of what was read (E2)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | A refill from what the ring still holds, then `ring_gap` for what stays missing, with hiding for each stream affected.                                                                                                                                                                                                                                  |
+| Clean ringserver restart, persistent ring                    | `READ` at the cursor validates                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | Nothing to report.                                                                                                                                                                                                                                                                                                                                      |
+| ringserver crash (`kill -9`)                                 | Validation fails: the packet id is above `LatestPacketID`, another packet now holds it, or `EarliestPacketID` exceeds `LatestPacketID`. ringserver saves its header and its stream index only at clean shutdown (`rs:src/ring.c:544-580`, `595-606`), and nothing in `ring.c` calls `msync` or `fsync`. With `MemoryMapRing 0`, version 1's pick, a `kill -9` between clean stops brought the ring back exactly as the last clean shutdown left it (E3, E4). A memory-mapped ring keeps its newer slot bytes behind the old header, since startup checks only the boundary slots (`rs:src/ring.c:432-474`). If it was full, the packets the crash lost stay readable, their ids then go to new packets in the same slots (`rs:src/ring.c:725-736`), and ids come out of order (E4). If it wasn't, the header's range can hold a window the clean stop never held, and the rest is unreadable (E4). | `ring_reset`. The re-read counts the holes, graded. Only packets frond-ear hadn't read yet are lost to it; what it read is in its store. If the writer restarted too, the lost tail is reported as unknown, with whatever bounds the witnesses give (§4.4).                                                                                             |
+| A kill, or systemd's stop timeout, during a clean stop       | Unproven. With `MemoryMapRing 0`, the clean stop rewrites the stream index, then the whole ring file from offset 0, header first, in one plain `write()` with no `fsync` (`rs:src/ring.c:544-580`, `631-641`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | A cut-off write can leave a new header over older slots, which the boundary check may not catch. Treated as a crash above. Set `TimeoutStopSec` above the measured stop time. Proving this is Q-S3's.                                                                                                                                                   |
+| Power loss                                                   | Untested. Neither mode syncs: the unmapped ring's file is written at clean stop with no `fsync` (`rs:src/ring.c:637`), and a mapped ring's pages reach disk when the kernel writes them back                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | Whatever comes back is validated as a reset. A torn slot fails the writer signature and counts as `unauthenticated`, expected after a reset rather than an alarm. Proving this is Q-S3's.                                                                                                                                                               |
+| Ring reset, volatile restart, or corrupt files               | `LatestPacketID` below the cursor, or another packet at the cursor's id (ids start again at 1). Not `StartTime`, which changes on every restart.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | `ring_reset`, and the counts come from the holes. With `AutoRecovery 1` (the default) corrupt files are set aside and the ring starts empty.                                                                                                                                                                                                            |
+| Ring resized                                                 | Packet ids are kept but their pkttimes are reset (E3)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | Envelope validation passes. Never rely on pkttime alone.                                                                                                                                                                                                                                                                                                |
+| Writer (daemon) restart                                      | A new run whose `hello` names the current one, or a higher run while the current one isn't bound                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | The previous run's items are hidden until a `resurfaced` re-append or the witness confirms them. Without its `bye` read, its tail is unknown (§4.4). A stream first seen in the new run past `stream_seq` 1 is a `ring_gap` for that stream.                                                                                                            |
+| Writer lost its run state, clock behind                      | A lower run whose `hello` or `tick` names the live daemon run                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | Accepted and reported as `run_regressed`, however late it is read: it is bound to the daemon incarnation, not to a freshness window (§4.3, rule 5). The run it replaces stays ended.                                                                                                                                                                    |
+| A replayed `hello` or `tick`                                 | It names an earlier daemon run, or an ended run                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | `stale_run`; it changes nothing, however recent it is.                                                                                                                                                                                                                                                                                                  |
+| Two writers on one ring                                      | New packets, with fresh `tick`s, from a run neither current nor ended                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | `two_writers`, health `degraded`, its packets skipped as `foreign_run`; an unbound run never ends the bound one. If both are bound to the live daemon run, `ring_blind` until one has sent nothing for three tick intervals.                                                                                                                            |
+| Station clock ahead                                          | The daemon's negative δ̂ travels in `offset_ms`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | Heard as on the socket path, up to 65 s ahead. Beyond that, frames are refused as `not-yet-valid` on the ring path only, and the daemon's `health` reports `clock_skew` (RFC:2185).                                                                                                                                                                     |
+| Station clock behind                                         | `expired_on_read` for that key; `expiry_delta` in shadow mode                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | Items expire early by the skew, on the ring path only. Fail closed.                                                                                                                                                                                                                                                                                     |
+| Unauthenticated packets                                      | The writer signature                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | Dropped and counted. They never move the seq accounting.                                                                                                                                                                                                                                                                                                |
+| A flood, untuned or forged                                   | `MATCH`, then the per-key queues and the verification budget (§4.6)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | Untuned packets cost the reader nothing but take retention; a flood that laps the ring shows as `stream_seq` holes. Forged packets over their key's queue are skipped unverified, counted as `over_cap` and refilled later; the streams they claim are hidden and reported meanwhile, and no other key's are touched.                                   |
+| Manifest change or mismatch                                  | The manifest SHA-256 in `hello` and `tick`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | A mismatch is reported (`manifest_mismatch`), and `primary` shows nothing from the ring until the manifests match (`ring_blind`, §8). frond-ear reads its manifest once at start, so a change on the daemon's side silences `primary` until frond-ear restarts with the new file.                                                                       |
+| A key revoked in the manifest                                | frond-ear's own manifest, at its next start                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | Until frond-ear restarts with the new file, the key's retained packets are still accepted on the ring path, while the daemon's `manifest_mismatch` blanks `primary`. At the restart, its packets and live rows are refused (§4.7).                                                                                                                      |
+| A local `AUTH` against a helper configured without arguments | Any local client sending `AUTH` (the pinned ref)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | The server crashes with SIGSEGV: `posix_spawn` gets a null argument vector (`rs:src/auth.c:483`; `rs:src/config.c:3428` builds one only when there are arguments; E5). Configure the helper with an argument (§2). Should it happen anyway, it is a crash as above.                                                                                     |
+| Local connection exhaustion                                  | Any local process can hold connections up to `MaxClients` (600)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | Availability only: `ring_unavailable` for the reader, and the writer's drops show as holes. With `WriteIP` unused, the daemon also loses ringserver's reserve slots for write addresses (`rs:src/ringserver.c:1181-1185`), and `MaxClientsPerIP` can't single out one process, since every client is 127.0.0.1 (`rs:src/ringserver.c:1165-1175`). Q-S1. |
 
 **Why there is no automatic fallback to the socket for content.**
 
@@ -913,18 +946,19 @@ measuring.
 
 - **`FakeRingserver`.** A DataLink server over a real loopback socket (`node:net`) that answers `ID`, `INFO STATUS`,
   `WRITE` (with flags `A`, `N` and `I`), `READ`, `POSITION SET` (an id, an id with a pkttime, `EARLIEST` and
-  `LATEST`), `MATCH`, `STREAM` and `ENDSTREAM`, using fixed slots. It reproduces the real server's quirks from
-  Appendix A:
+  `LATEST`), `MATCH`, `STREAM` and `ENDSTREAM`, on several connections at once, using fixed slots. It reproduces the
+  real server's quirks from Appendix A:
   - `POSITION SET N` or a good `READ N`, then `STREAM`, delivers from N + 1;
   - after a missed `READ` or a failed `POSITION SET`, `STREAM` starts at the next new packet on a connection that
     never had a position, and from the old position on one that had;
   - `EARLIEST` and `AFTER` skip their first match;
-  - a lapped reader is skipped forward without notice;
+  - a lapped reader is skipped forward without notice, and a `MATCH` reader with nothing to match waits up to 1 s;
   - `MATCH` filters `STREAM`, not `READ`;
   - an unmapped ring's crash rolls back to the last clean shutdown and hands ids out again;
-  - a mapped ring's crash keeps the newer slots behind the old header: earliest id above latest, lost packets
-    readable and then reissued in place, a `STREAM` from the earliest waiting for the next write and then out of id
-    order (E4);
+  - a mapped ring's crash keeps the newer slots behind the old header (E4). If the ring was full: earliest id above
+    latest, lost packets readable and then reissued in their own slots, a connection that has just read one missing
+    the new packet written over it, and a fresh `STREAM` out of id order. If it wasn't: a header range holding a
+    window the clean stop never held, and the rest unreadable;
   - a reset starts ids at 1, and a resize resets pkttimes;
   - a caught-up reader waits up to 1 s, and a client silent for its first 10 s is dropped;
   - every `WRITE` error disconnects.
@@ -934,13 +968,14 @@ measuring.
 - **`FakeWriter`.** Builds signed envelopes with a test writer key around frames signed with the station fixture keys
   (`test/fixtures/canticle/frame-v2-candidates.json`, as `test/canticle-listener.test.ts` does). It keeps its
   `rec_seq` in step with the fake host daemon in `canticle-host.ts`, and names that daemon's run. It has switches for
-  holes in `seq`, `key_seq` or the control sequence, queue drops by reason, retries, bad signatures, run numbers,
-  `prev_reserved_through`, `tick` heads, a second writer, retract packets, the `resurfaced` flag, `offset_ms`, and
-  runs with or without `bye`.
+  holes in `seq`, `stream_seq` or the control sequence, queue drops by reason, retries, bad signatures, run numbers,
+  `prev_run` and `prev_reserved_through` (or null), `tick` heads, a second writer, retract packets, the `resurfaced`
+  flag, `offset_ms`, and runs with or without `bye`.
 - **A conformance script,** outside `pnpm check` like `tools/chaos`, that runs the same scenarios against a real
   ringserver 4.5.4 built in a temp dir. It keeps the fake's quirks true to the server. Appendix A is its first run:
-  E1 to E3, then `kill -9` after a wrap in both ring modes (E4), the write gate and every `AUTH` failure (E5), and
-  nonlocal refusal (E6).
+  E1 to E3; then `kill -9` after a wrap in both ring modes, on one connection and on fresh ones (E4), which it repeats
+  with many stream ids, with a kill during a clean stop, and with a stop slower than `TimeoutStopSec`; the write gate
+  and every `AUTH` failure (E5); and nonlocal refusal (E6).
 
 Each case asserts the counters, what `hear` shows and what is pushed:
 
@@ -953,9 +988,9 @@ Each case asserts the counters, what `hear` shows and what is pushed:
    are dropped and counted, and the others show `late: … (replay)`.
 4. **Store failure.** While the store fails, the connection stays open, nothing surfaces and no checkpoint moves. The
    first checkpoint after recovery rewrites the live rows, and a later restart rebuilds every live item.
-5. **A gap for one key.**
-   - One `ring_gap` for that key with the exact count; that key's items heard before it are hidden, and other keys'
-     stay shown.
+5. **A gap for one stream.**
+   - One `ring_gap` for that stream with the exact count; that stream's items heard before it are hidden, and other
+     streams' stay shown.
    - The witness confirms an item only once the consumer has read up to `W`. With a retract still queued on the
      socket for a PLUCK lost in the hole, the item stays hidden, and the retract then removes it.
    - When the consumer can't confirm, a snapshot is requested on a second connection. The main connection sees no
@@ -963,17 +998,18 @@ Each case asserts the counters, what `hear` shows and what is pushed:
    - Absence from a complete snapshot removes an item.
    - An unconfirmed item leaves at expiry, counted as `off_air_unpushed` and `hidden_expired`; a confirmed one is
      pushed late.
-6. **Laps and refills.** After a lap (the fake skips forward), the reader refills from what the ring still holds; a
-   fully refilled hole reports no loss. A retry after a disconnect that arrives behind later packets fills its
-   missing `key_seq` rather than being taken as a duplicate.
+6. **Laps and refills.** After a lap (the fake skips forward), the reader refills on the second connection from what
+   the ring still holds, and the main stream never rewinds; a fully refilled hole reports no loss. A retry after a
+   disconnect that arrives behind later packets fills its missing `stream_seq` rather than being taken as a
+   duplicate.
 7. **Writer restarts.**
    - With or without `bye`, the previous run's items are hidden until `resurfaced` re-appends confirm them.
    - Without `bye`, `writer_restarted_without_bye` is reported, with the tail unknown (case 23).
-   - In a higher run, a key first seen at `key_seq` 5 is a `ring_gap` of exactly 4 for that key; a run first seen
-     past its `hello` reports that whether runs went by is unknown.
+   - In the new run, a stream first seen at `stream_seq` 5 is a `ring_gap` of exactly 4 for that stream. A run first
+     seen past its `hello` reports that whether runs went by is unknown.
 8. **Runs.**
-   - Replayed packets of a lower run, ended or not, count as `stale_run` and change nothing, and nothing goes blank.
-   - Two interleaved writers raise `two_writers`, and the bound run's content still flows (case 27).
+   - Replayed packets of an ended run count as `stale_run`, change nothing, raise no alert, and nothing goes blank.
+   - A second writer's packets are `foreign_run`, and the bound run's content still flows (case 27).
    - A lower run bound to the live daemon run is accepted as `run_regressed`, read early or late (case 25).
 9. **Cold start.** The reader joins the first run anywhere. `ring_joined_late` lasts until a complete snapshot lists
    nothing the ring path lacks.
@@ -981,15 +1017,16 @@ Each case asserts the counters, what `hear` shows and what is pushed:
     `READ EarliestPacketID` and `STREAM`. A `READ` that misses is retried after `INFO STATUS`, never followed by
     `STREAM`. An evicted cursor whose successors survive reports no loss.
 11. **Ids handed out again after a crash, and resets** (the fake rolls back). `ring_reset`; known (run, seq) pairs are
-    skipped and holes are counted; ids planted with flag `I` cause no hiding on their own. Out-of-order ids are
-    case 24.
+    skipped and holes are counted; ids planted with flag `I` cause no hiding on their own. Ids reused in place and out
+    of order are case 24.
 12. **Duplicates.** The same (run, seq) twice (a writer retry) is admitted once and counted as `ring_duplicate`. The
     same identity in two runs is pushed once.
 13. **Retract packets.**
     - A mirrored retract removes a live or hidden item.
     - A held item that is retracted before release never appears.
     - A plucked item that moved a mark retracts the older value.
-    - A quarantine retracts the key's items.
+    - A quarantine retracts the key's items, on each of its streams.
+    - A retracted item whose frame is read again later (a refill, a merged range, a rewind) stays retracted.
 14. **Expiry.**
     - A packet expired on read never reaches the live set, `hear` or a push, and counts as `expired_on_read`.
     - One with 2 s left is gone after 2 s (test EM-01, RFC:1788).
@@ -1014,8 +1051,8 @@ Each case asserts the counters, what `hear` shows and what is pushed:
     - With no session attached, delivery holds; the reader keeps reading, its cursor advances, and memory stays
       bounded.
     - Drops from `bufferPerStream` are counted.
-    - 100 000 packets from one key over the listener's quota are refused as `over-quota`, and memory stays bounded.
-      (The flood is case 22.)
+    - 100 000 authenticated packets from one key over the listener's quota, with the reader's queues set large enough
+      not to skip, are refused as `over-quota`, and memory stays bounded. (The flood is case 22.)
     - Hidden rows are evicted before live ones.
 18. **Ring unavailable.** `ring_unavailable`, backoff, and a line in `hear`. Recovery from the cursor; holes from
     writer drops show as `ring_gap`.
@@ -1028,72 +1065,86 @@ Each case asserts the counters, what `hear` shows and what is pushed:
     - Different manifests give `manifest_mismatch`.
 21. **Keepalive.** The first command goes out within 10 s, and an idle reader sends `ID` within `ClientTimeout`.
 22. **The flood test (acceptance; #116 amendment 4).** Against the fake, and in the conformance script against the
-    real build: an untuned key writes at line rate, and forged packets (bad writer signatures) arrive at line rate
-    under one tuned key F's stream id, while a quiet tuned key Q writes one item a second.
-    - Every one of Q's items is admitted within 2 s of being written, and Q reports no gap.
-    - Verifications per second stay within the budget, and memory stays bounded.
-    - The untuned packets cost no verification: never sent under `MATCH`, counted as `untuned` without it.
-    - F counts `over_cap`, its earlier items are hidden and reported, and no other key is hidden.
-    - Run with and without `MATCH`, with retention sized for the flood; a lap, if one happens, shows as Q's counted
-      loss, never as silence.
+    real build. An untuned stream U writes at a stated rate, at least 20 000 packets a second [PROPOSED], and forged
+    packets (bad writer signatures) arrive at the same rate under tuned stream F's id, while a quiet tuned stream Q of
+    another key writes one item a second, for 60 s.
+    - **With retention of at least 2 s of the flood:** every one of Q's items is admitted within 2 s of being
+      written, and Q has no gap. Verifications per second stay within the budget, and memory stays bounded. U costs no
+      verification: never sent under `MATCH`, counted as `untuned` without it. F counts `over_cap`, its streams are
+      `refill_pending` and hidden and reported, and no stream of another key is hidden.
+    - **With retention under 1 s of the flood:** the flood laps the reader silently (E2), and Q's lost packets show
+      as Q's `ring_gap` by `stream_seq`, never as silence.
+    - Each run with and without `MATCH`.
 23. **A crash with an unknown tail** (🌫).
     - The reader reads run R to seq 10; the fake ring loses 11 to 20 in a crash; the writer restarts as S, whose
       `hello` names R. The report is `writer_restarted_without_bye` with `run_tail_unknown` (R, last read 10), never
       an exact count, and R's items are hidden.
-    - With `prev_reserved_through` 4 096 the tail is `at_most` 4 086. With the socket having shown the records that
-      11 to 20 mirrored, it is `at_least` their number.
+    - With `prev_reserved_through` 4 096 the tail is `at_most` 4 086 packets across all streams. With the socket
+      having shown records on tuned streams that 11 to 20 mirrored, it is `at_least` their number on each of those
+      streams, reported apart. With `prev_run` null, the tail is `unknown`.
     - A `hello` naming a run the reader never saw reports `runs_absent`.
     - Repeated with a frond-ear restart between the crash and S's `hello`: the persisted witness gives the same
       report.
     - Alongside case 5's within-run holes, which stay `exact`.
-24. **Out of order after a wrap** (🍃).
-    - The fake reproduces E4: a crash of a full memory-mapped ring, after a lap and without one.
+24. **Ids reused and out of order after a crash** (🍃).
+    - The fake reproduces E4: a crash of a full memory-mapped ring, after a lap and without one, and of one that
+      wasn't full.
     - Earliest id above latest is reported as `ring_reset`. A cursor packet that is still readable validates.
-    - A `STREAM` that waits, then delivers ids out of order, is accounted by (run, seq) and `key_seq` with no false
-      hole, duplicate or confirmation.
+    - A connection that has just read a lost packet misses the new packet written over it: the `stream_seq` hole
+      shows it, and the refill finds it.
+    - A fresh `STREAM` that delivers ids out of order is accounted by (run, seq) and `stream_seq` with no false hole,
+      duplicate or confirmation.
     - Packets later reissued under the same ids fail digest validation at the next resume.
-    - The conformance script repeats `kill -9` after a wrap with `MemoryMapRing 1` and `0`, and checks that `0` rolls
-      back cleanly.
+    - The conformance script repeats `kill -9` after a wrap with `MemoryMapRing 1` and `0`, with one stream id and
+      with many, and checks that `0` comes back as its last clean stop left it. It also kills the server during a
+      clean stop, and lets systemd's stop timeout cut one short, and records what comes back.
 25. **A fresh `hello` replayed** (🌫).
     - The writer starts twice, 10 s apart: runs R1 < R2, naming daemon runs D1 and D2. A replay of R1's `hello`, or
-      a `tick`, 5 s after R2 started (inside the 30 s freshness window an earlier draft had) is `stale_run` and
-      changes nothing.
+      a `tick`, 5 s after R2 started is `stale_run` and changes nothing.
     - A regressed run R3 < R2 whose `hello` names the live D3 is accepted as `run_regressed` when read 1 s late and
       when read 10 minutes late.
+    - Once R3 is current, R2's retained packets read again (after a rewind, a reset or a restart) are `stale_run`,
+      and R2 never comes back.
     - With the host socket down, R3 waits, and is decided once the socket reports D3.
-26. **One key's gap while other keys flow** (🍃's H1).
-    - With keys A, B and C live, one of A's packets is lost. Only A's earlier items are hidden; B's and C's stay
-      shown, and their new items are pushed on time.
-    - A quiet key D's lost last packet shows as a hole when the next `tick` carries D's head.
+26. **One stream's gap while other streams flow** (🍃's H1).
+    - With streams A1 and A2 of one key, and B1 of another, live, one of A1's packets is lost. Only A1's earlier
+      items are hidden; A2's and B1's stay shown, and their new items are pushed on time.
+    - A reader that tunes A1 but not A2 sees no hole from A2's packets.
+    - A quiet stream D1's lost last packet shows as a hole when the next `tick` carries D1's head.
     - A `retract` lost on the ring but seen on the host socket hides its item at once.
-27. **Blind states** (🍃's H2).
-    - A second writer with a higher run naming another daemon run: the bound lower run stays current, `two_writers`
-      and `foreign_run` are reported, and health is `degraded`.
+27. **Blind states and second writers** (🍃's H2).
+    - A second writer with a higher run naming another daemon run never ends the bound run: `two_writers` and
+      `foreign_run` are reported, health is `degraded`, and the bound run's items keep flowing.
+    - A writer restarting within one daemon incarnation, its `hello` naming the previous run, raises nothing.
+    - History re-read after a reset raises no `two_writers`.
     - A current run that hasn't named the live daemon run for three intervals is `ring_blind` (`run_unbound`) in
       `ear_status` and `hear`, and clears when a bound run appears.
     - Two runs bound to the same daemon run are blind until one has sent nothing for three tick intervals.
-    - In each, health never reads `ok` while nothing new can be shown.
+    - In each blind state, health never reads `ok`.
 28. **The write gate and `AUTH`** (🌫's Q-S2; conformance script, E5 and E6).
     - Without `AUTH`, `ID` shows no `WRITE`, and a `WRITE` is refused and disconnected.
     - On a fresh connection, a helper timeout, a non-zero exit or malformed JSON leaves no write.
     - On an authorized connection, each of those leaves write in place, so revocation is by disconnecting.
     - A stream pattern that fails to compile replies `ERROR`, with write granted.
-    - An `AuthCommand` without arguments crashes the pinned build on the first `AUTH`.
-    - A nonlocal peer is closed before any reply, and `INFO CONNECTIONS` is refused to an untrusted local client.
+    - An `AuthCommand` without arguments crashes the pinned build on the first `AUTH`; with one, it doesn't.
+    - A connection from a non-loopback address is closed before any reply, and `INFO CONNECTIONS` is refused to an
+      untrusted local client.
 29. **Caps over their limits.**
-    - A ninth missing range for a key merges the two oldest, a late fill inside the span is processed, and the count
-      becomes `at_most`.
-    - A seventeenth run retires the oldest, with its tail unknown.
+    - A ninth missing range for a stream merges the two oldest, a late fill inside the span is processed, and the
+      count becomes `at_most`.
+    - A seventeenth run with open holes retires the oldest, with its tail unknown.
     - A live table full of live rows refuses new items as `live_overflow`, with health `degraded`; no key holds more
       than 512 rows.
-    - After an outage, one busy key's backlog overflows its queue: the excess is skipped, then refilled on the second
-      connection, and nothing is lost while the ring still holds it.
-30. **Hidden items across a restart.** frond-ear restarts with items hidden; their watermarks reload, and the witness
-    confirms them as before.
+    - After an outage, one busy stream's backlog overflows its key's queue: the excess is skipped and refilled on the
+      second connection, its items are hidden meanwhile, and nothing is reported lost while the ring still holds it.
+    - A 65th skip range for a stream merges into the oldest.
+    - With every tracked stream holding items, a new stream's items are hidden as `untracked_stream`.
+30. **Hidden items across a restart.** frond-ear restarts with items hidden and skips awaiting refill; their
+    watermarks and skips reload, and the witness and the refill carry on as before.
 31. **Shadow window.** At 60 frames a second for an hour the window holds without overflow; at its cap, comparison
     pauses as `shadow_incomplete`, and no false `socket_only` is counted.
-32. **Writer queue** (with the binary-canticle owners' writer). Drops by queue cap and by age leave per-key holes, and
-    `tick` counts them by reason; `accepted` never includes a dropped packet.
+32. **Writer queue** (with the binary-canticle owners' writer). Drops by queue cap and by age leave per-stream holes,
+    and `tick` counts them by reason; `accepted` never includes a dropped packet.
 
 ## 10. Open questions
 
@@ -1107,21 +1158,23 @@ Each case asserts the counters, what `hear` shows and what is pushed:
   avoids ringserver's 63-byte limit and the naming table.
 - **Q-B3.** Should the writer live inside the daemon, after its write-ahead save (W2, preferred), or in a sidecar that
   reads record v1? A sidecar can't produce lane (c): record v1 carries only the frame's digest and size, not its bytes
-  (RFC:2195). Nor could it bind runs to the daemon's incarnation as §4.3 needs.
+  (RFC:2195). (A sidecar restarting within one daemon incarnation is handled: its `hello` names its previous run,
+  §4.3.)
 - **Q-B4.** Are W1 to W9 and §3.2 workable? 🍃 finds them workable once the per-key subsequence lands and the first
-  hop is declared lossy; both are now in (W9, §1.1). The asks:
+  hop is declared lossy; both are now in (W9, §1.1). The subsequence is per ring stream rather than per key, because
+  `tune` and `MATCH` select station:stream pairs. The asks:
   - append on surfacing, and held items only on release;
   - `resurfaced` re-hearings flagged;
   - retract packets mirroring record v1, under the target item's stream id;
   - control-class items never;
-  - each packet carrying the `rec_seq` of the record it mirrors, and its `key_seq`;
-  - `tick`'s per-key heads, and the daemon run in `hello` and `tick`;
-  - W3's queue caps, and W5's sequence reservation with `prev_reserved_through`.
+  - each packet carrying the `rec_seq` of the record it mirrors, and its `stream_seq`;
+  - `tick`'s per-stream heads, and the daemon run in `hello` and `tick`;
+  - W3's queue caps, and W5's sequence reservation with `prev_reserved_through` (null when the writer lost its state).
 - **Q-B5.** 🍃's pick is now the proposal: the owner-signed manifest names the writer's public keys by epoch, rotated
   with an overlap, and envelope byte 7 names the epoch. Open: the manifest schema, and how the daemon gets its
   writer key.
-- **Q-B6. Answered by 🍃:** no beacons in the ring; `tick` carries per-key heads instead (W6). They witness tails lost
-  at the writer or in transit, not in a ring rollback (§4.4).
+- **Q-B6. Answered by 🍃:** no beacons in the ring; `tick` carries per-stream heads instead (W6). They witness tails
+  lost at the writer or in transit, not in a ring rollback (§4.4).
 - **Q-B7.** Should there be a reliable binding (station to ring, or relay to ring) for high-rate signed streams that
   can't go by reference? It would need an RFC amendment alongside §11. It is also where recovered streams would go
   (§1.1).
@@ -1132,32 +1185,34 @@ Each case asserts the counters, what `hear` shows and what is pushed:
 **For 🍃 frond-gloss:**
 
 - **Q-G1.** Do you agree there should be no automatic content fallback when the ring is down (§7)?
-- **Q-G2. Answered by 🍃:** hide and confirm, now per key, with the blind state in health. It still needs the socket
-  consumer to keep `frame.sha256`, expose its last `rec_seq`, keep its recent retracts and the witness set (§4.4),
-  and a second, short-lived connection for snapshots.
+- **Q-G2. Answered by 🍃:** hide and confirm, now per stream, with the blind state in health. It still needs the
+  socket consumer to keep `frame.sha256`, expose its last `rec_seq`, keep its recent retracts and the witness set
+  (§4.4), and a second, short-lived connection for snapshots.
 - **Q-G3.** Expired retained packets never reach a session. Or should there be a pull tool (a `canticle_replay`, with
   custody path `replay` and each item labelled expired)?
 - **Q-G4.** Should the mute for catch-up records apply at take-in, as for join snapshots today, or at hearing time?
 - **Q-G5.** Are custody's origin and `run:seq` fields worth the schema change?
 - **Q-G6.** Are §4.6's cap defaults right (256 packets and 256 KiB queued per key, 8 MiB in all, 2 000
-  verifications a second), and should an over-cap skip hide its key until refilled, as here, or only be counted?
+  verifications a second), and should a stream awaiting refill be hidden, as here, or only flagged?
 
 **For 🌫 silas:**
 
 - **Q-S1. Decided:** an IPv4 listener, `AcceptIP 127.0.0.1/32`, `WriteIP` and `TrustedIP` unused, no host firewall
-  (🍃's pick; figs ruled out LAN firewalls on 2026-11-15). Nonlocal refusal and refusal of an unauthenticated local
-  `WRITE` are shown in E5 and E6, and are conformance cases (§9, case 28). Your S1 candidate included a firewall.
-  Open: is the residual acceptable for a same-host shadow? ringserver binds every IPv4 address, so the port completes
-  a nonlocal handshake before closing it (E6), and any local process can hold connections against `MaxClients` (§7).
+  (🍃's pick; figs ruled out LAN firewalls on 2026-11-15). Refusal of a non-loopback peer (from this host's own LAN
+  address) and of an unauthenticated local `WRITE` are shown in E5 and E6, and are conformance cases (§9, case 28).
+  Your S1 candidate included a firewall. Open: is the residual acceptable for a same-host shadow? ringserver binds
+  every IPv4 address, so the port completes a nonlocal handshake before closing it (E6), and any local process can
+  hold connections against `MaxClients`, with the daemon's reserve slots gone (§7).
 - **Q-S2. Answered by 🌫, and confirmed in E5:** start from no write, test helper failures and re-`AUTH`, and never
   revoke by a failed `AUTH` (§2). Open, for the fork's owner: an `AuthCommand` without arguments crashes the server
   on the first `AUTH`, and a stream pattern that fails to compile replies `ERROR` while granting write. Patch the
   fork, or keep the workaround (an argument, and no patterns)?
-- **Q-S3. Decided for version 1:** `MemoryMapRing 0`, which rolls back cleanly (E4). No periodic-header patch: on its
-  own it doesn't establish crash durability (🌫); packet, header and stream-index consistency and flush ordering
-  would each need their own proof. Open: power loss, since nothing syncs (§7); RAM and stop time at size; the
-  installed ring size after the shadow experiment (1 GiB is a candidate, not a decision); and who owns the systemd
-  unit.
+- **Q-S3. Picked for version 1 (🍃):** `MemoryMapRing 0`, which came back as its last clean stop left it after every
+  `kill -9` in E4. Not claimed as crash-durable, and no periodic-header patch: on its own it doesn't establish crash
+  durability (🌫), and packet, header and stream-index consistency and flush ordering would each need their own
+  proof. Open: a kill or a stop timeout during the clean stop's write, header first (§7); power loss, since nothing
+  syncs; RAM, stop time and `TimeoutStopSec` at size; the installed ring size after the shadow experiment (1 GiB is a
+  candidate, not a decision); and who owns the systemd unit.
 - **Q-S4.** Lanes (b) and (e) stay as RFC §18.3 has them, for dashboards, on their own instance. Does anything here
   conflict with `bc:spike/silas-seedlink-mapping.md`?
 
@@ -1200,41 +1255,53 @@ node e3.mjs <port> write|status|read|pos   # between restarts: kill -TERM, kill 
 | E3  | `RingSize` changed from 1M to 2M across a restart                          | The packets were loaded from `.version3` with their ids kept. The pkttime changed (`…311328259` to `…311850677` µs). `POSITION SET 3 <old pkttime>` passed only because both fell in the same second (the check is to the second, `rs:src/dlclient.c:509-527`). |
 
 E3's `kill -9` cases all ran on a ring that had never filled. A second run, for this revision, used the same build
-(aarch64, glibc 2.39) and a new client, one fresh temp dir per scenario. E4 used the first run's settings with
-`MemoryMapRing` set per row. E5 and E6 used `MemoryMapRing 0`, `WriteIP 192.0.2.1/32`, `TrustedIP 192.0.2.1/32`,
-`AuthCommand <helper> canticle` and `AuthTimeout 2`, with a throwaway helper whose reply depends on the password.
+(aarch64, glibc 2.39) and a new client, one fresh temp dir per scenario. E4 used the first run's settings, plus
+`TrustedIP 127.0.0.1/32` and `MemoryMapRing` set per row, and wrote a single stream id. E5 and E6 used
+`MemoryMapRing 0`, `WriteIP 192.0.2.1/32`, `TrustedIP 192.0.2.1/32`, `AuthCommand <helper> canticle` and
+`AuthTimeout 2`, with a throwaway helper whose reply depends on the password.
 
 ```sh
 node crash.mjs build/ringserver <dir> 1|0 <scenario>   # E4: write, TERM, restart, write, kill -9, restart
                                                       #     scenario: full_wrap, full_nowrap or notfull_wrap
+node stall.mjs build/ringserver <dir>                 # E4: one connection across the crash, then new writes
 node auth.mjs build/ringserver <dir> <helper> <addr>  # E5, E6; addr: a non-loopback address of this host
+node authcrash.mjs build/ringserver <dir> <helper>    # E5: AuthCommand with no arguments, then with one
 ```
 
-| #   | What was checked                                                                                                   | Result                                                                                                                                                                                                                                                                                                                                                                |
-| --- | ------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| E4  | A full ring (255 to 1000) stopped cleanly, then 1 000 more (1001 to 2000, past a lap) and `kill -9`; memory-mapped | `EarliestPacketID` 1747, `LatestPacketID` 1746. Every slot still answered `READ`, 1255 to 2000, including the 254 packets the crash lost (1747 to 2000). A `STREAM` after `READ 1747` got nothing until the next write. The next 5 writes got ids 1747 to 1751 again, in place. A `STREAM` from 1752 then delivered 1753 to 2000, then 1255 to 1751: out of id order. |
-| E4  | A full ring stopped cleanly, then 50 more (1001 to 1050, no lap) and `kill -9`; memory-mapped                      | Earliest 1001, latest 1000: the same pattern without a lap. A `STREAM` from 1006 delivered 1007 to 1050, then 305 to 1005.                                                                                                                                                                                                                                            |
-| E4  | 100 packets stopped cleanly, then 1 000 more (101 to 1100) and `kill -9`; memory-mapped                            | Earliest 747, latest 846: in order, but a window the clean stop never held (it held 1 to 100). Packets 847 to 1100 were still in their slots, unseen, and were reissued from 847.                                                                                                                                                                                     |
-| E4  | The same three with `MemoryMapRing 0`                                                                              | Each came back exactly as its clean stop left it (255 to 1000, 255 to 1000, 1 to 100), in order. The next ids were 1001, 1001 and 101, again.                                                                                                                                                                                                                         |
-| E4  | `READ` of every id across each crashed ring                                                                        | Every packet present was found. With earliest above latest, the id search scans back from the latest instead of bisecting (`rs:src/ring.c:1887-1954`), so the binary-search miss 🍃 inferred didn't occur in these runs. The disorder showed in `STREAM` instead.                                                                                                     |
-| E5  | No `AUTH`                                                                                                          | `ID` without `WRITE`; `WRITE` → `ERROR`, and disconnected                                                                                                                                                                                                                                                                                                             |
-| E5  | `AUTH` on a fresh connection: accepted, denied, helper exit 1, helper timeout, malformed JSON                      | `OK` and write for the first; `ERROR` and no write for each of the other four                                                                                                                                                                                                                                                                                         |
-| E5  | The same failures as a second `AUTH` on an authorized connection                                                   | `ERROR`, and write kept: the next `WRITE` succeeded each time. A valid reply without write (denied, or connect only) did clear it.                                                                                                                                                                                                                                    |
-| E5  | A reply granting write with a stream pattern that fails to compile                                                 | `ERROR … Error performing authentication`, and write granted, on a fresh connection and on a re-`AUTH`                                                                                                                                                                                                                                                                |
-| E5  | `AuthCommand <helper>` with no arguments                                                                           | The server crashed (SIGSEGV) on the first `AUTH`. Under gdb, `posix_spawn` had a null argument vector (`rs:src/auth.c:483`; `rs:src/config.c:3428` builds one only when there are arguments).                                                                                                                                                                         |
-| E6  | A connection from this host's non-loopback address                                                                 | TCP connected, then closed before any reply; logged `Denying connection not in accept list`                                                                                                                                                                                                                                                                           |
-| E6  | `INFO STATUS` and `INFO CONNECTIONS` from an untrusted local client                                                | The status carried the packet id range, without the thread list. `CONNECTIONS` → `ERROR`, and disconnected.                                                                                                                                                                                                                                                           |
+| #   | What was checked                                                                                                   | Result                                                                                                                                                                                                                                                                              |
+| --- | ------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| E4  | A full ring (255 to 1000) stopped cleanly, then 1 000 more (1001 to 2000, past a lap) and `kill -9`; memory-mapped | `EarliestPacketID` 1747, `LatestPacketID` 1746. `READ` found 1255 to 2000, every slot, including the 254 packets the crash lost (1747 to 2000).                                                                                                                                     |
+| E4  | The same crash, then one connection: `READ 1747`, `STREAM`, and 5 new writes 2.7 s later                           | Nothing arrived before the writes. They got ids 1747 to 1751 again, in place, and the connection then received 1748 to 1751 only: the first new packet went into the slot it had just read, and was skipped with no message.                                                        |
+| E4  | After those writes, a new connection: `READ 1752`, `STREAM`                                                        | 1753 to 2000, then 1255 to 1751: out of id order.                                                                                                                                                                                                                                   |
+| E4  | A full ring stopped cleanly, then 50 more (1001 to 1050, no lap) and `kill -9`; memory-mapped                      | Earliest 1001, latest 1000: the same pattern without a lap. After 5 new writes, a new connection's `STREAM` from 1006 delivered 1007 to 1050, then 305 to 1005.                                                                                                                     |
+| E4  | 100 packets stopped cleanly, then 1 000 more (101 to 1100) and `kill -9`; memory-mapped                            | Earliest 747, latest 846: in order, but a window the clean stop never held (it held 1 to 100). `READ` found only 747 to 846. Packets 847 to 1100 were still in their slots but outside the header's range, unreadable, and their ids were reissued from 847.                        |
+| E4  | The same three with `MemoryMapRing 0`                                                                              | Each came back exactly as its clean stop left it (255 to 1000, 255 to 1000, 1 to 100), in order. The next ids were 1001, 1001 and 101, again.                                                                                                                                       |
+| E4  | `READ` of every id from 1 to 2010 across each crashed ring                                                         | Every packet inside the header's range was found. With earliest above latest, the id search scans back from the latest instead of bisecting (`rs:src/ring.c:1887-1954`), so the binary-search miss 🍃 inferred didn't occur in these runs. The disorder showed in `STREAM` instead. |
+| E5  | No `AUTH`                                                                                                          | `ID` without `WRITE`; `WRITE` → `ERROR`, and disconnected                                                                                                                                                                                                                           |
+| E5  | `AUTH` on a fresh connection: accepted, denied, helper exit 1, helper timeout, malformed JSON                      | `OK` and write for the first; `ERROR` and no write for each of the other four                                                                                                                                                                                                       |
+| E5  | The same failures as a second `AUTH` on an authorized connection                                                   | `ERROR`, and write kept: the next `WRITE` succeeded each time. A valid reply without write (denied, or connect only) did clear it.                                                                                                                                                  |
+| E5  | A reply granting write with a stream pattern that fails to compile                                                 | `ERROR … Error performing authentication`, and write granted, on a fresh connection and on a re-`AUTH`                                                                                                                                                                              |
+| E5  | `AuthCommand <helper>` with no arguments, then with one                                                            | With none, the server died with SIGSEGV on the first `AUTH` and the client's connection closed. With one, the same `AUTH` got `OK`. Under gdb, `posix_spawn` had a null argument vector (`rs:src/auth.c:483`; `rs:src/config.c:3428` builds one only when there are arguments).     |
+| E6  | A connection from this host's own LAN address, standing in for a remote peer                                       | TCP connected, then closed before any reply; logged `Denying connection not in accept list`                                                                                                                                                                                         |
+| E6  | `INFO STATUS` and `INFO CONNECTIONS` from an untrusted local client                                                | The status carried the packet id range, without the thread list. `CONNECTIONS` → `ERROR`, and disconnected.                                                                                                                                                                         |
+
+E4 wrote one stream id. ringserver's startup also checks that the boundary packets' streams are in its saved index,
+and eviction signals a shutdown when a packet's stream isn't indexed (`rs:src/ring.c:454-472`, `763-769`;
+`rs:src/dlclient.c:1047-1060`). A crash with many streams may come back differently, so the conformance script
+repeats E4 with many.
 
 What the experiments settle for the design:
 
-- A packet id can't serve as a cursor on its own (E3), and after a crash of a memory-mapped ring it says nothing
-  about order either (E4). pkttime is checked only to the second (`rs:src/dlclient.c:509-527`), so it can't tell a
-  reused id from the original when both fall in the same second.
+- A packet id can't serve as a cursor on its own (E3). After a crash of a memory-mapped ring it says nothing about
+  order either, and a reused id can make a streaming connection skip the packet written over the one it just read
+  (E4). pkttime is checked only to the second (`rs:src/dlclient.c:509-527`), so it can't tell a reused id from the
+  original when both fall in the same second.
 - A careless resume or a slow reader loses data with no message (E2); after a successful `READ`, a careless resume
   gives duplicates instead.
-- `MemoryMapRing 0` rolls back cleanly; the memory-mapped ring doesn't (E4).
+- `MemoryMapRing 0` came back as its last clean stop left it after each `kill -9` tried; the memory-mapped ring
+  didn't (E4).
 - Write can be gated by `AUTH` from a start with no write, but a failed `AUTH` revokes nothing (E5).
 
-Hence the signed (run, seq) envelope with a per-key subsequence, validating the cursor by `READ`, treating a hole in a
-signed sequence as the only loss signal, refilling holes from what the ring still holds, ordering by the envelope and
-never by packet id, and keeping what was read in frond-ear's own store.
+Hence the signed (run, seq) envelope with a per-stream subsequence, validating the cursor by `READ`, treating a hole
+in a signed sequence as the only loss signal, refilling holes from what the ring still holds, ordering by the
+envelope and never by packet id, and keeping what was read in frond-ear's own store.
