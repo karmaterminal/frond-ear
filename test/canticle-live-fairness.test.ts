@@ -3756,6 +3756,41 @@ for (const { keys, name } of ROTATIONS) {
     }
   });
 
+  test(`#119 E2, control (${name}): a stream that loses the place a record told at the revert gave it, and gets one back from a later push, takes the later push's key`, async () => {
+    const [stale, latest] = keys;
+    const { h, host, shim, sing, free } = await spent();
+    try {
+      // The first push carries the notes of 510 streams, and a record each of two more,
+      // off air before the pushes are given back.
+      sing(stale, 1, range(0, 509));
+      h.timers.advance(
+        status(h).lastPushAt! + 3_600_000 - 9_000 - h.clock.now(),
+      );
+      for (const i of [510, 511]) {
+        const station = `s${i}`;
+        host.sing(1, { station, key: stale, epoch: 100 + i, ttlMs: 20_000 });
+      }
+      h.timers.advance(10_000);
+      assert.equal(pushes(shim).length, 2, "510 notes and two records");
+      h.timers.advance(20_000);
+      // The records' notes take the last two places, owed nothing; s2, named in the first
+      // push and counted together in the second, takes s510's as the second is given back.
+      sing(latest, 2, [...range(256, 509), 0, 1, 2, 510]);
+      free();
+      shim.close(); // both given back, the earlier first
+      const next = h.attach("scribe", { sessionId: SESSION });
+      const off = offBut(512, 510);
+      assert.equal(wakesUnder(h, next, stale, off), 0, "the stale key");
+      assert.deepEqual(savedKey(h, "s510:ops.fleet"), {
+        key: latest,
+        owed: true,
+      });
+      assert.equal(wakesUnder(h, next, latest, off), 1, "the latest key");
+    } finally {
+      h.dispose();
+    }
+  });
+
   test(`#119 E2, control (${name}): past 512 streams, a stream that lost its place and is noted again under a later key, with no place, gets one back under that key, not the one it had when it lost it`, async () => {
     const [stale, latest] = keys;
     const { h, shim, sing, pause, free } = await spent();
