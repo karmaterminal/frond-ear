@@ -50,9 +50,10 @@
 // meet the boundary (the live set's shared count, and what the note counts past the 256
 // more it can keep by station) only ever rides with a push. Notes not yet told survive a
 // restart, and a note in a push the host never confirmed is told again once that push is
-// given back, its stream's station key as of that push: of several pushes given back
-// together (live, or after a crash), the latest one's key stands, whatever order they
-// come back in, and a note since any of them keeps its own.
+// given back. Its stream's station key stays the latest told of it, whatever order pushes
+// come back in (live, or after a crash): a note's is as of the first push that carried
+// it, a record's that a push gave back as of that push (after the notes it carried, and
+// the last heard last), and a note since any of them keeps its own.
 //
 // A tombstone is a dedupe claim, not delivery (binary-canticle#161). Each push is a batch:
 // its claim (batch, tombstones, cursor, a custody row per record) is written in one
@@ -317,9 +318,12 @@ interface Missed {
   /** The station key of its latest record: the boundary a push of its own meets. */
   key: string;
   /**
-   * The push `key` is as of (its batch id), when one carried the note, or the record it
-   * was noted of, and gave it back; none for a key noted since, which is later than any
-   * push's. Notes merged back in keep the later key by it, never by the merge's order.
+   * When `key` is as of, by the pushes that carried it: a note's, just before the first
+   * push that carried it (its batch id less ½), since the note was written before that
+   * push went, and a push carrying it again makes it no later; a record's that a push
+   * carried and gave back, that push (its batch id), since the record was on air when it
+   * went. None for a key noted since every push, which is the latest. Notes merged back
+   * in keep the later key by it, never by the merge's order.
    */
   asOf?: number;
   /** Owed a push of its own: a push said these wait, or the push budget held them. */
@@ -336,7 +340,7 @@ interface Missed {
 interface Folded {
   /** The station key of its latest record: the boundary a push of its own meets. */
   key: string;
-  /** The push `key` is as of, as a stream's own entry keeps it (`Missed.asOf`). */
+  /** When `key` is as of, as a stream's own entry keeps it (`Missed.asOf`). */
   asOf?: number;
   /** Owed a push of its own, as a stream's own entry would be. */
   owed: boolean;
@@ -401,21 +405,21 @@ const blankMissed = (key: string, asOf?: number): Missed => ({
   owed: false,
 });
 
-/** A station key, and the push it is as of (`Missed.asOf`). */
+/** A station key, and when it is as of (`Missed.asOf`). */
 interface Keyed {
   key: string;
   asOf?: number;
 }
 
 /**
- * Whether `note`'s key is at least as late as `than`'s: one noted since every push is the
- * latest; of two pushes' keys, the later push's (batch ids only grow). A tie goes to
- * `note`, the one merged in: a record a push carried is told after that push's notes.
+ * Whether `note`'s key is at least as late as `than`'s (`Missed.asOf`; batch ids only
+ * grow). A tie goes to `note`, the one merged in: of two notes since every push, the one
+ * noted last; of a push's records, the one told last, which is the last heard.
  */
 const asLate = (note: Keyed, than: Keyed) =>
   (note.asOf ?? Infinity) >= (than.asOf ?? Infinity);
 
-/** `into` takes `from`'s key, and the push it is as of. */
+/** `into` takes `from`'s key, and when it is as of. */
 function takeKey(into: Keyed, from: Keyed): void {
   into.key = from.key;
   if (from.asOf === undefined) delete into.asOf;
@@ -423,14 +427,18 @@ function takeKey(into: Keyed, from: Keyed): void {
 }
 
 /**
- * `missed` as push `batchId` carries it: every key in it is as of that push. So is a note
- * given back before and carried again, since that revert gave back every push before it.
+ * `missed` as push `batchId` carries it: a key no push carried before is as of just
+ * before this one; one already as of an earlier push stays so.
  */
 function carriedBy(missed: Missed, batchId: number): Missed {
-  missed.asOf = batchId;
-  for (const f of missed.streams?.values() ?? []) f.asOf = batchId;
+  missed.asOf ??= batchId - 0.5;
+  for (const f of missed.streams?.values() ?? []) f.asOf ??= batchId - 0.5;
   return missed;
 }
+
+/** A saved `asOf` that reads: a batch id, or one less ½. */
+const isAsOf = (value: unknown): value is number =>
+  typeof value === "number" && isCount(value * 2);
 
 /** Adds `from`'s counts and spans to `into`, which is owed if either is. */
 function addMissed(into: Missed, from: Missed): void {
@@ -700,7 +708,7 @@ function loadMissed(saved: unknown): Map<string, Missed> {
         const { key, owed, withheld, missed } = g;
         streams.set(g.stream, {
           key,
-          ...(isCount(g.asOf) ? { asOf: g.asOf } : {}),
+          ...(isAsOf(g.asOf) ? { asOf: g.asOf } : {}),
           owed,
           withheld,
           missed,
@@ -712,7 +720,7 @@ function loadMissed(saved: unknown): Map<string, Missed> {
       dropped: m.dropped,
       withheld,
       key: m.key,
-      ...(isCount(m.asOf) ? { asOf: m.asOf } : {}),
+      ...(isAsOf(m.asOf) ? { asOf: m.asOf } : {}),
       owed: m.owed,
       ...(stream === FOLDED ? { streams } : {}),
       ...(stream === FOLDED && m.more === true ? { more: true as const } : {}),
@@ -1650,9 +1658,9 @@ export class CanticleDelivery {
    * into them (`revertUnconfirmed`). Cursor and tombstones are read again from the store,
    * and the records wait for the next push, as a push no connection took leaves them,
    * along with what that push said was missed (owed again if it was owed); one already
-   * off air is counted so, never pushed late. What a push gives back tells of each stream
-   * as of that push, so of the pushes given back together (oldest first), the latest's
-   * key stands, and a note since any of them keeps its own. The records of a push this
+   * off air is counted so, never pushed late. Each stream keeps the latest key told of it
+   * (`Missed.asOf`), whatever order the pushes come back in (oldest first, here), and its
+   * records are told in the order they were heard. The records of a push this
    * process didn't make (a crash left it) or no longer keeps, and those refreshes, are
    * read from the view again on the next pass: a refresh is held back while the record
    * it re-issues waits, so it collapses once that record is pushed, and is news if the
@@ -1679,15 +1687,24 @@ export class CanticleDelivery {
       for (const [stream, missed] of push?.missed ?? []) {
         addNote(state.missed, stream, missed);
       }
-      for (const id of identities) {
-        const waiting = push?.records.find((record) => record.id === id);
+      // In the order they were heard, as records that wait are: of one stream's records
+      // told of, now or later, the last heard leaves its key.
+      const given = identities
+        .map((id) => ({
+          id,
+          waiting: push?.records.find((record) => record.id === id),
+        }))
+        .sort(
+          (a, b) =>
+            (a.waiting?.item.heardAt ?? 0) - (b.waiting?.item.heardAt ?? 0),
+        );
+      for (const { id, waiting } of given) {
         if (waiting === undefined || delivery === undefined) {
           state.seen.delete(id);
           continue;
         }
         if (state.waiting.has(id)) continue;
         waiting.asOf = batchId; // told of now or later, it tells as of this push
-
         if (waiting.expiresAt <= now) {
           if (waiting.dropped !== undefined) {
             this.#withhold(state, waiting, waiting.dropped);
@@ -1735,8 +1752,8 @@ export class CanticleDelivery {
   /**
    * What frond-ear withheld and hasn't told yet survives a restart (#168 §2.7a): the
    * notes waiting for the next push, and those a push the host never confirmed carried,
-   * which a revert after a crash gives back, as of that push (in any order, as `reverted`
-   * gives them back). Saved with `#saveWithheld`.
+   * which a revert after a crash gives back, each key as of when it was saved
+   * (`Missed.asOf`, as `reverted` keeps it). Saved with `#saveWithheld`.
    */
   #loadWithheld(ear: string, state: EarState): void {
     const saved = this.#deps.store.runtimeState(`canticle.withheld.${ear}`);
@@ -1762,7 +1779,7 @@ export class CanticleDelivery {
       if (!Number.isSafeInteger(batchId) || kept.has(batchId)) continue;
       const outcome = this.#deps.store.canticleOutcome(ear, batchId);
       const missed = loadMissed(saved);
-      // As of that push, whatever an earlier build saved of it.
+      // An earlier build saved no `asOf`: as of this push, at the latest.
       for (const m of missed.values()) carriedBy(m, batchId);
       if (outcome === "reverted") {
         // Given back already (the first attach after a crash reverts before this

@@ -3115,7 +3115,7 @@ for (const pass of [false, true]) {
       const name = "canticle.withheld.scribe";
       const saved = h.store.runtimeState(name)!;
       assert.match(saved, /"carried":\{"\d+":\{.*"asOf":\d+/u);
-      h.store.setRuntimeState(name, saved.replace(/,"asOf":\d+/gu, ""));
+      h.store.setRuntimeState(name, saved.replace(/,"asOf":[\d.]+/gu, ""));
       assert.doesNotMatch(h.store.runtimeState(name)!, /asOf/u);
       const again = crashed(
         h,
