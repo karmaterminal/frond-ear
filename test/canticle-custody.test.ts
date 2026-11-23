@@ -1313,9 +1313,12 @@ test("revert: a report the host never confirmed gives back its cursor with its c
     h.timers.advance(11_000);
     assert.equal(pushes(first).length, 1);
     assert.equal(pushes(first)[0]!.meta.report, "1");
-    const line =
-      /^ops:ops\.fleet: 2 new records \(items 7\/1 to 7\/2\), 1 went off air unpushed:$/mu;
+    // Record 3 went off air waiting for the report: a local omission, with its reason.
+    const line = /^ops:ops\.fleet: 2 new records \(items 7\/1 to 7\/2\):$/mu;
+    const missed =
+      /^- ops:ops\.fleet: 1 went off air unpushed while waiting for a push \(expired_waiting; heard \S+Z to \S+Z\)\.$/mu;
     assert.match(pushes(first)[0]!.content, line);
+    assert.match(pushes(first)[0]!.content, missed);
     first.close();
     assert.equal(status(h).waiting, 2);
     assert.equal(status(h).reports, 0, "the report number is given back");
@@ -1330,11 +1333,8 @@ test("revert: a report the host never confirmed gives back its cursor with its c
       "ops:ops.fleet/1",
       "ops:ops.fleet/2",
     ]);
-    assert.match(
-      report.content,
-      line,
-      "new records, not out of order, and what it missed",
-    );
+    assert.match(report.content, line, "new records, not out of order");
+    assert.match(report.content, missed, "and what it missed");
     await second.send({ type: "offered", batchId: report.batchId! });
     host.sing(3);
     h.timers.advance(11_000);

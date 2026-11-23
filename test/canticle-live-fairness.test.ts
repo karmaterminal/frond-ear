@@ -85,7 +85,10 @@ test("live set (c): every record the live set drops degrades receive health with
     host.sing(n, { stream: "ops.chatter", ttlMs: 60_000 });
   }
   assert.equal(c.health, "degraded", "an untuned refusal degrades");
-  assert.ok(c.healthReasons.includes("live_overflow_untuned"), c.healthReasons.join());
+  assert.ok(
+    c.healthReasons.includes("live_overflow_untuned"),
+    c.healthReasons.join(),
+  );
   assert.equal(c.counts.live_overflow, 10);
   assert.equal(c.counts.live_overflow_untuned, 10);
 
@@ -93,8 +96,11 @@ test("live set (c): every record the live set drops degrades receive health with
   for (let n = 1; n <= MAX_LIVE; n++) {
     host.sing(n, { station: "stray", stream: "ops.deploy", ttlMs: 60_000 });
   }
-  assert.ok(c.healthReasons.includes("live_overflow_tuned"), c.healthReasons.join());
-  const live = c.liveSet(time.now());
+  assert.ok(
+    c.healthReasons.includes("live_overflow_tuned"),
+    c.healthReasons.join(),
+  );
+  const live = c.liveStatus(time.now());
   assert.equal(live.max, MAX_LIVE);
   assert.ok(live.size <= MAX_LIVE);
   const deploy = live.omitted["stray:ops.deploy"]!;
@@ -107,7 +113,11 @@ test("live set (c): every record the live set drops degrades receive health with
   );
   assert.equal(c.counts.live_overflow_tuned, deploy.total);
   assert.equal(c.counts.live_overflow_untuned, untuned.total);
-  assert.equal(Object.keys(live.omitted).length, 2, "no untuned stream gets state of its own");
+  assert.equal(
+    Object.keys(live.omitted).length,
+    2,
+    "no untuned stream gets state of its own",
+  );
 
   // Now, not since: once every dropped record would have gone off air, the reasons lapse.
   time.value += 61_000;
@@ -137,7 +147,9 @@ test("live set (F9, a) end to end: with an untuned flood filling the live set, e
       range(1, 20).map((n) => `ops:ops.fleet/${n}`),
     );
     // The untuned stream's loss isn't this ear's to be told about in a push.
-    assert.ok(pushes(shim).every((push) => !/live_overflow/u.test(push.content)));
+    assert.ok(
+      pushes(shim).every((push) => !/live_overflow/u.test(push.content)),
+    );
   } finally {
     h.dispose();
   }
@@ -148,7 +160,11 @@ test("live set (b) end to end: a hear-only tuned flood can't keep a quiet stream
   try {
     const shim = h.attach("scribe");
     for (let n = 1; n <= MAX_LIVE + 300; n++) {
-      host.sing(n, { station: "stray", stream: "ops.deploy", ttlMs: 3_600_000 });
+      host.sing(n, {
+        station: "stray",
+        stream: "ops.deploy",
+        ttlMs: 3_600_000,
+      });
     }
     for (let n = 1; n <= 5; n++) {
       host.sing(n);
@@ -235,7 +251,7 @@ test("push budget (A4, d): what the budget held until it went off air is reporte
   }
 });
 
-test("push budget (e): \"N more wait for the next push\" is true when written: it says when the budget holds them, and the next push reports any that went off air", async () => {
+test('push budget (e): "N more wait for the next push" is true when written: it says when the budget holds them, and the next push reports any that went off air', async () => {
   const { h, host } = setup({
     mode: "immediate",
     maxItems: 1,
@@ -303,7 +319,7 @@ test("push budget (e), finding 3: a record a push said waits, routed to a report
     assert.deepEqual(order(note), []);
     assert.ok(
       note.includes(
-        `\n- ops:ops.fleet: 1 went off air unpushed while it waited for its push (expired_waiting; heard ${iso(heard)} to ${iso(heard)}).`,
+        `\n- ops:ops.fleet: 1 went off air unpushed while waiting for a push (expired_waiting; heard ${iso(heard)} to ${iso(heard)}).`,
       ),
       note,
     );

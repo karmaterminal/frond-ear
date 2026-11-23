@@ -1547,20 +1547,26 @@ export class Daemon {
         // are offered from here, under the session's boundary now (#161).
         if (client.ear && this.isAttachedSession(client, client.ear)) {
           const ear = client.ear;
-          const canticle = this.store.atomically(
-            () =>
-              this.store.confirmBatch(
+          const confirmed = this.store.atomically(() => {
+            if (
+              !this.store.confirmBatch(
                 message.batchId,
                 ear,
                 client.attachGeneration,
-              ) &&
-              this.store.offerCanticleCustody(ear, message.batchId, {
-                at: this.clock.now(),
-                sessionId: client.sessionId ?? null,
-                boundary: this.boundary(ear),
-              }) > 0,
-          );
-          if (canticle) {
+              )
+            ) {
+              return false;
+            }
+            this.store.offerCanticleCustody(ear, message.batchId, {
+              at: this.clock.now(),
+              sessionId: client.sessionId ?? null,
+              boundary: this.boundary(ear),
+            });
+            return true;
+          });
+          // A canticle push is confirmed whether it carried records or only its
+          // coverage note; for a Discord batch's id this does nothing.
+          if (confirmed) {
             this.canticle?.confirmed(ear, message.batchId);
           }
         }
@@ -3539,6 +3545,8 @@ export class Daemon {
     canticle: boolean;
     echoed: number;
     refused?: "forged" | "restarted" | "reverted";
+    /** The push carried a coverage note and no record: nothing to echo. */
+    note?: true;
   } {
     if (!this.isAttachedSession(client, ear)) {
       return { horizon: undefined, canticle: false, echoed: 0 };
@@ -3574,6 +3582,7 @@ export class Daemon {
           horizon: undefined,
           canticle: true,
           echoed: this.echoCanticle(client, ear, batch, tool),
+          ...(push.empty === true ? { note: true as const } : {}),
         };
       }
       return {
@@ -3864,7 +3873,9 @@ export class Daemon {
             ? `0 canticle records echoed: ${CANTICLE_REFUSED[seen.refused]}`
             : seen.echoed > 0
               ? `${seen.echoed} canticle record${seen.echoed === 1 ? "" : "s"} echoed as heard`
-              : "0 canticle records echoed: already echoed, or the push was never confirmed delivered to this session";
+              : seen.note === true
+                ? "0 canticle records echoed: that push was a coverage note and carried no record"
+                : "0 canticle records echoed: already echoed, or the push was never confirmed delivered to this session";
         }
         const marked = this.markSeenThrough(client, ear, chatId, seen.horizon);
         return `${marked} event${marked === 1 ? "" : "s"} marked seen`;
@@ -3888,6 +3899,7 @@ export class Daemon {
           stream,
           limit: numberArg(args, "limit", 10, 50),
           maxChars: this.config.limits.maxNotificationChars,
+          delivery: this.canticle?.hearNote(ear),
         });
         if (heard.length > 0 && this.isAttachedSession(client, ear)) {
           this.recordHear(client, ear, heard);

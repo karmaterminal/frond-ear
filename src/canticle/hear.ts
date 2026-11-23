@@ -184,6 +184,59 @@ export interface HearOptions {
   stream?: string | undefined;
   limit: number;
   maxChars: number;
+  /** Why delivery holds this ear's pushes now, as `CanticleDelivery.hearNote` says it. */
+  delivery?: string | undefined;
+}
+
+/** Local-omission lines `hear` names one by one; the rest are counted. */
+const MAX_OMISSION_LINES = 5;
+
+/**
+ * What frond-ear's own live set dropped that this ear would hear (binary-canticle#168
+ * §2.7a local omissions): each tuned stream while a record it lost would still be on air,
+ * the untuned share likewise, and a pattern tuned while that share was dropping records.
+ */
+export function omissionLines(
+  view: HearView,
+  only?: (station: string, stream: string) => boolean,
+): string[] {
+  const now = view.now;
+  const streams = (view.omitted ?? [])
+    .filter((o) => o.count > 0 && o.until > now)
+    .filter((o) => only === undefined || only(o.station, o.stream))
+    .sort((a, b) =>
+      a.station === b.station
+        ? a.stream < b.stream
+          ? -1
+          : 1
+        : a.station < b.station
+          ? -1
+          : 1,
+    );
+  const lines = streams
+    .slice(0, MAX_OMISSION_LINES)
+    .map(
+      (o) =>
+        `local omission (live_overflow): ${token(o.station)}:${token(o.stream)}: ${o.count} record${o.count === 1 ? "" : "s"} dropped by frond-ear's full live set between ${iso(o.from)} and ${iso(o.to)}; they would be on air until ${iso(o.until)}.`,
+    );
+  if (streams.length > MAX_OMISSION_LINES) {
+    lines.push(
+      `(${streams.length - MAX_OMISSION_LINES} more tuned streams lost records to frond-ear's full live set; ear_status counts them.)`,
+    );
+  }
+  const untuned = view.untunedOmitted;
+  if (untuned !== undefined && untuned.until > now && only === undefined) {
+    lines.push(
+      `local omission (live_overflow): untuned streams: ${untuned.count} record${untuned.count === 1 ? "" : "s"} dropped by frond-ear's full live set between ${iso(untuned.from)} and ${iso(untuned.to)}, on air until ${iso(untuned.until)}; tuned streams keep shares of their own.`,
+    );
+  }
+  for (const r of view.retuned ?? []) {
+    if (r.until <= now) continue;
+    lines.push(
+      `coverage unknown: ${token(r.pattern)} was tuned at ${iso(r.at)}, while frond-ear's live set was dropping untuned records (${r.dropped} that would be on air until ${iso(r.until)}); its records from before then may be missing, how many unknown (local omission, live_overflow).`,
+    );
+  }
+  return lines;
 }
 
 /**
@@ -238,17 +291,22 @@ export function hearResult(
     );
   }
   if (view.joinedLate && !view.ended) head.push(joinedLate(view.joinedLate));
+  if (options.delivery !== undefined) head.push(options.delivery);
+  const wanted = options.stream;
+  const narrow = wanted
+    ? (station: string, stream: string) => {
+        const at = wanted.indexOf(":");
+        const s = wanted.slice(0, at);
+        return (s === "*" || s === station) && wanted.slice(at + 1) === stream;
+      }
+    : undefined;
+  head.push(...omissionLines(view, narrow));
   if (view.stations.length > 0) {
     head.push(onAir(view.stations, Math.floor(max / 4)));
   }
   let items = view.items;
-  if (options.stream) {
-    const at = options.stream.indexOf(":");
-    const station = options.stream.slice(0, at);
-    const stream = options.stream.slice(at + 1);
-    items = items.filter(
-      (i) => (station === "*" || i.station === station) && i.stream === stream,
-    );
+  if (narrow !== undefined) {
+    items = items.filter((i) => narrow(i.station, i.stream));
   }
   // Freshest first; the least remaining life last (it'll be gone soonest anyway).
   items = [...items].sort((a, b) => b.heardAt - a.heardAt);
