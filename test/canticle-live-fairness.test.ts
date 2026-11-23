@@ -1679,3 +1679,58 @@ test("#119 re-review 1: records pushed before a reload are not told as dropped w
     h.dispose();
   }
 });
+
+test("#119 re-review 2: a record told as the live set's drop that comes back on air later is pushed all the same, and not told again", async () => {
+  const { h, host } = setup({
+    mode: "immediate",
+    maxPushesPerHour: 360,
+    bufferPerStream: 256,
+    maxItems: 10,
+  });
+  try {
+    const shim = h.attach("scribe");
+    sixteenShares(host);
+    h.timers.advance(1_000); // ops's 256 wait
+    host.sing(1, { station: "stray16", key: STRAY, epoch: 16, ttlMs: 300_000 });
+    h.timers.advance(1_000); // the pass that tells it
+    host.pluck(256, { station: "stray15", key: STRAY, epoch: 15 }); // a place frees
+    host.sing(1, { dedup: "resurfaced", ttlMs: 300_000 }); // ops's first, back on air
+    for (let t = 0; t < 60; t++) h.timers.advance(1_000);
+    assert.ok(
+      pushes(shim).some((push) =>
+        order(push.content).includes("ops:ops.fleet/1"),
+      ),
+      "pushed once back on air",
+    );
+    assert.equal(overflowTold(shim, "ops:ops.fleet"), 1, "the drop, told once");
+  } finally {
+    h.dispose();
+  }
+});
+
+test("#119 re-review 2: a hear-only flood's refusals can't push an allowlisted drop out of what the live set names", async () => {
+  const { h, host } = setup({
+    mode: "immediate",
+    maxPushesPerHour: 360,
+    bufferPerStream: 256,
+    maxItems: 10,
+  });
+  try {
+    const shim = h.attach("scribe");
+    sixteenShares(host);
+    h.timers.advance(1_000); // ops's 256 wait
+    host.sing(1, { station: "stray16", key: STRAY, epoch: 16, ttlMs: 300_000 });
+    // In the same second, stray1's full share refuses more than the set holds.
+    for (let n = 257; n <= 257 + MAX_LIVE + 100; n++) {
+      host.sing(n, { station: "stray1", key: STRAY, epoch: 1, ttlMs: 300_000 });
+    }
+    for (let t = 0; t < 310; t++) h.timers.advance(1_000);
+    host.sing(257, { ttlMs: 300_000 });
+    for (let t = 0; t < 120; t++) h.timers.advance(1_000);
+    const { pushed, reported: told } = tally(shim, "ops:ops.fleet");
+    assert.equal(pushed + told, 257, `pushed ${pushed}, reported ${told}`);
+    assert.equal(overflowTold(shim, "ops:ops.fleet"), 1);
+  } finally {
+    h.dispose();
+  }
+});
