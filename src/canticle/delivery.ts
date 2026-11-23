@@ -892,7 +892,7 @@ export class CanticleDelivery {
    * if this ear pushed or passed it over, or if a push or its footer already said it won't
    * come (dropped from a full buffer, or an earlier drop of it). One it waits on stops
    * waiting and is told with its stream. A drop past what the source still names can't be
-   * looked up and is told: at worst twice, never left out. A record pushed in a push not
+   * looked up and is told: at worst again, never left out. A record pushed in a push not
    * yet confirmed is marked, so a revert that gives the push back tells it as this drop.
    *
    * What the live set dropped past the streams it counts one by one (`otherOmitted`) has no
@@ -1013,10 +1013,15 @@ export class CanticleDelivery {
     }
   }
 
-  /** A record that waited was dropped by the live set at `at`: told with its stream, owed. */
+  /**
+   * A record that waited was dropped by the live set at `at`: told with its stream, owed.
+   * Should it come back on air (a resurfaced copy, a join snapshot), it is pushed all the
+   * same, as one delivery never saw would be: the note was true when written.
+   */
   #withhold(state: EarState, waiting: Waiting, at: number): void {
     this.#count(state, "live_overflow");
     this.#report(state, waiting.id, waiting.expiresAt + SETTLE_SKEW_MS);
+    state.seen.delete(waiting.id);
     const missed = this.#missed(state, waiting.stream, waiting.item.key);
     if (missed === undefined) return;
     missed.key = waiting.item.key;
@@ -1028,13 +1033,9 @@ export class CanticleDelivery {
   /** A push or its footer said this record won't come: a later drop of it isn't told again. */
   #report(state: EarState, id: string, until: number): void {
     if (!state.reported.has(id) && state.reported.size >= MAX_SEEN) {
-      // The soonest to lapse goes first; at worst that record is told again.
-      let soonest: string | undefined;
-      let at = Infinity;
-      for (const [key, lapses] of state.reported) {
-        if (lapses < at) [soonest, at] = [key, lapses];
-      }
-      if (soonest !== undefined) state.reported.delete(soonest);
+      // The longest held goes first, without a scan (a flood fills this fast); at worst
+      // that record is told again.
+      state.reported.delete(state.reported.keys().next().value!);
     }
     state.reported.set(id, Math.max(until, state.reported.get(id) ?? 0));
   }

@@ -731,23 +731,25 @@ order, how many are late, what went off air before a push could carry it, and wh
 report a cap cut short says how many records wait, and the next one starts after the last stream it covered
 (`continues after …`), so a busy stream can't starve the rest. The cursor survives restarts.
 
-**Coverage notes.** When frond-ear itself withheld records since the last push (local omissions,
-binary-canticle#168 §2.7a), the push ends with a `local omissions` note: per stream and reason, how many and the
-span of times. `push_budget`, `paused`, `no_session`, `breaker_open` and `breaker_half_open` name the hold a record
-went off air under; `expired_waiting` is one that went off air waiting for its push (say, sent on to a report due
-after its expiry); `live_overflow` is what the live set dropped that this ear would have pushed (an allowlisted
-key, sung at hop 0, not wake-derived). Each record is told once. A drop isn't told if the record is back on view,
-if this ear pushed it or passed it over, or if a push already said it won't come (dropped from the ear's own full
-buffer, or told as an earlier drop, say of a copy that came back and was refused again). One the ear was waiting
-to push stops waiting and is told as `live_overflow`, and so is a pushed record the live set dropped while its push
-was unconfirmed, once that push is given back. What a push said won't come is remembered in memory only, so after a
-frond-ear restart a copy refused again is told again. What the live set dropped past the 256 tuned streams it
-counts one by one is a single `other tuned streams` line: no station is known, so it says whether this ear would
-have pushed them is unknown. It only rides with a push that goes anyway, and not at all while nothing could be
-pushed (no `wakeKeys`, or a mute over every station). A record that left the view first (plucked, superseded,
-the link went) isn't frond-ear's doing, and is only counted, as before. What hasn't been told yet survives a restart
-(`canticle.withheld.<ear>` in the store), and a note in a push the host never confirmed is told again once that
-push is given back.
+**Coverage notes.** When frond-ear itself withheld records since the last push (local omissions, binary-canticle#168
+§2.7a), the push ends with a `local omissions` note: per stream and reason, how many and the span of times.
+`push_budget`, `paused`, `no_session`, `breaker_open` and `breaker_half_open` name the hold a record went off air
+under; `expired_waiting` is one that went off air waiting for its push (say, sent on to a report due after its
+expiry); `live_overflow` is what the live set dropped that this ear would have pushed (an allowlisted key, sung at
+hop 0, not wake-derived). Each record is told once. A drop isn't told if the record is back on view, if this ear
+pushed it or passed it over, or if a push already said it won't come (dropped from the ear's own full buffer, or
+told as an earlier drop, say of a copy that came back and was refused again). One the ear was waiting to push stops
+waiting and is told as `live_overflow`, and so is a pushed record the live set dropped while its push was
+unconfirmed, once that push is given back. What a push said won't come is remembered in memory only, so after a
+frond-ear restart a copy refused again is told again. A record told as dropped that comes back on air later (a
+resurfaced copy, a join snapshot) is pushed all the same: the note was true when written. A config reload reads what
+is on air again, as it always has, so a record dropped from the buffer before it can be told again, or pushed late.
+What the live set dropped past the 256 tuned streams it counts one by one is a single `other tuned streams` line: no
+station is known, so it says whether this ear would have pushed them is unknown. It only rides with a push that goes
+anyway, and not at all while nothing could be pushed (no `wakeKeys`, or a mute over every station). A record that
+left the view first (plucked, superseded, the link went) isn't frond-ear's doing, and is only counted, as before.
+What hasn't been told yet survives a restart (`canticle.withheld.<ear>` in the store), and a note in a push the host
+never confirmed is told again once that push is given back.
 
 **Late records.** A record that wasn't heard live just now has a `late:` line under its banner's timing line:
 `late: heard 54s ago (snapshot)`, `late: heard 7s ago (resurfaced)`, or

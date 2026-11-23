@@ -267,8 +267,8 @@ export interface LiveOmission {
   pushable: number;
   pushableTotal: number;
   /**
-   * In a `hearView`: the latest of `pushableTotal` still kept, oldest first (at most
-   * `MAX_LIVE` across every entry); one past the bound is known only by its count.
+   * In a `hearView`: the latest of `pushableTotal` still kept, oldest first (`MAX_LIVE`
+   * across every entry, in fair shares); one past the bound is known only by its count.
    */
   drops?: LiveDrop[];
   /** Tells this entry from an earlier one for the same share that was let go. */
@@ -429,12 +429,9 @@ export class RecordConsumer {
    * window opened: the ears `hearView` shows that count to.
    */
   readonly #otherPatterns = new Set<string>();
-  /** The latest pushable tuned drops, by entry (its key and serial), oldest first. */
-  readonly #drops = new Map<
-    number,
-    LiveDrop & { entry: string; serial: number }
-  >();
-  #dropSeq = 0;
+  /** The latest pushable tuned drops, per entry, each oldest first (`#keepDrop`). */
+  readonly #drops = new Map<string, Map<number, LiveDrop>>();
+  #dropCount = 0;
   /**
    * Patterns tuned (by `retune`) while the untuned share was dropping records that would
    * still be on air: until `until`, such a stream's records from before `at` may be missing.
@@ -957,6 +954,7 @@ export class RecordConsumer {
         serial: ++this.#omittedSerial,
       };
       this.#omitted.set(at, o);
+      this.#forgetDrops(at); // an earlier entry's, let go
     }
     if (o.until <= nowMs) {
       // The last window's records are all off air by now: a new one opens.
@@ -981,9 +979,7 @@ export class RecordConsumer {
       // No ear reads an untuned share's entry, so only a tuned drop is kept by name.
       if (tuned) {
         const { key, epoch, stream, seq } = r.item;
-        this.#drops.set(++this.#dropSeq, {
-          entry: at,
-          serial: o.serial,
+        this.#keepDrop(at, {
           n: o.pushableTotal,
           at: nowMs,
           until: r.localExpiryAt,
@@ -992,14 +988,36 @@ export class RecordConsumer {
           stream,
           seq,
         });
-        if (this.#drops.size > MAX_DROPS) {
-          this.#drops.delete(this.#drops.keys().next().value!);
-        }
       }
     }
     o.key = r.item.key;
     this.#count("live_overflow");
     this.#degrade(tuned ? "live_overflow_tuned" : "live_overflow_untuned");
+  }
+
+  /**
+   * Keeps a tuned drop by name for delivery, within `MAX_DROPS` in all. Past it, the entry
+   * holding the most gives up its oldest, so a flood on one stream can't push out another's.
+   */
+  #keepDrop(entry: string, drop: LiveDrop): void {
+    let kept = this.#drops.get(entry);
+    if (kept === undefined) this.#drops.set(entry, (kept = new Map()));
+    kept.set(drop.n, drop);
+    if (++this.#dropCount <= MAX_DROPS) return;
+    let most = entry;
+    for (const [other, drops] of this.#drops) {
+      if (drops.size > this.#drops.get(most)!.size) most = other;
+    }
+    const drops = this.#drops.get(most)!;
+    drops.delete(drops.keys().next().value!);
+    if (drops.size === 0) this.#drops.delete(most);
+    this.#dropCount -= 1;
+  }
+
+  /** An entry let go: the drops it kept by name go with it. */
+  #forgetDrops(entry: string): void {
+    this.#dropCount -= this.#drops.get(entry)?.size ?? 0;
+    this.#drops.delete(entry);
   }
 
   /**
@@ -1022,6 +1040,7 @@ export class RecordConsumer {
     }
     if (lapsed === undefined) return OTHER_TUNED;
     this.#omitted.delete(lapsed);
+    this.#forgetDrops(lapsed);
     return share;
   }
 
@@ -1375,17 +1394,10 @@ export class RecordConsumer {
     const tuned = (station: string, stream: string) =>
       tunes(patterns, station, stream);
     this.#syncOverflow(nowMs);
-    const drops = new Map<string, LiveDrop[]>();
-    for (const { entry, serial, ...d } of this.#drops.values()) {
-      if (this.#omitted.get(entry)?.serial !== serial) continue;
-      let list = drops.get(entry);
-      if (list === undefined) drops.set(entry, (list = []));
-      list.push(d);
-    }
     const view = (share: string, o: LiveOmission): LiveOmission => ({
       ...o,
       ...(o.until > nowMs ? {} : { count: 0, pushable: 0 }),
-      drops: drops.get(share) ?? [],
+      drops: [...(this.#drops.get(share)?.values() ?? [])],
     });
     const omitted = [...this.#omitted]
       .filter(
