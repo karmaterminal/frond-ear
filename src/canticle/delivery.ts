@@ -403,9 +403,42 @@ function foldedOf(notes: Map<string, Missed>): Missed {
 }
 
 /**
+ * `stream`'s place among the stations `FOLDED` keeps, made if need be. Past the bound, a
+ * stream owed a push takes the place of one owed nothing (which never wakes, so needs no
+ * station); with none, or not owed, it gets no place, and `more` says the count holds
+ * streams it can't name. A new place is blank: the caller fills it in.
+ */
+function slot(
+  folded: Missed,
+  stream: string,
+  owed: boolean,
+): Folded | undefined {
+  const streams = (folded.streams ??= new Map());
+  const f = streams.get(stream);
+  if (f !== undefined) return f;
+  if (streams.size >= MAX_CURSOR_STREAMS) {
+    folded.more = true;
+    let spare: string | undefined;
+    if (owed) {
+      for (const [name, g] of streams) {
+        if (!g.owed) {
+          spare = name;
+          break;
+        }
+      }
+    }
+    if (spare === undefined) return undefined;
+    streams.delete(spare);
+  }
+  const blank = { key: "", owed: false, withheld: false, missed: false };
+  streams.set(stream, blank);
+  return blank;
+}
+
+/**
  * `FOLDED` takes in `note`, of `stream`: its counts and spans with the rest, and the stream
- * by name (its key, owed, and what of it was noted) while the bound has room. With
- * `latest`, `note.key` becomes the stream's.
+ * by name (its key, owed, and what of it was noted) if it has or gets a place. With
+ * `latest`, or in a new place, `note.key` becomes the stream's.
  */
 function fold(
   folded: Missed,
@@ -414,16 +447,10 @@ function fold(
   latest: boolean,
 ): void {
   addMissed(folded, note);
-  const streams = (folded.streams ??= new Map());
-  let f = streams.get(stream);
-  if (f === undefined) {
-    if (streams.size >= MAX_CURSOR_STREAMS) {
-      folded.more = true;
-      return;
-    }
-    f = { key: note.key, owed: false, withheld: false, missed: false };
-    streams.set(stream, f);
-  } else if (latest) f.key = note.key;
+  const fresh = folded.streams?.has(stream) !== true;
+  const f = slot(folded, stream, note.owed);
+  if (f === undefined) return;
+  if (fresh || latest) f.key = note.key;
   f.owed ||= note.owed;
   f.withheld ||= note.withheld.size > 0;
   f.missed ||= note.offAir + note.dropped > 0;
@@ -466,26 +493,31 @@ function addNote(
 }
 
 /**
- * A kept `FOLDED` merged back in (a push given back, the saved notes). A stream it took
- * in that has an entry of its own here now is folded too, so no stream is counted twice.
+ * A kept `FOLDED` merged back in (a push given back, the saved notes): each stream it
+ * names keeps or gets a place here, as when it was folded. One that has an entry of its
+ * own here now is folded into that place, so no stream is named and kept both; with no
+ * place to be had, its entry stays as it is, keeping its push, and its kept records are
+ * counted with the streams the count can't name.
  */
 function mergeFolded(notes: Map<string, Missed>, from: Missed): void {
   const folded = foldedOf(notes);
   addMissed(folded, from);
   for (const [stream, f] of from.streams ?? []) {
     const named = notes.get(stream);
-    if (named !== undefined) {
-      notes.delete(stream);
-      fold(folded, stream, named, false);
-    }
-    const streams = (folded.streams ??= new Map());
-    const mine = streams.get(stream);
-    if (mine !== undefined) {
+    const had = folded.streams?.get(stream);
+    const mine = had ?? slot(folded, stream, f.owed || named?.owed === true);
+    if (mine === undefined) continue;
+    if (had === undefined) Object.assign(mine, f);
+    else {
       mine.owed ||= f.owed;
       mine.withheld ||= f.withheld;
       mine.missed ||= f.missed;
-    } else if (streams.size < MAX_CURSOR_STREAMS) streams.set(stream, { ...f });
-    else folded.more = true;
+    }
+    if (named !== undefined) {
+      // The entry here is the later: its key wins.
+      notes.delete(stream);
+      fold(folded, stream, named, true);
+    }
   }
   if (from.more === true) folded.more = true;
 }
@@ -2229,9 +2261,14 @@ interface RenderInput {
 
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
 
-/** How many of the streams `FOLDED` took in had `kind` noted. */
-const foldedCount = (folded: Missed, kind: "withheld" | "missed") =>
-  [...(folded.streams?.values() ?? [])].filter((f) => f[kind]).length;
+/**
+ * How many of the streams `FOLDED` names had `kind` noted; asked only when it holds some,
+ * so at least one when it holds streams it can't name.
+ */
+function foldedCount(folded: Missed, kind: "withheld" | "missed"): number {
+  const n = [...(folded.streams?.values() ?? [])].filter((f) => f[kind]).length;
+  return folded.more === true ? Math.max(n, 1) : n;
+}
 
 /** `3 streams`, or `at least 256 streams` when `FOLDED` took in more than it names. */
 const foldedStreams = (
