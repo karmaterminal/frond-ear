@@ -57,19 +57,22 @@ export interface Song {
  * and a rejoin gets the run's state back as a join snapshot (§14.18.3).
  */
 export class Host {
-  readonly consumer = new RecordConsumer();
+  readonly consumer: RecordConsumer;
   listening = true;
   run = "a1b2";
   /** What this run has on air (idem → frame fields), and each station's presence. */
   readonly onAir = new Map<string, R>();
   readonly stations = new Map<string, string>();
   /** The `station:stream` pairs the ear follows (`canticle.tune`). */
-  tune: string[] = TUNE;
+  tune: string[];
   #seq = 0;
   readonly #clock: { now(): number };
 
-  constructor(clock: { now(): number }) {
+  /** `tune` is the ear's, and the consumer admits records against it (§2.4 step 2). */
+  constructor(clock: { now(): number }, tune: string[] = TUNE) {
     this.#clock = clock;
+    this.tune = tune;
+    this.consumer = new RecordConsumer({ tune });
   }
 
   get now(): number {
@@ -304,6 +307,7 @@ export interface DeliveryStatus {
   waiting: number;
   nextPushAt: number | null;
   held: string | null;
+  heldUntil?: number | null;
   lastPushAt: number | null;
   pushesLastHour: number;
   maxPushesPerHour: number;
