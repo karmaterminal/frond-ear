@@ -702,22 +702,23 @@ and `source` still need a restart.
 }
 ```
 
-| Field                | Default        | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| -------------------- | -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `wakeKeys`           | `[]`           | Station key ids (16 hex digits, the `key=` of a `hear` banner) whose records may be pushed. Empty: nothing is pushed, and `ear_status` warns. Leave out the host's own station key, or it hears itself.                                                                                                                                                                                                                             |
-| `muted`              | `false`        | `true` mutes every push to every ear.                                                                                                                                                                                                                                                                                                                                                                                               |
-| `delivery.<ear>`     | absent (`off`) | The ear's ceiling. A bare string (`"digest"`) sets `mode` alone.                                                                                                                                                                                                                                                                                                                                                                    |
-| `….mode`             | `off`          | `immediate`, `digest` or `off`, for every station.                                                                                                                                                                                                                                                                                                                                                                                  |
-| `….stations`         | `{}`           | `station → mode`, overriding `mode` for that station. A station can be named by its key id (16 hex digits, the `key=` of a `hear` banner), which outlasts a manifest rename; where its key id and its name both have an entry, the narrower holds.                                                                                                                                                                                  |
-| `….windowMs`         | `60000`        | `digest`: at most one report per window, 5 s to 1 h. The window opens when a record starts waiting.                                                                                                                                                                                                                                                                                                                                 |
-| `….debounceMs`       | `5000`         | `immediate`: a burst is coalesced over this long, 5 s (RFC §14.10) to 1 min, and less than `maxAgeMs`.                                                                                                                                                                                                                                                                                                                              |
-| `….maxAgeMs`         | `30000`        | `immediate` pushes only a record heard at most this long ago and at most this old when first heard (RFC §14.10 item 9). Any other goes into the next report instead, marked late. 10 s to 2 min (item 9's 120 s).                                                                                                                                                                                                                   |
-| `….style`            | `records`      | `digest`: `records` (each record behind its banner) or `counts` (per stream: how many, seqs skipped, repeats caught; no payloads).                                                                                                                                                                                                                                                                                                  |
-| `….maxItems`         | `5`            | Records per push, 1 to 10 (RFC §14.6.5's dose is 5). The rest wait for the next push.                                                                                                                                                                                                                                                                                                                                               |
-| `….bufferPerStream`  | `32`           | Records waiting per `station:stream`, 1 to 256. When it is full the oldest is dropped, and the next push says so.                                                                                                                                                                                                                                                                                                                   |
-| `….maxPushesPerHour` | `60` or more   | Pushes to the ear per hour, from `immediate` and reports together, 1 to 360: 60 by default, or one per window when `windowMs` is under a minute, so a busy band's reports fit the hour. `ear_status` warns when it is less than one per window. Past it, records wait. The count survives a restart.                                                                                                                                |
-| `derivedPublication` | `false`        | Whether derived publication may open at all ([Derived publication](#derived-publication-binary-canticle161-item-4)). Off: no station call, `derivedQuery` and the capability probe included.                                                                                                                                                                                                                                        |
-| `roomPolicy`         | `observe`      | What the egress gate does at every room output ([Room output](#room-output-and-source-use-frond-ear-scope)): `observe` records and refuses nothing; `strict-fresh` refuses unless the speaker's canticle history is complete. It is a freshness-of-attention gate, not an output-content check; no seat should select it until the frond's source-use rule is settled. Anything else fails config load. It reloads with the config. |
+| Field                | Default              | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| -------------------- | -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `wakeKeys`           | `[]`                 | Station key ids (16 hex digits, the `key=` of a `hear` banner) whose records may be pushed. Empty: nothing is pushed, and `ear_status` warns. Leave out the host's own station key, or it hears itself.                                                                                                                                                                                                                             |
+| `muted`              | `false`              | `true` mutes every push to every ear.                                                                                                                                                                                                                                                                                                                                                                                               |
+| `delivery.<ear>`     | absent (`off`)       | The ear's ceiling. A bare string (`"digest"`) sets `mode` alone.                                                                                                                                                                                                                                                                                                                                                                    |
+| `….mode`             | `off`                | `immediate`, `digest` or `off`, for every station.                                                                                                                                                                                                                                                                                                                                                                                  |
+| `….stations`         | `{}`                 | `station → mode`, overriding `mode` for that station. A station can be named by its key id (16 hex digits, the `key=` of a `hear` banner), which outlasts a manifest rename; where its key id and its name both have an entry, the narrower holds.                                                                                                                                                                                  |
+| `….windowMs`         | `60000`              | `digest`: at most one report per window, 5 s to 1 h. The window opens when a record starts waiting.                                                                                                                                                                                                                                                                                                                                 |
+| `….debounceMs`       | `5000`               | `immediate`: a burst is coalesced over this long, 5 s (RFC §14.10) to 1 min, and less than `maxAgeMs`.                                                                                                                                                                                                                                                                                                                              |
+| `….maxAgeMs`         | `30000`              | `immediate` pushes only a record heard at most this long ago and at most this old when first heard (RFC §14.10 item 9). Any other goes into the next report instead, marked late. 10 s to 2 min (item 9's 120 s).                                                                                                                                                                                                                   |
+| `….style`            | `records`            | `digest`: `records` (each record behind its banner) or `counts` (per stream: how many, seqs skipped, repeats caught; no payloads).                                                                                                                                                                                                                                                                                                  |
+| `….maxItems`         | `5`                  | Records per push, 1 to 10 (RFC §14.6.5's dose is 5). The rest wait for the next push.                                                                                                                                                                                                                                                                                                                                               |
+| `….bufferPerStream`  | `32`                 | Records waiting per `station:stream`, 1 to 256. When it is full the oldest is dropped, and the next push says so.                                                                                                                                                                                                                                                                                                                   |
+| `….maxPushesPerHour` | `60` or more         | Pushes to the ear per hour, from `immediate` and reports together, 1 to 360: 60 by default, or one per window when `windowMs` is under a minute, so a busy band's reports fit the hour. `ear_status` warns when it is less than one per window. Past it, records wait. The count survives a restart.                                                                                                                                |
+| `derivedPublication` | `false`              | Whether derived publication may open at all ([Derived publication](#derived-publication-binary-canticle161-item-4)). Off: no station call, `derivedQuery` and the capability probe included.                                                                                                                                                                                                                                        |
+| `roomPolicy`         | `observe`            | What the egress gate does at every room output ([Room output](#room-output-and-source-use-frond-ear-scope)): `observe` records and refuses nothing; `strict-fresh` refuses unless the speaker's canticle history is complete. It is a freshness-of-attention gate, not an output-content check; no seat should select it until the frond's source-use rule is settled. Anything else fails config load. It reloads with the config. |
+| `exposure`           | `{"enabled": false}` | The exposure ledger ([Exposure ledger](#exposure-ledger-frond-ear117)): `enabled` (default `false`; off, no rows are written, though its empty table and index are in the schema), `maxAgeMs` (default 7 days) and `maxRecords` (per ear, default 10000) bound the offered and echoed records it keeps.                                                                                                                             |
 
 **What the session gets.** Channel events with `kind="canticle"` and `delivery="immediate"` (the new records of
 the last few seconds) or `delivery="report"` (a "what's on the radio" report, `report=<n>`). Each push is a batch
@@ -1010,6 +1011,66 @@ here checks them or vouches for them:
 - **Other MCP servers**: another Discord, Slack or chat server, or any tool holding its own credentials.
 
 frond-ear's own claude.ai connector (`src/connector/`) has no Discord access, so it has no room output to check.
+
+### Exposure ledger (frond-ear#117)
+
+With `canticle.exposure.enabled` on, frond-ear keeps a record of every canticle push that carried records to an
+ear's session, in binary-canticle#162's `canticle-payload-exposure/1` shape, for an issuer behind its own boundary
+to read later. frond-ear only records: it holds no key, signs nothing, calls no issuer and exports nothing (🌫's
+constraint on #117). Off, behaviour and `ear_status` are the same as without the ledger, but the database is not
+byte for byte the same: the store creates the empty `canticle_exposure` table and its index whether the flag is on
+or off. No rows are written. A config reload turns it on or off for the pushes that follow.
+
+Each record moves through custody's steps ([Custody and confirmation](#custody-and-confirmation-binary-canticle161)):
+
+| Phase     | When                                                                                                        |
+| --------- | ----------------------------------------------------------------------------------------------------------- |
+| `fenced`  | In the push's claim transaction, before the session's connection takes it. Its `pendingId` never changes.   |
+| `offered` | The host said it handed the push to the session (the shim's `offered`).                                     |
+| `echoed`  | The session it was offered to named the push's whole `batch_id`. The offered receipt is kept alongside.     |
+| `unknown` | A fence whose push never reached `offered`: `unsent` (no connection took it) or `reverted` (crash, detach). |
+
+A fence is never cleared. After a crash it stays `fenced` until the next attach reverts the push, then reads
+`unknown`; its records go out again under a new push, which is a record of its own. Another session's echo, even
+with the push's whole `batch_id`, leaves a record `offered`.
+
+What a record holds, never payload text and never the delivery token:
+
+- `sources`: one per pushed record, in the order the push's text carries them, with the verified record's own
+  provenance (tuple, `idem`, root, hop, class, lens, station, principal, stream, flags, times, body digests), its
+  `scope` exactly as heard, never widened (🌿's F1 on #162), and `renderedSha256` / `renderedBytes` of its exact
+  rendered entry (banner and quoted payload; for a `counts` report, its stream's line). `receiver` is the record v1
+  run, `live` or `snapshot`, and the record's `rec_seq`; it is `null` for a record the embedded receptor heard
+  itself. A record v1 `stream_id` that isn't a number is `null`, never made up, and so is a body's `ctype` that
+  record v1 left out (the body's digests are kept).
+- `resultSha256` / `resultBytes`: the whole pushed event text. `toolCallId` is `push:<batch id>`, the bare id.
+- `reader`, #162's `LocalReader` for a continuing session:
+
+  | `LocalReader`       | frond-ear                                                                                               |
+  | ------------------- | ------------------------------------------------------------------------------------------------------- |
+  | `sessionKey`        | `frond-ear:<ear>`: the ear is the continuing reader. #162 admits only sub-agent keys (#161 settles it). |
+  | `sessionId`         | The Claude Code session id holding the ear at the fence, or `null` when its shim gave none.             |
+  | `lifecycleRevision` | `attach:<generation>`: the ear's attach generation, new at every attach.                                |
+
+  Alongside it, `holder` is #114's holder identity at the fence (`known`, `unknown`, `in-doubt`). A record with no
+  session id, a `null` receiver, a `null` stream id or a `null` ctype is kept, but isn't passed off as a
+  `PayloadExposure` (#162's own record reader refuses a body with no `ctype`).
+
+**Bounds.** At the hourly prune (and a config reload), offered and echoed records fenced more than `maxAgeMs` ago
+are evicted, then, per ear past `maxRecords`, the oldest offered or echoed ones. Each eviction is counted
+(`canticle_exposure_evicted.<ear>`, and `evicted` in `ear_status`). Fenced and unknown records are never evicted,
+so they alone can hold an ear past `maxRecords`: each prune that finds it so logs `canticle.exposure_over_bound`
+(warn, with `held` and `maxRecords`) and counts it (`canticle_exposure_over_bound.<ear>`, `overBound` in
+`ear_status`), and `ear_status` gives the reason in `canticleExposure.reasons` while it lasts. Unknown records past
+the bound are a sign of many unsent or reverted pushes: look at the ear's attach churn.
+
+**Reading it.** While it is on, `ear_status` shows `canticleExposure`: the counts by phase, `evicted`,
+`overBound` and `reasons`. `frond-ear exposure --ear <name>
+[--since <ISO time | epoch ms>] [--json]` prints the records, one line each or as JSON; it opens the database
+(`FROND_EAR_DATABASE`) read-only, so it works with the daemon stopped. It never creates a database and writes no
+rows, but opening a WAL database, even read-only, can leave SQLite's `-wal` and `-shm` sidecar files beside it.
+
+Not yet recorded: what `hear` returns. Only pushes are.
 
 ### Derived publication (binary-canticle#161 item 4)
 

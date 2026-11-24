@@ -24,6 +24,7 @@ import {
   createCanticleSource,
   type CanticleSource,
 } from "./canticle/source.ts";
+import { runExposure } from "./canticle/exposure-cli.ts";
 import { Manifest } from "./canticle/manifest.ts";
 import { runConnectorEcho } from "./connector/echo.ts";
 import { Daemon } from "./daemon.ts";
@@ -86,6 +87,11 @@ usage:
                                       a PostCompact hook only reports); always exits 0
   frond-ear pressure --transcript <path>
                                       print a transcript's latest context size
+  frond-ear exposure --ear <name> [--since <ISO time | epoch ms>] [--json]
+                                      print an ear's canticle exposure ledger (#117; config canticle.exposure,
+                                      off by default): one record per canticle push, fenced before it went out,
+                                      then offered, echoed or unknown. Reads the database read-only; hashes
+                                      and provenance only, never payload text; no network side
   frond-ear inject --chat <id> --author <id> [--guild <id>] [--name <n>] [--bot] [--mention] <text…>
                                       push a synthetic MESSAGE_CREATE (dry-run or FROND_EAR_ALLOW_INJECT=1)
   frond-ear connector-echo [--public-url https://<host>] [--auth none|bearer|oauth] …
@@ -907,6 +913,13 @@ async function main(): Promise<void> {
       return;
     case "copilot-extension":
       runCopilotExtension(rest);
+      return;
+    case "exposure":
+      process.exitCode = await runExposure(rest, {
+        stdout: process.stdout,
+        stderr: process.stderr,
+        env: process.env,
+      });
       return;
     case "connector-echo":
       process.exitCode = await runConnectorEcho(rest, {
