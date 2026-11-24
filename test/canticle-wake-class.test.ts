@@ -453,6 +453,105 @@ test("#176 proof 4: across a restart a grant the same session can prove holds; o
   }
 });
 
+test("#176 proof 4: a grant held 500 s of 600 does not outlive its TTL across a restart on a clock stepped back 400 s: it is discarded, so nothing wakes 950 s into it", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "frond-ear-grant-"));
+  const path = join(directory, "ear.db");
+  const delivery = { mode: "immediate" };
+  try {
+    let grantedAt: number;
+    const first = setup(delivery, { wakeKeys: [OPS] }, {}, { path });
+    try {
+      const shim = first.h.attach("scribe", { sessionId: SESSION });
+      grantedAt = first.h.clock.now() + 500_000;
+      first.h.clock.value = grantedAt;
+      const result = await grant(first.h, shim, {
+        stream: "ops:ops.fleet",
+        classes: ["ambient"],
+        ttl_seconds: 600,
+      });
+      assert.equal(result.ok, true, result.text);
+      // The grant runs 500 s and wakes the session while it does.
+      first.h.timers.advance(490_000);
+      first.host.sing(1, AMBIENT);
+      first.h.timers.advance(10_000);
+      assert.equal(pushes(shim).length, 1, "the grant holds while it runs");
+    } finally {
+      first.h.dispose();
+    }
+    // Restarted on the same store with the clock 400 s behind, after the grant was made:
+    // its row alone can't tell that 500 s of it already ran.
+    const second = setup(delivery, { wakeKeys: [OPS] }, {}, { path });
+    try {
+      second.h.clock.value = grantedAt + 100_000;
+      const shim = second.h.attach("scribe", { sessionId: SESSION });
+      second.host.sing(2, AMBIENT);
+      second.h.timers.advance(10_000);
+      assert.equal(pushes(shim).length, 0, "a stepped-back clock discards it");
+      assert.equal(status(second.h).counts.wake_grant_discarded, 1);
+      assert.equal(status(second.h).counts["wake_withheld:ambient"], 1);
+      assert.equal(second.h.store.canticleWakeGrants("scribe").length, 0);
+      assert.deepEqual(
+        (status(second.h) as unknown as { wakeGrants: unknown }).wakeGrants,
+        [],
+      );
+      // 450 s on the stepped-back clock (950 s into a 600 s grant): still nothing wakes.
+      second.h.clock.value = grantedAt + 540_000;
+      second.host.sing(3, AMBIENT);
+      second.h.timers.advance(10_000);
+      assert.equal(pushes(shim).length, 0);
+    } finally {
+      second.h.dispose();
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("#176 proof 4: a clock that steps back mid-run discards every grant, so expiry never rests on a clock that went backwards", async () => {
+  const { h, host } = setup({ mode: "immediate" }, { wakeKeys: [OPS] });
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    const grantedAt = h.clock.now();
+    const result = await grant(h, shim, {
+      stream: "ops:ops.fleet",
+      classes: ["ambient"],
+      ttl_seconds: 600,
+    });
+    assert.equal(result.ok, true, result.text);
+    h.timers.advance(300_000);
+    assert.deepEqual(
+      (status(h) as unknown as { wakeGrants: unknown }).wakeGrants,
+      [
+        {
+          stream: "ops:ops.fleet",
+          classes: ["ambient"],
+          expiresAt: grantedAt + 600_000,
+        },
+      ],
+    );
+    // An NTP step back of 200 s: still after the grant was made, but behind what the
+    // daemon already saw while the grant held.
+    h.clock.value -= 200_000;
+    assert.deepEqual(
+      (status(h) as unknown as { wakeGrants: unknown }).wakeGrants,
+      [],
+      "a step back discards the grant",
+    );
+    assert.equal(status(h).counts.wake_grant_discarded, 1);
+    assert.equal(h.store.canticleWakeGrants("scribe").length, 0);
+    host.sing(1, AMBIENT);
+    h.timers.advance(10_000);
+    assert.equal(
+      pushes(shim).length,
+      0,
+      "nothing the grant let wake wakes now",
+    );
+    assert.equal(status(h).counts["wake_withheld:ambient"], 1);
+  } finally {
+    h.dispose();
+  }
+});
+
 test("#176 proof 5: what a station sends can't ask for a wake, make or extend a grant, or change a record's class", async () => {
   const { h, host } = setup({ mode: "immediate" }, { wakeKeys: [OPS] });
   try {
