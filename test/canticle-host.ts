@@ -49,6 +49,12 @@ export interface Song {
   scope?: string;
   /** Merged over `times`; a field set to `undefined` is left out. */
   times?: R;
+  /** The record's verified class (§10.4); `advisory` by default. */
+  class?: string;
+  /** The host's admission result (§10.9); `verified` by default. */
+  admission?: string;
+  /** Fields the station put on the record beyond record v1's own, merged over the rest. */
+  extra?: R;
 }
 
 /**
@@ -153,7 +159,7 @@ export class Host {
       idem: `canticle:${key}:${epoch}:${stream}:${seq}`,
       station: { name: station, principal: null },
       stream,
-      class: "advisory",
+      class: o.class ?? "advisory",
       scope: o.scope ?? "lan",
       hop: o.hop ?? 0,
       ...(o.stateKey !== undefined ? { state_key: o.stateKey } : {}),
@@ -167,7 +173,7 @@ export class Host {
           ...o.times,
         }).filter(([, value]) => value !== undefined),
       ),
-      admission: "verified",
+      admission: o.admission ?? "verified",
       disposition: "surface",
       dedup: o.dedup ?? "first",
       versions: { manifest_sha256: "00", manifest_label: "test" },
@@ -189,6 +195,7 @@ export class Host {
               ...o.flags,
             },
           }),
+      ...o.extra,
     };
   }
 
