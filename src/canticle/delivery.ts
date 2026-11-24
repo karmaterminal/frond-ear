@@ -2382,35 +2382,43 @@ export class CanticleDelivery {
   ): object {
     const store = this.#deps.store;
     const now = this.#deps.clock.now();
-    // Judge what is there first, so a grant already unprovable (the clock went back) is
-    // discarded and counted rather than silently replaced. The mark moves only once the
-    // request has succeeded (#grantsView below), so one that fails changes nothing.
+    // Judge what is there first, so a grant already unprovable (the clock went back, another
+    // holder) is discarded and counted rather than silently replaced. Those discards are
+    // safety checks and stand even if the request then fails.
     this.#grants(ear, this.#state(ear), now, false);
-    if (request.revoke) {
-      store.deleteCanticleWakeGrants(
-        ear,
-        request.station !== undefined && request.stream !== undefined
-          ? { station: request.station, stream: request.stream }
-          : undefined,
-      );
-    } else {
-      // Every class in one whole: a fault on any leaves none made and none extended.
-      store.setCanticleWakeGrants(
-        request.classes.map((cls) => ({
+    // The request itself is one whole (🌫 on #126): its writes, the mark its view moves and
+    // its counter. A failure in any reports failure with no grant made, extended or marked;
+    // a request that changed grants reports success.
+    return store.whole(() => {
+      if (request.revoke) {
+        store.deleteCanticleWakeGrants(
           ear,
-          station: request.station,
-          stream: request.stream,
-          cls,
-          sessionId,
-          grantedAt: now,
-          expiresAt: now + request.ttlMs,
-        })),
-      );
-    }
-    return {
-      grants: this.#grantsView(ear, this.#state(ear), now),
-      note: "a grant wakes you only for records from a station whose key is on canticle.wakeKeys, at hop 0, not wake-derived, under a delivery mode that pushes, within the push budget; it lapses at expiresAt and is discarded if another session takes the ear, even briefly",
-    };
+          request.station !== undefined && request.stream !== undefined
+            ? { station: request.station, stream: request.stream }
+            : undefined,
+        );
+      } else {
+        store.setCanticleWakeGrants(
+          request.classes.map((cls) => ({
+            ear,
+            station: request.station,
+            stream: request.stream,
+            cls,
+            sessionId,
+            grantedAt: now,
+            expiresAt: now + request.ttlMs,
+          })),
+        );
+      }
+      // Judged at the same moment as the check above, so it discards nothing more; it only
+      // moves the mark.
+      const grants = this.#grantsView(ear, this.#state(ear), now);
+      store.increment("canticle_wake_grants");
+      return {
+        grants,
+        note: "a grant wakes you only for records from a station whose key is on canticle.wakeKeys, at hop 0, not wake-derived, under a delivery mode that pushes, within the push budget; it lapses at expiresAt and is discarded if another session takes the ear, even briefly",
+      };
+    });
   }
 
   /** The grants that hold now, by station:stream, for `ear_status` and `wake_grant`. */

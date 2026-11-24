@@ -1123,9 +1123,10 @@ export class EventStore {
    * Runs `work` as one whole: in a transaction of its own, or, inside a caller's, in a
    * savepoint, so a failure part way undoes only `work` even if the caller catches it and
    * commits. Not for `transaction`'s callers to use instead: a BEGIN nested by mistake
-   * should still fail loudly there.
+   * should still fail loudly there. Public for a request whose every write must hold or
+   * none (`wake_grant`).
    */
-  private whole<T>(work: () => T): T {
+  public whole<T>(work: () => T): T {
     if (!this.database.isTransaction) return this.transaction(work);
     this.database.exec("SAVEPOINT whole");
     try {

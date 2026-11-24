@@ -1077,6 +1077,41 @@ for (const fault of ["mark", "counter", "none"] as const) {
   }
 }
 
+test("#176 proof 4: a safety discard by wake_grant's check stands even when the request then fails: a grant on a clock that stepped back is not brought back", async () => {
+  const { h, host } = setup({ mode: "immediate" }, { wakeKeys: [OPS] });
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    const t0 = h.clock.now();
+    const made = await grant(h, shim, {
+      stream: "ops:ops.fleet",
+      classes: ["ambient"],
+      ttl_seconds: 600,
+    });
+    assert.equal(made.ok, true, made.text);
+    h.timers.advance(2_000);
+    h.clock.value = t0 + 1_000; // behind the grant's mark
+    const heal = faultAfterWrite(h, "counter");
+    const failed = await grant(h, shim, {
+      stream: "ops:ops.fleet",
+      classes: ["chatter"],
+      ttl_seconds: 600,
+    });
+    heal();
+    assert.equal(failed.ok, false, failed.text);
+    assert.deepEqual(
+      h.store.canticleWakeGrants("scribe"),
+      [],
+      "the unprovable grant stays discarded; the failed request made nothing",
+    );
+    assert.equal(status(h).counts.wake_grant_discarded, 1);
+    host.sing(1, AMBIENT);
+    h.timers.advance(20_000);
+    assert.equal(pushes(shim).length, 0);
+  } finally {
+    h.dispose();
+  }
+});
+
 test("store: a wake_grant request's grants are one whole inside a caller's transaction too: a caught fault on one class commits none of them", () => {
   const { h } = setup({ mode: "immediate" }, { wakeKeys: [OPS] });
   try {
