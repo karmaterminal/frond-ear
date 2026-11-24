@@ -448,6 +448,86 @@ test("echo is atomic: a failure between the ledger's echo and custody's leaves t
   }
 });
 
+test("offer is atomic: a failure after the ledger's offer, in a push of several records, leaves the claim, the ledger and every custody row as they were, alone or inside a caller's transaction", async () => {
+  const { h, host } = setup({ mode: "immediate" }, ON);
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    host.sing(1);
+    host.sing(2);
+    host.sing(3, { stream: "ops.deploy" });
+    h.timers.advance(6_000);
+    const push = pushes(shim)[0]!;
+    const batchId = push.batchId!;
+    const database = (h.store as unknown as { database: DatabaseSync })
+      .database;
+    const claims = () =>
+      (
+        database
+          .prepare(
+            "SELECT COUNT(*) AS n FROM canticle_claims WHERE batch_id = ?",
+          )
+          .get(batchId) as { n: number }
+      ).n;
+    const custody = () =>
+      h.store.canticleCustody("scribe", 0).filter((r) => r.batchId === batchId);
+    assert.equal(custody().length, 3, "one custody row per record");
+    const untouched = () => {
+      assert.equal(claims(), 1, "the claim is still there");
+      assert.equal(
+        ledger(h)[0]!.phase,
+        "fenced",
+        "the ledger's offer rolled back",
+      );
+      assert.equal(ledger(h)[0]!.offered, null);
+      assert.ok(
+        custody().every((r) => r.offeredAt === null),
+        "no custody row was offered",
+      );
+    };
+    // A fault in JS between the writes: after the ledger's offer, before custody's.
+    const store = h.store as unknown as {
+      offerCanticleExposure: (...args: unknown[]) => number;
+    };
+    const offerExposure = store.offerCanticleExposure;
+    store.offerCanticleExposure = function (...args: unknown[]) {
+      offerExposure.apply(this, args);
+      throw new Error("injected after the ledger's offer");
+    };
+    const offer = {
+      at: h.clock.now(),
+      sessionId: SESSION,
+      boundary: null,
+    };
+    // On its own: its own transaction.
+    assert.throws(
+      () => h.store.offerCanticleCustody("scribe", batchId, offer),
+      /injected after the ledger's offer/u,
+    );
+    untouched();
+    // Inside a caller's transaction that catches the failure and commits: still whole.
+    h.store.atomically(() => {
+      assert.throws(
+        () => h.store.offerCanticleCustody("scribe", batchId, offer),
+        /injected after the ledger's offer/u,
+      );
+    });
+    untouched();
+    // Without the fault, the real push path offers it whole, inside the daemon's own
+    // transaction (confirmBatch with the offer), with no nested BEGIN.
+    store.offerCanticleExposure = offerExposure;
+    await shim.send({ type: "offered", batchId });
+    assert.equal(claims(), 0);
+    assert.equal(ledger(h)[0]!.phase, "offered");
+    assert.deepEqual(ledger(h)[0]!.offered, {
+      at: h.clock.now(),
+      sessionId: SESSION,
+    });
+    assert.ok(custody().every((r) => r.offeredAt === h.clock.now()));
+  } finally {
+    h.dispose();
+  }
+});
+
 test("crash: the fence is durable on disk at the moment of handover: a copy of the store taken then has the push fenced, reconciles to unknown at the next attach, and is never cleared", async () => {
   const directory = mkdtempSync(join(tmpdir(), "frond-ear-exposure-"));
   const path = join(directory, "ear.db");
