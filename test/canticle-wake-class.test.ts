@@ -260,6 +260,40 @@ test("#176 proof 4: a record waiting under a grant that lapses before its push i
   }
 });
 
+test("#176 proof 4: what a grant let wake and the push budget held until it went off air owes no push of its own: nothing wakes the ear once the grant lapses, and the next push that goes tells it", async () => {
+  const { h, host } = setup(
+    { mode: "immediate", maxItems: 1, maxPushesPerHour: 1 },
+    { wakeKeys: [OPS] },
+  );
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    await grant(h, shim, {
+      stream: "ops:ops.fleet",
+      classes: ["ambient"],
+      ttl_seconds: 600,
+    });
+    host.sing(1, { ...AMBIENT, ttlMs: 10_000 });
+    host.sing(2, { ...AMBIENT, ttlMs: 10_000 });
+    h.timers.advance(6_000);
+    assert.equal(pushes(shim).length, 1, "one carried, one promised");
+    assert.match(pushes(shim)[0]!.content, /1 more record waits/u);
+    await confirm(shim);
+    h.timers.advance(12_000); // the promised one goes off air under the spent budget
+    assert.equal(status(h).counts.off_air_unpushed, 1);
+    h.timers.advance(3_600_000); // the grant lapses, then the budget frees
+    assert.equal(pushes(shim).length, 1, "no wake for the note");
+    host.sing(3, ALARM);
+    h.timers.advance(6_000);
+    assert.equal(pushes(shim).length, 2, "the alarm wakes");
+    assert.match(
+      pushes(shim)[1]!.content,
+      /^- ops:ops\.fleet: 1 went off air unpushed while the hour's push budget was spent \(push_budget; /mu,
+    );
+  } finally {
+    h.dispose();
+  }
+});
+
 test("#176 proof 4: a grant asks for a TTL within bounds, exact station:stream and known classes, and only the attached session with an id can make one", async () => {
   const { h } = setup({ mode: "immediate" }, { wakeKeys: [OPS] });
   try {
