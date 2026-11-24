@@ -9,6 +9,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
 import type { HearView } from "../src/canticle/receptor.ts";
@@ -841,6 +842,121 @@ test("#176 proof 4: a forward step later corrected leaves no wake past the TTL: 
     host.sing(1, AMBIENT);
     h.timers.advance(400_000); // past where the poll was due on the stepped clock
     assert.equal(pushes(shim).length, 0, "no wake past the TTL");
+  } finally {
+    h.dispose();
+  }
+});
+
+/**
+ * A storage fault on the `chatter` row only, as 🌫's probe injected it (#124 follow-up): the
+ * second class of an `ambient, chatter` request fails after the first was written.
+ */
+function faultSecondClass(h: Harness): void {
+  (h.store as unknown as { database: DatabaseSync }).database.exec(`
+    CREATE TEMP TRIGGER wake_grant_test_fault
+      BEFORE INSERT ON canticle_wake_grants WHEN NEW.class = 'chatter'
+      BEGIN SELECT RAISE(ABORT, 'injected on the second class'); END`);
+}
+
+test("#176 proof 4: a multi-class wake_grant is one whole: a storage fault on its second class leaves no grant made, so nothing wakes", async () => {
+  const { h, host } = setup({ mode: "immediate" }, { wakeKeys: [OPS] });
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    faultSecondClass(h);
+    const failed = await grant(h, shim, {
+      stream: "ops:ops.fleet",
+      classes: ["ambient", "chatter"],
+      ttl_seconds: 600,
+    });
+    assert.equal(failed.ok, false, failed.text);
+    assert.match(failed.text, /injected on the second class/u);
+    assert.deepEqual(
+      h.store.canticleWakeGrants("scribe"),
+      [],
+      "the first class's row went with the failure",
+    );
+    host.sing(1, AMBIENT);
+    h.timers.advance(10_000);
+    assert.equal(pushes(shim).length, 0, "no wake from a request that failed");
+    assert.equal(status(h).counts["wake_withheld:ambient"], 1);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("#176 proof 4: a failed multi-class wake_grant leaves an existing grant exactly as it was: no longer expiry, no moved mark, and it stops waking at its own expiry", async () => {
+  const { h, host } = setup({ mode: "immediate" }, { wakeKeys: [OPS] });
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    const made = await grant(h, shim, {
+      stream: "ops:ops.fleet",
+      classes: ["ambient"],
+      ttl_seconds: 10,
+    });
+    assert.equal(made.ok, true, made.text);
+    const expiresAt = h.clock.now() + 10_000;
+    h.timers.advance(2_000);
+    // Between polls, so a mark moved by the request itself would show.
+    h.clock.value += 500;
+    const before = h.store.canticleWakeGrants("scribe");
+    assert.equal(before.length, 1);
+    assert.equal(before[0]!.expiresAt, expiresAt);
+    faultSecondClass(h);
+    const failed = await grant(h, shim, {
+      stream: "ops:ops.fleet",
+      classes: ["ambient", "chatter"],
+      ttl_seconds: 600,
+    });
+    assert.equal(failed.ok, false, failed.text);
+    assert.match(failed.text, /injected on the second class/u);
+    assert.deepEqual(
+      h.store.canticleWakeGrants("scribe"),
+      before,
+      "the row is byte for byte as it was: expiry, grant time, mark",
+    );
+    // The grant still holds until its own expiry...
+    host.sing(1, AMBIENT);
+    h.timers.advance(2_000);
+    assert.equal(pushes(shim).length, 1, "the original grant still wakes");
+    await confirm(shim);
+    // ...and not past it.
+    h.clock.value = expiresAt + 1_000;
+    host.sing(2, AMBIENT);
+    h.timers.advance(10_000);
+    assert.equal(pushes(shim).length, 1, "no wake past the original expiry");
+    assert.equal(status(h).counts["wake_withheld:ambient"], 1);
+    assert.deepEqual(h.store.canticleWakeGrants("scribe"), []);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("#176 proof 4: a multi-class wake_grant that succeeds makes every class it names, and each wakes", async () => {
+  const { h, host } = setup({ mode: "immediate" }, { wakeKeys: [OPS] });
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    const granted = await grant(h, shim, {
+      stream: "ops:ops.fleet",
+      classes: ["ambient", "chatter"],
+      ttl_seconds: 600,
+    });
+    assert.equal(granted.ok, true, granted.text);
+    const expiresAt = h.clock.now() + 600_000;
+    assert.deepEqual(JSON.parse(granted.text).grants, [
+      { stream: "ops:ops.fleet", classes: ["ambient", "chatter"], expiresAt },
+    ]);
+    assert.deepEqual(
+      h.store.canticleWakeGrants("scribe").map(({ cls }) => cls),
+      ["ambient", "chatter"],
+    );
+    host.sing(1, { class: "chatter" });
+    h.timers.advance(10_000);
+    assert.equal(pushes(shim).length, 1, "chatter wakes");
+    await confirm(shim);
+    host.sing(2, AMBIENT);
+    h.timers.advance(10_000);
+    assert.equal(pushes(shim).length, 2, "ambient wakes");
+    assert.deepEqual(order(pushes(shim)[1]!.content), ["ops:ops.fleet/2"]);
   } finally {
     h.dispose();
   }
