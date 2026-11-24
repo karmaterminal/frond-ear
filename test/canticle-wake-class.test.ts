@@ -731,6 +731,68 @@ test("#176 proof 4: a clock that steps back mid-run discards every grant, so exp
   }
 });
 
+test("#176 proof 4: a clock that steps forward only shortens a grant: a jump past its expiry lapses it for good, and stepping back afterwards brings nothing back", async () => {
+  const { h, host } = setup({ mode: "immediate" }, { wakeKeys: [OPS] });
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    const grantedAt = h.clock.now();
+    await grant(h, shim, {
+      stream: "ops:ops.fleet",
+      classes: ["ambient"],
+      ttl_seconds: 600,
+    });
+    h.timers.advance(100_000);
+    h.clock.value = grantedAt + 1_000_000; // a step forward past the grant's expiry
+    host.sing(1, AMBIENT);
+    h.timers.advance(10_000);
+    assert.equal(pushes(shim).length, 0, "lapsed on the stepped clock");
+    assert.equal(status(h).counts.wake_grant_lapsed, 1);
+    assert.equal(h.store.canticleWakeGrants("scribe").length, 0);
+    // Corrected back to 200 s into the grant: the row is gone, so nothing wakes.
+    h.clock.value = grantedAt + 200_000;
+    host.sing(2, AMBIENT);
+    h.timers.advance(1_200_000);
+    assert.equal(pushes(shim).length, 0, "a correction doesn't revive it");
+  } finally {
+    h.dispose();
+  }
+});
+
+test("#176 proof 4: a forward step later corrected leaves no wake past the TTL: the high-water mark it set discards the grant when the clock comes back", async () => {
+  const { h, host } = setup({ mode: "immediate" }, { wakeKeys: [OPS] });
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    const grantedAt = h.clock.now();
+    await grant(h, shim, {
+      stream: "ops:ops.fleet",
+      classes: ["ambient"],
+      ttl_seconds: 600,
+    });
+    h.timers.advance(100_000);
+    // A wrong step forward to 500 s in, still inside the TTL: polls move the mark there.
+    h.clock.value = grantedAt + 500_000;
+    h.timers.advance(5_000);
+    assert.equal(
+      (status(h) as unknown as { wakeGrants: unknown[] }).wakeGrants.length,
+      1,
+      "still inside its TTL",
+    );
+    // Corrected back to 110 s in: behind the mark, so the grant is discarded, not given
+    // the 400 s the wrong step would otherwise hand back.
+    h.clock.value = grantedAt + 110_000;
+    assert.deepEqual(
+      (status(h) as unknown as { wakeGrants: unknown }).wakeGrants,
+      [],
+    );
+    assert.equal(status(h).counts.wake_grant_discarded, 1);
+    host.sing(1, AMBIENT);
+    h.timers.advance(400_000); // past where the poll was due on the stepped clock
+    assert.equal(pushes(shim).length, 0, "no wake past the TTL");
+  } finally {
+    h.dispose();
+  }
+});
+
 test("#176 proof 5: what a station sends can't ask for a wake, make or extend a grant, or change a record's class", async () => {
   const { h, host } = setup({ mode: "immediate" }, { wakeKeys: [OPS] });
   try {

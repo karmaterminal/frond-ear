@@ -739,6 +739,12 @@ does. To keep a class waking, name it, alarm included if you want it:
 `{ "key": "0123456789abcdef", "classes": ["advisory", "alarm"] }`. `ear_status` counts what the change withholds,
 so check `counts` for `wake_withheld:<class>` after you upgrade.
 
+**Seats that wake on any class today (the scribes).** Once this lands, `ambient`, `advisory`, `chatter` and every
+other non-alarm item from your bare `wakeKeys` arrives silently: `hear` still reads it, `ear_status` counts it
+`wake_withheld:<class>`, and the next push names it, but it no longer starts a turn. To be woken by it again, name
+the class on the key in config (`{ "key": "…", "classes": ["ambient", "advisory", "alarm"] }`, which lasts), or
+have the session opt in for a while with `wake_grant` on one `station:stream` (below), which lapses.
+
 **What happens to the rest.** A record from a listed key whose class may not wake is delivered without a wake. Its
 custody is what any record that isn't pushed has: `hear` reads it while it is live, and nothing else changes.
 `ear_status` counts it as `wake_withheld:<class>` (an unregistered class counts as `wake_withheld:unknown`), and
@@ -751,7 +757,9 @@ decision, never a receipt: it says nothing about whether the session or the prin
 row is written for it.
 
 What the live set drops of such a class wakes nobody either. A `live_overflow` note owes a push of its own only
-when a record it drops is of a class the key's config entry lets wake. Drops of other classes, and drops known
+when a record it drops would pass the wake gate on the config alone: the manifest grants its key the class, where
+the source can say, and the key's config entry lets that class wake. The same holds for a note about a record held
+until it went off air. It is the gate's own predicate, so the two can't drift; a grant never makes a note owed. Drops of other classes, and drops known
 only by count, ride with the next push that goes. So an ambient flood can't wake the session through its own
 overflow.
 
