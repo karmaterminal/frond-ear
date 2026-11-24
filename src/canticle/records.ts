@@ -241,6 +241,8 @@ export interface LiveDrop {
   epoch: number;
   stream: string;
   seq: string;
+  /** Its verified class: whether it could have woken a session (binary-canticle#176). */
+  class: string;
 }
 
 /**
@@ -987,6 +989,7 @@ export class RecordConsumer {
           epoch,
           stream,
           seq,
+          class: r.item.class,
         });
       }
     }

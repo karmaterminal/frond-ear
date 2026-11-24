@@ -12,6 +12,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import type { HearView } from "../src/canticle/receptor.ts";
+import { MAX_LIVE } from "../src/canticle/records.ts";
 import {
   ALPHA,
   canticleConfig,
@@ -85,9 +86,45 @@ test("#176 proof 2: a verified alarm from the same bare key wakes; its push name
     assert.match(push.content, /not a sign it was seen/u);
     // wake_withheld is an attention decision, not a receipt: no custody of the ambient.
     await confirm(shim);
-    const custody = (await h.call(shim, "canticle_custody", {})).text;
-    assert.match(custody, /:2"/u);
-    assert.doesNotMatch(custody, /:1"/u);
+    const custody = JSON.parse(
+      (await h.call(shim, "canticle_custody", {})).text,
+    ) as { records: Array<{ item: string; state: string }> };
+    assert.deepEqual(
+      custody.records.map(({ item, state }) => ({ item, state })),
+      [{ item: "7/2", state: "offered" }],
+      "the alarm only: the withheld ambient was neither offered nor heard",
+    );
+  } finally {
+    h.dispose();
+  }
+});
+
+test("#176 proof 1: an ambient flood from a bare key that overflows the live set wakes nobody: what it dropped owes no push of its own and rides with the next push that goes", async () => {
+  const { h, host } = setup(
+    { mode: "immediate", maxPushesPerHour: 360 },
+    { wakeKeys: [OPS] },
+  );
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    for (let n = 1; n <= MAX_LIVE + 50; n++) {
+      host.sing(n, { ...AMBIENT, stream: "ops.deploy", ttlMs: 3_600_000 });
+    }
+    h.timers.advance(60_000);
+    assert.equal(pushes(shim).length, 0, "no wake, not even for the note");
+    assert.equal(status(h).counts.live_overflow, 50);
+    assert.equal(status(h).counts["wake_withheld:ambient"], MAX_LIVE);
+    h.timers.advance(120_000);
+    assert.equal(pushes(shim).length, 0);
+    host.sing(1, ALARM);
+    h.timers.advance(6_000);
+    assert.equal(pushes(shim).length, 1, "the alarm wakes");
+    const push = pushes(shim)[0]!.content;
+    assert.deepEqual(order(push), ["ops:ops.fleet/1"]);
+    assert.match(
+      push,
+      /^- ops:ops\.deploy: 50 dropped by frond-ear's full live set \(live_overflow; /mu,
+    );
+    assert.match(push, withheldLine("ops:ops.deploy", "ambient", MAX_LIVE));
   } finally {
     h.dispose();
   }
@@ -426,7 +463,11 @@ test("#176 proof 5: what a station sends can't ask for a wake, make or extend a 
       classes: ["ambient"],
       ttl_seconds: 60,
     });
-    host.sing(4, { class: "chatter", extra: { ...asks, class: "ambient" } });
+    // (The record's own `class` is the host's verified one; a station can only ask.)
+    host.sing(4, {
+      class: "chatter",
+      extra: { ...asks, requested_class: "ambient", wake_class: "ambient" },
+    });
     h.timers.advance(10_000);
     assert.equal(pushes(shim).length, 1);
     assert.equal(status(h).counts["wake_withheld:chatter"], 1);

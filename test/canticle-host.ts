@@ -26,6 +26,13 @@ export const KEYS: Readonly<Record<string, string>> = {
 };
 export const TUNE = ["*:ops.fleet", "*:ops.deploy"];
 
+/**
+ * `canticle.wakeKeys` entries letting these keys wake for advisory, the songs' default
+ * class (binary-canticle#176 decision 1: a bare key would be alarm only).
+ */
+export const advisory = (keys: readonly string[]) =>
+  keys.map((key) => ({ key, classes: ["advisory"] }));
+
 export interface Song {
   station?: string;
   stream?: string;
@@ -290,7 +297,9 @@ export function canticleConfig(
       source: "host-daemon",
       hostSocket: "/nonexistent/canticle.sock",
       tune: { scribe: TUNE },
-      wakeKeys: [OPS, ALPHA],
+      // The songs' default class is advisory: the keys' entries name it, so it may wake
+      // (binary-canticle#176 decision 1; a bare key would be alarm only).
+      wakeKeys: advisory([OPS, ALPHA]),
       ...(delivery !== undefined ? { delivery: { scribe: delivery } } : {}),
       ...canticle,
     },

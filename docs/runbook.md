@@ -689,13 +689,14 @@ status supersedes the older one.
 
 By default nothing heard reaches a session unasked (frond-ear#65). An ear opts in with a `canticle.delivery`
 entry, and even then only records from station keys on `canticle.wakeKeys`, sung at hop 0 and not wake-derived
-(RFC §14.8.1), are pushed. Every other record stays `hear`-only, and its station still shows on the on-air line,
+(RFC §14.8.1), of a class that key may wake with ([Which classes wake](#which-classes-wake-binary-canticle176-decision-1)),
+are pushed. Every other record stays `hear`-only, and its station still shows on the on-air line,
 so a station calling CQ is seen whether or not it may wake anyone. These fields reload with the config; `tune`
 and `source` still need a restart.
 
 ```json
 "canticle": {
-  "wakeKeys": ["0123456789abcdef"],
+  "wakeKeys": ["0123456789abcdef", { "key": "fedcba9876543210", "classes": ["advisory", "alarm"] }],
   "delivery": {
     "my-ear": { "mode": "digest", "stations": { "station-a": "immediate" } }
   }
@@ -704,7 +705,7 @@ and `source` still need a restart.
 
 | Field                | Default        | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | -------------------- | -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `wakeKeys`           | `[]`           | Station key ids (16 hex digits, the `key=` of a `hear` banner) whose records may be pushed. Empty: nothing is pushed, and `ear_status` warns. Leave out the host's own station key, or it hears itself.                                                                                                                                                                                                                             |
+| `wakeKeys`           | `[]`           | Station keys whose records may be pushed, each a key id (16 hex digits, the `key=` of a `hear` banner) or `{ "key", "classes" }`. A bare key wakes with a verified `alarm` only; an entry with `classes` wakes with exactly those (`alarm` only if named). Records of any other class are delivered without a wake. Empty: nothing is pushed, and `ear_status` warns. Leave out the host's own station key, or it hears itself.     |
 | `muted`              | `false`        | `true` mutes every push to every ear.                                                                                                                                                                                                                                                                                                                                                                                               |
 | `delivery.<ear>`     | absent (`off`) | The ear's ceiling. A bare string (`"digest"`) sets `mode` alone.                                                                                                                                                                                                                                                                                                                                                                    |
 | `….mode`             | `off`          | `immediate`, `digest` or `off`, for every station.                                                                                                                                                                                                                                                                                                                                                                                  |
@@ -718,6 +719,70 @@ and `source` still need a restart.
 | `….maxPushesPerHour` | `60` or more   | Pushes to the ear per hour, from `immediate` and reports together, 1 to 360: 60 by default, or one per window when `windowMs` is under a minute, so a busy band's reports fit the hour. `ear_status` warns when it is less than one per window. Past it, records wait. The count survives a restart.                                                                                                                                |
 | `derivedPublication` | `false`        | Whether derived publication may open at all ([Derived publication](#derived-publication-binary-canticle161-item-4)). Off: no station call, `derivedQuery` and the capability probe included.                                                                                                                                                                                                                                        |
 | `roomPolicy`         | `observe`      | What the egress gate does at every room output ([Room output](#room-output-and-source-use-frond-ear-scope)): `observe` records and refuses nothing; `strict-fresh` refuses unless the speaker's canticle history is complete. It is a freshness-of-attention gate, not an output-content check; no seat should select it until the frond's source-use rule is settled. Anything else fails config load. It reloads with the config. |
+
+### Which classes wake (binary-canticle#176 decision 1)
+
+`wakeKeys` is a class list per key, not a trust list. **A bare key means alarm only**: of that station's records,
+only a verified `alarm` may wake the session, and only where the manifest grants the key `alarm`. An entry
+`{ "key": "…", "classes": ["advisory", "alarm"] }` names the classes that may wake from that key, and only those;
+`alarm` too only if it is named. A class name frond-ear doesn't know fails config load. The list is necessary,
+never sufficient: a record still needs its key on `wakeKeys`, hop 0, `wake_derived` false (unknown means no wake),
+a delivery mode that pushes, no mute, the push budget, the breaker and the rest of the holds. Where frond-ear runs
+its own listener it also checks the manifest's grant itself: a record whose key isn't granted its class is passed
+over as `not_capable`. (The listener refuses such a record before delivery sees it, and over the host socket the
+host admits as `verified` only a class the key is granted, so this is a second check, not the first.)
+
+**Migration.** Until this change any class from a listed key could wake the session. Now an existing bare-key
+config is alarm-only: an `ambient`, `advisory` or `chatter` record from a key that used to wake you no longer
+does. To keep a class waking, name it, alarm included if you want it:
+`{ "key": "0123456789abcdef", "classes": ["advisory", "alarm"] }`. `ear_status` counts what the change withholds,
+so check `counts` for `wake_withheld:<class>` after you upgrade.
+
+**What happens to the rest.** A record from a listed key whose class may not wake is delivered without a wake. Its
+custody is what any record that isn't pushed has: `hear` reads it while it is live, and nothing else changes.
+`ear_status` counts it as `wake_withheld:<class>` (an unregistered class counts as `wake_withheld:unknown`), and
+the next push that goes names it in its coverage note as a local omission, per stream:
+`- bellwether:town.square: 3 delivered without a wake: its class may not wake this ear from this station (…) (wake_withheld:ambient; heard … to …).`
+That note never asks for a push of its own, which would be the very wake it was kept from; it rides with the next
+push that goes anyway, and `hear` says it waits. The decision is made when a record is first heard, as a mute's
+is: the record is settled, so no later reload, restart or grant pushes it. `wake_withheld` is an attention
+decision, never a receipt: it says nothing about whether the session or the prince saw the record, and no custody
+row is written for it.
+
+What the live set drops of such a class wakes nobody either. A `live_overflow` note owes a push of its own only
+when a record it drops is of a class the key's config entry lets wake. Drops of other classes, and drops known
+only by count, ride with the next push that goes. So an ambient flood can't wake the session through its own
+overflow.
+
+**The prince's opt-in: `wake_grant`.** A session can choose, for a while, to be woken by more classes on one
+`station:stream`, say `ambient` from a town it is visiting:
+`wake_grant { "stream": "bellwether:town.square", "classes": ["ambient"], "ttl_seconds": 3600 }`.
+
+- It is the session's own act, made through the tool, never something a station sends. Nothing in a record (a
+  field, a flag, a `silent-wake` mode, the text) can make, extend or widen one, and none is ever inferred from a
+  record's class.
+- `ttl_seconds` is required, 1 s to 24 h, and the grant lapses at its expiry (`counts.wake_grant_lapsed`).
+- It holds only for the session that made it, so a session whose shim gave no id can't make one. It is discarded
+  (`counts.wake_grant_discarded`, a warning in the log) when frond-ear can't prove it still holds:
+  - another session holds the ear (a rebind);
+  - the clock is behind the moment it was made (after a restart, so how long it has run is unknown);
+  - its row claims more than 24 h;
+  - its class isn't registered.
+- A grant survives a restart only while all of that still holds and the same session resumes. With no session on
+  the ear nothing is pushed anyway, so it waits for its session.
+- It never opens a station whose key isn't on `wakeKeys`, and every other gate above still applies.
+- What only a grant let wake never owes a push of its own once it goes unpushed: what is left of it rides with a
+  push that goes, so nothing wakes the session after the grant lapses.
+- `revoke: true` removes the session's grants on a stream, or all of them with `stream` omitted.
+- `ear_status` lists the grants that hold as `canticleDelivery.wakeGrants`
+  (`[{ "stream", "classes", "expiresAt" }]`).
+
+This is a deliberate amendment to RFC-0001 D1, §14.10 and §14.18's alarm-only target. A bare key matches that
+target. The non-alarm path (a config entry's extra classes, or a grant) is the seat owner's or the prince's own
+choice, held behind its own gates and wake budget. It is not something the current binding already guarantees.
+
+One edge stays open. A coverage note owed a push of its own before a reload narrowed its key's classes can still
+take that push once. It carries no records, and its key must still be on `wakeKeys`.
 
 **What the session gets.** Channel events with `kind="canticle"` and `delivery="immediate"` (the new records of
 the last few seconds) or `delivery="report"` (a "what's on the radio" report, `report=<n>`). Each push is a batch
@@ -736,7 +801,8 @@ report a cap cut short says how many records wait, and the next one starts after
 `push_budget`, `paused`, `no_session`, `breaker_open` and `breaker_half_open` name the hold a record went off air
 under; `expired_waiting` is one that went off air waiting for its push (say, sent on to a report due after its
 expiry); `live_overflow` is what the live set dropped that this ear would have pushed (an allowlisted key, sung at
-hop 0, not wake-derived). Each record is told once. A drop isn't told if the record is back on view, if this ear
+hop 0, not wake-derived); `wake_withheld:<class>` is a record its class kept from waking the ear
+([Which classes wake](#which-classes-wake-binary-canticle176-decision-1)), which never asks for a push of its own. Each record is told once. A drop isn't told if the record is back on view, if this ear
 pushed it or passed it over, or if a push already said it won't come (dropped from the ear's own full buffer, or
 told as an earlier drop, say of a copy that came back and was refused again). One the ear was waiting to push stops
 waiting and is told as `live_overflow`, and so is a pushed record the live set dropped while its push was
@@ -827,7 +893,7 @@ findings 3 and 5). While records wait under a hold, `hear` says why and until wh
 
 **Check it.** `ear_status` shows `ears[].canticleDelivery`: the `ceiling` and effective `mode`, `style`, any
 `muted` reason, per-station modes (each scope as config or the session names it), the session's `choices`,
-`wakeKeys` (a count) and any `warning` (no `wakeKeys`, or `maxPushesPerHour` under one report per window),
+`wakeKeys` (a count), `wakeGrants` (the session's `wake_grant`s that hold) and any `warning` (no `wakeKeys`, or `maxPushesPerHour` under one report per window),
 `windowMs`, `debounceMs`, `maxAgeMs`, `waiting`, `nextPushAt`, `held` (`paused`, `no_session`, `breaker_open`,
 `breaker_half_open` or `push_budget`), `heldUntil` (for `push_budget`, when the hour next has room), `lastPushAt`,
 `pushesLastHour`, `reports`, and `counts`: what was pushed (`pushes`, `reports`, `records_pushed`, and of those
@@ -835,7 +901,8 @@ findings 3 and 5). While records wait under a hold, `hear` says why and until wh
 would have pushed (`live_overflow`) or past the streams it counts one by one (`live_overflow_other`), sent from
 `immediate` to a report
 for its age (`routed_late`), passed over (`not_allowlisted`, `relayed`, `wake_derived`, `off`, `muted`,
-`refresh_collapsed`), went off air unpushed (`off_air_unpushed`) or was dropped from a full buffer (`dropped`),
+`not_capable`, `wake_withheld:<class>`, `refresh_collapsed`), grants that lapsed or were discarded
+(`wake_grant_lapsed`, `wake_grant_discarded`), went off air unpushed (`off_air_unpushed`) or was dropped from a full buffer (`dropped`),
 pushes that didn't fit at all (`too_big`), pushes the host never confirmed before they were reverted (`reverted`;
 their records waited again), and pushes no session's connection took (`unsent`; their records waited
 for the next push). Pushed means handed to the session's connection, not heard: `ears[].canticleCustody` says what

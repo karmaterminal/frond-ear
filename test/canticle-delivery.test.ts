@@ -22,6 +22,7 @@ import { canticleDelivers } from "../src/config.ts";
 import { StructuredLogger } from "../src/logger.ts";
 import { channelInstructions } from "../src/render.ts";
 import {
+  advisory,
   ALPHA,
   canticleConfig,
   confirm,
@@ -520,7 +521,10 @@ test("dedupe: tombstones, a standing mute and the report cursor survive a frond-
 });
 
 test("reload: a new config re-reads what is on air; what a mute passed over stays passed over", async () => {
-  const { h, host } = setup({ mode: "immediate" }, { wakeKeys: [OPS] });
+  const { h, host } = setup(
+    { mode: "immediate" },
+    { wakeKeys: advisory([OPS]) },
+  );
   try {
     const shim = h.attach("scribe");
     host.sing(1, { station: "alpha" }); // alpha isn't allowlisted yet
@@ -576,7 +580,10 @@ test("reload: a key taken off the allowlist holds back what it had waiting; a sh
     // alpha's key comes off the allowlist and the window shortens to 10 s: alpha's
     // waiting record is held back and never pushed; ops's goes out in the new window.
     h.daemon.reloadConfig(
-      canticleConfig({ mode: "digest", windowMs: 10_000 }, { wakeKeys: [OPS] }),
+      canticleConfig(
+        { mode: "digest", windowMs: 10_000 },
+        { wakeKeys: advisory([OPS]) },
+      ),
     );
     h.timers.advance(11_000);
     assert.equal(pushes(shim).length, 1);
@@ -1631,7 +1638,8 @@ test("embedded receptor: an allowlisted key's signed item is pushed once, its re
       source: "embedded",
       manifestPath: "unused",
       tune: { scribe: ["*:chatter"] },
-      wakeKeys: [test1.key_id],
+      // Its items are chatter, which the key's entry names (#176), and its manifest grants.
+      wakeKeys: [{ key: test1.key_id, classes: ["chatter"] }],
     },
   );
   let receptor: CanticleReceptor | undefined;

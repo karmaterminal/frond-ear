@@ -220,7 +220,7 @@ export const TOOLS = [
   {
     name: "set_canticle_delivery",
     description:
-      "Choose how binary-canticle broadcasts reach you unasked: immediate (each new record a few seconds after it is heard; one heard too long ago, or already old when first heard, goes into the next report instead, marked late), digest (a \"what's on the radio\" report at most once per window) or mute, for one station or, with station omitted, every station; a station's own choice beats the one for every station. The daemon's config is the ceiling (immediate, then digest, then mute), so this can only narrow. A mute at any scope wins, set_attention silence for everything included, and it is for good: a record first heard during a mute is never pushed, even after the mute lifts (hear still reads it while it is live). mode=configured clears your choice (every choice when station is omitted). ttl_seconds is optional; without it the choice lasts until you change it. Each scope holds one choice, as with set_attention: a new one replaces it, and when its ttl lapses the config applies again, style included. Only records from allowlisted station keys are ever pushed; the rest stay readable with hear. Only the session holding the ear can set it. Returns the effective modes.",
+      "Choose how binary-canticle broadcasts reach you unasked: immediate (each new record a few seconds after it is heard; one heard too long ago, or already old when first heard, goes into the next report instead, marked late), digest (a \"what's on the radio\" report at most once per window) or mute, for one station or, with station omitted, every station; a station's own choice beats the one for every station. The daemon's config is the ceiling (immediate, then digest, then mute), so this can only narrow. A mute at any scope wins, set_attention silence for everything included, and it is for good: a record first heard during a mute is never pushed, even after the mute lifts (hear still reads it while it is live). mode=configured clears your choice (every choice when station is omitted). ttl_seconds is optional; without it the choice lasts until you change it. Each scope holds one choice, as with set_attention: a new one replaces it, and when its ttl lapses the config applies again, style included. Only records from allowlisted station keys are ever pushed, and only of a class the key may wake with (a verified alarm by default; wake_grant opts in to more); the rest stay readable with hear. Only the session holding the ear can set it. Returns the effective modes.",
     inputSchema: {
       type: "object",
       properties: {
@@ -244,6 +244,35 @@ export const TOOLS = [
         },
       },
       required: ["mode"],
+    },
+  },
+  {
+    name: "wake_grant",
+    description:
+      "Opt in, for a while, to be woken by more classes of binary-canticle record on one station:stream. By default a station key on canticle.wakeKeys wakes you only with a verified alarm (or the classes the config names for it); every other record from it arrives without a wake: hear reads it, ear_status counts it as wake_withheld:<class>, and the next push names it as a local omission. A grant is your own act, never a station's: nothing a station sends can make, extend or widen one. It needs ttl_seconds (up to 86400) and lapses then; it holds only for this session, and is discarded if another session takes the ear or frond-ear can't prove it hasn't lapsed. It never opens a station whose key isn't on wakeKeys, and every other gate still holds (hop 0, not wake-derived, your delivery mode, mute, the push budget). revoke=true removes your grants on the stream (all of them with stream omitted). Only the session holding the ear can grant. Returns the grants that hold.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        stream: {
+          type: "string",
+          description:
+            "One station:stream, the station by the name hear shows or its key id (the key= of a hear banner); no *",
+        },
+        classes: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            'Classes to be woken by on that stream, e.g. ["ambient"] (chatter, ambient, live-state, advisory, finding-ref, regulatory, alarm, control, root)',
+        },
+        ttl_seconds: {
+          type: "number",
+          description: "Required: how long the grant lasts, at most 86400",
+        },
+        revoke: {
+          type: "boolean",
+          description: "Remove your grants on stream (or all) instead",
+        },
+      },
     },
   },
   {

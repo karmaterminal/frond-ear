@@ -70,9 +70,11 @@ import { createHash } from "node:crypto";
 
 import {
   canticleDelivers,
+  type CanticleConfig,
   type CanticleEarDelivery,
   type CanticleMode,
   type Config,
+  WAKE_DEFAULT_CLASSES,
 } from "../config.ts";
 import type { StructuredLogger } from "../logger.ts";
 import type { Notification } from "../render.ts";
@@ -82,10 +84,12 @@ import type {
   CanticleReverted,
   CanticleSettled,
   CanticleShown,
+  CanticleWakeGrant,
   EventStore,
 } from "../store.ts";
 import type { Clock, Timers } from "../types.ts";
 import { iso, joinedLate, onAir, renderItem, secs, token } from "./hear.ts";
+import { CLASS_BY_NAME } from "./ids.ts";
 import type { HearView, LiveItem } from "./receptor.ts";
 import type { LiveDrop, LiveOmission } from "./records.ts";
 
@@ -109,6 +113,27 @@ const MAX_MISSED_LINES = 5;
  * they are reverted; past it, the oldest one's records are read from the view again.
  */
 const MAX_UNCONFIRMED = 256;
+
+/** The longest a `wake_grant` may last (binary-canticle#176 decision 1): a visit, not a habit. */
+export const MAX_WAKE_GRANT_MS = 86_400_000;
+
+/** The counter and coverage-note reason for a record kept from waking by its class. */
+const WAKE_WITHHELD = "wake_withheld:";
+
+/**
+ * A record's class as a counter names it: a registered class, else `unknown`, so what a
+ * source calls a class can't grow ear_status without bound.
+ */
+const classToken = (cls: string) => (CLASS_BY_NAME.has(cls) ? cls : "unknown");
+
+/**
+ * Pass-overs that are for good: a mute's, and the class gate's (the manifest's capability,
+ * or a class that may not wake). The record is settled, never pushed later.
+ */
+const forGood = (passed: string) =>
+  passed === "muted" ||
+  passed === "not_capable" ||
+  passed.startsWith(WAKE_WITHHELD);
 
 /** `off`: the config allows nothing; `mute`: the session (or a global switch) chose silence. */
 export type DeliveryMode = "off" | "mute" | "digest" | "immediate";
@@ -341,6 +366,13 @@ interface Folded {
   /** So are records of it that went off air unpushed or a full buffer dropped. */
   missed: boolean;
 }
+
+/**
+ * How a coverage note says a record was kept from waking by its class (#176 decision 1): an
+ * attention decision, never a receipt.
+ */
+const WAKE_WITHHELD_TEXT =
+  "delivered without a wake: its class may not wake this ear from this station (hear reads it while it is live; not a sign it was seen)";
 
 /** How a coverage note says why frond-ear withheld records; reasons unknown here read as-is. */
 const WITHHELD: Readonly<Record<string, string>> = {
@@ -833,6 +865,90 @@ class Modes {
   }
 }
 
+/**
+ * What may wake an ear (binary-canticle#176 decision 1), as the config, the session's
+ * grants and the record source's manifest have it now. `has` is the allowlist
+ * (`canticle.wakeKeys`): necessary for any push, never sufficient. `gate` is the rest of
+ * the boundary on a record's class: the manifest must grant its key the class, where the
+ * source can say, and the class must be one the key's entry names (a bare key: alarm only)
+ * or one the session granted on its station:stream, still unlapsed. Nothing here is read
+ * from what a station sends but its verified class.
+ */
+class Boundary {
+  readonly #classes: ReadonlyMap<string, ReadonlySet<string>>;
+  readonly #grants: readonly CanticleWakeGrant[];
+  readonly #capability: HearView["capability"];
+
+  constructor(
+    canticle: CanticleConfig,
+    grants: readonly CanticleWakeGrant[] = [],
+    capability?: HearView["capability"],
+  ) {
+    this.#classes = configuredClasses(canticle);
+    this.#grants = grants;
+    this.#capability = capability;
+  }
+
+  /** How many keys are on the allowlist. */
+  get size(): number {
+    return this.#classes.size;
+  }
+
+  /** Whether the key is on `canticle.wakeKeys`. */
+  has(key: string): boolean {
+    return this.#classes.has(key.toLowerCase());
+  }
+
+  /** Whether the config alone lets this key's records of `cls` wake (no grant). */
+  configured(key: string, cls: string): boolean {
+    return this.#classes.get(key.toLowerCase())?.has(cls) === true;
+  }
+
+  /** Whether an unlapsed grant of the session's covers this record's station:stream and class. */
+  granted(item: Pick<LiveItem, "station" | "key" | "stream" | "class">) {
+    const key = item.key.toLowerCase();
+    return this.#grants.some(
+      (grant) =>
+        (grant.station === item.station || grant.station === key) &&
+        grant.stream === item.stream &&
+        grant.cls === item.class,
+    );
+  }
+
+  /**
+   * Why an allowlisted record's class keeps it from waking the ear (`not_capable`, or
+   * `wake_withheld:<class>`), or undefined when it may.
+   */
+  gate(
+    item: Pick<LiveItem, "station" | "key" | "stream" | "class">,
+  ): string | undefined {
+    if (this.#capability !== undefined) {
+      const granted = this.#capability(item.key.toLowerCase());
+      if (granted === undefined || !granted.has(item.class)) {
+        return "not_capable";
+      }
+    }
+    if (this.configured(item.key, item.class) || this.granted(item)) {
+      return undefined;
+    }
+    return `${WAKE_WITHHELD}${classToken(item.class)}`;
+  }
+}
+
+/** Per key on `wakeKeys`, the classes its entry lets wake; a bare key, alarm only. */
+function configuredClasses(
+  canticle: CanticleConfig,
+): Map<string, ReadonlySet<string>> {
+  return new Map(
+    canticle.wakeKeys.map((key) => [
+      key.toLowerCase(),
+      new Set(
+        canticle.wakeClasses?.[key.toLowerCase()] ?? WAKE_DEFAULT_CLASSES,
+      ),
+    ]),
+  );
+}
+
 export interface DeliveryDeps {
   /** The daemon's current config: delivery settings reload with it. */
   config: () => Config;
@@ -999,7 +1115,11 @@ export class CanticleDelivery {
     const state = this.#state(ear);
     const modes = this.#modes(ear, config, now);
     const view = this.#deps.hear(ear);
-    const keys = new Set(canticle.wakeKeys);
+    const keys = new Boundary(
+      canticle,
+      this.#grants(ear, state, now),
+      view.capability,
+    );
 
     for (const [id, seen] of state.seen) {
       if (seen.until <= now) state.seen.delete(id);
@@ -1025,8 +1145,11 @@ export class CanticleDelivery {
     const heard = liveNow(view);
     const live = new Set(heard.map(identity));
     this.#overflow(ear, state, view, live, keys, modes, now);
-    /** What a mute passed over: settled, so no restart or reload pushes it later. */
-    const muted: Settling[] = [];
+    /**
+     * What a mute passed over, or the class gate kept from waking: settled, so no restart,
+     * reload or later grant pushes it (#176: a wake is decided when a record is first heard).
+     */
+    const settling: Settling[] = [];
     // Refreshes last, so one finds the record it re-issues already waiting (§7.9).
     for (const item of [
       ...heard.filter((item) => item.refresh !== true),
@@ -1067,8 +1190,9 @@ export class CanticleDelivery {
       if (passed !== undefined) {
         // Read again after a reload, a pass-over was counted the first time.
         if (seen === undefined) this.#count(state, passed);
-        if (passed === "muted") {
-          muted.push({ item, expiresAt, outcome: "passed" });
+        if (forGood(passed)) {
+          settling.push({ item, expiresAt, outcome: "passed" });
+          if (passed !== "muted") this.#unwoken(state, item, passed);
         }
         continue;
       }
@@ -1088,21 +1212,23 @@ export class CanticleDelivery {
       if (!live.has(waiting.id)) waiting.gone = true;
     }
     // What waits meets the boundary and the modes again on every pass: a key a reload
-    // took off the allowlist, or a mute that began since (mute always wins), holds it back.
+    // took off the allowlist, a mute that began since (mute always wins), or a grant that
+    // lapsed or was discarded (#176), holds it back.
     for (const waiting of [...state.waiting.values()]) {
       const passed = this.#passOver(waiting.item, keys, modes);
       if (passed === undefined) continue;
       this.#unwait(state, waiting);
       this.#count(state, passed);
-      if (passed === "muted") {
-        muted.push({
+      if (forGood(passed)) {
+        settling.push({
           item: waiting.item,
           expiresAt: waiting.expiresAt,
           outcome: "passed",
         });
+        if (passed !== "muted") this.#unwoken(state, waiting.item, passed);
       }
     }
-    if (muted.length > 0) this.#settle(ear, muted);
+    if (settling.length > 0) this.#settle(ear, settling);
     // §14.10 item 9, per ear: what immediate would push once it is no longer fresh (heard
     // too long ago, or already old when first heard) goes into the next report instead,
     // marked late. It stays there, whatever the modes do next.
@@ -1164,19 +1290,19 @@ export class CanticleDelivery {
     if (state.dirty) this.#saveWithheld(ear, state);
   }
 
-  /** Why a record is never pushed to this ear, or undefined when it may be. */
-  #passOver(
-    item: LiveItem,
-    keys: ReadonlySet<string>,
-    modes: Modes,
-  ): string | undefined {
-    if (!keys.has(item.key.toLowerCase())) return "not_allowlisted";
+  /**
+   * Why a record is never pushed to this ear, or undefined when it may be. Mute is read
+   * before the class gate, so what a mute passed over stays the mute's (for good); then
+   * the manifest's capability and the class (#176 decision 1).
+   */
+  #passOver(item: LiveItem, keys: Boundary, modes: Modes): string | undefined {
+    if (!keys.has(item.key)) return "not_allowlisted";
     if (item.hop !== 0) return "relayed";
     if (item.wakeDerived !== false) return "wake_derived";
     const mode = modes.of(item);
     if (mode === "off") return "off";
     if (mode === "mute") return "muted";
-    return undefined;
+    return keys.gate(item);
   }
 
   /**
@@ -1203,7 +1329,7 @@ export class CanticleDelivery {
     state: EarState,
     view: HearView,
     live: ReadonlySet<string>,
-    keys: ReadonlySet<string>,
+    keys: Boundary,
     modes: Modes,
     now: number,
   ): void {
@@ -1298,7 +1424,13 @@ export class CanticleDelivery {
         if (!keys.has(o.key.toLowerCase()) || mode === "off" || mode === "mute")
           continue;
         this.#count(state, "live_overflow", told);
-        const note = { ...blankMissed(o.key), owed: true };
+        // Owed a push of its own only for a drop known to be of a class the config lets
+        // its key wake (#176): an ambient flood's drops, or ones known only by count, ride
+        // with a push that goes anyway, and never wake the ear themselves.
+        const note = {
+          ...blankMissed(o.key),
+          owed: fresh.some((d) => this.#owes(d)),
+        };
         // Dropped after the last pass looked: from then, or this window's start if later.
         const from = same ? Math.max(o.from, before.at) : o.from;
         widen(note.withheld, "live_overflow", told, from, o.to);
@@ -1320,7 +1452,10 @@ export class CanticleDelivery {
     this.#count(state, "live_overflow");
     this.#report(state, waiting.id, waiting.expiresAt + SETTLE_SKEW_MS);
     state.seen.delete(waiting.id);
-    const note = { ...blankMissed(waiting.item.key), owed: true };
+    const note = {
+      ...blankMissed(waiting.item.key),
+      owed: this.#owes(waiting.item),
+    };
     widen(note.withheld, "live_overflow", 1, at, at);
     addNote(state.missed, waiting.stream, note, true);
     state.dirty = true;
@@ -1346,7 +1481,7 @@ export class CanticleDelivery {
    */
   #noteCadence(
     state: EarState,
-    keys: ReadonlySet<string>,
+    keys: Boundary,
     modes: Modes,
   ): Cadence | undefined {
     const owed: Array<[string, string]> = [];
@@ -1902,9 +2037,74 @@ export class CanticleDelivery {
   }
 
   /**
+   * A record its class kept from waking the ear (#176 decision 1): told in the next push's
+   * coverage note as a local omission, and never owed a push of its own, which would be
+   * the very wake it was kept from. An attention decision, not a receipt: nothing here says
+   * the record was seen. (A `not_capable` one is only counted: the manifest refused it.)
+   */
+  #unwoken(state: EarState, item: LiveItem, reason: string): void {
+    if (!reason.startsWith(WAKE_WITHHELD)) return;
+    const note = blankMissed(item.key);
+    widen(note.withheld, reason, 1, item.heardAt, item.heardAt);
+    addNote(state.missed, streamOf(item), note, true);
+    state.dirty = true;
+  }
+
+  /**
+   * Whether a note about this record may owe a push of its own: only when the config alone
+   * lets its class wake (#176). What only a grant let wake rides with a push that goes
+   * anyway, so nothing it leaves behind can wake the ear once the grant is gone.
+   */
+  #owes(item: Pick<LiveItem, "key" | "class">): boolean {
+    const canticle = this.#deps.config().canticle;
+    return (
+      canticle !== undefined &&
+      new Boundary(canticle).configured(item.key, item.class)
+    );
+  }
+
+  /**
+   * The session's grants on this ear (`wake_grant`) that hold now. A grant lapses at its
+   * expiry. One frond-ear can't prove is discarded, fail closed (#176, 🪨's clarification
+   * 2): made longer than `MAX_WAKE_GRANT_MS`, made "after" now (the clock went back across
+   * a restart, so how long it has run is unknown), of a class not registered, or made by
+   * another session than the one holding the ear now (a rebind). With no session holding
+   * the ear, nothing is pushed anyway and a grant is kept for its own session's return.
+   */
+  #grants(ear: string, state: EarState, now: number): CanticleWakeGrant[] {
+    const store = this.#deps.store;
+    const rows = store.canticleWakeGrants(ear);
+    if (rows.length === 0) return [];
+    const session = this.#deps.session(ear);
+    const held: CanticleWakeGrant[] = [];
+    for (const grant of rows) {
+      const lapsed = grant.expiresAt <= now;
+      const unprovable =
+        !lapsed &&
+        (grant.grantedAt > now ||
+          grant.expiresAt - grant.grantedAt > MAX_WAKE_GRANT_MS ||
+          !CLASS_BY_NAME.has(grant.cls) ||
+          (session !== undefined && session.sessionId !== grant.sessionId));
+      if (!lapsed && !unprovable) {
+        held.push(grant);
+        continue;
+      }
+      store.deleteCanticleWakeGrants(ear, grant);
+      this.#count(state, lapsed ? "wake_grant_lapsed" : "wake_grant_discarded");
+      this.#deps.logger.log(
+        lapsed ? "info" : "warn",
+        lapsed ? "canticle.wake_grant_lapsed" : "canticle.wake_grant_discarded",
+        { ear, stream: `${grant.station}:${grant.stream}`, class: grant.cls },
+      );
+    }
+    return held;
+  }
+
+  /**
    * A waiting record went unpushed: off air, or dropped from a full buffer. `reason`, for
    * one that went off air while still on view, is why frond-ear withheld it (a local
-   * omission). A push must say so if one said it waits, or if the budget held it.
+   * omission). A push must say so if one said it waits, or if the budget held it, and
+   * the record's class is one the config lets wake (`#owes`).
    */
   #miss(
     state: EarState,
@@ -1915,7 +2115,9 @@ export class CanticleDelivery {
     this.#count(state, kind === "offAir" ? "off_air_unpushed" : "dropped");
     const note = {
       ...blankMissed(waiting.item.key),
-      owed: waiting.promised === true || reason === "push_budget",
+      owed:
+        (waiting.promised === true || reason === "push_budget") &&
+        this.#owes(waiting.item),
     };
     if (kind === "dropped") {
       note.dropped = 1;
@@ -2072,6 +2274,79 @@ export class CanticleDelivery {
   }
 
   /**
+   * The attached session's own opt-in to be woken by more classes on one station:stream
+   * (`wake_grant`, #176 decision 1), for `ttlMs`; or, with `revoke`, its grants there (every
+   * station:stream when none is named) are gone. Bound to the session that makes it: a
+   * session without an id can't prove a grant is its own, so it can't make one. A grant
+   * never opens a station whose key isn't on `canticle.wakeKeys`, and every other gate
+   * still holds. Returns the grants that hold after it.
+   */
+  grant(
+    ear: string,
+    sessionId: string,
+    request:
+      | {
+          revoke: false;
+          station: string;
+          stream: string;
+          classes: string[];
+          ttlMs: number;
+        }
+      | { revoke: true; station?: string; stream?: string },
+  ): object {
+    const store = this.#deps.store;
+    const now = this.#deps.clock.now();
+    if (request.revoke) {
+      store.deleteCanticleWakeGrants(
+        ear,
+        request.station !== undefined && request.stream !== undefined
+          ? { station: request.station, stream: request.stream }
+          : undefined,
+      );
+    } else {
+      for (const cls of request.classes) {
+        store.setCanticleWakeGrant({
+          ear,
+          station: request.station,
+          stream: request.stream,
+          cls,
+          sessionId,
+          grantedAt: now,
+          expiresAt: now + request.ttlMs,
+        });
+      }
+    }
+    return {
+      grants: this.#grantsView(ear, this.#state(ear), now),
+      note: "a grant wakes you only for records from a station whose key is on canticle.wakeKeys, at hop 0, not wake-derived, under a delivery mode that pushes, within the push budget; it lapses at expiresAt and is discarded if another session takes the ear",
+    };
+  }
+
+  /** The grants that hold now, by station:stream, for `ear_status` and `wake_grant`. */
+  #grantsView(
+    ear: string,
+    state: EarState,
+    now: number,
+  ): Array<{ stream: string; classes: string[]; expiresAt: number }> {
+    const by = new Map<
+      string,
+      { stream: string; classes: string[]; expiresAt: number }
+    >();
+    for (const grant of this.#grants(ear, state, now)) {
+      const stream = `${grant.station}:${grant.stream}`;
+      const at = `${stream}\n${grant.expiresAt}`;
+      const entry = by.get(at) ?? {
+        stream,
+        classes: [],
+        expiresAt: grant.expiresAt,
+      };
+      entry.classes.push(grant.cls);
+      by.set(at, entry);
+    }
+    return [...by.values()];
+  }
+
+  /**
    * The ear's effective mode for this record's station now, for custody of a `hear`
    * (binary-canticle#161): `off` where the ear has no delivery.
    */
@@ -2166,7 +2441,7 @@ export class CanticleDelivery {
         state.waiting.size === 0 &&
         this.#noteCadence(
           state,
-          new Set(config.canticle!.wakeKeys),
+          new Boundary(config.canticle!),
           this.#modes(ear, config, now),
         ) === undefined;
       const one = told === 1;
@@ -2221,6 +2496,7 @@ export class CanticleDelivery {
     return {
       ...this.view(ear),
       wakeKeys: config.canticle!.wakeKeys.length,
+      wakeGrants: this.#grantsView(ear, state, now),
       ...(warnings.length > 0 ? { warning: warnings.join("; ") } : {}),
       windowMs: delivery.windowMs,
       debounceMs: delivery.debounceMs,
@@ -2492,7 +2768,10 @@ function render(input: RenderInput): {
       ];
     }
     const why = (reason: string) =>
-      WITHHELD[reason] ?? `withheld (${token(reason)})`;
+      WITHHELD[reason] ??
+      (reason.startsWith(WAKE_WITHHELD)
+        ? WAKE_WITHHELD_TEXT
+        : `withheld (${token(reason)})`);
     const when = (reason: string, span: Span) =>
       reason === "live_overflow"
         ? `between ${iso(span.from)} and ${iso(span.to)}`

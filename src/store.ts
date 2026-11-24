@@ -282,6 +282,22 @@ export interface CanticleChoice {
 }
 
 /**
+ * A session's own opt-in to be woken by one more class of record on one station:stream
+ * (binary-canticle#176 decision 1): seat-local, made with `wake_grant`, never by a station.
+ * `station` is a station name or a key id (lowercase). It holds only for the session that
+ * made it, from `grantedAt` until `expiresAt`.
+ */
+export interface CanticleWakeGrant {
+  ear: string;
+  station: string;
+  stream: string;
+  cls: string;
+  sessionId: string;
+  grantedAt: number;
+  expiresAt: number;
+}
+
+/**
  * Something an ear's own session left for a later turn of itself (#88),
  * released to it as a channel event when its seat's SessionStart hook says
  * it compacted.
@@ -736,6 +752,16 @@ export class EventStore {
         set_at INTEGER NOT NULL,
         expires_at INTEGER,
         PRIMARY KEY (ear, scope)
+      );
+      CREATE TABLE IF NOT EXISTS canticle_wake_grants (
+        ear TEXT NOT NULL,
+        station TEXT NOT NULL,
+        stream TEXT NOT NULL,
+        class TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        granted_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        PRIMARY KEY (ear, station, stream, class)
       );
       CREATE TABLE IF NOT EXISTS letters (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1772,6 +1798,66 @@ export class EventStore {
            WHERE ear = ? ORDER BY scope`,
       )
       .all(ear) as unknown as CanticleChoice[];
+  }
+
+  /** Makes or replaces one class's grant on one station:stream (`wake_grant`). */
+  public setCanticleWakeGrant(grant: CanticleWakeGrant): void {
+    this.database
+      .prepare(
+        `INSERT INTO canticle_wake_grants
+           (ear, station, stream, class, session_id, granted_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(ear, station, stream, class) DO UPDATE SET
+           session_id = excluded.session_id, granted_at = excluded.granted_at,
+           expires_at = excluded.expires_at`,
+      )
+      .run(
+        grant.ear,
+        grant.station,
+        grant.stream,
+        grant.cls,
+        grant.sessionId,
+        grant.grantedAt,
+        grant.expiresAt,
+      );
+  }
+
+  /** Every grant row the ear has, whatever its state: delivery judges each one. */
+  public canticleWakeGrants(ear: string): CanticleWakeGrant[] {
+    return this.database
+      .prepare(
+        `SELECT ear, station, stream, class AS cls, session_id AS sessionId,
+           granted_at AS grantedAt, expires_at AS expiresAt
+         FROM canticle_wake_grants WHERE ear = ? ORDER BY station, stream, class`,
+      )
+      .all(ear) as unknown as CanticleWakeGrant[];
+  }
+
+  /**
+   * Removes the ear's grants: those on one station:stream when given (every class, or the
+   * one named), else all of them. Returns how many went.
+   */
+  public deleteCanticleWakeGrants(
+    ear: string,
+    where?: { station: string; stream: string; cls?: string },
+  ): number {
+    const result =
+      where === undefined
+        ? this.database
+            .prepare("DELETE FROM canticle_wake_grants WHERE ear = ?")
+            .run(ear)
+        : where.cls === undefined
+          ? this.database
+              .prepare(
+                "DELETE FROM canticle_wake_grants WHERE ear = ? AND station = ? AND stream = ?",
+              )
+              .run(ear, where.station, where.stream)
+          : this.database
+              .prepare(
+                "DELETE FROM canticle_wake_grants WHERE ear = ? AND station = ? AND stream = ? AND class = ?",
+              )
+              .run(ear, where.station, where.stream, where.cls);
+    return Number(result.changes);
   }
 
   // ---- room egress (binary-canticle#161 item 3) ---------------------------------------
