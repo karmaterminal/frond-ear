@@ -7,7 +7,13 @@
 // sent, and what the ledger, ear_status and `frond-ear exposure` say about it.
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -398,30 +404,91 @@ test("echo: naming the whole batch_id upgrades the record to echoed, its offered
   }
 });
 
-test("crash: a push fenced and never offered survives the restart as fenced, reconciles to unknown at the next attach, and is never cleared", async () => {
+test("echo is atomic: a failure between the ledger's echo and custody's leaves the two agreeing, neither echoed", async () => {
+  const { h, host } = setup({ mode: "immediate" }, ON);
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    const push = await offered(h, host, shim, 1);
+    // Custody's own echo fails after the ledger's has run: a fault injected between them.
+    const database = (h.store as unknown as { database: DatabaseSync })
+      .database;
+    database.exec(`CREATE TEMP TRIGGER exposure_test_fault
+      BEFORE UPDATE OF echoed_at ON canticle_custody
+      BEGIN SELECT RAISE(ABORT, 'injected between the two echoes'); END`);
+    const echo = {
+      at: h.clock.now(),
+      kind: "ack",
+      sessionId: SESSION,
+      generation: 1,
+      boundary: undefined,
+    };
+    assert.throws(
+      () => h.store.echoCanticleCustody("scribe", push.batchId!, echo),
+      /injected between the two echoes/u,
+    );
+    assert.equal(
+      ledger(h)[0]!.phase,
+      "offered",
+      "the ledger's echo rolled back",
+    );
+    assert.equal(ledger(h)[0]!.echoed, null);
+    assert.ok(
+      h.store.canticleCustody("scribe", 0).every((r) => r.echoedAt === null),
+      "custody's echo never happened",
+    );
+    // Without the fault the same echo lands in both, whole.
+    database.exec("DROP TRIGGER exposure_test_fault");
+    assert.equal(h.store.echoCanticleCustody("scribe", push.batchId!, echo), 1);
+    assert.equal(ledger(h)[0]!.phase, "echoed");
+    assert.ok(
+      h.store.canticleCustody("scribe", 0).every((r) => r.echoedAt !== null),
+    );
+  } finally {
+    h.dispose();
+  }
+});
+
+test("crash: the fence is durable on disk at the moment of handover: a copy of the store taken then has the push fenced, reconciles to unknown at the next attach, and is never cleared", async () => {
   const directory = mkdtempSync(join(tmpdir(), "frond-ear-exposure-"));
   const path = join(directory, "ear.db");
+  // The process dies the instant the push is handed over: what is on disk then is
+  // everything a restart has. The database, its WAL and its shared memory are copied
+  // at that moment, while the store is still open, and never closed cleanly.
+  const crashed = join(directory, "crashed");
+  mkdirSync(crashed);
+  const copy = join(crashed, "ear.db");
   try {
     const first = setup({ mode: "immediate" }, ON, {}, { path });
-    const shim = first.h.attach("scribe", { sessionId: SESSION });
-    first.host.sing(1);
-    first.h.timers.advance(6_000);
-    assert.equal(pushes(shim).length, 1);
-    const crashed = pushes(shim)[0]!;
-    const at = first.h.clock.now();
-    // The process dies after the fence, before the host's offered: no shutdown.
-    first.h.store.close();
-    rmSync(first.h.directory, { recursive: true, force: true });
+    let pushed: number | null = null;
+    let at = 0;
+    try {
+      const shim = first.h.attach("scribe", { sessionId: SESSION });
+      onCanticle(shim.connection, (event) => {
+        pushed = event.batchId;
+        at = first.h.clock.now();
+        for (const suffix of ["", "-wal", "-shm"]) {
+          if (existsSync(`${path}${suffix}`)) {
+            copyFileSync(`${path}${suffix}`, `${copy}${suffix}`);
+          }
+        }
+      });
+      first.host.sing(1);
+      first.h.timers.advance(6_000);
+      assert.equal(pushes(shim).length, 1);
+      assert.ok(existsSync(copy), "the store was copied at handover");
+    } finally {
+      first.h.dispose();
+    }
 
-    // The store alone, reopened: the fence is there, still fenced.
-    const reopened = new EventStore(path);
+    // The store as the crash left it, reopened: the fence is there, still fenced.
+    const reopened = new EventStore(copy);
     const kept = reopened.canticleExposures("scribe", 0);
     reopened.close();
-    assert.equal(kept.length, 1);
+    assert.equal(kept.length, 1, "the fence was on disk before the handover");
     assert.equal(kept[0]!.phase, "fenced");
-    assert.equal(kept[0]!.batchId, crashed.batchId);
+    assert.equal(kept[0]!.batchId, pushed);
 
-    const second = setup({ mode: "immediate" }, ON, {}, { path });
+    const second = setup({ mode: "immediate" }, ON, {}, { path: copy });
     try {
       second.h.clock.value = at + 10_000;
       const next = second.h.attach("scribe", { sessionId: SESSION });
@@ -526,15 +593,15 @@ test("flag off: canticle.exposure is off by default, and off nothing is written 
     h.timers.advance(6_000);
     shim.close();
     assert.deepEqual(ledger(h), []);
-    assert.deepEqual(summary(h), {
-      enabled: false,
-      records: 0,
-      fenced: 0,
-      offered: 0,
-      echoed: 0,
-      unknown: 0,
-      evicted: 0,
-    });
+    // ear_status is as it was before the ledger: no canticleExposure at all.
+    assert.equal(summary(h), undefined);
+    assert.ok(
+      !(
+        "canticleExposure" in
+        (h.daemon.status("scribe") as { ears: object[] }).ears[0]!
+      ),
+      "ear_status gains nothing with the flag off",
+    );
     const db = new DatabaseSync(join(h.directory, "ear.db"), {
       readOnly: true,
     });
@@ -677,6 +744,8 @@ test("status: ear_status counts the ledger by phase", async () => {
       echoed: 1,
       unknown: 0,
       evicted: 0,
+      overBound: 0,
+      reasons: [],
     });
     shim.close();
     assert.equal(summary(h)!.fenced, 0);
@@ -771,4 +840,86 @@ test("config: canticle.exposure takes enabled, maxAgeMs and maxRecords, and refu
   assert.throws(() => parse({ maxAgeMs: -1 }), /canticle\.exposure\.maxAgeMs/u);
   assert.throws(() => parse({ issuer: "x" }), /canticle\.exposure/u);
   assert.throws(() => parse("on"), /canticle\.exposure/u);
+});
+
+test("ctype: a body whose record v1 names no ctype keeps a null ctype, never a made-up 1, and is not passed off as a PayloadExposure", async () => {
+  const { h, host } = setup({ mode: "immediate" }, ON);
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    host.sing(1, { streamId: 1, ctype: null });
+    h.timers.advance(6_000);
+    await shim.send({ type: "offered", batchId: pushes(shim)[0]!.batchId! });
+    const [row] = ledger(h);
+    assert.ok(row);
+    // The body's hash is still the body's: only the ctype record v1 left out is unknown.
+    assert.deepEqual(row.record.sources[0]!.sourceBody, {
+      ctype: null,
+      size: Buffer.byteLength("deploy.started 1"),
+      sha256: sha256("deploy.started 1"),
+      textSha256: sha256("deploy.started 1"),
+    });
+    // #162 takes no body without a ctype (its bodyOf refuses one), so neither does this.
+    assert.equal(conformant(row.record), null);
+    // The same record with its ctype said is conformant: the ctype is all that differs.
+    host.sing(2, { streamId: 1 });
+    h.timers.advance(6_000);
+    await shim.send({ type: "offered", batchId: pushes(shim)[1]!.batchId! });
+    const said = ledger(h).at(-1)!;
+    assert.equal(said.record.sources[0]!.sourceBody?.ctype, 1);
+    assert.ok(conformant(said.record));
+  } finally {
+    h.dispose();
+  }
+});
+
+test("over bound: fenced and unknown records alone past maxRecords are never evicted, but each prune that finds them so warns, counted, and ear_status names it", async () => {
+  const { h, host } = setup(
+    { mode: "immediate" },
+    { exposure: { enabled: true, maxAgeMs: 3_600_000, maxRecords: 1 } },
+  );
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    // Two pushes never offered, given back at the close: two unknown, over a bound of one.
+    host.sing(1);
+    h.timers.advance(6_000);
+    host.sing(2);
+    h.timers.advance(6_000);
+    shim.close();
+    assert.deepEqual(
+      ledger(h).map((r) => r.phase),
+      ["unknown", "unknown"],
+    );
+    assert.deepEqual(summary(h)!.reasons, [
+      "2 fenced or unknown records over maxRecords 1; they are never evicted",
+    ]);
+    h.daemon.prune();
+    assert.equal(ledger(h).length, 2, "nothing evicted");
+    assert.equal(h.store.counters()["canticle_exposure_over_bound.scribe"], 1);
+    const warned = h.logs
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+      .filter((entry) => entry.event === "canticle.exposure_over_bound");
+    assert.equal(warned.length, 1);
+    assert.equal(warned[0]!.level, "warn");
+    assert.equal(warned[0]!.ear, "scribe");
+    assert.equal(warned[0]!.held, 2);
+    assert.equal(warned[0]!.maxRecords, 1);
+    h.daemon.prune();
+    assert.equal(h.store.counters()["canticle_exposure_over_bound.scribe"], 2);
+    assert.equal(summary(h)!.overBound, 2);
+    // Under the bound again, no reason and no further warning.
+    const roomy = setup(
+      { mode: "immediate" },
+      { exposure: { enabled: true, maxRecords: 5 } },
+    );
+    try {
+      roomy.h.attach("scribe", { sessionId: SESSION });
+      roomy.h.daemon.prune();
+      assert.deepEqual(summary(roomy.h)!.reasons, []);
+      assert.equal(summary(roomy.h)!.overBound, 0);
+    } finally {
+      roomy.h.dispose();
+    }
+  } finally {
+    h.dispose();
+  }
 });

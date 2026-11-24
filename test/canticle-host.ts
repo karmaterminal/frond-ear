@@ -51,6 +51,8 @@ export interface Song {
   times?: R;
   /** The frame's `stream_id` as a number (§14.18.3); by default the stream's name. */
   streamId?: number;
+  /** `null` leaves `body.ctype` out, as a host daemon that doesn't say would. */
+  ctype?: null;
 }
 
 /**
@@ -176,7 +178,7 @@ export class Host {
       body: o.binary
         ? { ctype: 2, size: 64 }
         : {
-            ctype: 1,
+            ...(o.ctype === null ? {} : { ctype: 1 }),
             text,
             size: Buffer.byteLength(text),
             ...(o.digest !== undefined ? { sha256: o.digest } : {}),
