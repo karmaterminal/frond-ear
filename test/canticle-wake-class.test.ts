@@ -378,6 +378,61 @@ test("#176 proof 4: a grant is revoked by the session, and discarded when anothe
   }
 });
 
+test("#176 proof 4: another holder taking the ear discards its grants at the attach, so an A -> B -> A rebind before any poll leaves A no grant; a session with no id counts as another holder", async () => {
+  for (const between of [
+    { sessionId: "22222222-bbbb-4bbb-8bbb-000000000002" },
+    {}, // a shim that gave no session id
+  ]) {
+    const { h, host } = setup({ mode: "immediate" }, { wakeKeys: [OPS] });
+    try {
+      const a = h.attach("scribe", { sessionId: SESSION });
+      const granted = await grant(h, a, {
+        stream: "ops:ops.fleet",
+        classes: ["ambient"],
+        ttl_seconds: 600,
+      });
+      assert.equal(granted.ok, true, granted.text);
+      // B takes the ear, then A takes it back, with no delivery poll in between.
+      h.attach("scribe", between);
+      const rowsAtB = h.store.canticleWakeGrants("scribe").length;
+      const again = h.attach("scribe", { sessionId: SESSION });
+      host.sing(1, AMBIENT);
+      h.timers.advance(10_000);
+      assert.equal(
+        pushes(again).length,
+        0,
+        `A's grant didn't cross B's hold (${JSON.stringify(between)})`,
+      );
+      assert.equal(rowsAtB, 0, "gone at B's attach, before any poll");
+      assert.equal(status(h).counts.wake_grant_discarded, 1);
+      assert.equal(status(h).counts["wake_withheld:ambient"], 1);
+    } finally {
+      h.dispose();
+    }
+  }
+});
+
+test("#176 proof 4: the same session reattaching (compaction, resume) keeps its grant", async () => {
+  const { h, host } = setup({ mode: "immediate" }, { wakeKeys: [OPS] });
+  try {
+    const a = h.attach("scribe", { sessionId: SESSION });
+    await grant(h, a, {
+      stream: "ops:ops.fleet",
+      classes: ["ambient"],
+      ttl_seconds: 600,
+    });
+    a.close();
+    const again = h.attach("scribe", { sessionId: SESSION });
+    assert.equal(h.store.canticleWakeGrants("scribe").length, 1);
+    host.sing(1, AMBIENT);
+    h.timers.advance(10_000);
+    assert.equal(pushes(again).length, 1, "the same session's grant holds");
+    assert.equal(status(h).counts.wake_grant_discarded, undefined);
+  } finally {
+    h.dispose();
+  }
+});
+
 test("#176 proof 4: across a restart a grant the same session can prove holds; one whose expiry can't be proved (the clock went back) is discarded", async () => {
   const directory = mkdtempSync(join(tmpdir(), "frond-ear-grant-"));
   const path = join(directory, "ear.db");
