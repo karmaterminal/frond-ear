@@ -765,11 +765,14 @@ overflow.
 - It holds only for the session that made it, so a session whose shim gave no id can't make one. It is discarded
   (`counts.wake_grant_discarded`, a warning in the log) when frond-ear can't prove it still holds:
   - another session holds the ear (a rebind);
-  - the clock is behind the moment it was made (after a restart, so how long it has run is unknown);
+  - the clock stepped back: it reads earlier than the moment the grant was made, or than the latest moment
+    frond-ear found it holding (it keeps that mark per grant, in the store). Mid-run or across a restart, a
+    clock that went backwards leaves how long the grant has run unknown, so every grant it holds is discarded
+    rather than left to expire on that clock. A new `wake_grant` afterwards starts a fresh one;
   - its row claims more than 24 h;
   - its class isn't registered.
-- A grant survives a restart only while all of that still holds and the same session resumes. With no session on
-  the ear nothing is pushed anyway, so it waits for its session.
+- A grant survives a restart only while all of that still holds (the clock reads no earlier than its mark) and the
+  same session resumes. With no session on the ear nothing is pushed anyway, so it waits for its session.
 - It never opens a station whose key isn't on `wakeKeys`, and every other gate above still applies.
 - What only a grant let wake never owes a push of its own once it goes unpushed: what is left of it rides with a
   push that goes, so nothing wakes the session after the grant lapses.

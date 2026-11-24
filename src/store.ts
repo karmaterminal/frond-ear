@@ -285,7 +285,9 @@ export interface CanticleChoice {
  * A session's own opt-in to be woken by one more class of record on one station:stream
  * (binary-canticle#176 decision 1): seat-local, made with `wake_grant`, never by a station.
  * `station` is a station name or a key id (lowercase). It holds only for the session that
- * made it, from `grantedAt` until `expiresAt`.
+ * made it, from `grantedAt` until `expiresAt`. `seenAt` is the latest clock reading at which
+ * delivery found it holding, a high-water mark: a clock behind it went back, so how long the
+ * grant has run is unknown.
  */
 export interface CanticleWakeGrant {
   ear: string;
@@ -295,6 +297,7 @@ export interface CanticleWakeGrant {
   sessionId: string;
   grantedAt: number;
   expiresAt: number;
+  seenAt: number;
 }
 
 /**
@@ -761,6 +764,7 @@ export class EventStore {
         session_id TEXT NOT NULL,
         granted_at INTEGER NOT NULL,
         expires_at INTEGER NOT NULL,
+        seen_at INTEGER NOT NULL,
         PRIMARY KEY (ear, station, stream, class)
       );
       CREATE TABLE IF NOT EXISTS letters (
@@ -1800,16 +1804,19 @@ export class EventStore {
       .all(ear) as unknown as CanticleChoice[];
   }
 
-  /** Makes or replaces one class's grant on one station:stream (`wake_grant`). */
-  public setCanticleWakeGrant(grant: CanticleWakeGrant): void {
+  /**
+   * Makes or replaces one class's grant on one station:stream (`wake_grant`), seen first at
+   * the moment it is made.
+   */
+  public setCanticleWakeGrant(grant: Omit<CanticleWakeGrant, "seenAt">): void {
     this.database
       .prepare(
         `INSERT INTO canticle_wake_grants
-           (ear, station, stream, class, session_id, granted_at, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+           (ear, station, stream, class, session_id, granted_at, expires_at, seen_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(ear, station, stream, class) DO UPDATE SET
            session_id = excluded.session_id, granted_at = excluded.granted_at,
-           expires_at = excluded.expires_at`,
+           expires_at = excluded.expires_at, seen_at = excluded.seen_at`,
       )
       .run(
         grant.ear,
@@ -1819,7 +1826,17 @@ export class EventStore {
         grant.sessionId,
         grant.grantedAt,
         grant.expiresAt,
+        grant.grantedAt,
       );
+  }
+
+  /** Moves the high-water mark of every grant the ear has up to `now` (never down). */
+  public markCanticleWakeGrantsSeen(ear: string, now: number): void {
+    this.database
+      .prepare(
+        "UPDATE canticle_wake_grants SET seen_at = ? WHERE ear = ? AND seen_at < ?",
+      )
+      .run(now, ear, now);
   }
 
   /** Every grant row the ear has, whatever its state: delivery judges each one. */
@@ -1827,7 +1844,7 @@ export class EventStore {
     return this.database
       .prepare(
         `SELECT ear, station, stream, class AS cls, session_id AS sessionId,
-           granted_at AS grantedAt, expires_at AS expiresAt
+           granted_at AS grantedAt, expires_at AS expiresAt, seen_at AS seenAt
          FROM canticle_wake_grants WHERE ear = ? ORDER BY station, stream, class`,
       )
       .all(ear) as unknown as CanticleWakeGrant[];

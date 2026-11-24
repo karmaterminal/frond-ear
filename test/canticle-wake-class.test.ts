@@ -539,8 +539,10 @@ test("#176 proof 4: a clock that steps back mid-run discards every grant, so exp
     );
     assert.equal(status(h).counts.wake_grant_discarded, 1);
     assert.equal(h.store.canticleWakeGrants("scribe").length, 0);
+    // The fake timers keep the absolute time the next poll was due, so run past it: on the
+    // stepped-back clock that is 310 s into a 600 s grant, which would still hold.
     host.sing(1, AMBIENT);
-    h.timers.advance(10_000);
+    h.timers.advance(210_000);
     assert.equal(
       pushes(shim).length,
       0,

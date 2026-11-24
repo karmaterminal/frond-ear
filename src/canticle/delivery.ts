@@ -2066,10 +2066,13 @@ export class CanticleDelivery {
   /**
    * The session's grants on this ear (`wake_grant`) that hold now. A grant lapses at its
    * expiry. One frond-ear can't prove is discarded, fail closed (#176, 🪨's clarification
-   * 2): made longer than `MAX_WAKE_GRANT_MS`, made "after" now (the clock went back across
-   * a restart, so how long it has run is unknown), of a class not registered, or made by
-   * another session than the one holding the ear now (a rebind). With no session holding
-   * the ear, nothing is pushed anyway and a grant is kept for its own session's return.
+   * 2): made longer than `MAX_WAKE_GRANT_MS`, of a class not registered, made by another
+   * session than the one holding the ear now (a rebind), or judged on a clock behind its
+   * high-water mark (the latest reading at which it was found holding, or the moment it was
+   * made). A clock that went back, mid-run or across a restart, leaves how long a grant has
+   * run unknown, so expiry never rests on it. Each judgement moves the mark of what is left
+   * up to now. With no session holding the ear, nothing is pushed anyway and a grant is kept
+   * for its own session's return.
    */
   #grants(ear: string, state: EarState, now: number): CanticleWakeGrant[] {
     const store = this.#deps.store;
@@ -2081,7 +2084,7 @@ export class CanticleDelivery {
       const lapsed = grant.expiresAt <= now;
       const unprovable =
         !lapsed &&
-        (grant.grantedAt > now ||
+        (now < Math.max(grant.grantedAt, grant.seenAt) ||
           grant.expiresAt - grant.grantedAt > MAX_WAKE_GRANT_MS ||
           !CLASS_BY_NAME.has(grant.cls) ||
           (session !== undefined && session.sessionId !== grant.sessionId));
@@ -2097,6 +2100,7 @@ export class CanticleDelivery {
         { ear, stream: `${grant.station}:${grant.stream}`, class: grant.cls },
       );
     }
+    if (held.length > 0) store.markCanticleWakeGrantsSeen(ear, now);
     return held;
   }
 
@@ -2296,6 +2300,9 @@ export class CanticleDelivery {
   ): object {
     const store = this.#deps.store;
     const now = this.#deps.clock.now();
+    // Judge what is there first, so a grant already unprovable (the clock went back) is
+    // discarded and counted rather than silently replaced.
+    this.#grants(ear, this.#state(ear), now);
     if (request.revoke) {
       store.deleteCanticleWakeGrants(
         ear,
