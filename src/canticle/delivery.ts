@@ -2158,10 +2158,15 @@ export class CanticleDelivery {
 
   /**
    * Grants the store already discarded when another holder took the ear (an attach or a
-   * session change, #176): counted and logged as any discarded grant is. The store does
+   * session change), or when the holder fell in doubt (#176): counted and logged as any
+   * discarded grant is. The store does
    * the discard itself, in the attach's own transaction, so no poll in between matters.
    */
-  grantsDiscarded(ear: string, grants: readonly CanticleWakeGrant[]): void {
+  grantsDiscarded(
+    ear: string,
+    grants: readonly CanticleWakeGrant[],
+    reason: "holder_changed" | "holder_in_doubt" = "holder_changed",
+  ): void {
     if (grants.length === 0) return;
     const state = this.#state(ear);
     for (const grant of grants) {
@@ -2170,7 +2175,7 @@ export class CanticleDelivery {
         ear,
         stream: `${grant.station}:${grant.stream}`,
         class: grant.cls,
-        reason: "holder_changed",
+        reason,
       });
     }
   }

@@ -3564,6 +3564,24 @@ export class EventStore {
     });
   }
 
+  /**
+   * The session holding the ear is in doubt (#111: a hook named one frond-ear can't tie to
+   * its shim). Every wake grant on the ear goes (#176): none was proved to be the doubted
+   * session's own, so none crosses into the doubt or out of it. `turn`, the doubt's runtime
+   * row when there is one, is kept in the same transaction. Returns the grants that went.
+   */
+  public doubtEar(
+    ear: string,
+    turn: { name: string; value: string } | undefined,
+  ): CanticleWakeGrant[] {
+    return this.transaction(() => {
+      const gone = this.canticleWakeGrants(ear);
+      if (gone.length > 0) this.deleteCanticleWakeGrants(ear);
+      if (turn !== undefined) this.setRuntimeState(turn.name, turn.value);
+      return gone;
+    });
+  }
+
   /** Removes the ear's wake grants not made by `sessionId` (null: all); returns them. */
   private discardOtherHoldersGrants(
     ear: string,

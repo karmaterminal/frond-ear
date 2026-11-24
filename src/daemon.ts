@@ -1892,10 +1892,9 @@ export class Daemon {
     this.touchHolder(ear, client);
     client.sessionId = sessionId;
     delete client.wakeDoubt;
-    this.canticle?.grantsDiscarded(
-      ear,
-      this.store.updateEarSession(ear, sessionId),
-    );
+    // The write runs whether or not canticle does: `?.` would skip its arguments too.
+    const discarded = this.store.updateEarSession(ear, sessionId);
+    this.canticle?.grantsDiscarded(ear, discarded);
     this.touchHolder(ear, client);
     if (this.attached.get(ear) === client && changed) {
       this.logger.log("info", "ear.session_changed", {
@@ -2025,12 +2024,18 @@ export class Daemon {
       return { kind: "other-process" };
     }
     client.wakeDoubt = { claimed: sessionId, at: this.clock.now(), source };
-    if (spawned !== undefined) {
-      this.store.setRuntimeState(
-        `session.turn.${ear}`,
-        JSON.stringify({ spawned, doubt: client.wakeDoubt }),
-      );
-    }
+    // The ear's wake grants go with the doubt's own record, in one transaction (#176).
+    // (Kept apart from the `?.` below, so the doubt's record is written without canticle.)
+    const discarded = this.store.doubtEar(
+      ear,
+      spawned !== undefined
+        ? {
+            name: `session.turn.${ear}`,
+            value: JSON.stringify({ spawned, doubt: client.wakeDoubt }),
+          }
+        : undefined,
+    );
+    this.canticle?.grantsDiscarded(ear, discarded, "holder_in_doubt");
     this.logger.log("warn", "ear.wake_identity_doubt", {
       ear,
       source,
@@ -4810,6 +4815,11 @@ export class Daemon {
     if (!client.sessionId) {
       throw new Error(
         "frond-ear does not know this session's id (its shim had no CLAUDE_CODE_SESSION_ID), so it could not prove a grant is this session's own; nothing was granted",
+      );
+    }
+    if (client.wakeDoubt && args.revoke !== true) {
+      throw new Error(
+        "the session holding this ear is in doubt (a hook named another session frond-ear can't tie to this shim), so it could not prove a grant is this session's own; nothing was granted. This session's own SessionStart hook ends the doubt",
       );
     }
     const named = stringArg(args, "stream");

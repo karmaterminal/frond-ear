@@ -777,6 +777,9 @@ overflow.
     before any delivery poll, so a grant never crosses another holder's hold even when the ear comes back to its
     maker. A shim that gave no session id counts as another holder, and so does the attached shim turning to
     another session (its `session` message or a SessionStart hook);
+  - the session holding the ear falls in doubt: a hook names a session frond-ear can't tie to the shim, so its
+    wakes are held. Every grant on the ear goes as the doubt is recorded, and `wake_grant` refuses a new one
+    (`revoke` still works) until the session's own hook ends the doubt, so no grant crosses into or out of it;
   - the clock stepped back: it reads earlier than the moment the grant was made, or than the latest moment
     frond-ear found it holding (it keeps that mark per grant, in the store). Mid-run or across a restart, a
     clock that went backwards leaves how long the grant has run unknown, so every grant it holds is discarded
