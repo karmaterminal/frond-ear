@@ -1017,7 +1017,8 @@ frond-ear's own claude.ai connector (`src/connector/`) has no Discord access, so
 With `canticle.exposure.enabled` on, frond-ear keeps a record of every canticle push that carried records to an
 ear's session, in binary-canticle#162's `canticle-payload-exposure/1` shape, for an issuer behind its own boundary
 to read later. frond-ear only records: it holds no key, signs nothing, calls no issuer and exports nothing (🌫's
-constraint on #117). Off, nothing is written; a config reload turns it on or off for the pushes that follow.
+constraint on #117). Off, nothing is written and `ear_status` is as it was (its table is still created, empty); a
+config reload turns it on or off for the pushes that follow.
 
 Each record moves through custody's steps ([Custody and confirmation](#custody-and-confirmation-binary-canticle161)):
 
@@ -1039,7 +1040,8 @@ What a record holds, never payload text and never the delivery token:
   `scope` exactly as heard, never widened (🌿's F1 on #162), and `renderedSha256` / `renderedBytes` of its exact
   rendered entry (banner and quoted payload; for a `counts` report, its stream's line). `receiver` is the record v1
   run, `live` or `snapshot`, and the record's `rec_seq`; it is `null` for a record the embedded receptor heard
-  itself. A record v1 `stream_id` that isn't a number is `null`, never made up.
+  itself. A record v1 `stream_id` that isn't a number is `null`, never made up, and so is a body's `ctype` that
+  record v1 left out (the body's digests are kept).
 - `resultSha256` / `resultBytes`: the whole pushed event text. `toolCallId` is `push:<batch id>`, the bare id.
 - `reader`, #162's `LocalReader` for a continuing session:
 
@@ -1050,13 +1052,19 @@ What a record holds, never payload text and never the delivery token:
   | `lifecycleRevision` | `attach:<generation>`: the ear's attach generation, new at every attach.                                |
 
   Alongside it, `holder` is #114's holder identity at the fence (`known`, `unknown`, `in-doubt`). A record with no
-  session id, a `null` receiver or a `null` stream id is kept, but isn't passed off as a `PayloadExposure`.
+  session id, a `null` receiver, a `null` stream id or a `null` ctype is kept, but isn't passed off as a
+  `PayloadExposure` (#162's own record reader refuses a body with no `ctype`).
 
 **Bounds.** At the hourly prune (and a config reload), offered and echoed records fenced more than `maxAgeMs` ago
 are evicted, then, per ear past `maxRecords`, the oldest offered or echoed ones. Each eviction is counted
-(`canticle_exposure_evicted.<ear>`, and `evicted` in `ear_status`). Fenced and unknown records are never evicted.
+(`canticle_exposure_evicted.<ear>`, and `evicted` in `ear_status`). Fenced and unknown records are never evicted,
+so they alone can hold an ear past `maxRecords`: each prune that finds it so logs `canticle.exposure_over_bound`
+(warn, with `held` and `maxRecords`) and counts it (`canticle_exposure_over_bound.<ear>`, `overBound` in
+`ear_status`), and `ear_status` gives the reason in `canticleExposure.reasons` while it lasts. Unknown records past
+the bound are a sign of many unsent or reverted pushes: look at the ear's attach churn.
 
-**Reading it.** `ear_status` shows `canticleExposure` with the counts by phase. `frond-ear exposure --ear <name>
+**Reading it.** While it is on, `ear_status` shows `canticleExposure`: the counts by phase, `evicted`,
+`overBound` and `reasons`. `frond-ear exposure --ear <name>
 [--since <ISO time | epoch ms>] [--json]` prints the records, one line each or as JSON; it opens the database
 (`FROND_EAR_DATABASE`) read-only, so it works with the daemon stopped, and creates nothing.
 

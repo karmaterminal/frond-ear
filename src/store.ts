@@ -1694,7 +1694,8 @@ export class EventStore {
    * vouch for the push it names (🍃 on #112). The same session is the one the offer went
    * to, by id; only an offer made while no id was known falls back to the attach. A
    * session that changed within one attach (a /clear) never echoes what the one before it
-   * was shown, and a push the host never confirmed echoes nothing. Returns how many
+   * was shown, and a push the host never confirmed echoes nothing. The exposure ledger's
+   * echo (#117) is in the same transaction, so the two never disagree. Returns how many
    * records were echoed.
    */
   public echoCanticleCustody(
@@ -1708,30 +1709,32 @@ export class EventStore {
       boundary: CompactionBoundary;
     },
   ): number {
-    // The ledger takes the echo on its own terms (the session it was offered to).
-    this.echoCanticleExposure(ear, batchId, echo);
-    return Number(
-      this.database
-        .prepare(
-          `UPDATE canticle_custody SET echoed_at = ?, echo_kind = ?, echo_batch = ?,
-             echo_session = ?, echo_boundary = ?, echo_boundary_known = ?
-           WHERE ear = ? AND batch_id = ?
-             AND offered_at IS NOT NULL AND echoed_at IS NULL
-             AND (offer_session = ? OR (offer_session IS NULL AND generation = ?))`,
-        )
-        .run(
-          echo.at,
-          echo.kind,
-          batchId,
-          echo.sessionId,
-          echo.boundary ?? null,
-          echo.boundary === undefined ? 0 : 1,
-          ear,
-          batchId,
-          echo.sessionId,
-          echo.generation,
-        ).changes,
-    );
+    return this.transaction(() => {
+      // The ledger takes the echo on its own terms (the session it was offered to).
+      this.echoCanticleExposure(ear, batchId, echo);
+      return Number(
+        this.database
+          .prepare(
+            `UPDATE canticle_custody SET echoed_at = ?, echo_kind = ?, echo_batch = ?,
+               echo_session = ?, echo_boundary = ?, echo_boundary_known = ?
+             WHERE ear = ? AND batch_id = ?
+               AND offered_at IS NOT NULL AND echoed_at IS NULL
+               AND (offer_session = ? OR (offer_session IS NULL AND generation = ?))`,
+          )
+          .run(
+            echo.at,
+            echo.kind,
+            batchId,
+            echo.sessionId,
+            echo.boundary ?? null,
+            echo.boundary === undefined ? 0 : 1,
+            ear,
+            batchId,
+            echo.sessionId,
+            echo.generation,
+          ).changes,
+      );
+    });
   }
 
   /**
@@ -1932,14 +1935,18 @@ export class EventStore {
    * Bounds the ledger (#117): offered and echoed records fenced more than `maxAgeMs` ago
    * go, then, per ear past `maxRecords`, the oldest offered or echoed ones until the bound
    * holds. A fenced or unknown record is never evicted. Every eviction is counted per ear
-   * (`canticle_exposure_evicted.<ear>`). Returns how many went, per ear.
+   * (`canticle_exposure_evicted.<ear>`). An ear whose fenced and unknown records alone are
+   * still past `maxRecords` stays so, and each prune that finds it so counts it
+   * (`canticle_exposure_over_bound.<ear>`). Returns how many went per ear, and how many
+   * records each ear over its bound still holds.
    */
   public pruneCanticleExposure(bounds: {
     maxAgeMs: number;
     maxRecords: number;
-  }): Record<string, number> {
+  }): { evicted: Record<string, number>; overBound: Record<string, number> } {
     return this.transaction(() => {
       const evicted: Record<string, number> = {};
+      const overBound: Record<string, number> = {};
       const cutoff = this.clock.now() - bounds.maxAgeMs;
       const ears = (
         this.database
@@ -1974,8 +1981,18 @@ export class EventStore {
           this.increment(`canticle_exposure_evicted.${ear}`, gone);
           evicted[ear] = gone;
         }
+        // Whatever is left past the bound is fenced or unknown: kept, but never quietly.
+        const { held } = this.database
+          .prepare(
+            "SELECT COUNT(*) AS held FROM canticle_exposure WHERE ear = ?",
+          )
+          .get(ear) as { held: number };
+        if (held > bounds.maxRecords) {
+          this.increment(`canticle_exposure_over_bound.${ear}`);
+          overBound[ear] = held;
+        }
       }
-      return evicted;
+      return { evicted, overBound };
     });
   }
 

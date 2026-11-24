@@ -457,7 +457,9 @@ function frameProvenance(
     sourceBody:
       body && bodySha !== undefined
         ? {
-            ctype: str(body.ctype) || int(body.ctype) ? body.ctype : 1,
+            // As record v1 gives it, or null: never a made-up 1 (#162 takes no body
+            // without one, so `conformant` won't either).
+            ctype: str(body.ctype) || int(body.ctype) ? body.ctype : null,
             size: int(body.size)
               ? body.size
               : Buffer.byteLength(text ?? "", "utf8"),

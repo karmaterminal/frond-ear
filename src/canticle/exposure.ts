@@ -46,17 +46,27 @@ export type SourceTuple = Omit<Tuple, "stream_id"> & {
   stream_id: number | null;
 };
 
+/** #162's `sourceBody`, except a `ctype` record v1 left out is null, not made up. */
+export type SourceBody = Omit<
+  NonNullable<PayloadSource["sourceBody"]>,
+  "ctype"
+> & {
+  ctype: NonNullable<PayloadSource["sourceBody"]>["ctype"] | null;
+};
+
 /**
  * #162's `PayloadSource` as frond-ear can fill it. `receiver` is null where frond-ear heard
- * the record itself (the embedded receptor has no record v1 run), and a tuple's `stream_id`
- * is null where record v1 named the stream by something other than its number.
+ * the record itself (the embedded receptor has no record v1 run), a tuple's `stream_id` is
+ * null where record v1 named the stream by something other than its number, and a body's
+ * `ctype` is null where record v1 left it out.
  */
 export type ExposureSource = Omit<
   PayloadSource,
-  "item" | "root" | "receiver"
+  "item" | "root" | "receiver" | "sourceBody"
 > & {
   item: SourceTuple;
   root: SourceTuple | null;
+  sourceBody: SourceBody | null;
   receiver: PayloadSource["receiver"] | null;
 };
 
@@ -209,8 +219,9 @@ const tupleOf = (t: SourceTuple): Tuple | null =>
 
 /**
  * The record as #162's `PayloadExposure`, or null when frond-ear could not fill it whole: a
- * reader with no session id, a source frond-ear heard itself (no record v1 receiver), or a
- * tuple whose stream had no number. Never fills a gap with a made-up value.
+ * reader with no session id, a source frond-ear heard itself (no record v1 receiver), a
+ * tuple whose stream had no number, or a body with no ctype (#162's own record reader
+ * refuses such a body). Never fills a gap with a made-up value.
  */
 export function conformant(record: ExposureRecord): PayloadExposure | null {
   const { sessionId } = record.reader;
@@ -219,14 +230,22 @@ export function conformant(record: ExposureRecord): PayloadExposure | null {
   for (const source of record.sources) {
     const item = tupleOf(source.item);
     const root = source.root === null ? null : tupleOf(source.root);
+    const body = source.sourceBody;
     if (
       item === null ||
       (source.root !== null && root === null) ||
-      source.receiver === null
+      source.receiver === null ||
+      (body !== null && body.ctype === null)
     ) {
       return null;
     }
-    sources.push({ ...source, item, root, receiver: source.receiver });
+    sources.push({
+      ...source,
+      item,
+      root,
+      sourceBody: body === null ? null : { ...body, ctype: body.ctype! },
+      receiver: source.receiver,
+    });
   }
   return {
     version: record.version,
