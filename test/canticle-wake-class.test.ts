@@ -534,6 +534,59 @@ test("#176 proof 4: the attached shim turning to another session discards the gr
   }
 });
 
+/** A seat's SessionStart hook naming `sessionId` for scribe's ear, as the CLI sends it. */
+async function release(h: Harness, sessionId: string, source = "clear") {
+  const cli = h.attach(undefined, { role: "cli" });
+  await cli.send({ type: "release", id: 1, ear: "scribe", source, sessionId });
+  const result = cli.connection.results().find((item) => item.id === 1);
+  cli.close();
+  return result;
+}
+
+test("#176 proof 4: while the session holding the ear is in doubt (a hook names a session frond-ear can't tie to the shim), its grants are discarded and no new one is made, so no grant crosses into or out of the doubt", async () => {
+  const { h, host } = setup({ mode: "immediate" }, { wakeKeys: [OPS] });
+  try {
+    const a = h.attach("scribe", { sessionId: SESSION });
+    const granted = await grant(h, a, {
+      stream: "ops:ops.fleet",
+      classes: ["ambient"],
+      ttl_seconds: 600,
+    });
+    assert.equal(granted.ok, true, granted.text);
+    // A hook names C, with no CLAUDE_PID to tie it to this shim: in doubt.
+    const doubt = await release(h, "33333333-cccc-4ccc-8ccc-000000000003");
+    assert.match(doubt?.text ?? "", /in doubt/u);
+    const rowsAtDoubt = h.store.canticleWakeGrants("scribe").length;
+    host.sing(1, AMBIENT);
+    h.timers.advance(10_000);
+    assert.equal(pushes(a).length, 0, "no grant wakes a session in doubt");
+    assert.equal(rowsAtDoubt, 0, "gone as the doubt began, before any poll");
+    assert.equal(status(h).counts.wake_grant_discarded, 1);
+    // Nor can one be made while the doubt holds.
+    const during = await grant(h, a, {
+      stream: "ops:ops.fleet",
+      classes: ["ambient"],
+      ttl_seconds: 600,
+    });
+    assert.equal(during.ok, false, during.text);
+    assert.match(during.text, /in doubt/u);
+    assert.equal(h.store.canticleWakeGrants("scribe").length, 0);
+    // A's own hook ends the doubt; a grant made after it is A's again.
+    await release(h, SESSION, "resume");
+    const after = await grant(h, a, {
+      stream: "ops:ops.fleet",
+      classes: ["ambient"],
+      ttl_seconds: 600,
+    });
+    assert.equal(after.ok, true, after.text);
+    host.sing(2, AMBIENT);
+    h.timers.advance(10_000);
+    assert.equal(pushes(a).length, 1, "a grant made after the doubt wakes");
+  } finally {
+    h.dispose();
+  }
+});
+
 test("#176 proof 4: the same session reattaching (compaction, resume) keeps its grant", async () => {
   const { h, host } = setup({ mode: "immediate" }, { wakeKeys: [OPS] });
   try {
