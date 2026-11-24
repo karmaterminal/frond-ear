@@ -4885,12 +4885,16 @@ export class Daemon {
         ttlMs: seconds * 1_000,
       });
     }
-    this.store.increment("canticle_wake_grants");
-    this.logger.log("info", "canticle.wake_granted", {
-      ear,
-      ...(named !== undefined ? { stream: `${station}:${stream}` } : {}),
-      revoke: args.revoke === true,
-    });
+    // The request committed whole (its counter with it): nothing after may report it failed.
+    try {
+      this.logger.log("info", "canticle.wake_granted", {
+        ear,
+        ...(named !== undefined ? { stream: `${station}:${stream}` } : {}),
+        revoke: args.revoke === true,
+      });
+    } catch {
+      // A log line that can't be written is no reason to say the grant wasn't made.
+    }
     return JSON.stringify(result, null, 2);
   }
 

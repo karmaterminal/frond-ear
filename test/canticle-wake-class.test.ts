@@ -9,6 +9,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
 import type { HearView } from "../src/canticle/receptor.ts";
@@ -841,6 +842,301 @@ test("#176 proof 4: a forward step later corrected leaves no wake past the TTL: 
     host.sing(1, AMBIENT);
     h.timers.advance(400_000); // past where the poll was due on the stepped clock
     assert.equal(pushes(shim).length, 0, "no wake past the TTL");
+  } finally {
+    h.dispose();
+  }
+});
+
+/**
+ * A storage fault on the `chatter` row only, as 🌫's probe injected it (#124 follow-up): the
+ * second class of an `ambient, chatter` request fails after the first was written.
+ */
+function faultSecondClass(h: Harness): void {
+  (h.store as unknown as { database: DatabaseSync }).database.exec(`
+    CREATE TEMP TRIGGER wake_grant_test_fault
+      BEFORE INSERT ON canticle_wake_grants WHEN NEW.class = 'chatter'
+      BEGIN SELECT RAISE(ABORT, 'injected on the second class'); END`);
+}
+
+test("#176 proof 4: a multi-class wake_grant is one whole: a storage fault on its second class leaves no grant made, so nothing wakes", async () => {
+  const { h, host } = setup({ mode: "immediate" }, { wakeKeys: [OPS] });
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    faultSecondClass(h);
+    const failed = await grant(h, shim, {
+      stream: "ops:ops.fleet",
+      classes: ["ambient", "chatter"],
+      ttl_seconds: 600,
+    });
+    assert.equal(failed.ok, false, failed.text);
+    assert.match(failed.text, /injected on the second class/u);
+    assert.deepEqual(
+      h.store.canticleWakeGrants("scribe"),
+      [],
+      "the first class's row went with the failure",
+    );
+    host.sing(1, AMBIENT);
+    h.timers.advance(10_000);
+    assert.equal(pushes(shim).length, 0, "no wake from a request that failed");
+    assert.equal(status(h).counts["wake_withheld:ambient"], 1);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("#176 proof 4: a failed multi-class wake_grant leaves an existing grant exactly as it was: no longer expiry, no moved mark, and it stops waking at its own expiry", async () => {
+  const { h, host } = setup({ mode: "immediate" }, { wakeKeys: [OPS] });
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    const made = await grant(h, shim, {
+      stream: "ops:ops.fleet",
+      classes: ["ambient"],
+      ttl_seconds: 10,
+    });
+    assert.equal(made.ok, true, made.text);
+    const expiresAt = h.clock.now() + 10_000;
+    h.timers.advance(2_000);
+    // Between polls, so a mark moved by the request itself would show.
+    h.clock.value += 500;
+    const before = h.store.canticleWakeGrants("scribe");
+    assert.equal(before.length, 1);
+    assert.equal(before[0]!.expiresAt, expiresAt);
+    faultSecondClass(h);
+    const failed = await grant(h, shim, {
+      stream: "ops:ops.fleet",
+      classes: ["ambient", "chatter"],
+      ttl_seconds: 600,
+    });
+    assert.equal(failed.ok, false, failed.text);
+    assert.match(failed.text, /injected on the second class/u);
+    assert.deepEqual(
+      h.store.canticleWakeGrants("scribe"),
+      before,
+      "the row is byte for byte as it was: expiry, grant time, mark",
+    );
+    // The grant still holds until its own expiry...
+    host.sing(1, AMBIENT);
+    h.timers.advance(7_000);
+    assert.ok(h.clock.now() < expiresAt);
+    assert.equal(pushes(shim).length, 1, "the original grant still wakes");
+    await confirm(shim);
+    // ...and not past it.
+    h.clock.value = expiresAt + 1_000;
+    host.sing(2, AMBIENT);
+    h.timers.advance(10_000);
+    assert.equal(pushes(shim).length, 1, "no wake past the original expiry");
+    assert.equal(status(h).counts["wake_withheld:ambient"], 1);
+    assert.deepEqual(h.store.canticleWakeGrants("scribe"), []);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("#176 proof 4: a multi-class wake_grant that succeeds makes every class it names, and each wakes", async () => {
+  const { h, host } = setup({ mode: "immediate" }, { wakeKeys: [OPS] });
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    const granted = await grant(h, shim, {
+      stream: "ops:ops.fleet",
+      classes: ["ambient", "chatter"],
+      ttl_seconds: 600,
+    });
+    assert.equal(granted.ok, true, granted.text);
+    const expiresAt = h.clock.now() + 600_000;
+    assert.deepEqual(JSON.parse(granted.text).grants, [
+      { stream: "ops:ops.fleet", classes: ["ambient", "chatter"], expiresAt },
+    ]);
+    assert.deepEqual(
+      h.store.canticleWakeGrants("scribe").map(({ cls }) => cls),
+      ["ambient", "chatter"],
+    );
+    host.sing(1, { class: "chatter" });
+    h.timers.advance(10_000);
+    assert.equal(pushes(shim).length, 1, "chatter wakes");
+    await confirm(shim);
+    host.sing(2, AMBIENT);
+    h.timers.advance(10_000);
+    assert.equal(pushes(shim).length, 2, "ambient wakes");
+    assert.deepEqual(order(pushes(shim)[1]!.content), ["ops:ops.fleet/2"]);
+  } finally {
+    h.dispose();
+  }
+});
+
+/**
+ * 🌫's post-write faults on #126 (review 6040781795): a step the request takes after its
+ * class writes fails. `mark`: the seen_at UPDATE of an unrelated grant (ops:ops.deploy),
+ * as the grants view moves every mark. `counter`: the `canticle_wake_grants` counter.
+ */
+function faultAfterWrite(h: Harness, fault: "mark" | "counter"): () => void {
+  const database = (h.store as unknown as { database: DatabaseSync }).database;
+  database.exec(
+    fault === "mark"
+      ? `CREATE TEMP TRIGGER wake_grant_test_post
+           BEFORE UPDATE OF seen_at ON canticle_wake_grants
+           WHEN NEW.stream = 'ops.deploy' AND NEW.seen_at > OLD.seen_at
+           BEGIN SELECT RAISE(ABORT, 'injected after the write'); END;`
+      : `CREATE TEMP TRIGGER wake_grant_test_post
+           BEFORE INSERT ON counters WHEN NEW.name = 'canticle_wake_grants'
+           BEGIN SELECT RAISE(ABORT, 'injected after the write'); END;
+         CREATE TEMP TRIGGER wake_grant_test_post_update
+           BEFORE UPDATE ON counters WHEN NEW.name = 'canticle_wake_grants'
+           BEGIN SELECT RAISE(ABORT, 'injected after the write'); END;`,
+  );
+  return () =>
+    database.exec(`DROP TRIGGER IF EXISTS wake_grant_test_post;
+      DROP TRIGGER IF EXISTS wake_grant_test_post_update;`);
+}
+
+for (const fault of ["mark", "counter", "none"] as const) {
+  for (const target of ["absent", "existing"] as const) {
+    for (const classes of [["ambient"], ["ambient", "chatter"]]) {
+      const name =
+        fault === "none"
+          ? `#176 proof 4: control, no fault: a ${classes.length}-class wake_grant with the target ${target} and another stream granted succeeds, and its grant wakes`
+          : `#176 proof 4: a ${classes.length}-class wake_grant whose ${fault === "mark" ? "mark of another grant" : "counter"} fails after its writes, the target ${target}, reports failure and changed no grant: nothing wakes past what was there`;
+      test(name, async () => {
+        const { h, host } = setup({ mode: "immediate" }, { wakeKeys: [OPS] });
+        try {
+          const shim = h.attach("scribe", { sessionId: SESSION });
+          const t0 = h.clock.now();
+          const other = await grant(h, shim, {
+            stream: "ops:ops.deploy",
+            classes: ["ambient"],
+            ttl_seconds: 600,
+          });
+          assert.equal(other.ok, true, other.text);
+          if (target === "existing") {
+            const made = await grant(h, shim, {
+              stream: "ops:ops.fleet",
+              classes: ["ambient"],
+              ttl_seconds: 10,
+            });
+            assert.equal(made.ok, true, made.text);
+          }
+          h.timers.advance(2_000);
+          // Between polls, so the request is the one to move the other grant's mark.
+          h.clock.value += 500;
+          const before = h.store.canticleWakeGrants("scribe");
+          const count = h.store.counters().canticle_wake_grants;
+          const heal = fault === "none" ? () => {} : faultAfterWrite(h, fault);
+          const result = await grant(h, shim, {
+            stream: "ops:ops.fleet",
+            classes,
+            ttl_seconds: 600,
+          });
+          heal();
+          if (fault === "none") {
+            assert.equal(result.ok, true, result.text);
+            assert.equal(h.store.counters().canticle_wake_grants, count! + 1);
+            assert.deepEqual(
+              h.store
+                .canticleWakeGrants("scribe")
+                .filter(({ stream }) => stream === "ops.fleet")
+                .map(({ cls, expiresAt }) => ({ cls, expiresAt })),
+              classes.map((cls) => ({
+                cls,
+                expiresAt: h.clock.now() + 600_000,
+              })),
+            );
+            h.clock.value = t0 + 11_000;
+            host.sing(1, AMBIENT);
+            h.timers.advance(10_000);
+            assert.equal(pushes(shim).length, 1, "the new grant wakes");
+            return;
+          }
+          assert.equal(result.ok, false, result.text);
+          assert.match(result.text, /injected after the write/u);
+          assert.deepEqual(
+            h.store.canticleWakeGrants("scribe"),
+            before,
+            "no grant changed: none made, none extended, no mark moved",
+          );
+          assert.equal(h.store.counters().canticle_wake_grants, count);
+          if (target === "existing") {
+            host.sing(1, AMBIENT);
+            h.timers.advance(6_000);
+            assert.ok(h.clock.now() < t0 + 10_000);
+            assert.equal(pushes(shim).length, 1, "the original grant wakes");
+            await confirm(shim);
+          }
+          // Past the original expiry, nothing the failed request asked for wakes.
+          h.clock.value = t0 + 11_000;
+          host.sing(2, AMBIENT);
+          h.timers.advance(10_000);
+          assert.equal(
+            pushes(shim).length,
+            target === "existing" ? 1 : 0,
+            "no wake from a request that reported failure",
+          );
+        } finally {
+          h.dispose();
+        }
+      });
+    }
+  }
+}
+
+test("#176 proof 4: a safety discard by wake_grant's check stands even when the request then fails: a grant on a clock that stepped back is not brought back", async () => {
+  const { h, host } = setup({ mode: "immediate" }, { wakeKeys: [OPS] });
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    const t0 = h.clock.now();
+    const made = await grant(h, shim, {
+      stream: "ops:ops.fleet",
+      classes: ["ambient"],
+      ttl_seconds: 600,
+    });
+    assert.equal(made.ok, true, made.text);
+    h.timers.advance(2_000);
+    h.clock.value = t0 + 1_000; // behind the grant's mark
+    const heal = faultAfterWrite(h, "counter");
+    const failed = await grant(h, shim, {
+      stream: "ops:ops.fleet",
+      classes: ["chatter"],
+      ttl_seconds: 600,
+    });
+    heal();
+    assert.equal(failed.ok, false, failed.text);
+    assert.deepEqual(
+      h.store.canticleWakeGrants("scribe"),
+      [],
+      "the unprovable grant stays discarded; the failed request made nothing",
+    );
+    assert.equal(status(h).counts.wake_grant_discarded, 1);
+    host.sing(1, AMBIENT);
+    h.timers.advance(20_000);
+    assert.equal(pushes(shim).length, 0);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("store: a wake_grant request's grants are one whole inside a caller's transaction too: a caught fault on one class commits none of them", () => {
+  const { h } = setup({ mode: "immediate" }, { wakeKeys: [OPS] });
+  try {
+    faultSecondClass(h);
+    const row = (cls: string) => ({
+      ear: "scribe",
+      station: "ops",
+      stream: "ops.fleet",
+      cls,
+      sessionId: SESSION,
+      grantedAt: 1_000,
+      expiresAt: 61_000,
+    });
+    h.store.atomically(() => {
+      h.store.setCanticleWakeGrant(row("alarm"));
+      assert.throws(
+        () => h.store.setCanticleWakeGrants([row("ambient"), row("chatter")]),
+        /injected on the second class/u,
+      );
+    });
+    assert.deepEqual(
+      h.store.canticleWakeGrants("scribe").map(({ cls }) => cls),
+      ["alarm"],
+      "the caller's own write commits; none of the failed request's does",
+    );
   } finally {
     h.dispose();
   }

@@ -771,6 +771,10 @@ overflow.
   field, a flag, a `silent-wake` mode, the text) can make, extend or widen one, and none is ever inferred from a
   record's class.
 - `ttl_seconds` is required, 1 s to 24 h, and the grant lapses at its expiry (`counts.wake_grant_lapsed`).
+- A request is all or nothing. Every class it names, the mark it moves and its counter are written in one store
+  transaction, so a `wake_grant` that returns an error has granted no class and left every existing grant as it
+  was (no later expiry), except one its check before the request discards as unprovable (below): that discard
+  stands. A `wake_grant` that changed grants returns success.
 - It holds only for the session that made it, so a session whose shim gave no id can't make one. It is discarded
   (`counts.wake_grant_discarded`, a warning in the log) when frond-ear can't prove it still holds:
   - another session takes the ear (a rebind): discarded at that attach, in the same transaction that records it,
