@@ -1087,6 +1087,26 @@ export class EventStore {
     return this.transaction(work);
   }
 
+  /**
+   * Runs `work` as one whole: in a transaction of its own, or, inside a caller's, in a
+   * savepoint, so a failure part way undoes only `work` even if the caller catches it and
+   * commits. Not for `transaction`'s callers to use instead: a BEGIN nested by mistake
+   * should still fail loudly there.
+   */
+  private whole<T>(work: () => T): T {
+    if (!this.database.isTransaction) return this.transaction(work);
+    this.database.exec("SAVEPOINT whole");
+    try {
+      const result = work();
+      this.database.exec("RELEASE whole");
+      return result;
+    } catch (error) {
+      this.database.exec("ROLLBACK TO whole");
+      this.database.exec("RELEASE whole");
+      throw error;
+    }
+  }
+
   private transaction<T>(work: () => T): T {
     this.database.exec("BEGIN IMMEDIATE");
     try {
@@ -1610,7 +1630,9 @@ export class EventStore {
   /**
    * The host handed canticle batch `batchId` to the session (the shim's `offered`): its
    * records are offered now, to the session holding the ear now, under its boundary now,
-   * and no revert can give the push back. Returns how many.
+   * and no revert can give the push back. The claim's release, the exposure ledger's offer
+   * (#117) and custody's are one whole: a failure part way leaves all three as they were,
+   * whether this runs alone or inside a caller's transaction. Returns how many.
    */
   public offerCanticleCustody(
     ear: string,
@@ -1621,26 +1643,29 @@ export class EventStore {
       boundary: CompactionBoundary;
     },
   ): number {
-    this.database
-      .prepare("DELETE FROM canticle_claims WHERE ear = ? AND batch_id = ?")
-      .run(ear, batchId);
-    this.offerCanticleExposure(ear, batchId, offer);
-    return Number(
+    // The daemon offers inside its own transaction (with confirmBatch), so this one nests.
+    return this.whole(() => {
       this.database
-        .prepare(
-          `UPDATE canticle_custody SET offered_at = ?, offer_session = ?, offer_boundary = ?,
-             offer_boundary_known = ?
-           WHERE ear = ? AND batch_id = ? AND offered_at IS NULL`,
-        )
-        .run(
-          offer.at,
-          offer.sessionId,
-          offer.boundary ?? null,
-          offer.boundary === undefined ? 0 : 1,
-          ear,
-          batchId,
-        ).changes,
-    );
+        .prepare("DELETE FROM canticle_claims WHERE ear = ? AND batch_id = ?")
+        .run(ear, batchId);
+      this.offerCanticleExposure(ear, batchId, offer);
+      return Number(
+        this.database
+          .prepare(
+            `UPDATE canticle_custody SET offered_at = ?, offer_session = ?, offer_boundary = ?,
+               offer_boundary_known = ?
+             WHERE ear = ? AND batch_id = ? AND offered_at IS NULL`,
+          )
+          .run(
+            offer.at,
+            offer.sessionId,
+            offer.boundary ?? null,
+            offer.boundary === undefined ? 0 : 1,
+            ear,
+            batchId,
+          ).changes,
+      );
+    });
   }
 
   /** Whether `batchId` is one of this ear's canticle pushes that custody still holds. */
