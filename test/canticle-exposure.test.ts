@@ -658,7 +658,7 @@ test("scope: each source carries its record's scope exactly as heard, never wide
   }
 });
 
-test("flag off: canticle.exposure is off by default, and off nothing is written and nothing else changes", async () => {
+test("flag off: canticle.exposure is off by default, and off no row is written and behaviour and ear_status are as without the ledger (its empty table and index are in the schema)", async () => {
   const { h, host } = setup({ mode: "immediate" });
   try {
     assert.deepEqual(canticleConfig({ mode: "immediate" }).canticle!.exposure, {
@@ -690,6 +690,17 @@ test("flag off: canticle.exposure is off by default, and off nothing is written 
         .prepare("SELECT COUNT(*) AS n FROM canticle_exposure")
         .get() as { n: number };
       assert.equal(row.n, 0, "zero rows");
+      // Not byte for byte the same database: the table and its index are there, empty.
+      const schema = db
+        .prepare(
+          "SELECT type, name FROM sqlite_master WHERE name LIKE 'canticle_exposure%' ORDER BY name",
+        )
+        .all()
+        .map((r) => `${r.type}:${r.name}`);
+      assert.deepEqual(schema, [
+        "table:canticle_exposure",
+        "index:canticle_exposure_ear",
+      ]);
     } finally {
       db.close();
     }
@@ -835,7 +846,7 @@ test("status: ear_status counts the ledger by phase", async () => {
   }
 });
 
-test("cli: frond-ear exposure reads the ledger read-only, as JSON or lines, from --since; it never writes a store", async () => {
+test("cli: frond-ear exposure reads the ledger read-only, as JSON or lines, from --since; it writes no rows and creates no database", async () => {
   const directory = mkdtempSync(join(tmpdir(), "frond-ear-exposure-"));
   const path = join(directory, "ear.db");
   try {
@@ -887,7 +898,7 @@ test("cli: frond-ear exposure reads the ledger read-only, as JSON or lines, from
     assert.deepEqual(JSON.parse(other.out), []);
     assert.equal((await run([])).code, 1, "--ear is required");
     assert.equal((await run(["--ear", "scribe", "--since", "soon"])).code, 1);
-    // No store there: it says so, and creates none.
+    // No store there: it says so, and creates no database.
     const none = join(directory, "none.db");
     let err = "";
     const code = await runExposure(["--ear", "scribe"], {

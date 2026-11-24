@@ -589,7 +589,9 @@ function mapEvent(row: EventRow): StoredEvent {
 /**
  * The exposure ledger (#117, canticle/exposure.ts): one row per canticle push that carried
  * records, fenced in the push's claim and never deleted except as a confirmed (offered or
- * echoed) record past its bounds. `batch_id` is unique: batch ids are never reused.
+ * echoed) record past its bounds. `batch_id` is unique: batch ids are never reused. The
+ * table and its index are created whether `canticle.exposure.enabled` is on or off: off,
+ * they stay empty, and behaviour is as without them.
  */
 const EXPOSURE_TABLE = `
       CREATE TABLE IF NOT EXISTS canticle_exposure (

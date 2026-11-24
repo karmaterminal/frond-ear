@@ -1,6 +1,8 @@
 // `frond-ear exposure --ear <ear> [--since <time>] [--json]` (frond-ear#117): the exposure
 // ledger, read-only, for a future issuer behind its own boundary to read. It opens the
-// database read-only and never creates one, so it works with the daemon running or stopped.
+// database read-only, so it works with the daemon running or stopped. It never creates a
+// database and writes no rows, though SQLite opening a WAL database, even read-only, can
+// leave its -wal and -shm sidecar files beside it.
 // It has no network side at all: no export, no issuer call. The records hold hashes and
 // provenance, never payload text, and never a delivery token.
 

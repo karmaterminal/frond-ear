@@ -718,7 +718,7 @@ and `source` still need a restart.
 | `….maxPushesPerHour` | `60` or more         | Pushes to the ear per hour, from `immediate` and reports together, 1 to 360: 60 by default, or one per window when `windowMs` is under a minute, so a busy band's reports fit the hour. `ear_status` warns when it is less than one per window. Past it, records wait. The count survives a restart.                                                                                                                                |
 | `derivedPublication` | `false`              | Whether derived publication may open at all ([Derived publication](#derived-publication-binary-canticle161-item-4)). Off: no station call, `derivedQuery` and the capability probe included.                                                                                                                                                                                                                                        |
 | `roomPolicy`         | `observe`            | What the egress gate does at every room output ([Room output](#room-output-and-source-use-frond-ear-scope)): `observe` records and refuses nothing; `strict-fresh` refuses unless the speaker's canticle history is complete. It is a freshness-of-attention gate, not an output-content check; no seat should select it until the frond's source-use rule is settled. Anything else fails config load. It reloads with the config. |
-| `exposure`           | `{"enabled": false}` | The exposure ledger ([Exposure ledger](#exposure-ledger-frond-ear117)): `enabled` (default `false`; off, nothing is written), `maxAgeMs` (default 7 days) and `maxRecords` (per ear, default 10000) bound the offered and echoed records it keeps.                                                                                                                                                                                  |
+| `exposure`           | `{"enabled": false}` | The exposure ledger ([Exposure ledger](#exposure-ledger-frond-ear117)): `enabled` (default `false`; off, no rows are written, though its empty table and index are in the schema), `maxAgeMs` (default 7 days) and `maxRecords` (per ear, default 10000) bound the offered and echoed records it keeps.                                                                                                                             |
 
 **What the session gets.** Channel events with `kind="canticle"` and `delivery="immediate"` (the new records of
 the last few seconds) or `delivery="report"` (a "what's on the radio" report, `report=<n>`). Each push is a batch
@@ -1017,8 +1017,9 @@ frond-ear's own claude.ai connector (`src/connector/`) has no Discord access, so
 With `canticle.exposure.enabled` on, frond-ear keeps a record of every canticle push that carried records to an
 ear's session, in binary-canticle#162's `canticle-payload-exposure/1` shape, for an issuer behind its own boundary
 to read later. frond-ear only records: it holds no key, signs nothing, calls no issuer and exports nothing (🌫's
-constraint on #117). Off, nothing is written and `ear_status` is as it was (its table is still created, empty); a
-config reload turns it on or off for the pushes that follow.
+constraint on #117). Off, behaviour and `ear_status` are the same as without the ledger, but the database is not
+byte for byte the same: the store creates the empty `canticle_exposure` table and its index whether the flag is on
+or off. No rows are written. A config reload turns it on or off for the pushes that follow.
 
 Each record moves through custody's steps ([Custody and confirmation](#custody-and-confirmation-binary-canticle161)):
 
@@ -1066,7 +1067,8 @@ the bound are a sign of many unsent or reverted pushes: look at the ear's attach
 **Reading it.** While it is on, `ear_status` shows `canticleExposure`: the counts by phase, `evicted`,
 `overBound` and `reasons`. `frond-ear exposure --ear <name>
 [--since <ISO time | epoch ms>] [--json]` prints the records, one line each or as JSON; it opens the database
-(`FROND_EAR_DATABASE`) read-only, so it works with the daemon stopped, and creates nothing.
+(`FROND_EAR_DATABASE`) read-only, so it works with the daemon stopped. It never creates a database and writes no
+rows, but opening a WAL database, even read-only, can leave SQLite's `-wal` and `-shm` sidecar files beside it.
 
 Not yet recorded: what `hear` returns. Only pushes are.
 
