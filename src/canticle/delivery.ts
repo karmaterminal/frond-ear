@@ -629,6 +629,11 @@ function mergeFolded(
 
 interface EarState {
   /**
+   * What the record source's manifest grants each key, from the ear's latest poll (absent
+   * where the source can't say): the wake gate's capability check, for `#owes` too.
+   */
+  capability?: HearView["capability"];
+  /**
    * Identity → when to forget it, and the config it was read under: every record already
    * taken in or passed over. A reload bumps `gen`, so what is on air is read again.
    */
@@ -929,16 +934,31 @@ class Boundary {
   gate(
     item: Pick<LiveItem, "station" | "key" | "stream" | "class">,
   ): string | undefined {
+    return this.#verdict(item.key, item.class, () => this.granted(item));
+  }
+
+  /**
+   * Whether a note about this record (dropped, or held until it went off air) may owe a
+   * push of its own: the gate's own verdict, the manifest's capability included, on the
+   * config alone. A grant never makes a note owed: what only a grant let wake rides with a
+   * push that goes anyway, so nothing it leaves behind can wake the ear once it's gone.
+   */
+  owes(item: Pick<LiveItem, "key" | "class">): boolean {
+    return this.#verdict(item.key, item.class, () => false) === undefined;
+  }
+
+  /** The one predicate behind `gate` and `owes`, so the two can never drift apart. */
+  #verdict(
+    key: string,
+    cls: string,
+    granted: () => boolean,
+  ): string | undefined {
     if (this.#capability !== undefined) {
-      const granted = this.#capability(item.key.toLowerCase());
-      if (granted === undefined || !granted.has(item.class)) {
-        return "not_capable";
-      }
+      const classes = this.#capability(key.toLowerCase());
+      if (classes === undefined || !classes.has(cls)) return "not_capable";
     }
-    if (this.configured(item.key, item.class) || this.granted(item)) {
-      return undefined;
-    }
-    return `${WAKE_WITHHELD}${classToken(item.class)}`;
+    if (this.configured(key, cls) || granted()) return undefined;
+    return `${WAKE_WITHHELD}${classToken(cls)}`;
   }
 }
 
@@ -1127,6 +1147,8 @@ export class CanticleDelivery {
     const state = this.#state(ear);
     const modes = this.#modes(ear, config, now);
     const view = this.#deps.hear(ear);
+    if (view.capability !== undefined) state.capability = view.capability;
+    else delete state.capability;
     const keys = new Boundary(
       canticle,
       this.#grants(ear, state, now),
@@ -1441,7 +1463,7 @@ export class CanticleDelivery {
         // with a push that goes anyway, and never wake the ear themselves.
         const note = {
           ...blankMissed(o.key),
-          owed: fresh.some((d) => this.#owes(d)),
+          owed: fresh.some((d) => this.#owes(state, d)),
         };
         // Dropped after the last pass looked: from then, or this window's start if later.
         const from = same ? Math.max(o.from, before.at) : o.from;
@@ -1466,7 +1488,7 @@ export class CanticleDelivery {
     state.seen.delete(waiting.id);
     const note = {
       ...blankMissed(waiting.item.key),
-      owed: this.#owes(waiting.item),
+      owed: this.#owes(state, waiting.item),
     };
     widen(note.withheld, "live_overflow", 1, at, at);
     addNote(state.missed, waiting.stream, note, true);
@@ -2081,15 +2103,15 @@ export class CanticleDelivery {
   }
 
   /**
-   * Whether a note about this record may owe a push of its own: only when the config alone
-   * lets its class wake (#176). What only a grant let wake rides with a push that goes
-   * anyway, so nothing it leaves behind can wake the ear once the grant is gone.
+   * Whether a note about this record may owe a push of its own (#176): `Boundary.owes`,
+   * the wake gate's own predicate without grants, under the config now and what the
+   * record source's manifest grants as of the ear's latest poll.
    */
-  #owes(item: Pick<LiveItem, "key" | "class">): boolean {
+  #owes(state: EarState, item: Pick<LiveItem, "key" | "class">): boolean {
     const canticle = this.#deps.config().canticle;
     return (
       canticle !== undefined &&
-      new Boundary(canticle).configured(item.key, item.class)
+      new Boundary(canticle, [], state.capability).owes(item)
     );
   }
 
@@ -2170,7 +2192,7 @@ export class CanticleDelivery {
       ...blankMissed(waiting.item.key),
       owed:
         (waiting.promised === true || reason === "push_budget") &&
-        this.#owes(waiting.item),
+        this.#owes(state, waiting.item),
     };
     if (kind === "dropped") {
       note.dropped = 1;
