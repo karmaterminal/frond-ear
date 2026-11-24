@@ -130,6 +130,103 @@ test("#176 proof 1: an ambient flood from a bare key that overflows the live set
   }
 });
 
+/**
+ * A host whose view says what the manifest grants each key, as the embedded receptor's
+ * does: `caps` per key, live (a test may take a class away, as a manifest reload would).
+ */
+function capable(
+  caps: Map<string, Set<string>>,
+  delivery: unknown,
+  canticle: R,
+): { h: Harness; host: Host } {
+  let host: Host | undefined;
+  const h = harness(canticleConfig(delivery, canticle), {
+    canticleHear: (): HearView => ({
+      ...host!.view(),
+      capability: (key: string) => caps.get(key.toLowerCase()),
+    }),
+  });
+  host = new Host(h.clock);
+  host.start();
+  return { h, host };
+}
+
+test("#176 proof 3 (🌿's MUST): alarms from a bare key the manifest doesn't grant alarm, dropped by a full live set, owe no push of its own; the next legitimate push tells it", async () => {
+  const caps = new Map([
+    [OPS, new Set(["advisory", "ambient"])],
+    [ALPHA, new Set(["alarm"])],
+  ]);
+  const { h, host } = capable(
+    caps,
+    { mode: "immediate", maxPushesPerHour: 360 },
+    { wakeKeys: [OPS, ALPHA] },
+  );
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    for (let n = 1; n <= MAX_LIVE + 50; n++) {
+      host.sing(n, {
+        ...ALARM,
+        stateKey: `fire-${n}`,
+        stream: "ops.deploy",
+        ttlMs: 3_600_000,
+      });
+    }
+    h.timers.advance(60_000);
+    assert.equal(pushes(shim).length, 0, "no wake, not even for the note");
+    assert.equal(status(h).counts.live_overflow, 50);
+    assert.equal(status(h).counts.not_capable, MAX_LIVE);
+    h.timers.advance(120_000);
+    assert.equal(pushes(shim).length, 0);
+    host.sing(1, { ...ALARM, station: "alpha" });
+    h.timers.advance(6_000);
+    assert.equal(pushes(shim).length, 1, "the capable alarm wakes");
+    assert.match(
+      pushes(shim)[0]!.content,
+      /^- ops:ops\.deploy: 50 dropped by frond-ear's full live set \(live_overflow; /mu,
+    );
+  } finally {
+    h.dispose();
+  }
+});
+
+test("#176 proof 3 (🌿's MUST): an alarm the push budget held, whose key lost alarm in the manifest before it went off air, owes no push of its own; the next legitimate push tells it", async () => {
+  const caps = new Map([
+    [OPS, new Set(["alarm"])],
+    [ALPHA, new Set(["alarm"])],
+  ]);
+  const { h, host } = capable(
+    caps,
+    { mode: "immediate", maxItems: 1, maxPushesPerHour: 1 },
+    { wakeKeys: [OPS, ALPHA] },
+  );
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    host.sing(1, { ...ALARM, stateKey: "fire-1", ttlMs: 10_000 });
+    host.sing(2, { ...ALARM, stateKey: "fire-2", ttlMs: 10_000 });
+    h.timers.advance(6_000);
+    assert.equal(pushes(shim).length, 1, "one carried, one promised");
+    assert.match(pushes(shim)[0]!.content, /1 more record waits/u);
+    await confirm(shim);
+    h.timers.advance(3_500); // 9.5 s: still on air, still held, still capable
+    // The manifest stops granting OPS alarm in the same poll interval the promised one
+    // goes off air under the spent budget: the off-air pass sees it before any re-check.
+    caps.get(OPS)!.delete("alarm");
+    h.timers.advance(8_500);
+    assert.equal(status(h).counts.off_air_unpushed, 1);
+    h.timers.advance(3_600_000); // the budget frees
+    assert.equal(pushes(shim).length, 1, "no wake for the note");
+    host.sing(1, { ...ALARM, station: "alpha" });
+    h.timers.advance(6_000);
+    assert.equal(pushes(shim).length, 2, "the capable alarm wakes");
+    assert.match(
+      pushes(shim)[1]!.content,
+      /^- ops:ops\.fleet: 1 went off air unpushed while the hour's push budget was spent \(push_budget; /mu,
+    );
+  } finally {
+    h.dispose();
+  }
+});
+
 test("#176 proof 3 (🪨's negative): a verified alarm from a bare key the manifest doesn't grant alarm does not wake; granted alarm, the same record does", async () => {
   for (const granted of [false, true]) {
     let host: Host | undefined;
