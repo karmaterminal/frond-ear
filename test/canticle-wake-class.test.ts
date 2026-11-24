@@ -1008,3 +1008,15 @@ function canticleInput(canticle: R): R {
     },
   };
 }
+
+test("#176: on a daemon without canticle, a session change still records the ear's new holder (discarding grants never skips the write)", async () => {
+  const h = harness(testConfig());
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    const other = "22222222-bbbb-4bbb-8bbb-000000000002";
+    await shim.send({ type: "session", sessionId: other });
+    assert.equal(h.store.ear("scribe")?.sessionId, other);
+  } finally {
+    h.dispose();
+  }
+});
