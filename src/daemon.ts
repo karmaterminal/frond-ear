@@ -1795,6 +1795,8 @@ export class Daemon {
     // A turn or doubt kept for this shim's spawn-time id still holds (#111).
     this.restoreTurn(client, ear);
     const record = this.store.attachEar(ear, client.sessionId ?? null, nonce);
+    // Another holder's grants went in the attach's own transaction (#176).
+    this.canticle?.grantsDiscarded(ear, record.discardedWakeGrants);
     // A reading belongs to the session that reported it; a new session starts with none.
     if (this.pressure.get(ear)?.sessionId !== client.sessionId) {
       this.pressure.delete(ear);
@@ -1890,7 +1892,10 @@ export class Daemon {
     this.touchHolder(ear, client);
     client.sessionId = sessionId;
     delete client.wakeDoubt;
-    this.store.updateEarSession(ear, sessionId);
+    this.canticle?.grantsDiscarded(
+      ear,
+      this.store.updateEarSession(ear, sessionId),
+    );
     this.touchHolder(ear, client);
     if (this.attached.get(ear) === client && changed) {
       this.logger.log("info", "ear.session_changed", {

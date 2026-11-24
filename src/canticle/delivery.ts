@@ -2135,6 +2135,25 @@ export class CanticleDelivery {
   }
 
   /**
+   * Grants the store already discarded when another holder took the ear (an attach or a
+   * session change, #176): counted and logged as any discarded grant is. The store does
+   * the discard itself, in the attach's own transaction, so no poll in between matters.
+   */
+  grantsDiscarded(ear: string, grants: readonly CanticleWakeGrant[]): void {
+    if (grants.length === 0) return;
+    const state = this.#state(ear);
+    for (const grant of grants) {
+      this.#count(state, "wake_grant_discarded");
+      this.#deps.logger.log("warn", "canticle.wake_grant_discarded", {
+        ear,
+        stream: `${grant.station}:${grant.stream}`,
+        class: grant.cls,
+        reason: "holder_changed",
+      });
+    }
+  }
+
+  /**
    * A waiting record went unpushed: off air, or dropped from a full buffer. `reason`, for
    * one that went off air while still on view, is why frond-ear withheld it (a local
    * omission). A push must say so if one said it waits, or if the budget held it, and
@@ -2355,7 +2374,7 @@ export class CanticleDelivery {
     }
     return {
       grants: this.#grantsView(ear, this.#state(ear), now),
-      note: "a grant wakes you only for records from a station whose key is on canticle.wakeKeys, at hop 0, not wake-derived, under a delivery mode that pushes, within the push budget; it lapses at expiresAt and is discarded if another session takes the ear",
+      note: "a grant wakes you only for records from a station whose key is on canticle.wakeKeys, at hop 0, not wake-derived, under a delivery mode that pushes, within the push budget; it lapses at expiresAt and is discarded if another session takes the ear, even briefly",
     };
   }
 

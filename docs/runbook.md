@@ -765,7 +765,10 @@ overflow.
 - `ttl_seconds` is required, 1 s to 24 h, and the grant lapses at its expiry (`counts.wake_grant_lapsed`).
 - It holds only for the session that made it, so a session whose shim gave no id can't make one. It is discarded
   (`counts.wake_grant_discarded`, a warning in the log) when frond-ear can't prove it still holds:
-  - another session holds the ear (a rebind);
+  - another session takes the ear (a rebind): discarded at that attach, in the same transaction that records it,
+    before any delivery poll, so a grant never crosses another holder's hold even when the ear comes back to its
+    maker. A shim that gave no session id counts as another holder, and so does the attached shim turning to
+    another session (its `session` message or a SessionStart hook);
   - the clock stepped back: it reads earlier than the moment the grant was made, or than the latest moment
     frond-ear found it holding (it keeps that mark per grant, in the store). Mid-run or across a restart, a
     clock that went backwards leaves how long the grant has run unknown, so every grant it holds is discarded
@@ -776,8 +779,10 @@ overflow.
     grant survives it, overrunning by as much as the clock went back, which is less than the time it was down;
   - its row claims more than 24 h;
   - its class isn't registered.
-- A grant survives a restart only while all of that still holds (the clock reads no earlier than its mark) and the
-  same session resumes. With no session on the ear nothing is pushed anyway, so it waits for its session.
+- The same session reattaching keeps its grant: a compaction, a resume, a new shim, or a daemon restart that the
+  same session id comes back to (A then A, with no other holder between). Across a restart that holds only while
+  all of the above still does (the clock reads no earlier than its mark). With no session on the ear nothing is
+  pushed anyway, so it waits for its session.
 - It never opens a station whose key isn't on `wakeKeys`, and every other gate above still applies.
 - What only a grant let wake never owes a push of its own once it goes unpushed: what is left of it rides with a
   push that goes, so nothing wakes the session after the grant lapses.

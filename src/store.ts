@@ -3484,12 +3484,23 @@ export class EventStore {
 
   // ---- ears -------------------------------------------------------------------
 
+  /**
+   * Records an attach: the ear's next generation, held by `sessionId`. In the same
+   * transaction, the ear's wake grants made by any other session are discarded (#176): a
+   * grant is its maker's own act and never crosses another holder's hold, even one that
+   * hands the ear back before delivery looks. A session with no id is another holder.
+   * Returns the record and the grants discarded.
+   */
   public attachEar(
     name: string,
     sessionId: string | null,
     canaryNonce: string | null,
-  ): EarRecord {
+  ): EarRecord & { discardedWakeGrants: CanticleWakeGrant[] } {
     return this.transaction(() => {
+      const discardedWakeGrants = this.discardOtherHoldersGrants(
+        name,
+        sessionId,
+      );
       this.database
         .prepare(
           `INSERT INTO ears (name, generation, attached_at, session_id, registered, canary_nonce)
@@ -3505,7 +3516,7 @@ export class EventStore {
           canaryNonce === null ? 1 : 0,
           canaryNonce,
         );
-      return this.ear(name) as EarRecord;
+      return { ...(this.ear(name) as EarRecord), discardedWakeGrants };
     });
   }
 
@@ -3536,10 +3547,39 @@ export class EventStore {
       : undefined;
   }
 
-  public updateEarSession(name: string, sessionId: string): void {
-    this.database
-      .prepare("UPDATE ears SET session_id = ? WHERE name = ?")
-      .run(sessionId, name);
+  /**
+   * The attached client now speaks for `sessionId`. As at attach, the ear's wake grants
+   * made by any other session are discarded in the same transaction; returns them.
+   */
+  public updateEarSession(
+    name: string,
+    sessionId: string,
+  ): CanticleWakeGrant[] {
+    return this.transaction(() => {
+      const discarded = this.discardOtherHoldersGrants(name, sessionId);
+      this.database
+        .prepare("UPDATE ears SET session_id = ? WHERE name = ?")
+        .run(sessionId, name);
+      return discarded;
+    });
+  }
+
+  /** Removes the ear's wake grants not made by `sessionId` (null: all); returns them. */
+  private discardOtherHoldersGrants(
+    ear: string,
+    sessionId: string | null,
+  ): CanticleWakeGrant[] {
+    const gone = this.canticleWakeGrants(ear).filter(
+      (grant) => grant.sessionId !== sessionId,
+    );
+    if (gone.length > 0) {
+      this.database
+        .prepare(
+          "DELETE FROM canticle_wake_grants WHERE ear = ? AND session_id IS NOT ?",
+        )
+        .run(ear, sessionId);
+    }
+    return gone;
   }
 
   /** Was batch `id` offered (pushed) to this ear in this attach generation? */
