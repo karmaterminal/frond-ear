@@ -2176,6 +2176,21 @@ export class EventStore {
       );
   }
 
+  /**
+   * One `wake_grant` request's grants, every class it names, as one whole: a failure part
+   * way leaves every row as it was, so a request that fails never leaves a class it named
+   * granted or an existing grant extended (🌫 on #124). Inside a caller's transaction it is
+   * a savepoint, so a caller catching the failure still commits none of it. (A revoke is one
+   * DELETE, whole already.)
+   */
+  public setCanticleWakeGrants(
+    grants: ReadonlyArray<Omit<CanticleWakeGrant, "seenAt">>,
+  ): void {
+    this.whole(() => {
+      for (const grant of grants) this.setCanticleWakeGrant(grant);
+    });
+  }
+
   /** Moves the high-water mark of every grant the ear has up to `now` (never down). */
   public markCanticleWakeGrantsSeen(ear: string, now: number): void {
     this.database

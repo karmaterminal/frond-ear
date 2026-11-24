@@ -2123,10 +2123,16 @@ export class CanticleDelivery {
    * high-water mark (the latest reading at which it was found holding, or the moment it was
    * made). A clock that went back, mid-run or across a restart, leaves how long a grant has
    * run unknown, so expiry never rests on it. Each judgement moves the mark of what is left
-   * up to now. With no session holding the ear, nothing is pushed anyway and a grant is kept
-   * for its own session's return.
+   * up to now, unless `mark` is false: `wake_grant` judges before its request without
+   * moving it, so a request that fails changes no grant at all. With no session holding the
+   * ear, nothing is pushed anyway and a grant is kept for its own session's return.
    */
-  #grants(ear: string, state: EarState, now: number): CanticleWakeGrant[] {
+  #grants(
+    ear: string,
+    state: EarState,
+    now: number,
+    mark = true,
+  ): CanticleWakeGrant[] {
     const store = this.#deps.store;
     const rows = store.canticleWakeGrants(ear);
     if (rows.length === 0) return [];
@@ -2152,7 +2158,7 @@ export class CanticleDelivery {
         { ear, stream: `${grant.station}:${grant.stream}`, class: grant.cls },
       );
     }
-    if (held.length > 0) store.markCanticleWakeGrantsSeen(ear, now);
+    if (mark && held.length > 0) store.markCanticleWakeGrantsSeen(ear, now);
     return held;
   }
 
@@ -2377,8 +2383,9 @@ export class CanticleDelivery {
     const store = this.#deps.store;
     const now = this.#deps.clock.now();
     // Judge what is there first, so a grant already unprovable (the clock went back) is
-    // discarded and counted rather than silently replaced.
-    this.#grants(ear, this.#state(ear), now);
+    // discarded and counted rather than silently replaced. The mark moves only once the
+    // request has succeeded (#grantsView below), so one that fails changes nothing.
+    this.#grants(ear, this.#state(ear), now, false);
     if (request.revoke) {
       store.deleteCanticleWakeGrants(
         ear,
@@ -2387,8 +2394,9 @@ export class CanticleDelivery {
           : undefined,
       );
     } else {
-      for (const cls of request.classes) {
-        store.setCanticleWakeGrant({
+      // Every class in one whole: a fault on any leaves none made and none extended.
+      store.setCanticleWakeGrants(
+        request.classes.map((cls) => ({
           ear,
           station: request.station,
           stream: request.stream,
@@ -2396,8 +2404,8 @@ export class CanticleDelivery {
           sessionId,
           grantedAt: now,
           expiresAt: now + request.ttlMs,
-        });
-      }
+        })),
+      );
     }
     return {
       grants: this.#grantsView(ear, this.#state(ear), now),

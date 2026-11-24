@@ -916,7 +916,8 @@ test("#176 proof 4: a failed multi-class wake_grant leaves an existing grant exa
     );
     // The grant still holds until its own expiry...
     host.sing(1, AMBIENT);
-    h.timers.advance(2_000);
+    h.timers.advance(7_000);
+    assert.ok(h.clock.now() < expiresAt);
     assert.equal(pushes(shim).length, 1, "the original grant still wakes");
     await confirm(shim);
     // ...and not past it.
@@ -957,6 +958,36 @@ test("#176 proof 4: a multi-class wake_grant that succeeds makes every class it 
     h.timers.advance(10_000);
     assert.equal(pushes(shim).length, 2, "ambient wakes");
     assert.deepEqual(order(pushes(shim)[1]!.content), ["ops:ops.fleet/2"]);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("store: a wake_grant request's grants are one whole inside a caller's transaction too: a caught fault on one class commits none of them", () => {
+  const { h } = setup({ mode: "immediate" }, { wakeKeys: [OPS] });
+  try {
+    faultSecondClass(h);
+    const row = (cls: string) => ({
+      ear: "scribe",
+      station: "ops",
+      stream: "ops.fleet",
+      cls,
+      sessionId: SESSION,
+      grantedAt: 1_000,
+      expiresAt: 61_000,
+    });
+    h.store.atomically(() => {
+      h.store.setCanticleWakeGrant(row("alarm"));
+      assert.throws(
+        () => h.store.setCanticleWakeGrants([row("ambient"), row("chatter")]),
+        /injected on the second class/u,
+      );
+    });
+    assert.deepEqual(
+      h.store.canticleWakeGrants("scribe").map(({ cls }) => cls),
+      ["alarm"],
+      "the caller's own write commits; none of the failed request's does",
+    );
   } finally {
     h.dispose();
   }
