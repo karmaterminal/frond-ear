@@ -769,7 +769,11 @@ overflow.
   - the clock stepped back: it reads earlier than the moment the grant was made, or than the latest moment
     frond-ear found it holding (it keeps that mark per grant, in the store). Mid-run or across a restart, a
     clock that went backwards leaves how long the grant has run unknown, so every grant it holds is discarded
-    rather than left to expire on that clock. A new `wake_grant` afterwards starts a fresh one;
+    rather than left to expire on that clock. A new `wake_grant` afterwards starts a fresh one. Two honest
+    limits: the mark moves once a poll (`POLL_MS`, 1 s), so a step back smaller than the time since the last poll
+    isn't seen and a grant can overrun its TTL by up to one poll; and if the daemon was down longer than the clock
+    went back, the clock still reads past the mark on restart, so no wall-clock mark can see that step and the
+    grant survives it, overrunning by as much as the clock went back, which is less than the time it was down;
   - its row claims more than 24 h;
   - its class isn't registered.
 - A grant survives a restart only while all of that still holds (the clock reads no earlier than its mark) and the
