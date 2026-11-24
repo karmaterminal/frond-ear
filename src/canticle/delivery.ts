@@ -88,6 +88,13 @@ import type {
   EventStore,
 } from "../store.ts";
 import type { Clock, Timers } from "../types.ts";
+import {
+  type ExposureFence,
+  exposureReader,
+  exposureRecord,
+  exposureSource,
+  type HolderIdentity,
+} from "./exposure.ts";
 import { iso, joinedLate, onAir, renderItem, secs, token } from "./hear.ts";
 import { CLASS_BY_NAME } from "./ids.ts";
 import type { HearView, LiveItem } from "./receptor.ts";
@@ -962,9 +969,14 @@ export interface DeliveryDeps {
    * The session holding the ear now, as frond-ear knows it (its attach generation, and its
    * id when its shim gave one), or undefined when none does.
    */
-  session: (
-    ear: string,
-  ) => { generation: number; sessionId: string | null } | undefined;
+  session: (ear: string) =>
+    | {
+        generation: number;
+        sessionId: string | null;
+        /** #114's holder identity, for the exposure ledger (#117). */
+        holder?: HolderIdentity;
+      }
+    | undefined;
   /**
    * Sends one notification to the ear's session (and its taps) as canticle batch
    * `batchId`. Returns whether a session's connection took it; that is not delivery,
@@ -1612,6 +1624,21 @@ export class CanticleDelivery {
       now,
     ];
     const path = cadence === "digest" ? "report" : "immediate";
+    // The exposure ledger (#117), only when it is on: fenced in the claim, before the push.
+    const fence = config.canticle!.exposure.enabled
+      ? (batchId: number): ExposureFence => ({
+          record: exposureRecord(
+            ear,
+            batchId,
+            exposureReader(ear, session),
+            rendered.content,
+            rendered.entries.map(({ waiting, text }) =>
+              exposureSource(waiting.item.provenance(), text),
+            ),
+          ),
+          holder: session.holder ?? (session.sessionId ? "known" : "unknown"),
+        })
+      : undefined;
     const claimed = this.#claim(
       ear,
       session,
@@ -1630,6 +1657,7 @@ export class CanticleDelivery {
           rendered.shown.get(waiting) ?? "none",
         ),
       ),
+      fence,
     );
     let sent = false;
     let failure: string | undefined;
@@ -1706,6 +1734,7 @@ export class CanticleDelivery {
     cursor: Cursor,
     previous: Cursor,
     exposures: readonly CanticleExposure[],
+    fence?: (batchId: number) => ExposureFence,
   ): { batchId: number; restore: () => void } {
     const rows = this.#rows(records);
     const batchId = this.#deps.store.claimCanticlePush(
@@ -1718,6 +1747,7 @@ export class CanticleDelivery {
         before: JSON.stringify(previous),
       },
       exposures,
+      fence,
     );
     const settled = this.#settled.get(ear);
     const refreshes = this.#refreshes.get(ear);
@@ -2691,6 +2721,12 @@ function render(input: RenderInput): {
   pushed: Waiting[];
   /** How much of each pushed record the text shows (custody's `shown`). */
   shown: ReadonlyMap<Waiting, CanticleShown>;
+  /**
+   * Each pushed record in the order the text carries it, with the exact text that shows
+   * it: its banner and quoted payload, or for counts its stream's line (the exposure
+   * ledger's rendered entry, #117).
+   */
+  entries: ReadonlyArray<{ waiting: Waiting; text: string }>;
 } {
   const { cadence, ordered, view, maxChars, delivery } = input;
   /** `compact` keeps the two lines every push needs and drops the rest. */
@@ -2883,6 +2919,7 @@ function render(input: RenderInput): {
     content: string,
     pushed: Waiting[],
     shown: (waiting: Waiting) => CanticleShown,
+    entries: Array<{ waiting: Waiting; text: string }>,
   ) =>
     pushed.length > 0
       ? {
@@ -2890,8 +2927,15 @@ function render(input: RenderInput): {
           meta: meta(pushed),
           pushed,
           shown: new Map(pushed.map((waiting) => [waiting, shown(waiting)])),
+          entries,
         }
-      : { content: "", meta: meta([]), pushed: [], shown: new Map() };
+      : {
+          content: "",
+          meta: meta([]),
+          pushed: [],
+          shown: new Map(),
+          entries: [],
+        };
 
   if (ordered.length === 0) {
     // A push of its own for the coverage note, when no record is left to carry it.
@@ -2903,6 +2947,7 @@ function render(input: RenderInput): {
       meta: meta([]),
       pushed: [],
       shown: new Map(),
+      entries: [],
     };
   }
 
@@ -2910,21 +2955,21 @@ function render(input: RenderInput): {
     // One line per stream; a stream is whole or waits for the next report. The header's
     // optional lines and the missed streams' own lines go first when one doesn't fit.
     const groups = [...byStream(ordered)];
+    const line = ([stream, records]: [string, Waiting[]]) =>
+      streamLine(
+        stream,
+        records,
+        input.cursor.streams[stream],
+        input.missed.get(stream),
+        true,
+        input.late,
+      );
     const assemble = (taken: Array<[string, Waiting[]]>, compact: boolean) => {
       const count = taken.reduce((n, [, records]) => n + records.length, 0);
       return [
         ...head(count, taken.length, compact),
         "",
-        ...taken.map(([stream, records]) =>
-          streamLine(
-            stream,
-            records,
-            input.cursor.streams[stream],
-            input.missed.get(stream),
-            true,
-            input.late,
-          ),
-        ),
+        ...taken.map(line),
         ...foot(
           ordered.length - count,
           new Set(taken.map(([s]) => s)),
@@ -2940,11 +2985,15 @@ function render(input: RenderInput): {
       if (assemble([...taken, group], compact).length > maxChars) break;
       taken.push(group);
     }
-    // Counts carry no payload at all.
+    // Counts carry no payload at all: each record is shown by its stream's line.
     return result(
       assemble(taken, compact),
       taken.flatMap(([, records]) => records),
       () => "none",
+      taken.flatMap((group) => {
+        const text = line(group);
+        return group[1].map((waiting) => ({ waiting, text }));
+      }),
     );
   }
 
@@ -3014,6 +3063,8 @@ function render(input: RenderInput): {
     return render({ ...input, style: "counts" });
   }
   const cut = new Set(taken.filter((t) => t.cut).map((t) => t.waiting));
+  // The order `assemble` writes them in: by stream, as each stream first comes.
+  const streams = [...byStream(taken.map((t) => t.waiting)).keys()];
   return result(
     assemble(taken),
     taken.map((t) => t.waiting),
@@ -3023,5 +3074,10 @@ function render(input: RenderInput): {
         : cut.has(waiting)
           ? "cut"
           : "whole",
+    streams.flatMap((stream) =>
+      taken
+        .filter((t) => t.waiting.stream === stream)
+        .map((t) => ({ waiting: t.waiting, text: t.text })),
+    ),
   );
 }

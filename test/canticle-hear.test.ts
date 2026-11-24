@@ -28,6 +28,9 @@ const item = (over: Partial<LiveItem> = {}): LiveItem => ({
   ageMs: 20_000,
   expiresInMs: 880_000,
   copies: 3,
+  provenance: () => {
+    throw new Error("hear never reads a record's exposure provenance");
+  },
   ...over,
 });
 

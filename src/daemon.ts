@@ -745,12 +745,13 @@ export class Daemon {
           logger: this.logger,
           session: (ear) => {
             const client = this.attached.get(ear);
-            return client
-              ? {
-                  generation: client.attachGeneration,
-                  sessionId: client.sessionId ?? null,
-                }
-              : undefined;
+            if (!client) return undefined;
+            const holder = this.holderIdentity(ear);
+            return {
+              generation: client.attachGeneration,
+              sessionId: client.sessionId ?? null,
+              holder: holder === "detached" ? "unknown" : holder,
+            };
           },
           push: (ear, batchId, notification) =>
             this.pushCanticle(ear, batchId, notification),
@@ -893,6 +894,22 @@ export class Daemon {
         scheduleId: wake.scheduleId,
         wakeId: wake.id,
       });
+    }
+    // The exposure ledger's own bounds (#117): only confirmed records go, counted. Fenced
+    // and unknown ones are never evicted, so an ear they alone keep past the bound warns.
+    const exposure = this.config.canticle?.exposure;
+    if (exposure) {
+      const pruned = this.store.pruneCanticleExposure(exposure);
+      for (const [ear, evicted] of Object.entries(pruned.evicted)) {
+        this.logger.log("info", "canticle.exposure_evicted", { ear, evicted });
+      }
+      for (const [ear, held] of Object.entries(pruned.overBound)) {
+        this.logger.log("warn", "canticle.exposure_over_bound", {
+          ear,
+          held,
+          maxRecords: exposure.maxRecords,
+        });
+      }
     }
     return this.store.prune(this.config.limits.retentionMs);
   }
@@ -2606,7 +2623,9 @@ export class Daemon {
     }
   }
 
-  private holderIdentity(ear: string): string {
+  private holderIdentity(
+    ear: string,
+  ): "detached" | "in-doubt" | "known" | "unknown" {
     const client = this.attached.get(ear);
     if (!client) {
       return "detached";
@@ -5176,6 +5195,29 @@ export class Daemon {
     };
   }
 
+  /**
+   * The exposure ledger's summary for ear_status (#117): its records by phase, how many
+   * were evicted, how many prunes found it past its bound, and why it is degraded: fenced
+   * and unknown records are never evicted, so they alone can hold it past `maxRecords`.
+   */
+  private exposureSummary(ear: string, bounds: { maxRecords: number }): object {
+    const counts = this.store.canticleExposureCounts(ear);
+    const counters = this.store.counters();
+    const held = counts.fenced + counts.unknown;
+    return {
+      enabled: true,
+      ...counts,
+      evicted: counters[`canticle_exposure_evicted.${ear}`] ?? 0,
+      overBound: counters[`canticle_exposure_over_bound.${ear}`] ?? 0,
+      reasons:
+        held > bounds.maxRecords
+          ? [
+              `${held} fenced or unknown records over maxRecords ${bounds.maxRecords}; they are never evicted`,
+            ]
+          : [],
+    };
+  }
+
   public status(onlyEar?: string): object {
     const ears = Object.entries(this.config.ears)
       .filter(([name]) => onlyEar === undefined || name === onlyEar)
@@ -5185,6 +5227,10 @@ export class Daemon {
         const canticleDelivery = this.canticle?.status(name);
         const canticleCustody = this.options.canticleHear
           ? this.custodySummary(name)
+          : undefined;
+        // The exposure ledger (#117), by phase; read-only, and only while it is on.
+        const canticleExposure = this.config.canticle?.exposure.enabled
+          ? this.exposureSummary(name, this.config.canticle.exposure)
           : undefined;
         return {
           name,
@@ -5213,6 +5259,7 @@ export class Daemon {
           hold: this.holdView(name),
           ...(canticleDelivery ? { canticleDelivery } : {}),
           ...(canticleCustody ? { canticleCustody } : {}),
+          ...(canticleExposure ? { canticleExposure } : {}),
           roomEgress: {
             policy: this.config.canticle?.roomPolicy ?? "observe",
             windowMs: CUSTODY_WINDOW_MS,

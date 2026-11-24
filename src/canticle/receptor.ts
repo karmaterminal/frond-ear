@@ -13,6 +13,7 @@ import { createSocket, type Socket } from "node:dgram";
 import type { CanticleConfig } from "../config.ts";
 import type { StructuredLogger } from "../logger.ts";
 import type { Clock, Timers } from "../types.ts";
+import type { HeardProvenance, SourceTuple } from "./exposure.ts";
 import { systemClock, systemTimers } from "../types.ts";
 import { CLASSES, SCOPE_NAMES } from "./ids.ts";
 import { Listener, type ListenerEvent, type SafetyState } from "./listener.ts";
@@ -22,6 +23,7 @@ import {
   FLAG_REFRESH,
   FLAG_WAKE_DERIVED,
   type Identity,
+  type Item,
 } from "./wire.ts";
 
 /** A station key id as items carry it: SHA-256(public key)[0:8] in hex (§5.1). */
@@ -102,6 +104,11 @@ export interface LiveItem {
    * restarted (§14.18.3, D36). Delivery marks either late.
    */
   origin?: "snapshot" | "resurfaced" | undefined;
+  /**
+   * What the verified record says of itself, as the exposure ledger (#117, binary-canticle
+   * #162's `PayloadSource`) keeps it. Lazy: only a push the ledger fences asks for it.
+   */
+  provenance: () => HeardProvenance;
 }
 
 export interface HearView {
@@ -204,6 +211,85 @@ function rootOf(
 ): string {
   const r = root ?? { keyId: Buffer.from(kid, "hex"), ...self };
   return `${Buffer.from(r.keyId).toString("hex").slice(0, 16)}:${r.epoch}:${r.stream.toString(16).padStart(8, "0")}:${r.seq}`;
+}
+
+const tupleOf = (identity: Identity): SourceTuple => ({
+  key_id: Buffer.from(identity.keyId).toString("hex").slice(0, 16),
+  epoch: identity.epoch,
+  stream_id: identity.stream,
+  seq: identity.seq.toString(),
+});
+
+const sha256Hex = (bytes: Uint8Array) =>
+  createHash("sha256").update(bytes).digest("hex");
+
+/**
+ * A record this listener heard itself, as the exposure ledger keeps it (#117). There is no
+ * record v1 run, so no receiver; the times are this listener's own.
+ */
+function embeddedProvenance(
+  h: {
+    kid: string;
+    item: Item;
+    firstHeard: number;
+    localExpiry: number;
+  },
+  station: string,
+  stream: string,
+  offset: number,
+): HeardProvenance {
+  const it = h.item;
+  const key = h.kid.toLowerCase().slice(0, 16);
+  const streamHex = it.stream.toString(16).padStart(8, "0");
+  return {
+    item: {
+      key_id: key,
+      epoch: it.epoch,
+      stream_id: it.stream,
+      seq: it.seq.toString(),
+    },
+    idem: `canticle:${key}:${it.epoch}:${streamHex}:${it.seq}`,
+    root: it.root === undefined ? null : tupleOf(it.root),
+    hop: it.hop,
+    class: CLASSES.get(it.cls)?.name ?? String(it.cls),
+    scope: SCOPE_NAMES.get(it.scope) ?? String(it.scope),
+    lens: it.lens ?? null,
+    station,
+    principal: null,
+    stream,
+    stateKey: it.stateKey ?? null,
+    flags: {
+      refresh: (it.flags & FLAG_REFRESH) !== 0,
+      wake_derived: (it.flags & FLAG_WAKE_DERIVED) !== 0,
+      exercise: (it.flags & FLAG_EXERCISE) !== 0,
+    },
+    times: {
+      issued_at: it.issuedAt,
+      expires_at: it.expiresAt,
+      received_at: null,
+      heard_at: h.firstHeard,
+      offset_ms: offset,
+      local_expiry_at: h.localExpiry,
+    },
+    sourceBody:
+      it.body === undefined
+        ? null
+        : {
+            ctype: it.ctype,
+            size: it.body.length,
+            sha256: sha256Hex(it.body),
+            textSha256: it.ctype === 1 ? sha256Hex(it.body) : null,
+          },
+    bodyRef:
+      it.bodyRef === undefined
+        ? null
+        : {
+            url: it.bodyRef.url,
+            sha256: Buffer.from(it.bodyRef.sha256).toString("hex"),
+            size: Number(it.bodyRef.size),
+          },
+    receiver: null,
+  };
 }
 
 export class CanticleReceptor {
@@ -485,6 +571,7 @@ export class CanticleReceptor {
         ?.streamNames.get(h.item.stream);
       if (stream === undefined || !tuned(patterns, station, stream)) continue;
       const it = h.item;
+      const offset = this.#listener.clockOffset(h.kid);
       out.push({
         station,
         key: h.kid,
@@ -512,14 +599,8 @@ export class CanticleReceptor {
           sha256: Buffer.from(it.bodyRef.sha256).toString("hex"),
           size: it.bodyRef.size.toString(),
         },
-        ageMs: Math.max(
-          0,
-          now - it.issuedAt - this.#listener.clockOffset(h.kid),
-        ),
-        ageAtHearingMs: Math.max(
-          0,
-          h.firstHeard - it.issuedAt - this.#listener.clockOffset(h.kid),
-        ),
+        ageMs: Math.max(0, now - it.issuedAt - offset),
+        ageAtHearingMs: Math.max(0, h.firstHeard - it.issuedAt - offset),
         expiresInMs: Math.max(0, h.localExpiry - now),
         copies: h.copies,
         wakeDerived: (it.flags & FLAG_WAKE_DERIVED) !== 0,
@@ -529,6 +610,7 @@ export class CanticleReceptor {
           it.stateKey !== undefined && it.body !== undefined
             ? createHash("sha256").update(it.body).digest("hex")
             : undefined,
+        provenance: () => embeddedProvenance(h, station, stream, offset),
       });
     }
     return out;

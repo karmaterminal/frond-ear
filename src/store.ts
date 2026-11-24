@@ -3,6 +3,15 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
+import {
+  type ExposureCounts,
+  type ExposureEntry,
+  type ExposureFence,
+  type ExposurePhase,
+  type ExposureRecord,
+  type HolderIdentity,
+  pendingIdOf,
+} from "./canticle/exposure.ts";
 import { WakeStore } from "./wake-store.ts";
 import type {
   BatchKind,
@@ -596,6 +605,96 @@ function mapEvent(row: EventRow): StoredEvent {
   };
 }
 
+/**
+ * The exposure ledger (#117, canticle/exposure.ts): one row per canticle push that carried
+ * records, fenced in the push's claim and never deleted except as a confirmed (offered or
+ * echoed) record past its bounds. `batch_id` is unique: batch ids are never reused. The
+ * table and its index are created whether `canticle.exposure.enabled` is on or off: off,
+ * they stay empty, and behaviour is as without them.
+ */
+const EXPOSURE_TABLE = `
+      CREATE TABLE IF NOT EXISTS canticle_exposure (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        pending_id TEXT NOT NULL UNIQUE,
+        ear TEXT NOT NULL,
+        batch_id INTEGER NOT NULL UNIQUE,
+        generation INTEGER NOT NULL,
+        phase TEXT NOT NULL CHECK (phase IN ('fenced', 'offered', 'echoed', 'unknown')),
+        holder TEXT NOT NULL CHECK (holder IN ('known', 'unknown', 'in-doubt')),
+        fenced_at INTEGER NOT NULL,
+        offered_at INTEGER,
+        offer_session TEXT,
+        echoed_at INTEGER,
+        echo_session TEXT,
+        echo_kind TEXT,
+        unknown_at INTEGER,
+        unknown_reason TEXT CHECK (unknown_reason IN ('unsent', 'reverted')),
+        record TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS canticle_exposure_ear
+        ON canticle_exposure (ear, fenced_at);`;
+
+interface ExposureRow {
+  pending_id: string;
+  ear: string;
+  batch_id: number;
+  phase: ExposurePhase;
+  holder: HolderIdentity;
+  fenced_at: number;
+  offered_at: number | null;
+  offer_session: string | null;
+  echoed_at: number | null;
+  echo_session: string | null;
+  echo_kind: string | null;
+  unknown_at: number | null;
+  unknown_reason: "unsent" | "reverted" | null;
+  record: string;
+}
+
+/** One exposure ledger row as `ExposureEntry`: also how `frond-ear exposure` reads one. */
+export function exposureEntry(row: ExposureRow): ExposureEntry {
+  return {
+    pendingId: row.pending_id,
+    ear: row.ear,
+    batchId: row.batch_id,
+    phase: row.phase,
+    fencedAt: row.fenced_at,
+    holder: row.holder,
+    offered:
+      row.offered_at === null
+        ? null
+        : { at: row.offered_at, sessionId: row.offer_session },
+    echoed:
+      row.echoed_at === null
+        ? null
+        : {
+            at: row.echoed_at,
+            sessionId: row.echo_session,
+            by: row.echo_kind ?? "",
+          },
+    unknown:
+      row.unknown_at === null
+        ? null
+        : { at: row.unknown_at, reason: row.unknown_reason ?? "reverted" },
+    record: JSON.parse(row.record) as ExposureRecord,
+  };
+}
+
+/** The ledger's rows for `ear` fenced at or after `since`, oldest first. */
+export function readExposures(
+  database: DatabaseSync,
+  ear: string,
+  since: number,
+): ExposureEntry[] {
+  return (
+    database
+      .prepare(
+        "SELECT * FROM canticle_exposure WHERE ear = ? AND fenced_at >= ? ORDER BY id",
+      )
+      .all(ear, since) as unknown as ExposureRow[]
+  ).map(exposureEntry);
+}
+
 const PENDING_STATES = "('context', 'queued', 'stored')";
 const UNSEEN_STATES = "('context', 'queued', 'stored', 'offered')";
 /**
@@ -821,6 +920,7 @@ export class EventStore {
         ON canticle_custody (claimed_at);
       CREATE INDEX IF NOT EXISTS canticle_custody_identity
         ON canticle_custody (ear, identity);
+      ${EXPOSURE_TABLE}
       CREATE TABLE IF NOT EXISTS canticle_claims (
         batch_id INTEGER PRIMARY KEY,
         ear TEXT NOT NULL,
@@ -1017,6 +1117,26 @@ export class EventStore {
   /** Runs `work` in one IMMEDIATE transaction (not re-entrant). */
   public atomically<T>(work: () => T): T {
     return this.transaction(work);
+  }
+
+  /**
+   * Runs `work` as one whole: in a transaction of its own, or, inside a caller's, in a
+   * savepoint, so a failure part way undoes only `work` even if the caller catches it and
+   * commits. Not for `transaction`'s callers to use instead: a BEGIN nested by mistake
+   * should still fail loudly there.
+   */
+  private whole<T>(work: () => T): T {
+    if (!this.database.isTransaction) return this.transaction(work);
+    this.database.exec("SAVEPOINT whole");
+    try {
+      const result = work();
+      this.database.exec("RELEASE whole");
+      return result;
+    } catch (error) {
+      this.database.exec("ROLLBACK TO whole");
+      this.database.exec("RELEASE whole");
+      throw error;
+    }
   }
 
   private transaction<T>(work: () => T): T {
@@ -1451,6 +1571,7 @@ export class EventStore {
     rows: ReadonlyArray<Omit<CanticleSettled, "ear">>,
     cursor: { name: string; value: string; before: string },
     exposures: readonly CanticleExposure[],
+    fence?: (batchId: number) => ExposureFence,
   ): number {
     return this.transaction(() => {
       const now = this.clock.now();
@@ -1495,6 +1616,10 @@ export class EventStore {
           lineageOf(exposure),
         );
       }
+      // The exposure ledger's fence (#117), in the claim: durable before the push goes out.
+      if (fence !== undefined && exposures.length > 0) {
+        this.fenceCanticleExposure(ear, batchId, fence(batchId));
+      }
       return batchId;
     });
   }
@@ -1512,6 +1637,7 @@ export class EventStore {
     this.transaction(() => {
       this.dropCanticleClaim(ear, batchId);
       this.setRuntimeState(cursor.name, cursor.value);
+      this.unknownCanticleExposure(ear, batchId, "unsent");
     });
   }
 
@@ -1536,7 +1662,9 @@ export class EventStore {
   /**
    * The host handed canticle batch `batchId` to the session (the shim's `offered`): its
    * records are offered now, to the session holding the ear now, under its boundary now,
-   * and no revert can give the push back. Returns how many.
+   * and no revert can give the push back. The claim's release, the exposure ledger's offer
+   * (#117) and custody's are one whole: a failure part way leaves all three as they were,
+   * whether this runs alone or inside a caller's transaction. Returns how many.
    */
   public offerCanticleCustody(
     ear: string,
@@ -1547,25 +1675,29 @@ export class EventStore {
       boundary: CompactionBoundary;
     },
   ): number {
-    this.database
-      .prepare("DELETE FROM canticle_claims WHERE ear = ? AND batch_id = ?")
-      .run(ear, batchId);
-    return Number(
+    // The daemon offers inside its own transaction (with confirmBatch), so this one nests.
+    return this.whole(() => {
       this.database
-        .prepare(
-          `UPDATE canticle_custody SET offered_at = ?, offer_session = ?, offer_boundary = ?,
-             offer_boundary_known = ?
-           WHERE ear = ? AND batch_id = ? AND offered_at IS NULL`,
-        )
-        .run(
-          offer.at,
-          offer.sessionId,
-          offer.boundary ?? null,
-          offer.boundary === undefined ? 0 : 1,
-          ear,
-          batchId,
-        ).changes,
-    );
+        .prepare("DELETE FROM canticle_claims WHERE ear = ? AND batch_id = ?")
+        .run(ear, batchId);
+      this.offerCanticleExposure(ear, batchId, offer);
+      return Number(
+        this.database
+          .prepare(
+            `UPDATE canticle_custody SET offered_at = ?, offer_session = ?, offer_boundary = ?,
+               offer_boundary_known = ?
+             WHERE ear = ? AND batch_id = ? AND offered_at IS NULL`,
+          )
+          .run(
+            offer.at,
+            offer.sessionId,
+            offer.boundary ?? null,
+            offer.boundary === undefined ? 0 : 1,
+            ear,
+            batchId,
+          ).changes,
+      );
+    });
   }
 
   /** Whether `batchId` is one of this ear's canticle pushes that custody still holds. */
@@ -1619,7 +1751,8 @@ export class EventStore {
    * vouch for the push it names (🍃 on #112). The same session is the one the offer went
    * to, by id; only an offer made while no id was known falls back to the attach. A
    * session that changed within one attach (a /clear) never echoes what the one before it
-   * was shown, and a push the host never confirmed echoes nothing. Returns how many
+   * was shown, and a push the host never confirmed echoes nothing. The exposure ledger's
+   * echo (#117) is in the same transaction, so the two never disagree. Returns how many
    * records were echoed.
    */
   public echoCanticleCustody(
@@ -1633,28 +1766,32 @@ export class EventStore {
       boundary: CompactionBoundary;
     },
   ): number {
-    return Number(
-      this.database
-        .prepare(
-          `UPDATE canticle_custody SET echoed_at = ?, echo_kind = ?, echo_batch = ?,
-             echo_session = ?, echo_boundary = ?, echo_boundary_known = ?
-           WHERE ear = ? AND batch_id = ?
-             AND offered_at IS NOT NULL AND echoed_at IS NULL
-             AND (offer_session = ? OR (offer_session IS NULL AND generation = ?))`,
-        )
-        .run(
-          echo.at,
-          echo.kind,
-          batchId,
-          echo.sessionId,
-          echo.boundary ?? null,
-          echo.boundary === undefined ? 0 : 1,
-          ear,
-          batchId,
-          echo.sessionId,
-          echo.generation,
-        ).changes,
-    );
+    return this.transaction(() => {
+      // The ledger takes the echo on its own terms (the session it was offered to).
+      this.echoCanticleExposure(ear, batchId, echo);
+      return Number(
+        this.database
+          .prepare(
+            `UPDATE canticle_custody SET echoed_at = ?, echo_kind = ?, echo_batch = ?,
+               echo_session = ?, echo_boundary = ?, echo_boundary_known = ?
+             WHERE ear = ? AND batch_id = ?
+               AND offered_at IS NOT NULL AND echoed_at IS NULL
+               AND (offer_session = ? OR (offer_session IS NULL AND generation = ?))`,
+          )
+          .run(
+            echo.at,
+            echo.kind,
+            batchId,
+            echo.sessionId,
+            echo.boundary ?? null,
+            echo.boundary === undefined ? 0 : 1,
+            ear,
+            batchId,
+            echo.sessionId,
+            echo.generation,
+          ).changes,
+      );
+    });
   }
 
   /**
@@ -1704,6 +1841,215 @@ export class EventStore {
           lineageOf(exposure),
         );
       }
+    });
+  }
+
+  // ---- the exposure ledger (#117) --------------------------------------------------
+
+  /**
+   * Fences canticle push `batchId`'s exposure record, before the push goes out (#162's
+   * `begin`): written as `fenced` and returned by its pendingId. The same record fenced
+   * again is the same fence (its pendingId, no second row, its phase as it is); another
+   * record for a push already fenced is refused. Inside the push's claim it shares its
+   * transaction; on its own it is one statement.
+   */
+  public fenceCanticleExposure(
+    ear: string,
+    batchId: number,
+    fence: ExposureFence,
+  ): string {
+    const pendingId = pendingIdOf(ear, batchId, fence.record);
+    const held = this.database
+      .prepare(
+        "SELECT pending_id, ear FROM canticle_exposure WHERE batch_id = ?",
+      )
+      .get(batchId) as { pending_id: string; ear: string } | undefined;
+    if (held !== undefined) {
+      if (held.pending_id === pendingId && held.ear === ear) return pendingId;
+      throw new Error(
+        `canticle push ${batchId} is already fenced under another exposure record`,
+      );
+    }
+    const batch = this.database
+      .prepare(
+        "SELECT attach_generation AS generation FROM batches WHERE id = ? AND ear = ? AND kind = 'canticle'",
+      )
+      .get(batchId, ear) as { generation: number } | undefined;
+    if (batch === undefined) {
+      throw new Error(`no canticle push ${batchId} of ear ${ear} to fence`);
+    }
+    this.database
+      .prepare(
+        `INSERT INTO canticle_exposure (pending_id, ear, batch_id, generation, phase, holder,
+           fenced_at, record)
+         VALUES (?, ?, ?, ?, 'fenced', ?, ?, ?)`,
+      )
+      .run(
+        pendingId,
+        ear,
+        batchId,
+        batch.generation,
+        fence.holder,
+        this.clock.now(),
+        JSON.stringify(fence.record),
+      );
+    return pendingId;
+  }
+
+  /** The host handed push `batchId` to the session: its fenced record is offered. */
+  public offerCanticleExposure(
+    ear: string,
+    batchId: number,
+    offer: { at: number; sessionId: string | null },
+  ): number {
+    return Number(
+      this.database
+        .prepare(
+          `UPDATE canticle_exposure SET phase = 'offered', offered_at = ?, offer_session = ?
+           WHERE ear = ? AND batch_id = ? AND phase = 'fenced'`,
+        )
+        .run(offer.at, offer.sessionId, ear, batchId).changes,
+    );
+  }
+
+  /**
+   * The session named push `batchId`'s whole batch_id: its offered record is echoed, its
+   * offered receipt kept. Only the session it was offered to can echo it (by id; an offer
+   * made while no id was known falls back to its attach, as custody does), so a foreign
+   * session's echo changes nothing. Returns how many records it echoed (0 or 1).
+   */
+  public echoCanticleExposure(
+    ear: string,
+    batchId: number,
+    echo: {
+      at: number;
+      kind: string;
+      sessionId: string | null;
+      generation: number;
+    },
+  ): number {
+    return Number(
+      this.database
+        .prepare(
+          `UPDATE canticle_exposure SET phase = 'echoed', echoed_at = ?, echo_session = ?,
+             echo_kind = ?
+           WHERE ear = ? AND batch_id = ? AND phase = 'offered'
+             AND (offer_session = ? OR (offer_session IS NULL AND generation = ?))`,
+        )
+        .run(
+          echo.at,
+          echo.sessionId,
+          echo.kind,
+          ear,
+          batchId,
+          echo.sessionId,
+          echo.generation,
+        ).changes,
+    );
+  }
+
+  /** A fence whose push never reached `offered` becomes unknown: never cleared. */
+  private unknownCanticleExposure(
+    ear: string,
+    batchId: number,
+    reason: "unsent" | "reverted",
+  ): void {
+    this.database
+      .prepare(
+        `UPDATE canticle_exposure SET phase = 'unknown', unknown_at = ?, unknown_reason = ?
+         WHERE ear = ? AND batch_id = ? AND phase = 'fenced'`,
+      )
+      .run(this.clock.now(), reason, ear, batchId);
+  }
+
+  /** The ear's exposure records fenced at or after `since`, oldest first. */
+  public canticleExposures(ear: string, since: number): ExposureEntry[] {
+    return readExposures(this.database, ear, since);
+  }
+
+  /** The ear's exposure records by phase. */
+  public canticleExposureCounts(ear: string): ExposureCounts {
+    const rows = this.database
+      .prepare(
+        "SELECT phase, COUNT(*) AS n FROM canticle_exposure WHERE ear = ? GROUP BY phase",
+      )
+      .all(ear) as Array<{ phase: ExposurePhase; n: number }>;
+    const counts: ExposureCounts = {
+      records: 0,
+      fenced: 0,
+      offered: 0,
+      echoed: 0,
+      unknown: 0,
+    };
+    for (const { phase, n } of rows) {
+      counts[phase] = n;
+      counts.records += n;
+    }
+    return counts;
+  }
+
+  /**
+   * Bounds the ledger (#117): offered and echoed records fenced more than `maxAgeMs` ago
+   * go, then, per ear past `maxRecords`, the oldest offered or echoed ones until the bound
+   * holds. A fenced or unknown record is never evicted. Every eviction is counted per ear
+   * (`canticle_exposure_evicted.<ear>`). An ear whose fenced and unknown records alone are
+   * still past `maxRecords` stays so, and each prune that finds it so counts it
+   * (`canticle_exposure_over_bound.<ear>`). Returns how many went per ear, and how many
+   * records each ear over its bound still holds.
+   */
+  public pruneCanticleExposure(bounds: {
+    maxAgeMs: number;
+    maxRecords: number;
+  }): { evicted: Record<string, number>; overBound: Record<string, number> } {
+    return this.transaction(() => {
+      const evicted: Record<string, number> = {};
+      const overBound: Record<string, number> = {};
+      const cutoff = this.clock.now() - bounds.maxAgeMs;
+      const ears = (
+        this.database
+          .prepare("SELECT DISTINCT ear FROM canticle_exposure")
+          .all() as Array<{ ear: string }>
+      ).map((row) => row.ear);
+      for (const ear of ears) {
+        let gone = Number(
+          this.database
+            .prepare(
+              `DELETE FROM canticle_exposure WHERE ear = ? AND fenced_at < ?
+               AND phase IN ('offered', 'echoed')`,
+            )
+            .run(ear, cutoff).changes,
+        );
+        const { n } = this.database
+          .prepare("SELECT COUNT(*) AS n FROM canticle_exposure WHERE ear = ?")
+          .get(ear) as { n: number };
+        if (n > bounds.maxRecords) {
+          gone += Number(
+            this.database
+              .prepare(
+                `DELETE FROM canticle_exposure WHERE id IN (
+                   SELECT id FROM canticle_exposure
+                   WHERE ear = ? AND phase IN ('offered', 'echoed')
+                   ORDER BY id LIMIT ?)`,
+              )
+              .run(ear, n - bounds.maxRecords).changes,
+          );
+        }
+        if (gone > 0) {
+          this.increment(`canticle_exposure_evicted.${ear}`, gone);
+          evicted[ear] = gone;
+        }
+        // Whatever is left past the bound is fenced or unknown: kept, but never quietly.
+        const { held } = this.database
+          .prepare(
+            "SELECT COUNT(*) AS held FROM canticle_exposure WHERE ear = ?",
+          )
+          .get(ear) as { held: number };
+        if (held > bounds.maxRecords) {
+          this.increment(`canticle_exposure_over_bound.${ear}`);
+          overBound[ear] = held;
+        }
+      }
+      return { evicted, overBound };
     });
   }
 
@@ -2892,6 +3238,7 @@ export class EventStore {
               .all(ear, batch.id) as Array<{ identity: string }>
           ).map((row) => row.identity);
           this.dropCanticleClaim(ear, batch.id);
+          this.unknownCanticleExposure(ear, batch.id, "reverted");
           this.database
             .prepare(
               `INSERT INTO canticle_reverted (batch_id, ear, reverted_at) VALUES (?, ?, ?)
