@@ -412,6 +412,31 @@ test("#176 proof 4: another holder taking the ear discards its grants at the att
   }
 });
 
+test("#176 proof 4: the attached shim turning to another session discards the grants too, so A -> B -> A by session change before any poll leaves A no grant", async () => {
+  const { h, host } = setup({ mode: "immediate" }, { wakeKeys: [OPS] });
+  try {
+    const a = h.attach("scribe", { sessionId: SESSION });
+    await grant(h, a, {
+      stream: "ops:ops.fleet",
+      classes: ["ambient"],
+      ttl_seconds: 600,
+    });
+    await a.send({
+      type: "session",
+      sessionId: "22222222-bbbb-4bbb-8bbb-000000000002",
+    });
+    const rowsAtB = h.store.canticleWakeGrants("scribe").length;
+    await a.send({ type: "session", sessionId: SESSION });
+    host.sing(1, AMBIENT);
+    h.timers.advance(10_000);
+    assert.equal(pushes(a).length, 0, "A's grant didn't cross B's hold");
+    assert.equal(rowsAtB, 0, "gone at the session change, before any poll");
+    assert.equal(status(h).counts.wake_grant_discarded, 1);
+  } finally {
+    h.dispose();
+  }
+});
+
 test("#176 proof 4: the same session reattaching (compaction, resume) keeps its grant", async () => {
   const { h, host } = setup({ mode: "immediate" }, { wakeKeys: [OPS] });
   try {
