@@ -26,6 +26,13 @@ export const KEYS: Readonly<Record<string, string>> = {
 };
 export const TUNE = ["*:ops.fleet", "*:ops.deploy"];
 
+/**
+ * `canticle.wakeKeys` entries letting these keys wake for advisory, the songs' default
+ * class (binary-canticle#176 decision 1: a bare key would be alarm only).
+ */
+export const advisory = (keys: readonly string[]) =>
+  keys.map((key) => ({ key, classes: ["advisory"] }));
+
 export interface Song {
   station?: string;
   stream?: string;
@@ -49,6 +56,12 @@ export interface Song {
   scope?: string;
   /** Merged over `times`; a field set to `undefined` is left out. */
   times?: R;
+  /** The record's verified class (§10.4); `advisory` by default. */
+  class?: string;
+  /** The host's admission result (§10.9); `verified` by default. */
+  admission?: string;
+  /** Fields the station put on the record beyond record v1's own, merged over the rest. */
+  extra?: R;
   /** The frame's `stream_id` as a number (§14.18.3); by default the stream's name. */
   streamId?: number;
   /** `null` leaves `body.ctype` out, as a host daemon that doesn't say would. */
@@ -157,7 +170,7 @@ export class Host {
       idem: `canticle:${key}:${epoch}:${stream}:${seq}`,
       station: { name: station, principal: null },
       stream,
-      class: "advisory",
+      class: o.class ?? "advisory",
       scope: o.scope ?? "lan",
       hop: o.hop ?? 0,
       ...(o.stateKey !== undefined ? { state_key: o.stateKey } : {}),
@@ -171,7 +184,7 @@ export class Host {
           ...o.times,
         }).filter(([, value]) => value !== undefined),
       ),
-      admission: "verified",
+      admission: o.admission ?? "verified",
       disposition: "surface",
       dedup: o.dedup ?? "first",
       versions: { manifest_sha256: "00", manifest_label: "test" },
@@ -193,6 +206,7 @@ export class Host {
               ...o.flags,
             },
           }),
+      ...o.extra,
     };
   }
 
@@ -287,7 +301,9 @@ export function canticleConfig(
       source: "host-daemon",
       hostSocket: "/nonexistent/canticle.sock",
       tune: { scribe: TUNE },
-      wakeKeys: [OPS, ALPHA],
+      // The songs' default class is advisory: the keys' entries name it, so it may wake
+      // (binary-canticle#176 decision 1; a bare key would be alarm only).
+      wakeKeys: advisory([OPS, ALPHA]),
       ...(delivery !== undefined ? { delivery: { scribe: delivery } } : {}),
       ...canticle,
     },

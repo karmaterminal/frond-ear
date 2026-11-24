@@ -22,6 +22,7 @@ import { canticleDelivers } from "../src/config.ts";
 import { StructuredLogger } from "../src/logger.ts";
 import { channelInstructions } from "../src/render.ts";
 import {
+  advisory,
   ALPHA,
   canticleConfig,
   confirm,
@@ -520,7 +521,10 @@ test("dedupe: tombstones, a standing mute and the report cursor survive a frond-
 });
 
 test("reload: a new config re-reads what is on air; what a mute passed over stays passed over", async () => {
-  const { h, host } = setup({ mode: "immediate" }, { wakeKeys: [OPS] });
+  const { h, host } = setup(
+    { mode: "immediate" },
+    { wakeKeys: advisory([OPS]) },
+  );
   try {
     const shim = h.attach("scribe");
     host.sing(1, { station: "alpha" }); // alpha isn't allowlisted yet
@@ -576,7 +580,10 @@ test("reload: a key taken off the allowlist holds back what it had waiting; a sh
     // alpha's key comes off the allowlist and the window shortens to 10 s: alpha's
     // waiting record is held back and never pushed; ops's goes out in the new window.
     h.daemon.reloadConfig(
-      canticleConfig({ mode: "digest", windowMs: 10_000 }, { wakeKeys: [OPS] }),
+      canticleConfig(
+        { mode: "digest", windowMs: 10_000 },
+        { wakeKeys: advisory([OPS]) },
+      ),
     );
     h.timers.advance(11_000);
     assert.equal(pushes(shim).length, 1);
@@ -1596,8 +1603,12 @@ const secret = createPrivateKey({
   type: "pkcs8",
 });
 
-/** A signed ITEM from test1 on `chatter`, issued at T0. */
-function signed(seq: number, flags = 0): Uint8Array {
+/** A signed ITEM from test1 on `chatter`, issued at T0; `extra` overrides its fields. */
+function signed(
+  seq: number,
+  flags = 0,
+  extra: Record<number, cbor.CborValue | number> = {},
+): Uint8Array {
   const m: cbor.CborMap = new Map();
   const fields: Record<number, cbor.CborValue | number> = {
     1: 1, // epoch
@@ -1611,6 +1622,7 @@ function signed(seq: number, flags = 0): Uint8Array {
     11: 0, // hop
     13: 1, // text
     ...(flags !== 0 ? { 15: flags } : {}),
+    ...extra,
   };
   for (const [k, v] of Object.entries(fields))
     m.set(BigInt(k), typeof v === "number" ? BigInt(v) : v);
@@ -1631,7 +1643,8 @@ test("embedded receptor: an allowlisted key's signed item is pushed once, its re
       source: "embedded",
       manifestPath: "unused",
       tune: { scribe: ["*:chatter"] },
-      wakeKeys: [test1.key_id],
+      // Its items are chatter, which the key's entry names (#176), and its manifest grants.
+      wakeKeys: [{ key: test1.key_id, classes: ["chatter"] }],
     },
   );
   let receptor: CanticleReceptor | undefined;
@@ -1705,5 +1718,68 @@ test("embedded receptor: an allowlisted key's signed item is pushed once, its re
     receptor.stop();
   } finally {
     h.dispose();
+  }
+});
+
+test("#176 proof 3, embedded with a real manifest: a verified alarm from a bare wakeKeys key wakes only where the manifest grants that key alarm", async () => {
+  // test1's manifest entry grants no alarm; the same entry with alarm added does.
+  const plain = vectors.manifest as {
+    stations: Array<{ name: string; classes: string[] }>;
+  };
+  const withAlarm = structuredClone(plain);
+  withAlarm.stations.find((s) => s.name === "test1")!.classes.push("alarm");
+  // A keyed alarm (class 7) at hop 0, on a stream test1 may sing.
+  const alarm = signed(1, 0, { 6: 7, 10: "fire" });
+  for (const [granted, manifest] of [
+    [false, plain],
+    [true, withAlarm],
+  ] as const) {
+    const config = canticleConfig(
+      { mode: "immediate" },
+      {
+        source: "embedded",
+        manifestPath: "unused",
+        tune: { scribe: ["*:chatter"] },
+        wakeKeys: [test1.key_id], // bare: alarm only
+      },
+    );
+    let receptor: CanticleReceptor | undefined;
+    const h = harness(config, {
+      canticleHear: (ear) => receptor!.hearView(ear),
+    });
+    try {
+      h.clock.value = T0 + 1_000;
+      receptor = new CanticleReceptor({
+        config: config.canticle!,
+        manifest: Manifest.fromJson(manifest),
+        store: h.store,
+        logger: new StructuredLogger(() => {}),
+        clock: h.clock,
+        timers: h.timers,
+        socket: () =>
+          ({
+            on: () => {},
+            bind: (_port: number, _host: string, bound: () => void) => bound(),
+            close: () => {},
+          }) as never,
+      });
+      receptor.start();
+      const shim = h.attach("scribe");
+      receptor.receive(alarm);
+      h.timers.advance(5_000);
+      assert.equal(pushes(shim).length, granted ? 1 : 0, `granted=${granted}`);
+      if (granted) {
+        assert.deepEqual(order(pushes(shim)[0]!.content), ["test1:chatter/1"]);
+      } else {
+        // The listener refuses a class the manifest doesn't grant: never heard, so never
+        // counted as withheld, and nothing reads it.
+        assert.equal(status(h).counts["wake_withheld:alarm"], undefined);
+        const heard = await h.call(shim, "hear", {});
+        assert.doesNotMatch(heard.text, /test1:chatter/u);
+      }
+      receptor.stop();
+    } finally {
+      h.dispose();
+    }
   }
 });

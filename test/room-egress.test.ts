@@ -67,6 +67,7 @@ const NOT_ROOM_OUTPUT = [
   "schedules",
   "set_attention",
   "set_canticle_delivery",
+  "wake_grant",
   "wake_on",
 ];
 
@@ -88,6 +89,8 @@ function argsFor(tool: string, message: string): Record<string, unknown> {
       return { mode: "room", chat_id: CHANNEL, ttl_seconds: 60 };
     case "set_canticle_delivery":
       return { mode: "digest" };
+    case "wake_grant":
+      return { stream: "ops:ops.fleet", classes: ["ambient"], ttl_seconds: 60 };
     case "leave_letter":
       return { reason: "test", body: "a note to a later turn" };
     case "hold_compaction":

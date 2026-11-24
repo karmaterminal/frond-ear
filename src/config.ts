@@ -2,6 +2,7 @@ import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { CLASS_BY_NAME } from "./canticle/ids.ts";
 import { ROOM_POLICIES, type RoomPolicy } from "./egress.ts";
 import type { Mode } from "./types.ts";
 
@@ -117,6 +118,13 @@ export interface CanticleConfig {
    * (frond-ear#65, 🍃's boundary). Every other station stays readable with `hear` only.
    */
   wakeKeys: string[];
+  /**
+   * Per key on `wakeKeys`, the classes whose records may wake a session (binary-canticle#176
+   * decision 1). A bare key in the config is `["alarm"]`; an entry `{ key, classes }` names
+   * its own. Necessary, never sufficient: the manifest must grant the key the class, and
+   * every other gate still holds. Records of any other class are delivered without a wake.
+   */
+  wakeClasses: Record<string, string[]>;
   /** Global mute: no canticle push to any ear, whatever its delivery says. */
   muted: boolean;
   /** Per ear, what reaches its session unasked. An ear left out is `off`. */
@@ -380,18 +388,8 @@ function parseCanticle(
   if (typeof hostSocket !== "string" || hostSocket === "") {
     throw new Error("canticle.hostSocket must be a path");
   }
-  const wakeKeys = [
-    ...new Set(
-      stringArray(value.wakeKeys, "canticle.wakeKeys").map((key) => {
-        if (!KEY_ID.test(key)) {
-          throw new Error(
-            `canticle.wakeKeys: ${JSON.stringify(key)} must be a station key id (16 hex digits)`,
-          );
-        }
-        return key.toLowerCase();
-      }),
-    ),
-  ];
+  const wakeClasses = parseWakeKeys(value.wakeKeys);
+  const wakeKeys = Object.keys(wakeClasses);
   if (value.muted !== undefined && typeof value.muted !== "boolean") {
     throw new Error("canticle.muted must be true or false");
   }
@@ -430,6 +428,7 @@ function parseCanticle(
     source,
     hostSocket,
     wakeKeys,
+    wakeClasses,
     muted: value.muted === true,
     delivery,
     derivedPublication: value.derivedPublication === true,
@@ -441,6 +440,70 @@ function parseCanticle(
 /** A station key id: SHA-256(public key)[0:8] in hex, the `key=` of a banner (§5.1). */
 export const CANTICLE_KEY_ID = /^[0-9a-f]{16}$/iu;
 const KEY_ID = CANTICLE_KEY_ID;
+
+/** What a bare `wakeKeys` key may wake for (binary-canticle#176 decision 1; RFC-0001 D1). */
+export const WAKE_DEFAULT_CLASSES: readonly string[] = ["alarm"];
+
+/**
+ * `canticle.wakeKeys`: each entry a bare key id (alarm only) or `{ key, classes }`, whose
+ * classes are exactly those named (alarm too only if named). A key listed twice wakes for
+ * every class either entry names. Key ids are kept in lowercase; classes sorted.
+ */
+function parseWakeKeys(value: unknown): Record<string, string[]> {
+  if (value === undefined) return {};
+  if (!Array.isArray(value)) {
+    throw new Error(
+      "canticle.wakeKeys must be an array of station key ids or { key, classes } entries",
+    );
+  }
+  const out = new Map<string, Set<string>>();
+  for (const entry of value as unknown[]) {
+    let key: unknown;
+    let classes: readonly unknown[];
+    if (typeof entry === "string") {
+      key = entry;
+      classes = WAKE_DEFAULT_CLASSES;
+    } else if (isObject(entry)) {
+      const extra = Object.keys(entry).filter(
+        (field) => field !== "key" && field !== "classes",
+      );
+      if (extra.length > 0) {
+        throw new Error(
+          `canticle.wakeKeys: an entry has only key and classes, not ${extra.join(", ")}`,
+        );
+      }
+      key = entry.key;
+      if (!Array.isArray(entry.classes) || entry.classes.length === 0) {
+        throw new Error(
+          `canticle.wakeKeys: ${JSON.stringify(key)} needs classes, a non-empty array of class names (a bare key means alarm only)`,
+        );
+      }
+      classes = entry.classes as unknown[];
+    } else {
+      throw new Error(
+        "canticle.wakeKeys entries must be a station key id or { key, classes }",
+      );
+    }
+    if (typeof key !== "string" || !KEY_ID.test(key)) {
+      throw new Error(
+        `canticle.wakeKeys: ${JSON.stringify(key)} must be a station key id (16 hex digits)`,
+      );
+    }
+    const set = out.get(key.toLowerCase()) ?? new Set<string>();
+    for (const name of classes) {
+      if (typeof name !== "string" || !CLASS_BY_NAME.has(name)) {
+        throw new Error(
+          `canticle.wakeKeys: ${key}: unknown class ${JSON.stringify(name)} (one of ${[...CLASS_BY_NAME.keys()].join(", ")})`,
+        );
+      }
+      set.add(name);
+    }
+    out.set(key.toLowerCase(), set);
+  }
+  return Object.fromEntries(
+    [...out].map(([key, set]) => [key, [...set].sort()]),
+  );
+}
 /** A station name a tune can name on its own (the station half of `TUNE`). */
 export const CANTICLE_STATION = /^[a-z][a-z0-9-]{0,30}$/u;
 

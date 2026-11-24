@@ -204,6 +204,7 @@ test("dry-run daemon + channel shim + MCP client: inject → <channel> notificat
     "schedules",
     "set_attention",
     "set_canticle_delivery",
+    "wake_grant",
     "wake_on",
   ]);
 

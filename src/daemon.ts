@@ -22,7 +22,11 @@ import {
   type CustodyView,
   type PublicationDecision,
 } from "./canticle/custody.ts";
-import { CanticleDelivery, exposure } from "./canticle/delivery.ts";
+import {
+  CanticleDelivery,
+  exposure,
+  MAX_WAKE_GRANT_MS,
+} from "./canticle/delivery.ts";
 import {
   DERIVED_TEXT_MAX_BYTES,
   ELECTION_ID,
@@ -80,6 +84,7 @@ import {
 } from "./outbound-files.ts";
 import { chunkMessage, definitive, RestError } from "./rest.ts";
 import { hearResult, iso, type HeardItem } from "./canticle/hear.ts";
+import { CLASS_BY_NAME } from "./canticle/ids.ts";
 import {
   LETTER_LIMITS,
   leaveLetter,
@@ -391,6 +396,8 @@ function stringArg(
 const SNOWFLAKE = /^\d{1,25}$/u;
 const CANTICLE_TUNE =
   /^(\*|[a-z][a-z0-9-]{0,30}):[a-z][a-z0-9-]{0,30}(\.[a-z][a-z0-9-]{0,30}){0,3}$/u;
+/** A stream name (RFC-0001 §5.4): up to four dot-separated segments. */
+const CANTICLE_STREAM = /^[a-z][a-z0-9-]{0,30}(\.[a-z][a-z0-9-]{0,30}){0,3}$/u;
 
 /** The window ear_status's canticle custody summary covers; canticle_custody's default. */
 const CUSTODY_WINDOW_MS = 60 * 60 * 1_000;
@@ -1788,6 +1795,8 @@ export class Daemon {
     // A turn or doubt kept for this shim's spawn-time id still holds (#111).
     this.restoreTurn(client, ear);
     const record = this.store.attachEar(ear, client.sessionId ?? null, nonce);
+    // Another holder's grants went in the attach's own transaction (#176).
+    this.canticle?.grantsDiscarded(ear, record.discardedWakeGrants);
     // A reading belongs to the session that reported it; a new session starts with none.
     if (this.pressure.get(ear)?.sessionId !== client.sessionId) {
       this.pressure.delete(ear);
@@ -1883,7 +1892,9 @@ export class Daemon {
     this.touchHolder(ear, client);
     client.sessionId = sessionId;
     delete client.wakeDoubt;
-    this.store.updateEarSession(ear, sessionId);
+    // The write runs whether or not canticle does: `?.` would skip its arguments too.
+    const discarded = this.store.updateEarSession(ear, sessionId);
+    this.canticle?.grantsDiscarded(ear, discarded);
     this.touchHolder(ear, client);
     if (this.attached.get(ear) === client && changed) {
       this.logger.log("info", "ear.session_changed", {
@@ -2013,12 +2024,18 @@ export class Daemon {
       return { kind: "other-process" };
     }
     client.wakeDoubt = { claimed: sessionId, at: this.clock.now(), source };
-    if (spawned !== undefined) {
-      this.store.setRuntimeState(
-        `session.turn.${ear}`,
-        JSON.stringify({ spawned, doubt: client.wakeDoubt }),
-      );
-    }
+    // The ear's wake grants go with the doubt's own record, in one transaction (#176).
+    // (Kept apart from the `?.` below, so the doubt's record is written without canticle.)
+    const discarded = this.store.doubtEar(
+      ear,
+      spawned !== undefined
+        ? {
+            name: `session.turn.${ear}`,
+            value: JSON.stringify({ spawned, doubt: client.wakeDoubt }),
+          }
+        : undefined,
+    );
+    this.canticle?.grantsDiscarded(ear, discarded, "holder_in_doubt");
     this.logger.log("warn", "ear.wake_identity_doubt", {
       ear,
       source,
@@ -3903,6 +3920,8 @@ export class Daemon {
         return this.setAttention(client, args);
       case "set_canticle_delivery":
         return this.setCanticleDelivery(client, args);
+      case "wake_grant":
+        return this.wakeGrant(client, args);
       case "hear": {
         const ear = this.readableEar(client, args);
         if (!this.options.canticleHear) {
@@ -4780,6 +4799,99 @@ export class Daemon {
       mode,
     });
     return JSON.stringify(view, null, 2);
+  }
+
+  /**
+   * `wake_grant` (binary-canticle#176 decision 1): the attached session's own opt-in to be
+   * woken by more classes of record on one station:stream, for a TTL it must give. Only
+   * the session holding the ear, and only one frond-ear knows the id of, since a grant
+   * holds only for the session that made it. Nothing a station sends reaches this.
+   */
+  private wakeGrant(client: Client, args: Record<string, unknown>): string {
+    const ear = this.requireHolder(client, "grant itself canticle wakes");
+    if (!this.canticle || !this.config.canticle?.enabled) {
+      return "canticle is not enabled on this daemon (config canticle.enabled).";
+    }
+    if (!client.sessionId) {
+      throw new Error(
+        "frond-ear does not know this session's id (its shim had no CLAUDE_CODE_SESSION_ID), so it could not prove a grant is this session's own; nothing was granted",
+      );
+    }
+    if (client.wakeDoubt && args.revoke !== true) {
+      throw new Error(
+        "the session holding this ear is in doubt (a hook named another session frond-ear can't tie to this shim), so it could not prove a grant is this session's own; nothing was granted. This session's own SessionStart hook ends the doubt",
+      );
+    }
+    const named = stringArg(args, "stream");
+    let station: string | undefined;
+    let stream: string | undefined;
+    if (named !== undefined) {
+      const at = named.indexOf(":");
+      station = named.slice(0, at);
+      stream = named.slice(at + 1);
+      if (
+        at < 1 ||
+        (!CANTICLE_STATION.test(station) && !CANTICLE_KEY_ID.test(station)) ||
+        !CANTICLE_STREAM.test(stream)
+      ) {
+        throw new Error(
+          "stream must be one station:stream, the station by the name hear shows or its key id (16 hex digits); no *",
+        );
+      }
+      // A key id is kept in lowercase, as config keeps it.
+      if (CANTICLE_KEY_ID.test(station)) station = station.toLowerCase();
+    }
+    let result: object;
+    if (args.revoke === true) {
+      result = this.canticle.grant(ear, client.sessionId, {
+        revoke: true,
+        ...(station !== undefined && stream !== undefined
+          ? { station, stream }
+          : {}),
+      });
+    } else {
+      if (station === undefined || stream === undefined) {
+        throw new Error("stream is required (one station:stream)");
+      }
+      const classes = args.classes;
+      if (
+        !Array.isArray(classes) ||
+        classes.length === 0 ||
+        classes.some(
+          (cls) => typeof cls !== "string" || !CLASS_BY_NAME.has(cls),
+        )
+      ) {
+        throw new Error(
+          `classes must be a non-empty array of class names (${[...CLASS_BY_NAME.keys()].join(", ")})`,
+        );
+      }
+      const seconds = Number(args.ttl_seconds);
+      if (
+        args.ttl_seconds === undefined ||
+        args.ttl_seconds === null ||
+        !Number.isSafeInteger(seconds) ||
+        seconds < 1 ||
+        seconds * 1_000 > MAX_WAKE_GRANT_MS
+      ) {
+        throw new Error(
+          `ttl_seconds is required: a whole number of seconds, 1 to ${MAX_WAKE_GRANT_MS / 1_000}; a grant always lapses`,
+        );
+      }
+      result = this.canticle.grant(ear, client.sessionId, {
+        revoke: false,
+        station,
+        stream,
+        classes: [...new Set(classes as string[])],
+        ttlMs: seconds * 1_000,
+      });
+    }
+    this.store.increment("canticle_wake_grants");
+    this.logger.log("info", "canticle.wake_granted", {
+      ear,
+      ...(named !== undefined ? { stream: `${station}:${stream}` } : {}),
+      revoke: args.revoke === true,
+    });
+    return JSON.stringify(result, null, 2);
   }
 
   /** Configured ceiling narrowed by the session's own choice. */

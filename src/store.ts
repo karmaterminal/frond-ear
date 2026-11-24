@@ -291,6 +291,25 @@ export interface CanticleChoice {
 }
 
 /**
+ * A session's own opt-in to be woken by one more class of record on one station:stream
+ * (binary-canticle#176 decision 1): seat-local, made with `wake_grant`, never by a station.
+ * `station` is a station name or a key id (lowercase). It holds only for the session that
+ * made it, from `grantedAt` until `expiresAt`. `seenAt` is the latest clock reading at which
+ * delivery found it holding, a high-water mark: a clock behind it went back, so how long the
+ * grant has run is unknown.
+ */
+export interface CanticleWakeGrant {
+  ear: string;
+  station: string;
+  stream: string;
+  cls: string;
+  sessionId: string;
+  grantedAt: number;
+  expiresAt: number;
+  seenAt: number;
+}
+
+/**
  * Something an ear's own session left for a later turn of itself (#88),
  * released to it as a channel event when its seat's SessionStart hook says
  * it compacted.
@@ -835,6 +854,17 @@ export class EventStore {
         set_at INTEGER NOT NULL,
         expires_at INTEGER,
         PRIMARY KEY (ear, scope)
+      );
+      CREATE TABLE IF NOT EXISTS canticle_wake_grants (
+        ear TEXT NOT NULL,
+        station TEXT NOT NULL,
+        stream TEXT NOT NULL,
+        class TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        granted_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        seen_at INTEGER NOT NULL,
+        PRIMARY KEY (ear, station, stream, class)
       );
       CREATE TABLE IF NOT EXISTS letters (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2120,6 +2150,79 @@ export class EventStore {
       .all(ear) as unknown as CanticleChoice[];
   }
 
+  /**
+   * Makes or replaces one class's grant on one station:stream (`wake_grant`), seen first at
+   * the moment it is made.
+   */
+  public setCanticleWakeGrant(grant: Omit<CanticleWakeGrant, "seenAt">): void {
+    this.database
+      .prepare(
+        `INSERT INTO canticle_wake_grants
+           (ear, station, stream, class, session_id, granted_at, expires_at, seen_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(ear, station, stream, class) DO UPDATE SET
+           session_id = excluded.session_id, granted_at = excluded.granted_at,
+           expires_at = excluded.expires_at, seen_at = excluded.seen_at`,
+      )
+      .run(
+        grant.ear,
+        grant.station,
+        grant.stream,
+        grant.cls,
+        grant.sessionId,
+        grant.grantedAt,
+        grant.expiresAt,
+        grant.grantedAt,
+      );
+  }
+
+  /** Moves the high-water mark of every grant the ear has up to `now` (never down). */
+  public markCanticleWakeGrantsSeen(ear: string, now: number): void {
+    this.database
+      .prepare(
+        "UPDATE canticle_wake_grants SET seen_at = ? WHERE ear = ? AND seen_at < ?",
+      )
+      .run(now, ear, now);
+  }
+
+  /** Every grant row the ear has, whatever its state: delivery judges each one. */
+  public canticleWakeGrants(ear: string): CanticleWakeGrant[] {
+    return this.database
+      .prepare(
+        `SELECT ear, station, stream, class AS cls, session_id AS sessionId,
+           granted_at AS grantedAt, expires_at AS expiresAt, seen_at AS seenAt
+         FROM canticle_wake_grants WHERE ear = ? ORDER BY station, stream, class`,
+      )
+      .all(ear) as unknown as CanticleWakeGrant[];
+  }
+
+  /**
+   * Removes the ear's grants: those on one station:stream when given (every class, or the
+   * one named), else all of them. Returns how many went.
+   */
+  public deleteCanticleWakeGrants(
+    ear: string,
+    where?: { station: string; stream: string; cls?: string },
+  ): number {
+    const result =
+      where === undefined
+        ? this.database
+            .prepare("DELETE FROM canticle_wake_grants WHERE ear = ?")
+            .run(ear)
+        : where.cls === undefined
+          ? this.database
+              .prepare(
+                "DELETE FROM canticle_wake_grants WHERE ear = ? AND station = ? AND stream = ?",
+              )
+              .run(ear, where.station, where.stream)
+          : this.database
+              .prepare(
+                "DELETE FROM canticle_wake_grants WHERE ear = ? AND station = ? AND stream = ? AND class = ?",
+              )
+              .run(ear, where.station, where.stream, where.cls);
+    return Number(result.changes);
+  }
+
   // ---- room egress (binary-canticle#161 item 3) ---------------------------------------
 
   /**
@@ -3381,12 +3484,23 @@ export class EventStore {
 
   // ---- ears -------------------------------------------------------------------
 
+  /**
+   * Records an attach: the ear's next generation, held by `sessionId`. In the same
+   * transaction, the ear's wake grants made by any other session are discarded (#176): a
+   * grant is its maker's own act and never crosses another holder's hold, even one that
+   * hands the ear back before delivery looks. A session with no id is another holder.
+   * Returns the record and the grants discarded.
+   */
   public attachEar(
     name: string,
     sessionId: string | null,
     canaryNonce: string | null,
-  ): EarRecord {
+  ): EarRecord & { discardedWakeGrants: CanticleWakeGrant[] } {
     return this.transaction(() => {
+      const discardedWakeGrants = this.discardOtherHoldersGrants(
+        name,
+        sessionId,
+      );
       this.database
         .prepare(
           `INSERT INTO ears (name, generation, attached_at, session_id, registered, canary_nonce)
@@ -3402,7 +3516,7 @@ export class EventStore {
           canaryNonce === null ? 1 : 0,
           canaryNonce,
         );
-      return this.ear(name) as EarRecord;
+      return { ...(this.ear(name) as EarRecord), discardedWakeGrants };
     });
   }
 
@@ -3433,10 +3547,57 @@ export class EventStore {
       : undefined;
   }
 
-  public updateEarSession(name: string, sessionId: string): void {
-    this.database
-      .prepare("UPDATE ears SET session_id = ? WHERE name = ?")
-      .run(sessionId, name);
+  /**
+   * The attached client now speaks for `sessionId`. As at attach, the ear's wake grants
+   * made by any other session are discarded in the same transaction; returns them.
+   */
+  public updateEarSession(
+    name: string,
+    sessionId: string,
+  ): CanticleWakeGrant[] {
+    return this.transaction(() => {
+      const discarded = this.discardOtherHoldersGrants(name, sessionId);
+      this.database
+        .prepare("UPDATE ears SET session_id = ? WHERE name = ?")
+        .run(sessionId, name);
+      return discarded;
+    });
+  }
+
+  /**
+   * The session holding the ear is in doubt (#111: a hook named one frond-ear can't tie to
+   * its shim). Every wake grant on the ear goes (#176): none was proved to be the doubted
+   * session's own, so none crosses into the doubt or out of it. `turn`, the doubt's runtime
+   * row when there is one, is kept in the same transaction. Returns the grants that went.
+   */
+  public doubtEar(
+    ear: string,
+    turn: { name: string; value: string } | undefined,
+  ): CanticleWakeGrant[] {
+    return this.transaction(() => {
+      const gone = this.canticleWakeGrants(ear);
+      if (gone.length > 0) this.deleteCanticleWakeGrants(ear);
+      if (turn !== undefined) this.setRuntimeState(turn.name, turn.value);
+      return gone;
+    });
+  }
+
+  /** Removes the ear's wake grants not made by `sessionId` (null: all); returns them. */
+  private discardOtherHoldersGrants(
+    ear: string,
+    sessionId: string | null,
+  ): CanticleWakeGrant[] {
+    const gone = this.canticleWakeGrants(ear).filter(
+      (grant) => grant.sessionId !== sessionId,
+    );
+    if (gone.length > 0) {
+      this.database
+        .prepare(
+          "DELETE FROM canticle_wake_grants WHERE ear = ? AND session_id IS NOT ?",
+        )
+        .run(ear, sessionId);
+    }
+    return gone;
   }
 
   /** Was batch `id` offered (pushed) to this ear in this attach generation? */

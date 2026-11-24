@@ -26,6 +26,9 @@ import {
   type Item,
 } from "./wire.ts";
 
+/** A station key id as items carry it: SHA-256(public key)[0:8] in hex (§5.1). */
+const CANTICLE_KEY_HEX = /^[0-9a-f]{16}$/iu;
+
 const STATE_KEY = "canticle.listener_state";
 const TICK_MS = 1_000;
 /** The guard journal is checkpointed into a full snapshot before it outgrows either cap. */
@@ -144,6 +147,13 @@ export interface HearView {
    * and stream empty), when one of this ear's patterns took in a stream they came from.
    */
   otherOmitted?: import("./records.ts").LiveOmission;
+  /**
+   * The embedded receptor: the class names its manifest grants a station key (§10.4), or
+   * undefined for a key it doesn't know. Delivery wakes on no record whose key this denies
+   * its class (binary-canticle#176, 🪨's negative). Not set over record v1: frond-ear has no
+   * manifest there, and the host admits as `verified` only a class the key is granted.
+   */
+  capability?: (key: string) => ReadonlySet<string> | undefined;
   /** Record v1: the untuned share's drops, while any of them would still be on air. */
   untunedOmitted?: { count: number; from: number; to: number; until: number };
   /**
@@ -640,6 +650,17 @@ export class CanticleReceptor {
       lastDatagramAt: this.#lastDatagramAt,
       stations,
       items: this.live(ear),
+      capability: (key) => {
+        if (!CANTICLE_KEY_HEX.test(key)) return undefined;
+        const entry = this.#options.manifest.entry(Buffer.from(key, "hex"));
+        if (entry === undefined || entry.revoked) return undefined;
+        return new Set(
+          [...entry.classes].flatMap((code) => {
+            const name = CLASSES.get(code)?.name;
+            return name === undefined ? [] : [name];
+          }),
+        );
+      },
     };
   }
 

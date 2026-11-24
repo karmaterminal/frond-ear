@@ -16,6 +16,7 @@ import { MAX_LIVE, RECORD_V } from "../src/canticle/records.ts";
 import { StructuredLogger } from "../src/logger.ts";
 import { channelInstructions } from "../src/render.ts";
 import {
+  advisory,
   ALPHA,
   canticleConfig,
   confirm,
@@ -1858,7 +1859,9 @@ test("#119 second review R1: a note owed before a reload took its key off wakeKe
     );
     assert.equal(withheldSum(pendingNotes(h)), 1, "kept");
     // Another station's key: still nothing of its own, but that station's push tells it.
-    h.daemon.reloadConfig(canticleConfig(delivery, { wakeKeys: [ALPHA] }));
+    h.daemon.reloadConfig(
+      canticleConfig(delivery, { wakeKeys: advisory([ALPHA]) }),
+    );
     h.timers.advance(60_000);
     assert.equal(pushes(shim).length, 1);
     host.sing(1, { station: "alpha" });
@@ -1999,7 +2002,7 @@ test("#119 second review R2 (i): with 256 named streams' drops untold, what the 
     ];
     const { h, host } = setup(
       { mode: "immediate", maxPushesPerHour: 360 },
-      { wakeKeys },
+      { wakeKeys: advisory(wakeKeys) },
     );
     try {
       const shim = h.attach("scribe");
@@ -2056,7 +2059,7 @@ async function promised(
   ];
   const { h, host } = setup(
     { mode: "immediate", maxItems: 1, maxPushesPerHour: 1, ...delivery },
-    { wakeKeys },
+    { wakeKeys: advisory(wakeKeys) },
     {},
     options,
   );
@@ -2121,7 +2124,12 @@ test("#119 second review R2: what is folded past the 256 named streams survives 
     const first = await promised(258, {}, { path });
     const { frees, wakeKeys } = first;
     first.h.dispose();
-    const second = setup(delivery, { wakeKeys }, {}, { path });
+    const second = setup(
+      delivery,
+      { wakeKeys: advisory(wakeKeys) },
+      {},
+      { path },
+    );
     let at: number;
     try {
       second.h.clock.value = frees + 1_000;
@@ -2144,7 +2152,12 @@ test("#119 second review R2: what is folded past the 256 named streams survives 
       second.h.dispose();
       throw error;
     }
-    const third = setup(delivery, { wakeKeys }, {}, { path });
+    const third = setup(
+      delivery,
+      { wakeKeys: advisory(wakeKeys) },
+      {},
+      { path },
+    );
     try {
       third.h.clock.value = at + 10_000;
       const shim = third.h.attach("scribe", { sessionId: SESSION });
@@ -2171,7 +2184,7 @@ test("#119 second review R2: what is folded keeps each stream's station, so a fo
       h.daemon.reloadConfig(
         canticleConfig(
           { mode: "immediate", maxItems: 1, maxPushesPerHour: 1 },
-          { wakeKeys: allowed ? [ALPHA, manyKey(257)] : [ALPHA] },
+          { wakeKeys: advisory(allowed ? [ALPHA, manyKey(257)] : [ALPHA]) },
         ),
       );
       h.timers.advance(frees + 60_000 - h.clock.now());
@@ -2225,7 +2238,7 @@ test("#119 second review R2: at the bound, with 256 notes owed nothing in every 
   ];
   const { h, host } = setup(
     { mode: "immediate", maxItems: 1, maxPushesPerHour: 1 },
-    { wakeKeys },
+    { wakeKeys: advisory(wakeKeys) },
   );
   try {
     const shim = h.attach("scribe");
@@ -2263,7 +2276,7 @@ test("#119 second review R2: a note too long for limits.maxNotificationChars sum
     h.daemon.reloadConfig(
       canticleConfig(
         { mode: "immediate", maxItems: 1, maxPushesPerHour: 1 },
-        { wakeKeys },
+        { wakeKeys: advisory(wakeKeys) },
         { limits: { maxNotificationChars: 500 } },
       ),
     );
@@ -2291,7 +2304,7 @@ test("#119 second review, re-review 1: with 256 named notes owed a push their st
       ...Array.from({ length: streams }, (_, i) => manyKey(i)),
       manyKey(300),
     ];
-    const { h, host } = setup(delivery, { wakeKeys });
+    const { h, host } = setup(delivery, { wakeKeys: advisory(wakeKeys) });
     try {
       const shim = h.attach("scribe", { sessionId: SESSION });
       for (let i = 0; i < streams; i++) {
@@ -2303,7 +2316,7 @@ test("#119 second review, re-review 1: with 256 named notes owed a push their st
       h.timers.advance(12_000);
       // Every one of those stations' keys goes; s300's stays.
       h.daemon.reloadConfig(
-        canticleConfig(delivery, { wakeKeys: [ALPHA, manyKey(300)] }),
+        canticleConfig(delivery, { wakeKeys: advisory([ALPHA, manyKey(300)]) }),
       );
       h.timers.advance(1_000);
       host.sing(1, { station: "s300", key: manyKey(300), ttlMs: 10_000 });
@@ -2325,7 +2338,9 @@ test("#119 second review, re-review 2: a push given back after new notes came in
   const { h, host, shim, frees, wakeKeys } = await promised(258);
   try {
     h.daemon.reloadConfig(
-      canticleConfig(delivery, { wakeKeys: [...wakeKeys, x(0), x(1), x(2)] }),
+      canticleConfig(delivery, {
+        wakeKeys: advisory([...wakeKeys, x(0), x(1), x(2)]),
+      }),
     );
     h.timers.advance(frees + 6_000 - h.clock.now());
     assert.equal(pushes(shim).length, 2);
@@ -2358,7 +2373,7 @@ test("#119 second review, re-review 2: a stream folded once stays folded until t
     ...Array.from({ length: 256 }, (_, i) => manyKey(i)),
     manyKey(400),
   ];
-  const { h, host } = setup(delivery, { wakeKeys });
+  const { h, host } = setup(delivery, { wakeKeys: advisory(wakeKeys) });
   try {
     const shim = h.attach("scribe", { sessionId: SESSION });
     host.sing(1, { station: "alpha", ttlMs: 7_200_000 });
@@ -2367,7 +2382,11 @@ test("#119 second review, re-review 2: a stream folded once stays folded until t
     const frees = status(h).lastPushAt! + 3_600_000;
     // Paused: 256 streams' notes and x0's go off air, owed nothing; x0's is folded.
     h.daemon.reloadConfig(
-      canticleConfig(delivery, { wakeKeys }, { paused: true }),
+      canticleConfig(
+        delivery,
+        { wakeKeys: advisory(wakeKeys) },
+        { paused: true },
+      ),
     );
     for (let i = 0; i < 256; i++) {
       host.sing(1, { station: `s${i}`, key: manyKey(i), ttlMs: 10_000 });
@@ -2377,7 +2396,7 @@ test("#119 second review, re-review 2: a stream folded once stays folded until t
     h.daemon.reloadConfig(
       canticleConfig(
         delivery,
-        { wakeKeys },
+        { wakeKeys: advisory(wakeKeys) },
         { limits: { maxNotificationChars: 600 } },
       ),
     );
@@ -2405,7 +2424,9 @@ test("#119 second review, re-review 3: hear says a note waits when what it owes 
     const frees = status(h).lastPushAt! + 3_600_000;
     host.pluck(2); // promised, leaves the view, then goes off air
     h.timers.advance(12_000);
-    h.daemon.reloadConfig(canticleConfig(delivery, { wakeKeys: [ALPHA] }));
+    h.daemon.reloadConfig(
+      canticleConfig(delivery, { wakeKeys: advisory([ALPHA]) }),
+    );
     h.timers.advance(frees + 60_000 - h.clock.now());
     assert.equal(pushes(shim).length, 1);
     assert.match(
@@ -2426,7 +2447,7 @@ test("#119 second review, re-review 3: hear says a note waits when what it owes 
 test("#119 second review, re-review 4: past five streams, the footer counts the records the rest missed, so every promised record is accounted for", async () => {
   const delivery = { mode: "immediate", maxItems: 1, maxPushesPerHour: 1 };
   const wakeKeys = [ALPHA, ...Array.from({ length: 7 }, (_, i) => manyKey(i))];
-  const { h, host } = setup(delivery, { wakeKeys });
+  const { h, host } = setup(delivery, { wakeKeys: advisory(wakeKeys) });
   try {
     const shim = h.attach("scribe", { sessionId: SESSION });
     host.sing(1, { station: "s0", key: manyKey(0), ttlMs: 10_000 });
@@ -2547,7 +2568,7 @@ test("#119 second review, re-review 5: the stations FOLDED keeps go to streams o
   for (const unowed of [256, 255]) {
     const { h, host } = setup(
       { mode: "immediate", maxItems: 1, maxPushesPerHour: 1 },
-      { wakeKeys: [ALPHA, s] },
+      { wakeKeys: advisory([ALPHA, s]) },
     );
     try {
       const now = h.clock.now();
@@ -2597,7 +2618,9 @@ test("#119 second review, re-review 5: a given-back FOLDED with every station it
     const delivery = { mode: "immediate", maxItems: 1, maxPushesPerHour: 1 };
     const t = Array.from({ length: 255 }, (_, i) => manyKey(i));
     const u = Array.from({ length: folded }, (_, i) => manyKey(300 + i));
-    const { h, host } = setup(delivery, { wakeKeys: [ALPHA, s, ...t, ...u] });
+    const { h, host } = setup(delivery, {
+      wakeKeys: advisory([ALPHA, s, ...t, ...u]),
+    });
     try {
       const at = h.clock.now() - 1_000;
       h.store.setRuntimeState(
@@ -2642,7 +2665,9 @@ test("#119 second review, re-review 5: a given-back FOLDED with every station it
       );
       h.timers.advance(12_000);
       shim.close(); // given back: the folded s merges in
-      h.daemon.reloadConfig(canticleConfig(delivery, { wakeKeys: [ALPHA, s] }));
+      h.daemon.reloadConfig(
+        canticleConfig(delivery, { wakeKeys: advisory([ALPHA, s]) }),
+      );
       const next = h.attach("scribe", { sessionId: SESSION });
       h.timers.advance(60_000);
       assert.equal(pushes(next).length, 1, `s's push of its own (${folded})`);
@@ -2697,7 +2722,9 @@ test("#119 second review, re-review 6: a given-back FOLDED owed for a stream wit
     const delivery = { mode: "immediate", maxItems: 1, maxPushesPerHour: 1 };
     const t = Array.from({ length: 255 }, (_, i) => manyKey(i));
     const u = Array.from({ length: folded }, (_, i) => manyKey(300 + i));
-    const { h, host } = setup(delivery, { wakeKeys: [ALPHA, s, ...t, ...u] });
+    const { h, host } = setup(delivery, {
+      wakeKeys: advisory([ALPHA, s, ...t, ...u]),
+    });
     try {
       const at = h.clock.now() - 1_000;
       h.store.setRuntimeState(
@@ -2745,7 +2772,9 @@ test("#119 second review, re-review 6: a given-back FOLDED owed for a stream wit
       h.timers.advance(11_000);
       assert.equal(pendingNotes(h)["s:ops.fleet"]?.owed, false);
       shim.close(); // given back: the folded s, owed, merges in
-      h.daemon.reloadConfig(canticleConfig(delivery, { wakeKeys: [ALPHA, s] }));
+      h.daemon.reloadConfig(
+        canticleConfig(delivery, { wakeKeys: advisory([ALPHA, s]) }),
+      );
       const next = h.attach("scribe", { sessionId: SESSION });
       h.timers.advance(60_000);
       assert.equal(pushes(next).length, 1, `owed again, and told (${folded})`);
@@ -2791,7 +2820,7 @@ function wakesUnder(
   h.daemon.reloadConfig(
     canticleConfig(
       { mode: "immediate", maxPushesPerHour: 1, stations },
-      { wakeKeys: [key] },
+      { wakeKeys: advisory([key]) },
     ),
   );
   h.timers.advance(60_000);
@@ -2913,7 +2942,7 @@ for (const pass of [false, true]) {
             maxPushesPerHour: 1,
             stations: offBut(257, 256),
           },
-          { wakeKeys: [first] },
+          { wakeKeys: advisory([first]) },
         );
         try {
           const place = foldedPlace(again.h, "s256:ops.fleet");
@@ -3029,7 +3058,7 @@ for (const pass of [false, true]) {
             maxPushesPerHour: 1,
             stations: offBut(257, 256),
           },
-          { wakeKeys: [first] },
+          { wakeKeys: advisory([first]) },
         );
         try {
           assert.equal(foldedPlace(again.h, "s256:ops.fleet")?.key, later);
@@ -3503,7 +3532,7 @@ for (const when of ["on view", "plucked", "off air at the revert"] as const) {
 test("#119 R3 fresh review: a record told at the revert, between an earlier push's note and a later one's, keeps its key, as at 3824a7e: it is told since every push", async () => {
   const third = manyKey(900);
   const delivery = { mode: "immediate", maxPushesPerHour: 2 };
-  const canticle = { wakeKeys: [OPS, ALPHA, third] };
+  const canticle = { wakeKeys: advisory([OPS, ALPHA, third]) };
   const { h, host } = setup(delivery, canticle);
   try {
     const shim = h.attach("scribe", { sessionId: SESSION });
@@ -3698,7 +3727,7 @@ for (const regain of REGAINED) {
             path,
             pass,
             { mode: "immediate", maxPushesPerHour: 1, stations: off },
-            { wakeKeys: [stale] },
+            { wakeKeys: advisory([stale]) },
           );
           try {
             again.h.timers.advance(60_000);
