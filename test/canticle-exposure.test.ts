@@ -20,7 +20,11 @@ import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
 import { runExposure } from "../src/canticle/exposure-cli.ts";
-import { conformant, type ExposureEntry } from "../src/canticle/exposure.ts";
+import {
+  conformant,
+  exposureReader,
+  type ExposureEntry,
+} from "../src/canticle/exposure.ts";
 import type {
   HeardFrameFlags,
   HeardFrameTimes,
@@ -278,7 +282,7 @@ test("fence then offer: one canticle push is fenced in the ledger before the ses
     assert.deepEqual(record.reader, {
       sessionKey: "frond-ear:scribe",
       sessionId: SESSION,
-      lifecycleRevision: "attach:1",
+      lifecycleRevision: `claude-session:${SESSION}`,
     });
     assert.equal(row.holder, "known");
     // The bare id: the delivery token is the session's to echo, never kept.
@@ -1013,4 +1017,29 @@ test("over bound: fenced and unknown records alone past maxRecords are never evi
   } finally {
     h.dispose();
   }
+});
+
+test("a reattach of the same session keeps its reader; only a new session is a new reader", () => {
+  // binary-canticle#162 derives a reader generation from (key, session id, revision), and a new
+  // generation with no records can be attested as an observed birth. A reattach keeps the same
+  // Claude Code session and context, so a new revision there would launder everything it heard.
+  const first = exposureReader("scribe", { generation: 1, sessionId: "s-1" });
+  const reattached = exposureReader("scribe", {
+    generation: 2,
+    sessionId: "s-1",
+  });
+  assert.deepEqual(
+    reattached,
+    first,
+    "same session, same context: same reader",
+  );
+  const other = exposureReader("scribe", { generation: 3, sessionId: "s-2" });
+  assert.notEqual(
+    other.lifecycleRevision,
+    first.lifecycleRevision,
+    "a new session is a new reader",
+  );
+  const unknown = exposureReader("scribe", { generation: 4, sessionId: null });
+  assert.equal(unknown.sessionId, null);
+  assert.equal(unknown.lifecycleRevision, "claude-session:unknown");
 });
