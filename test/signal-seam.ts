@@ -50,8 +50,14 @@ if (at === "bind") {
       return (connect as (...a: unknown[]) => net.Socket)(...args);
     }
     const socket = new net.Socket();
+    // Signal handles are unref'd and this socket has none yet: hold the loop
+    // open until the signal is dispatched, as the real probe's handle would.
+    const hold = setInterval(() => undefined, 1_000);
     process.kill(process.pid, "SIGTERM");
-    void sigterm.then(() => socket.connect(socketPath));
+    void sigterm.then(() => {
+      clearInterval(hold);
+      socket.connect(socketPath);
+    });
     return socket;
   } as typeof net.connect;
   // server.ts imports `connect` by name; refresh the ESM named exports.
