@@ -240,7 +240,7 @@ test("🪨 #129: an older save after a newer one, and two sessions at once, lose
   assert.equal(latestSample(dir)?.at, NOW + 10_009);
 });
 
-test("🪨 #129: two hooks of the same session racing: the newer level survives, and only one says it", () => {
+test("🪨 #129: two hooks of the same session racing: the newer level survives; a raced change is said at most twice", () => {
   const env = seat();
   const dir = quotaDir(env);
   // Hook X (newer) and hook Y (older) of one session, Y's write landing last.
@@ -251,10 +251,12 @@ test("🪨 #129: two hooks of the same session racing: the newer level survives,
     "the older write is not the newest",
   );
   assert.equal(loadAnnounced(dir, "session-a"), "exhausted");
-  // The same change raced by two hooks: whichever is newest speaks, the other stays quiet.
+  // The same change raced by two hooks: no atomic claim, so both may say it (the documented bound is
+  // at most twice); what never happens is an older level after a newer one.
   const first = saveAnnounced(dir, "session-b", "burn", NOW);
   const second = saveAnnounced(dir, "session-b", "burn", NOW);
-  assert.equal(Number(first) + Number(second) >= 1, true);
+  assert.ok(first || second, "at least one says it");
+  assert.equal(loadAnnounced(dir, "session-b"), "burn");
   assert.ok(
     readdirSync(dir).filter((f) => f.startsWith("a-session-a~")).length <= 2,
     "pruned",

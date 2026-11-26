@@ -6,7 +6,8 @@
  * The pressure hook (opt-in: FROND_EAR_QUOTA=claude) reads the seat's usage at most once per
  * QUOTA_TTL_MS, from the same endpoint Claude Code's own usage view reads
  * (GET https://api.anthropic.com/api/oauth/usage, with the seat's OAuth access token from
- * $CLAUDE_CONFIG_DIR/.credentials.json). It says so in the session's context once per change of level.
+ * $CLAUDE_CONFIG_DIR/.credentials.json). It says so in the session's context on each change of level: once ordinarily, at most twice when
+ * two hooks of one session race (🪨 on #129), and never an older level after a newer one.
  *
  * The token is only ever sent to api.anthropic.com. It is never printed, logged or stored. The refresh
  * token is never used: refreshing would rotate it under the live session. An expired access token reads
@@ -274,8 +275,10 @@ export function loadAnnounced(
 }
 
 /**
- * Record that this session heard `level`. Returns whether this write is now the session's newest, so
- * of two hooks racing the same change only one says it.
+ * Record that this session heard `level`. Returns whether this write is now the session's newest. A
+ * hook says the line only then, so a change is said once in the ordinary case; two hooks of one
+ * session racing the same change can both see themselves newest and both say it (at most twice), and
+ * never say an older level after a newer one (🪨 on #129).
  */
 export function saveAnnounced(
   dir: string,
