@@ -11,7 +11,9 @@
  * from an older reading may arrive after a newer one: Claude Code orders concurrent hook output itself,
  * so nothing here can order it. What is guaranteed: the state on disk never goes back to an older
  * reading ("older" by when its request started, bounded by the 2 s fetch timeout), and every line says
- * when its reading was taken, so the latest reading time is the one to believe.
+ * when its reading was taken, so the latest reading time is the one to believe (to the second). Two
+ * readings started in the same second are one race: both lines can be equally true of that moment,
+ * the store keeps one of them, and the next change of level after the TTL settles it.
  *
  * The token is only ever sent to api.anthropic.com. It is never printed, logged or stored. The refresh
  * token is never used: refreshing would rotate it under the live session. An expired access token reads
@@ -147,7 +149,7 @@ export function quotaLine(
   // order, and no lock can order them in the session's context, so the reading time is the order.
   const at =
     readAt !== undefined && Number.isFinite(readAt)
-      ? ` (read ${new Date(readAt).toISOString().slice(11, 16)}Z)`
+      ? ` (read ${new Date(readAt).toISOString().slice(11, 19)}Z)`
       : "";
   return `frond-ear quota${at}: ${summary ? `${summary}; ` : ""}${what[reading.level]}`;
 }

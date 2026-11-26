@@ -164,7 +164,7 @@ test("the pressure hook adds the quota line as added context on PostToolUse", as
   assert.equal(parsed.hookSpecificOutput.hookEventName, "PostToolUse");
   assert.match(
     parsed.hookSpecificOutput.additionalContext,
-    /frond-ear quota \(read \d\d:\d\dZ\): weekly 2% used/u,
+    /frond-ear quota \(read \d\d:\d\d:\d\dZ\): weekly 2% used/u,
   );
   out = "";
   await runPressureCommand(["--hook"], {
@@ -272,6 +272,9 @@ test("🌫 #129: each line carries its reading time, so lines that race out of o
     server([body(100)]).impl,
     "s",
   );
-  assert.match(first ?? "", /^frond-ear quota \(read 09:00Z\): .*near/u);
-  assert.match(later ?? "", /^frond-ear quota \(read 09:31Z\): .*exhausted/u);
+  assert.match(first ?? "", /^frond-ear quota \(read 09:00:00Z\): .*near/u);
+  assert.match(
+    later ?? "",
+    /^frond-ear quota \(read 09:31:00Z\): .*exhausted/u,
+  );
 });
