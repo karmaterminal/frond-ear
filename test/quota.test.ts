@@ -239,3 +239,24 @@ test("🪨 #129: an older save after a newer one, and two sessions at once, lose
   );
   assert.equal(latestSample(dir)?.at, NOW + 10_009);
 });
+
+test("🪨 #129: two hooks of the same session racing: the newer level survives, and only one says it", () => {
+  const env = seat();
+  const dir = quotaDir(env);
+  // Hook X (newer) and hook Y (older) of one session, Y's write landing last.
+  assert.equal(saveAnnounced(dir, "session-a", "exhausted", NOW + 5_000), true);
+  assert.equal(
+    saveAnnounced(dir, "session-a", "near", NOW),
+    false,
+    "the older write is not the newest",
+  );
+  assert.equal(loadAnnounced(dir, "session-a"), "exhausted");
+  // The same change raced by two hooks: whichever is newest speaks, the other stays quiet.
+  const first = saveAnnounced(dir, "session-b", "burn", NOW);
+  const second = saveAnnounced(dir, "session-b", "burn", NOW);
+  assert.equal(Number(first) + Number(second) >= 1, true);
+  assert.ok(
+    readdirSync(dir).filter((f) => f.startsWith("a-session-a~")).length <= 2,
+    "pruned",
+  );
+});

@@ -226,45 +226,80 @@ export function saveSample(dir: string, sample: QuotaSample): void {
   }
 }
 
-function sessionFile(dir: string, sessionId: string): string {
+function sessionPrefix(sessionId: string): string {
   const safe = sessionId.replace(/[^A-Za-z0-9._-]/gu, "_").slice(0, 128) || "_";
-  return join(dir, `a-${safe}.json`);
+  return `a-${safe}~`;
+}
+
+/**
+ * A session's announcements are files too, one per write (`a-<session>~<at>-<pid>-<nonce>.json`), so two
+ * hooks of the same session racing (🪨 on #129) can't replace each other's newer level: the newest by
+ * `at`, then by name, is what the session last heard.
+ */
+function announcements(dir: string, sessionId: string): string[] {
+  const prefix = sessionPrefix(sessionId);
+  try {
+    return readdirSync(dir)
+      .filter((name) => name.startsWith(prefix) && name.endsWith(".json"))
+      .map((name) => ({
+        name,
+        at: Number(name.slice(prefix.length).split("-")[0]),
+      }))
+      .filter((f) => Number.isFinite(f.at))
+      .sort(
+        (x, y) =>
+          y.at - x.at || (y.name < x.name ? -1 : y.name > x.name ? 1 : 0),
+      )
+      .map((f) => f.name);
+  } catch {
+    return [];
+  }
 }
 
 export function loadAnnounced(
   dir: string,
   sessionId: string,
 ): QuotaLevel | undefined {
-  try {
-    const level = (
-      JSON.parse(readFileSync(sessionFile(dir, sessionId), "utf8")) as {
-        level?: unknown;
-      }
-    ).level;
-    return typeof level === "string" ? (level as QuotaLevel) : undefined;
-  } catch {
-    return undefined;
+  for (const name of announcements(dir, sessionId)) {
+    try {
+      const level = (
+        JSON.parse(readFileSync(join(dir, name), "utf8")) as { level?: unknown }
+      ).level;
+      if (typeof level === "string") return level as QuotaLevel;
+    } catch {
+      // Pruned under us: the next one.
+    }
   }
+  return undefined;
 }
 
+/**
+ * Record that this session heard `level`. Returns whether this write is now the session's newest, so
+ * of two hooks racing the same change only one says it.
+ */
 export function saveAnnounced(
   dir: string,
   sessionId: string,
   level: QuotaLevel,
   now: number,
-): void {
+): boolean {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
-  writeAtomic(sessionFile(dir, sessionId), { level, at: now });
+  const name = `${sessionPrefix(sessionId)}${now}-${process.pid}-${Math.random().toString(36).slice(2, 10)}.json`;
+  writeAtomic(join(dir, name), { level, at: now });
+  const mine = announcements(dir, sessionId);
+  const newest = mine[0] === name;
   try {
-    for (const name of readdirSync(dir)) {
-      if (!name.startsWith("a-") || !name.endsWith(".json")) continue;
-      const file = join(dir, name);
-      if (now - statSync(file).mtimeMs > SESSION_TTL_MS)
-        rmSync(file, { force: true });
+    for (const old of mine.slice(2)) rmSync(join(dir, old), { force: true });
+    for (const file of readdirSync(dir)) {
+      if (!file.startsWith("a-") || !file.endsWith(".json")) continue;
+      const path = join(dir, file);
+      if (now - statSync(path).mtimeMs > SESSION_TTL_MS)
+        rmSync(path, { force: true });
     }
   } catch {
     // Pruning is housekeeping only.
   }
+  return newest;
 }
 
 export type QuotaFetch = (url: string, init: RequestInit) => Promise<Response>;
@@ -340,8 +375,10 @@ export async function quotaNotice(
     const level = sample.reading.level;
     const said = loadAnnounced(dir, sessionId);
     if (level === said) return undefined;
-    saveAnnounced(dir, sessionId, level, now);
-    return quotaStep(level, said) ? quotaLine(sample.reading, now) : undefined;
+    const newest = saveAnnounced(dir, sessionId, level, now);
+    return newest && quotaStep(level, said)
+      ? quotaLine(sample.reading, now)
+      : undefined;
   } catch {
     return undefined;
   }
