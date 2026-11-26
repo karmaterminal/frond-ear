@@ -22,6 +22,7 @@ import { join } from "node:path";
 import { parseArgs } from "node:util";
 
 import { request } from "./client.ts";
+import { quotaNotice } from "./quota.ts";
 
 export const DEFAULT_BANDS = [150_000, 200_000, 300_000, 450_000, 650_000];
 
@@ -738,8 +739,29 @@ export async function runPressureCommand(
       // Best effort: the gauge in the session's own context is unchanged.
     }
   }
-  io.stdout.write(withNotice(printed, report?.event, notice));
+  let out = withNotice(printed, report?.event, notice);
+  // Quota bands (opt-in: FROND_EAR_QUOTA=claude), said beside the band line and any daemon
+  // notice, on PostToolUse and UserPromptSubmit only. Never changes the exit code.
+  const event = report?.event ?? hookEventOf(io.stdin);
+  if (event === "PostToolUse" || event === "UserPromptSubmit") {
+    const sessionId =
+      report?.sessionId ?? pressureHookInput(io.stdin ?? "").sessionId ?? "";
+    const line = await quotaNotice(io.env, Date.now(), fetch, sessionId);
+    if (line) out = withNotice(out, event, line);
+  }
+  io.stdout.write(out);
   return code;
+}
+
+/** The hook event named on stdin, when the hook ran without an ear (so no report). */
+function hookEventOf(stdin: string | undefined): string | undefined {
+  try {
+    const event = (JSON.parse(stdin ?? "") as { hook_event_name?: unknown })
+      .hook_event_name;
+    return typeof event === "string" ? event : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
