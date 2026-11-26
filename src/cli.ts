@@ -196,6 +196,22 @@ async function runDaemon(argv: string[]): Promise<void> {
       ? { canticleHear: (ear: string) => canticle!.hearView(ear) }
       : {}),
   });
+  // Signal handlers go in before the socket can be seen: a SIGTERM from a
+  // supervisor that saw it would otherwise meet the default disposition and
+  // kill the daemon past shutdown (stale socket, store left open). A signal
+  // that lands before startup ends is held until everything shutdown closes
+  // exists.
+  let started = false;
+  let signalled = false;
+  const onSignal = (): void => {
+    if (started) {
+      shutdown(0);
+    } else {
+      signalled = true;
+    }
+  };
+  process.on("SIGINT", onSignal);
+  process.on("SIGTERM", onSignal);
   const server = tcp
     ? await listenTcp(daemon, tcp.host, tcp.port)
     : await listenUnix(daemon, runtime.socketPath);
@@ -267,8 +283,10 @@ async function runDaemon(argv: string[]): Promise<void> {
       setTimeout(() => process.exit(code), 500).unref();
     });
   }
-  process.on("SIGINT", () => shutdown(0));
-  process.on("SIGTERM", () => shutdown(0));
+  started = true;
+  if (signalled) {
+    shutdown(0);
+  }
 }
 
 function runShim(): void {
