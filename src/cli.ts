@@ -28,6 +28,7 @@ import { runExposure } from "./canticle/exposure-cli.ts";
 import { Manifest } from "./canticle/manifest.ts";
 import { runConnectorEcho } from "./connector/echo.ts";
 import { Daemon } from "./daemon.ts";
+import { databaseLockPath, lockDatabase } from "./db-lock.ts";
 import { LETTER_HINT, hookInput } from "./letters.ts";
 import { DiscordGateway } from "./gateway.ts";
 import { watchdogOutcome } from "./watchdog.ts";
@@ -119,6 +120,9 @@ async function runDaemon(argv: string[]): Promise<void> {
   // wake_on's read-only token (#111): only in the daemon, never logged or passed on.
   const githubToken = readGithubToken(env);
   const logger = new StructuredLogger(undefined, token ? [token] : []);
+  // Before the first write (F1): opening the store migrates, prunes, and the daemon
+  // repairs and reconciles. A second daemon must refuse here, not at the socket.
+  const databaseLock = lockDatabase(runtime.databasePath);
   const store = new EventStore(runtime.databasePath);
   const pruned = store.prune(config.limits.retentionMs);
 
@@ -176,6 +180,7 @@ async function runDaemon(argv: string[]): Promise<void> {
       runtime.databasePath,
       `${runtime.databasePath}-wal`,
       `${runtime.databasePath}-shm`,
+      databaseLockPath(runtime.databasePath),
       ...(env.DISCORD_BOT_TOKEN_FILE ? [env.DISCORD_BOT_TOKEN_FILE] : []),
       ...(env.FROND_EAR_TOKEN_FILE ? [env.FROND_EAR_TOKEN_FILE] : []),
       ...(env.FROND_EAR_GITHUB_TOKEN_FILE
@@ -258,6 +263,7 @@ async function runDaemon(argv: string[]): Promise<void> {
     server.close();
     void daemon.shutdown().then(({ drained }) => {
       store.close();
+      databaseLock?.release();
       logger.log("info", "daemon.stopped", { code, drained });
       process.exitCode = code;
       setTimeout(() => process.exit(code), 500).unref();
