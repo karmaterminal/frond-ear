@@ -23,9 +23,12 @@
 //   only sub-agent keys, so a continuing-session form is still to settle (#117, #161).
 // - `sessionId`: the Claude Code session id holding the ear when the push was fenced (the
 //   shim's CLAUDE_CODE_SESSION_ID or a hook's), or null when its shim gave none.
-// - `lifecycleRevision`: `attach:<generation>`, the ear's attach generation: it changes at
-//   every attach, so a shim that reconnects, or another session taking the ear, is a new
-//   revision.
+// - `lifecycleRevision`: `claude-session:<session id>` (`claude-session:unknown` without one).
+//   It changes only when the context does: another session taking the ear, or /clear or a
+//   fresh start (a new session id). A compaction, a resume or a shim that reattaches keeps it,
+//   because the session keeps what it heard. It was the ear's attach generation until 11-25;
+//   that made every reattach a new #162 reader generation with an empty ledger, which an
+//   issuer could attest as an observed birth and so launder every earlier exposure.
 // - Alongside, not in the reader: #114's holder identity then (`known`, `unknown`,
 //   `in-doubt`). A record whose reader has no session id is kept, but `conformant` never
 //   passes it off as a `PayloadExposure`.
@@ -160,7 +163,7 @@ export function exposureReader(
   return {
     sessionKey: `frond-ear:${ear}`,
     sessionId: session.sessionId,
-    lifecycleRevision: `attach:${session.generation}`,
+    lifecycleRevision: `claude-session:${session.sessionId ?? "unknown"}`,
   };
 }
 
