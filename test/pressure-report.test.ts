@@ -795,3 +795,150 @@ test("hook → real daemon: a pre-compaction hook run delivered after the PostCo
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ---- 🌫's review of #110: an unknown reading must reach ear_status --------------------
+
+test("hook → real daemon (#110): a newer invalid usage row replaces the kept size with unknown, with or without an older marker", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "fe-pressure-unknown-"));
+  const now = Date.now();
+  const iso = (ms: number) => new Date(ms).toISOString();
+  const valid = (ms: number) =>
+    JSON.stringify({
+      type: "assistant",
+      timestamp: iso(ms),
+      message: {
+        role: "assistant",
+        usage: {
+          input_tokens: 10,
+          cache_read_input_tokens: 249_940,
+          output_tokens: 50,
+        },
+      },
+    });
+  const invalid = (ms: number) =>
+    JSON.stringify({
+      type: "assistant",
+      timestamp: iso(ms),
+      message: {
+        role: "assistant",
+        usage: { input_tokens: null, output_tokens: 1 },
+      },
+    });
+  const marker = (ms: number) =>
+    JSON.stringify({
+      type: "system",
+      subtype: "compact_boundary",
+      uuid: "m-old",
+      timestamp: iso(ms),
+    });
+  try {
+    for (const [name, rows] of [
+      ["no marker", [valid(now - 60_000), invalid(now - 30_000)]],
+      [
+        "older marker",
+        [marker(now - 120_000), valid(now - 60_000), invalid(now - 20_000)],
+      ],
+    ] as const) {
+      // A fresh daemon per case: each case's evidence times stand on their own.
+      const socketPath = join(dir, `${name.replace(" ", "-")}.sock`);
+      const h = harness();
+      h.clock.value = now;
+      const server = await listenUnix(h.daemon, socketPath);
+      h.attach("scribe", { sessionId: SESSION });
+      try {
+        const transcript = join(dir, `${name.replace(" ", "-")}.jsonl`);
+        // First the valid reading alone, so the daemon keeps 250k.
+        writeFileSync(transcript, `${rows.slice(0, -1).join("\n")}\n`);
+        const input = JSON.stringify({
+          session_id: SESSION,
+          transcript_path: transcript,
+          hook_event_name: "PostToolUse",
+        });
+        const env = {
+          XDG_STATE_HOME: join(dir, `state-${name.replace(" ", "-")}`),
+          FROND_EAR_SOCKET: socketPath,
+        };
+        assert.equal(
+          (await run(["--hook", "--ear", "scribe"], input, env)).code,
+          0,
+        );
+        assert.equal(
+          (earPressure(h) as { tokens: number }).tokens,
+          250_000,
+          `${name}: kept`,
+        );
+        // Then the newer invalid row: unknown must replace the size, at that row's time.
+        writeFileSync(transcript, `${rows.join("\n")}\n`);
+        const after = await run(["--hook", "--ear", "scribe"], input, env);
+        assert.equal(after.code, 0);
+        const p = earPressure(h) as {
+          tokens: number | null;
+          at: number;
+          idleCompactDueAt: number | null;
+        };
+        assert.equal(p.tokens, null, `${name}: unknown reaches ear_status`);
+        const lastTime = Date.parse(
+          (JSON.parse(rows.at(-1) ?? "{}") as { timestamp: string }).timestamp,
+        );
+        assert.equal(p.at, lastTime, `${name}: at is the invalid row's time`);
+        assert.equal(
+          p.idleCompactDueAt,
+          null,
+          `${name}: no forecast from an unknown`,
+        );
+      } finally {
+        server.close();
+        h.dispose();
+      }
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("daemon (#110): an unknown report never ends a hold, even when its marker has no time of its own", async () => {
+  const h = harness();
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    await h.call(shim, "hold_compaction", { reason: "wait" });
+    h.clock.advance(5_000);
+    // tokens null + a marker id with no boundaryAt: before #110 the daemon read `at` as the marker time.
+    const cli = h.attach(undefined, { role: "cli" });
+    await cli.send({
+      type: "pressure",
+      id: 9101,
+      ear: "scribe",
+      sessionId: SESSION,
+      tokens: null,
+      band: null,
+      boundary: "m-old",
+      at: h.clock.now(),
+      unknown: true,
+    });
+    const status = h.daemon.status("scribe") as {
+      ears: Array<{ name: string; hold: unknown }>;
+    };
+    assert.ok(
+      status.ears.find((e) => e.name === "scribe")?.hold,
+      "the hold stands",
+    );
+    // The control: the same report without `unknown` is a marker-only reading and ends it.
+    h.clock.advance(1_000);
+    await cli.send({
+      type: "pressure",
+      id: 9102,
+      ear: "scribe",
+      sessionId: SESSION,
+      tokens: null,
+      band: null,
+      boundary: "m-new",
+      at: h.clock.now(),
+    });
+    const after = h.daemon.status("scribe") as {
+      ears: Array<{ name: string; hold: unknown }>;
+    };
+    assert.equal(after.ears.find((e) => e.name === "scribe")?.hold, null);
+  } finally {
+    h.dispose();
+  }
+});

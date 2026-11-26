@@ -463,13 +463,14 @@ test("reading: sidechain rows never count, and `at` is the chosen row's time (#9
   const main = JSON.stringify({
     type: "assistant",
     timestamp: "2026-11-18T19:50:00.000Z",
-    message: { usage: { input_tokens: 300_000 } },
+    // A real usage row carries both counters (#109: the gauge reads it strictly).
+    message: { usage: { input_tokens: 300_000, output_tokens: 0 } },
   });
   const side = JSON.stringify({
     type: "assistant",
     isSidechain: true,
     timestamp: "2026-11-18T19:51:00.000Z",
-    message: { usage: { input_tokens: 10_000 } },
+    message: { usage: { input_tokens: 10_000, output_tokens: 0 } },
   });
   const sideMarker = JSON.stringify({
     type: "system",

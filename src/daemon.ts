@@ -2107,6 +2107,7 @@ export class Daemon {
     idleFloor?: unknown;
     event?: unknown;
     boundaryAt?: unknown;
+    unknown?: unknown;
     hostPid?: unknown;
   }): { ok: boolean; text: string; notice?: string } {
     const ear = typeof message.ear === "string" ? message.ear : "";
@@ -2215,7 +2216,7 @@ export class Daemon {
         typeof message.boundaryAt === "number" &&
         Number.isFinite(message.boundaryAt)
           ? message.boundaryAt
-          : tokens === null
+          : tokens === null && message.unknown !== true
             ? (at as number)
             : undefined;
       if (
