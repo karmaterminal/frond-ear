@@ -301,11 +301,21 @@ test("the database guard comes before the store opens: a held lock and no databa
   lock?.release();
   const next = spawnDaemon(t, setup.envB);
   await waitFor(
-    () => (existsSync(setup.envB.FROND_EAR_SOCKET!) ? true : undefined),
+    () =>
+      existsSync(setup.envB.FROND_EAR_SOCKET!)
+        ? true
+        : next.child.exitCode !== null
+          ? (() => {
+              throw new Error(
+                `the next daemon exited ${next.child.exitCode}: ${next.stderr()}`,
+              );
+            })()
+          : undefined,
     "the next daemon's socket",
   );
-  next.child.kill("SIGTERM");
-  assert.equal(await next.exited, 0);
+  // It serves (the socket appears before the daemon installs its signal handlers, so
+  // its exit code on a kill this early proves nothing).
+  assert.equal((await run(["status"], setup.envB)).code, 0);
 });
 
 test("the database guard follows the real path: a symlinked state directory is the same database", async (t) => {
@@ -350,6 +360,5 @@ test("the database guard is released by the OS: a SIGKILLed daemon leaves nothin
           : undefined,
     "the restarted daemon's socket",
   );
-  restarted.child.kill("SIGTERM");
-  assert.equal(await restarted.exited, 0);
+  assert.equal((await run(["status"], setup.envB)).code, 0);
 });
