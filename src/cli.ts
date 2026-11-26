@@ -124,6 +124,16 @@ async function runDaemon(argv: string[]): Promise<void> {
   const githubToken = readGithubToken(env);
   const logger = new StructuredLogger(undefined, token ? [token] : []);
   const store = new EventStore(runtime.databasePath);
+  if (store.reset) {
+    // #115: said once here, and in ear_status for as long as the record stands.
+    logger.log("warn", "store.set_aside", {
+      keptAt: store.reset.keptAt,
+      moved: store.reset.moved,
+      // SQLite's own words or quick_check's page findings, never ledger text ("error"
+      // is a key the logger redacts wholesale).
+      found: store.reset.error,
+    });
+  }
   const pruned = store.prune(config.limits.retentionMs);
 
   let gateway: DiscordGateway | undefined;

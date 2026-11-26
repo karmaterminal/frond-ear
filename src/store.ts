@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
@@ -12,6 +12,11 @@ import {
   type HolderIdentity,
   pendingIdOf,
 } from "./canticle/exposure.ts";
+import {
+  probeStore,
+  setStoreAside,
+  type StoreReset,
+} from "./store-recovery.ts";
 import { WakeStore } from "./wake-store.ts";
 import type {
   BatchKind,
@@ -717,15 +722,50 @@ export class EventStore {
   private readonly clock: Clock;
   /** Daemon-held schedules, watches and the wakes they owe (#111). */
   public readonly wakes: WakeStore;
+  /** Set when this open found the store corrupt and set it aside (#115). */
+  public readonly reset: StoreReset | undefined;
 
   public constructor(path: string, clock: Clock = systemClock) {
     if (path !== ":memory:") {
       mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     }
     this.clock = clock;
+    // #115: a store file that is damaged is set aside whole, never deleted, and a fresh
+    // store starts in its place. The probe is read-only, so SQLite can't fold or remove
+    // its sidecars while it looks, and it throws anything that is not corruption
+    // (locked, busy, unreadable) with no file moved: the daemon refuses as before.
+    let reset: StoreReset | undefined;
+    if (path !== ":memory:" && existsSync(path)) {
+      const damage = probeStore(path);
+      if (damage !== undefined) {
+        reset = setStoreAside(path, damage, clock.now());
+      }
+    }
     this.database = new DatabaseSync(path);
+    this.wakes = this.migrate();
+    if (reset !== undefined) {
+      this.database
+        .prepare(
+          "INSERT INTO store_resets (reset_at, kept_at, moved, error) VALUES (?, ?, ?, ?)",
+        )
+        .run(reset.at, reset.keptAt, JSON.stringify(reset.moved), reset.error);
+      // A fresh store reads as "nothing was ever exposed"; after a reset that is unknown.
+      this.setRuntimeState(CUSTODY_SINCE, String(reset.at));
+    }
+    this.reset = reset;
+  }
+
+  /** Opens the schema on `this.database`: every table and migration, then the wake store. */
+  private migrate(): WakeStore {
     this.database.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
     this.database.exec(`
+      CREATE TABLE IF NOT EXISTS store_resets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        reset_at INTEGER NOT NULL,
+        kept_at TEXT NOT NULL,
+        moved TEXT NOT NULL,
+        error TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         message_id TEXT NOT NULL UNIQUE,
@@ -1104,10 +1144,31 @@ export class EventStore {
       CREATE INDEX IF NOT EXISTS derived_publications_key
         ON derived_publications (publication_key, state);
     `);
-    this.wakes = new WakeStore(
+    return new WakeStore(
       this.database,
       <T>(work: () => T): T => this.transaction(work),
     );
+  }
+
+  /** Every time a corrupt store was set aside for this one (#115), oldest first. */
+  public storeResets(): StoreReset[] {
+    return (
+      this.database
+        .prepare(
+          "SELECT reset_at AS at, kept_at AS keptAt, moved, error FROM store_resets ORDER BY id",
+        )
+        .all() as Array<{
+        at: number;
+        keptAt: string;
+        moved: string;
+        error: string;
+      }>
+    ).map((row) => ({
+      at: row.at,
+      keptAt: row.keptAt,
+      moved: JSON.parse(row.moved) as string[],
+      error: row.error,
+    }));
   }
 
   public close(): void {
