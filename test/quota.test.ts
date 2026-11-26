@@ -164,7 +164,7 @@ test("the pressure hook adds the quota line as added context on PostToolUse", as
   assert.equal(parsed.hookSpecificOutput.hookEventName, "PostToolUse");
   assert.match(
     parsed.hookSpecificOutput.additionalContext,
-    /frond-ear quota: weekly 2% used/u,
+    /frond-ear quota \(read \d\d:\d\dZ\): weekly 2% used/u,
   );
   out = "";
   await runPressureCommand(["--hook"], {
@@ -240,7 +240,7 @@ test("🪨 #129: an older save after a newer one, and two sessions at once, lose
   assert.equal(latestSample(dir)?.at, NOW + 10_009);
 });
 
-test("🪨 #129: two hooks of the same session racing: the newer level survives; a raced change is said at most twice", () => {
+test("🪨 #129: two hooks of the same session racing: the stored newer level survives; duplicates are allowed", () => {
   const env = seat();
   const dir = quotaDir(env);
   // Hook X (newer) and hook Y (older) of one session, Y's write landing last.
@@ -251,8 +251,8 @@ test("🪨 #129: two hooks of the same session racing: the newer level survives;
     "the older write is not the newest",
   );
   assert.equal(loadAnnounced(dir, "session-a"), "exhausted");
-  // The same change raced by two hooks: no atomic claim, so both may say it (the documented bound is
-  // at most twice); what never happens is an older level after a newer one.
+  // The same change raced by two hooks: no atomic claim, so both may say it (duplicates are part of the
+  // contract); what the store never does is go back to an older level.
   const first = saveAnnounced(dir, "session-b", "burn", NOW);
   const second = saveAnnounced(dir, "session-b", "burn", NOW);
   assert.ok(first || second, "at least one says it");
@@ -261,4 +261,17 @@ test("🪨 #129: two hooks of the same session racing: the newer level survives;
     readdirSync(dir).filter((f) => f.startsWith("a-session-a~")).length <= 2,
     "pruned",
   );
+});
+
+test("🌫 #129: each line carries its reading time, so lines that race out of order can be told apart", async () => {
+  const env = seat();
+  const first = await quotaNotice(env, NOW, server([body(90)]).impl, "s");
+  const later = await quotaNotice(
+    env,
+    NOW + QUOTA_TTL_MS + 60_000,
+    server([body(100)]).impl,
+    "s",
+  );
+  assert.match(first ?? "", /^frond-ear quota \(read 09:00Z\): .*near/u);
+  assert.match(later ?? "", /^frond-ear quota \(read 09:31Z\): .*exhausted/u);
 });

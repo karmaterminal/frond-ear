@@ -6,8 +6,12 @@
  * The pressure hook (opt-in: FROND_EAR_QUOTA=claude) reads the seat's usage at most once per
  * QUOTA_TTL_MS, from the same endpoint Claude Code's own usage view reads
  * (GET https://api.anthropic.com/api/oauth/usage, with the seat's OAuth access token from
- * $CLAUDE_CONFIG_DIR/.credentials.json). It says so in the session's context on each change of level: once ordinarily, at most twice when
- * two hooks of one session race (🪨 on #129), and never an older level after a newer one.
+ * $CLAUDE_CONFIG_DIR/.credentials.json). The contract, as narrowed in review (🌫, 🪨, 🌿 on #129): a change of level is said in the session's
+ * context, ordinarily once. When hooks run concurrently a line may be said more than once, and a line
+ * from an older reading may arrive after a newer one: Claude Code orders concurrent hook output itself,
+ * so nothing here can order it. What is guaranteed: the state on disk never goes back to an older
+ * reading ("older" by when its request started, bounded by the 2 s fetch timeout), and every line says
+ * when its reading was taken, so the latest reading time is the one to believe.
  *
  * The token is only ever sent to api.anthropic.com. It is never printed, logged or stored. The refresh
  * token is never used: refreshing would rotate it under the live session. An expired access token reads
@@ -125,7 +129,11 @@ export function quotaSummary(reading: QuotaReading, now: number): string {
 }
 
 /** The line said in the session's context on a change of level. */
-export function quotaLine(reading: QuotaReading, now: number): string {
+export function quotaLine(
+  reading: QuotaReading,
+  now: number,
+  readAt?: number,
+): string {
   const summary = quotaSummary(reading, now);
   const what: Record<QuotaLevel, string> = {
     ok: "back to ok.",
@@ -135,7 +143,13 @@ export function quotaLine(reading: QuotaReading, now: number): string {
       "exhausted: no turns until the reset. Push what you have and leave a letter.",
     unknown: `unknown (${reading.problem ?? "the check failed"}). It is retried every 30 min.`,
   };
-  return `frond-ear quota: ${summary ? `${summary}; ` : ""}${what[reading.level]}`;
+  // Each line says when its reading was taken (🌫 on #129): two hooks racing can deliver lines out of
+  // order, and no lock can order them in the session's context, so the reading time is the order.
+  const at =
+    readAt !== undefined && Number.isFinite(readAt)
+      ? ` (read ${new Date(readAt).toISOString().slice(11, 16)}Z)`
+      : "";
+  return `frond-ear quota${at}: ${summary ? `${summary}; ` : ""}${what[reading.level]}`;
 }
 
 /**
@@ -276,9 +290,9 @@ export function loadAnnounced(
 
 /**
  * Record that this session heard `level`. Returns whether this write is now the session's newest. A
- * hook says the line only then, so a change is said once in the ordinary case; two hooks of one
- * session racing the same change can both see themselves newest and both say it (at most twice), and
- * never say an older level after a newer one (🪨 on #129).
+ * hook says the line only then, so a change is said once in the ordinary case. Concurrent hooks can
+ * each see themselves newest and each say it: duplicates are possible, and so is an older line arriving
+ * last (the module header has the contract).
  */
 export function saveAnnounced(
   dir: string,
@@ -380,7 +394,7 @@ export async function quotaNotice(
     if (level === said) return undefined;
     const newest = saveAnnounced(dir, sessionId, level, now);
     return newest && quotaStep(level, said)
-      ? quotaLine(sample.reading, now)
+      ? quotaLine(sample.reading, now, sample.at)
       : undefined;
   } catch {
     return undefined;
