@@ -68,6 +68,10 @@ usage:
   frond-ear copilot-extension --ear <name> [--dir <path>]
                                       install the Copilot CLI extension for an ear
                                       (default dir $COPILOT_HOME/extensions/frond-ear; run copilot --experimental)
+  frond-ear quota [--json]            this Claude seat's subscription quota (CLAUDE_CONFIG_DIR): weekly and
+                                      5-hour use, reset, level ok|burn|near|exhausted|unknown; read-only, the
+                                      token goes only to api.anthropic.com. The pressure hook says the level
+                                      on each change when FROND_EAR_QUOTA=claude
   frond-ear tap --ear <name>          stream the batches pushed to an ear's attached session (read-only;\n                                      wakes a session without channel push; a shim must be attached)
   frond-ear release --ear <name> [--source <s>] [--session <id>] [--hook]
                                       release an ear's letters (#88) to its attached session; for a
@@ -197,6 +201,22 @@ async function runDaemon(argv: string[]): Promise<void> {
       ? { canticleHear: (ear: string) => canticle!.hearView(ear) }
       : {}),
   });
+  // Signal handlers go in before the socket can be seen: a SIGTERM from a
+  // supervisor that saw it would otherwise meet the default disposition and
+  // kill the daemon past shutdown (stale socket, store left open). A signal
+  // that lands before startup ends is held until everything shutdown closes
+  // exists.
+  let started = false;
+  let signalled = false;
+  const onSignal = (): void => {
+    if (started) {
+      shutdown(0);
+    } else {
+      signalled = true;
+    }
+  };
+  process.on("SIGINT", onSignal);
+  process.on("SIGTERM", onSignal);
   const server = tcp
     ? await listenTcp(daemon, tcp.host, tcp.port)
     : await listenUnix(daemon, runtime.socketPath);
@@ -269,8 +289,10 @@ async function runDaemon(argv: string[]): Promise<void> {
       setTimeout(() => process.exit(code), 500).unref();
     });
   }
-  process.on("SIGINT", () => shutdown(0));
-  process.on("SIGTERM", () => shutdown(0));
+  started = true;
+  if (signalled) {
+    shutdown(0);
+  }
 }
 
 function runShim(): void {
@@ -914,6 +936,19 @@ async function main(): Promise<void> {
         env: process.env,
       });
       return;
+    case "quota": {
+      // A person's check: always a fresh read; the hook's announced level is left alone.
+      const { readQuota, quotaSummary } = await import("./quota.ts");
+      const now = Date.now();
+      const reading = await readQuota(process.env, now);
+      process.stdout.write(
+        rest.includes("--json")
+          ? `${JSON.stringify(reading)}\n`
+          : `${[quotaSummary(reading, now), `level ${reading.level}`, reading.problem].filter(Boolean).join("; ")}\n`,
+      );
+      process.exitCode = reading.level === "unknown" ? 1 : 0;
+      return;
+    }
     case "tap":
       runTap(rest);
       return;
