@@ -1,6 +1,6 @@
 // Quota bands for a Claude seat (figs, 2026-11-26): the pressure hook says the level once per change.
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -8,7 +8,11 @@ import test from "node:test";
 import { runPressureCommand } from "../src/pressure.ts";
 import {
   QUOTA_TTL_MS,
-  quotaCacheFile,
+  latestSample,
+  loadAnnounced,
+  quotaDir,
+  saveAnnounced,
+  saveSample,
   quotaNotice,
   quotaReading,
   quotaStep,
@@ -74,19 +78,10 @@ test("levels: ok, burn near a reset, near, exhausted by percent or lock, unknown
 });
 
 test("step: a first ok is silent, a first non-ok is said, each change is said once", () => {
-  const at = NOW;
-  assert.equal(quotaStep({ at, reading: { level: "ok" } }).announce, false);
-  assert.equal(quotaStep({ at, reading: { level: "burn" } }).announce, true);
-  assert.equal(
-    quotaStep({ at, reading: { level: "burn" }, announced: { "": "burn" } })
-      .announce,
-    false,
-  );
-  assert.equal(
-    quotaStep({ at, reading: { level: "ok" }, announced: { "": "burn" } })
-      .announce,
-    true,
-  );
+  assert.equal(quotaStep("ok", undefined), false);
+  assert.equal(quotaStep("burn", undefined), true);
+  assert.equal(quotaStep("burn", "burn"), false);
+  assert.equal(quotaStep("ok", "burn"), true);
 });
 
 test("the notice is opt-in, reads at most once per TTL, and says each change once", async () => {
@@ -117,8 +112,11 @@ test("the token goes only in the request header: never in a line, the cache, or 
   assert.ok(!(line ?? "").includes(TOKEN));
   const headers = api.calls[0]!.headers as Record<string, string>;
   assert.equal(headers.Authorization, `Bearer ${TOKEN}`);
-  const cache = readFileSync(quotaCacheFile(env), "utf8");
-  assert.ok(!cache.includes(TOKEN) && !cache.includes("REFRESH"));
+  const dir = quotaDir(env);
+  for (const name of readdirSync(dir)) {
+    const text = readFileSync(`${dir}/${name}`, "utf8");
+    assert.ok(!text.includes(TOKEN) && !text.includes("REFRESH"), name);
+  }
   const reading = JSON.stringify(await readQuota(env, NOW, api.impl));
   assert.ok(!reading.includes(TOKEN));
 });
@@ -216,12 +214,28 @@ test("🌫 #129: a slower, older read never overwrites a newer one", async () =>
   assert.match(newer ?? "", /exhausted/u);
   releaseOld();
   await older;
-  const cache = JSON.parse(readFileSync(quotaCacheFile(env), "utf8")) as {
-    reading: { level: string };
-  };
   assert.equal(
-    cache.reading.level,
+    latestSample(quotaDir(env))?.reading.level,
     "exhausted",
     "the older near did not replace it",
   );
+});
+
+test("🪨 #129: an older save after a newer one, and two sessions at once, lose nothing", () => {
+  const env = seat();
+  const dir = quotaDir(env);
+  saveSample(dir, { at: NOW + 5_000, reading: { level: "exhausted" } });
+  saveSample(dir, { at: NOW, reading: { level: "near" } }); // renamed last, taken first
+  assert.equal(latestSample(dir)?.reading.level, "exhausted");
+  saveAnnounced(dir, "session-a", "near", NOW);
+  saveAnnounced(dir, "session-b", "exhausted", NOW);
+  assert.equal(loadAnnounced(dir, "session-a"), "near");
+  assert.equal(loadAnnounced(dir, "session-b"), "exhausted");
+  for (let n = 0; n < 10; n += 1)
+    saveSample(dir, { at: NOW + 10_000 + n, reading: { level: "ok" } });
+  assert.ok(
+    readdirSync(dir).filter((f) => f.startsWith("r-")).length <= 4,
+    "readings pruned",
+  );
+  assert.equal(latestSample(dir)?.at, NOW + 10_009);
 });

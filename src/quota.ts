@@ -13,7 +13,15 @@
  * as `unknown` until Claude Code renews it.
  */
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -38,20 +46,11 @@ export interface QuotaReading {
   problem?: string;
 }
 
-export interface QuotaCache {
+export interface QuotaSample {
   /** When the reading was taken (epoch ms). */
   at: number;
   reading: QuotaReading;
-  /**
-   * The level last said in each session's context, by session id (🌫 on #129: one config can serve
-   * several sessions, and each must hear its own first warning). Bounded to MAX_SESSIONS, the most
-   * recently written kept.
-   */
-  announced?: Record<string, QuotaLevel>;
 }
-
-/** Sessions whose last-said level is kept per Claude config. */
-export const MAX_SESSIONS = 32;
 
 const percent = (value: unknown): number | undefined =>
   typeof value === "number" && Number.isFinite(value) && value >= 0
@@ -139,74 +138,133 @@ export function quotaLine(reading: QuotaReading, now: number): string {
 }
 
 /**
- * Whether this reading is said now. The first reading says nothing when it is ok; after that, every
- * change of level is said once.
+ * Whether a level is said now to a session that last heard `said`. A first reading says nothing when it
+ * is ok; after that, every change of level is said once.
  */
 export function quotaStep(
-  cache: QuotaCache,
-  sessionId = "",
-): {
-  cache: QuotaCache;
-  announce: boolean;
-} {
-  const level = cache.reading.level;
-  const said = cache.announced?.[sessionId];
-  const announce = level !== said && !(said === undefined && level === "ok");
-  const others = Object.entries(cache.announced ?? {}).filter(
-    ([id]) => id !== sessionId,
-  );
-  const announced = Object.fromEntries([
-    ...others.slice(-(MAX_SESSIONS - 1)),
-    [sessionId, level],
-  ]) as Record<string, QuotaLevel>;
-  return { cache: { ...cache, announced }, announce };
+  level: QuotaLevel,
+  said: QuotaLevel | undefined,
+): boolean {
+  return level !== said && !(said === undefined && level === "ok");
 }
 
 export function quotaConfigDir(env: NodeJS.ProcessEnv): string {
   return env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
 }
 
-export function quotaCacheFile(env: NodeJS.ProcessEnv): string {
+/**
+ * Where a Claude config's quota state lives: one directory per config, holding one file per reading
+ * (`r-<at>-<pid>.json`) and one per session's last-said level (`a-<session>.json`). Nothing is ever
+ * rewritten in place, so concurrent hooks can't lose each other's writes (🌫, 🪨 on #129): an older
+ * reading can't replace a newer one, because the newest file by `at` wins, and each session writes
+ * only its own announcement.
+ */
+export function quotaDir(env: NodeJS.ProcessEnv): string {
   const stateHome = env.XDG_STATE_HOME ?? join(homedir(), ".local", "state");
   const key = createHash("sha256")
     .update(quotaConfigDir(env))
     .digest("hex")
     .slice(0, 16);
-  return join(stateHome, "frond-ear", "quota", `${key}.json`);
+  return join(stateHome, "frond-ear", "quota", key);
 }
 
-export function loadQuotaCache(file: string): QuotaCache | undefined {
+/** Readings kept per config (the newest by `at`); older files are pruned. */
+export const KEEP_READINGS = 4;
+/** A session's announcement file older than this is pruned. */
+export const SESSION_TTL_MS = 7 * 86_400_000;
+
+const READING = /^r-(\d+)-\d+\.json$/u;
+
+function writeAtomic(file: string, value: unknown): void {
+  const temp = `${file}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
+  writeFileSync(temp, JSON.stringify(value), { mode: 0o600 });
+  renameSync(temp, file);
+}
+
+/** The newest readable reading, by when it was taken. */
+export function latestSample(dir: string): QuotaSample | undefined {
+  let names: string[];
   try {
-    const parsed = JSON.parse(readFileSync(file, "utf8")) as QuotaCache;
-    if (
-      typeof parsed.at === "number" &&
-      parsed.reading &&
-      typeof parsed.reading.level === "string"
-    ) {
-      // A per-session map only; anything else (an older single level) starts the sessions again.
-      const announced =
-        parsed.announced &&
-        typeof parsed.announced === "object" &&
-        !Array.isArray(parsed.announced)
-          ? parsed.announced
-          : undefined;
-      return {
-        at: parsed.at,
-        reading: parsed.reading,
-        ...(announced ? { announced } : {}),
-      };
-    }
+    names = readdirSync(dir);
   } catch {
-    // None yet, or unreadable: read again.
+    return undefined;
+  }
+  const byAt = names
+    .map((name) => ({ name, at: Number(READING.exec(name)?.[1]) }))
+    .filter((f) => Number.isFinite(f.at))
+    .sort((x, y) => y.at - x.at);
+  for (const f of byAt) {
+    try {
+      const parsed = JSON.parse(
+        readFileSync(join(dir, f.name), "utf8"),
+      ) as QuotaSample;
+      if (
+        typeof parsed.at === "number" &&
+        typeof parsed.reading?.level === "string"
+      ) {
+        return parsed;
+      }
+    } catch {
+      // Pruned or torn under us: try the next one.
+    }
   }
   return undefined;
 }
 
-export function saveQuotaCache(file: string, cache: QuotaCache): void {
-  mkdirSync(join(file, ".."), { recursive: true, mode: 0o700 });
-  const temp = `${file}.${process.pid}.tmp`;
-  writeFileSync(temp, JSON.stringify(cache), { mode: 0o600 });
-  renameSync(temp, file);
+export function saveSample(dir: string, sample: QuotaSample): void {
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  writeAtomic(join(dir, `r-${sample.at}-${process.pid}.json`), sample);
+  try {
+    const old = readdirSync(dir)
+      .map((name) => ({ name, at: Number(READING.exec(name)?.[1]) }))
+      .filter((f) => Number.isFinite(f.at))
+      .sort((x, y) => y.at - x.at)
+      .slice(KEEP_READINGS);
+    for (const f of old) rmSync(join(dir, f.name), { force: true });
+  } catch {
+    // Pruning is housekeeping only.
+  }
+}
+
+function sessionFile(dir: string, sessionId: string): string {
+  const safe = sessionId.replace(/[^A-Za-z0-9._-]/gu, "_").slice(0, 128) || "_";
+  return join(dir, `a-${safe}.json`);
+}
+
+export function loadAnnounced(
+  dir: string,
+  sessionId: string,
+): QuotaLevel | undefined {
+  try {
+    const level = (
+      JSON.parse(readFileSync(sessionFile(dir, sessionId), "utf8")) as {
+        level?: unknown;
+      }
+    ).level;
+    return typeof level === "string" ? (level as QuotaLevel) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function saveAnnounced(
+  dir: string,
+  sessionId: string,
+  level: QuotaLevel,
+  now: number,
+): void {
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  writeAtomic(sessionFile(dir, sessionId), { level, at: now });
+  try {
+    for (const name of readdirSync(dir)) {
+      if (!name.startsWith("a-") || !name.endsWith(".json")) continue;
+      const file = join(dir, name);
+      if (now - statSync(file).mtimeMs > SESSION_TTL_MS)
+        rmSync(file, { force: true });
+    }
+  } catch {
+    // Pruning is housekeeping only.
+  }
 }
 
 export type QuotaFetch = (url: string, init: RequestInit) => Promise<Response>;
@@ -268,29 +326,22 @@ export async function quotaNotice(
 ): Promise<string | undefined> {
   if (env.FROND_EAR_QUOTA !== "claude") return undefined;
   try {
-    const file = quotaCacheFile(env);
-    const kept = loadQuotaCache(file);
-    const fresh = kept && now - kept.at < QUOTA_TTL_MS && now >= kept.at;
-    let cache: QuotaCache;
-    if (fresh) {
-      cache = kept;
-    } else {
-      const reading = await readQuota(env, now, fetchImpl);
-      // Another hook may have written while this one waited (🌫 on #129): a reading taken earlier
-      // than the one now on disk never replaces it. Announcements always merge from the latest file.
-      const latest = loadQuotaCache(file);
-      cache =
-        latest && latest.at > now
-          ? latest
-          : {
-              at: now,
-              reading,
-              ...(latest?.announced ? { announced: latest.announced } : {}),
-            };
+    const dir = quotaDir(env);
+    let sample = latestSample(dir);
+    if (!sample || now - sample.at >= QUOTA_TTL_MS || now < sample.at) {
+      saveSample(dir, {
+        at: now,
+        reading: await readQuota(env, now, fetchImpl),
+      });
+      // Another hook may have saved a newer reading meanwhile: the newest by `at` is the one used.
+      sample = latestSample(dir);
     }
-    const { cache: next, announce } = quotaStep(cache, sessionId);
-    if (!fresh || announce) saveQuotaCache(file, next);
-    return announce ? quotaLine(next.reading, now) : undefined;
+    if (!sample) return undefined;
+    const level = sample.reading.level;
+    const said = loadAnnounced(dir, sessionId);
+    if (level === said) return undefined;
+    saveAnnounced(dir, sessionId, level, now);
+    return quotaStep(level, said) ? quotaLine(sample.reading, now) : undefined;
   } catch {
     return undefined;
   }
