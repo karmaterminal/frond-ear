@@ -39,6 +39,7 @@ import {
   KIND_ITEM,
   KIND_PLUCK,
   Reject,
+  localExpiryCapMs,
   localExpiryMs,
   parse,
   type Frame,
@@ -47,6 +48,11 @@ import {
 } from "./wire.ts";
 
 export const SKEW_MS = 5_000;
+/**
+ * How long a beacon mark that has moved may go unsaved (binary-canticle#175): `tick()` sets
+ * `dirty` once it has, so after a crash only beacons this recent can be heard as new again.
+ */
+export const MARK_SAVE_MS = 10_000;
 const OFFSET_SAMPLES = 16;
 const LIVE_STATE = CLASS_BY_NAME.get("live-state")!.code;
 
@@ -135,6 +141,12 @@ function newStation(): StationState {
     streamEntries: new Map(),
     catalogPages: new Map(),
   };
+}
+
+/** A station's beacon mark and δ̂ floor as saved (v4), or undefined when there is nothing to keep. */
+function beaconMark(st: StationState): [number, string, number] | undefined {
+  if (!st.epochHwm || st.offsets.length === 0) return undefined;
+  return [st.epochHwm, st.bseq.toString(), Math.min(...st.offsets)];
 }
 
 const offsetMs = (st: StationState | undefined) =>
@@ -252,14 +264,23 @@ export interface ListenerOptions {
    */
   journal?: readonly SafetyState[];
   ephemeral?: true;
+  /**
+   * Opt-in (binary-canticle#175): refuse a beacon whose clock is further off than this, as
+   * `clock-skew`, before it moves the epoch, the beacon mark or δ̂. Off by default, so a station
+   * clock an hour wrong still delivers (§12.2 step 3, F-CARRIER). For receivers whose stations
+   * keep time: it bounds how old a captured stream can be and still land on a first join, or after
+   * 16 replayed beacons of an epoch never heard.
+   */
+  maxSkewMs?: number;
 }
 
 /**
  * 2: dedup rows carry the ITEM's (expires_at, scope) for the §9.7 PLUCK check.
  * 3: marks carry their class (§23.2 q21), in snapshots and `takeJournal()` records alike.
- * 1 and 2 still load, as snapshots or journal records (their marks' class is unknown).
+ * 4: each key's beacon mark and δ̂ floor (binary-canticle#175).
+ * 1 to 3 still load, as snapshots or journal records (their marks' class, or the beacon marks, unknown).
  */
-export const SAFETY_STATE_VERSION = 3;
+export const SAFETY_STATE_VERSION = 4;
 
 /** The state that must survive a restart, as JSON (bigints as decimal strings). */
 export interface SafetyState {
@@ -278,6 +299,12 @@ export interface SafetyState {
     | [string, number, number, string, number]
     | [string, number, number, string, number, number | null]
   >;
+  /**
+   * key-id → [epoch, bseq (decimal), δ̂ floor in ms] (v4). After a restart a captured beacon is a
+   * duplicate, and a beacon of an epoch never heard can't lift δ̂: a replay only adds a larger
+   * sample, and δ̂ is the minimum (binary-canticle#175).
+   */
+  beacons?: Record<string, [number, string, number]>;
 }
 
 export class Listener {
@@ -317,6 +344,13 @@ export class Listener {
   #raisedIdents = new Set<string>();
   #raisedNow = false;
   #admitted: string | undefined;
+  readonly maxSkewMs: number | undefined;
+  /** True when the restored state had no beacon marks (before v4): as exposed as a first join. */
+  loadedWithoutMarks = false;
+  /** Beacon marks as last saved, and when (binary-canticle#175). */
+  #marksSaved = new Map<string, bigint>();
+  #marksSavedAt = 0;
+  #nowSeen = 0;
 
   constructor(manifest: Manifest, options: ListenerOptions) {
     if (options.ephemeral !== true && options.restore === undefined) {
@@ -335,8 +369,19 @@ export class Listener {
     this.perKeyMarkQuota = options.perKeyMarkQuota;
     this.binding = binding;
     this.warmup = options.warmup ?? true;
+    if (options.maxSkewMs !== undefined && !(options.maxSkewMs >= 0)) {
+      throw new Error("maxSkewMs must be at least 0");
+    }
+    this.maxSkewMs = options.maxSkewMs;
     if (options.restore) this.#load(options.restore);
     for (const record of options.journal ?? []) this.#load(record);
+    this.loadedWithoutMarks =
+      options.restore != null &&
+      options.restore.beacons === undefined &&
+      Object.keys(options.restore.epochs).length > 0;
+    this.#marksSaved = new Map(
+      [...this.stations].map(([k, st]) => [k, st.bseq]),
+    );
   }
 
   // ------------------------------------------------------------ persisted safety state
@@ -360,6 +405,10 @@ export class Listener {
   markSaved(): void {
     this.#dirty = false;
     this.#urgent = false;
+    this.#marksSaved = new Map(
+      [...this.stations].map(([k, st]) => [k, st.bseq]),
+    );
+    this.#marksSavedAt = this.#nowSeen;
     this.#raised = undefined;
     this.#raisedIdents.clear();
   }
@@ -390,10 +439,13 @@ export class Listener {
       dedup: [],
       stickyPluck: [],
       hwm: [],
+      beacons: {},
     };
     for (const kid of r.kids) {
       const st = this.stations.get(kid);
       if (st?.epochHwm) part.epochs[kid] = [st.epochHwm, st.epochSeenAt];
+      const mark = st && beaconMark(st);
+      if (mark) part.beacons![kid] = mark;
     }
     for (const ident of this.#raisedIdents) {
       const v = this.dedup.get(ident);
@@ -429,11 +481,15 @@ export class Listener {
 
   snapshot(): SafetyState {
     const epochs: Record<string, [number, number]> = {};
+    const beacons: Record<string, [number, string, number]> = {};
     for (const [kid, st] of this.stations) {
       if (st.epochHwm) epochs[kid] = [st.epochHwm, st.epochSeenAt];
+      const mark = beaconMark(st);
+      if (mark) beacons[kid] = mark;
     }
     return {
       version: SAFETY_STATE_VERSION,
+      beacons,
       epochs,
       dedup: [...this.dedup].map(([ident, v]) => [
         ident,
@@ -456,7 +512,7 @@ export class Listener {
 
   /** Merge a snapshot or journal record in. Monotone, so applying one twice changes nothing. */
   #load(state: SafetyState): void {
-    if (![1, 2, SAFETY_STATE_VERSION].includes(state.version)) {
+    if (![1, 2, 3, SAFETY_STATE_VERSION].includes(state.version)) {
       throw new Error(
         `listener state: unsupported version ${String(state.version)}`,
       );
@@ -466,6 +522,19 @@ export class Listener {
       if (epoch > st.epochHwm) {
         st.epochHwm = epoch;
         st.epochSeenAt = seenAt;
+      }
+    }
+    // Monotone too: bseq max within the epoch held, and the δ̂ floor only ever goes down, so a record
+    // applied twice, or out of order, changes nothing (binary-canticle#175).
+    for (const [kid, [epoch, bseq, floor]] of Object.entries(
+      state.beacons ?? {},
+    )) {
+      const st = this.#st(kid);
+      if (epoch === st.epochHwm && BigInt(bseq) > st.bseq)
+        st.bseq = BigInt(bseq);
+      if (st.offsets.length === 0 || floor < Math.min(...st.offsets)) {
+        st.offsets.push(floor);
+        if (st.offsets.length > OFFSET_SAMPLES) st.offsets.shift();
       }
     }
     for (const row of state.dedup) {
@@ -632,18 +701,36 @@ export class Listener {
     const b = f.body;
     const kid = hex(f.keyId);
     const events: ListenerEvent[] = [];
+    if (
+      this.maxSkewMs !== undefined &&
+      Math.abs(nowMs - b.wallclock) > this.maxSkewMs
+    ) {
+      // Before the epoch, the mark or δ̂ moves: a refusal is state-neutral (§10.9).
+      events.push(
+        this.#evidence(
+          "clock-skew",
+          kid,
+          `beacon clock ${nowMs - b.wallclock} ms off, bound ${this.maxSkewMs} ms`,
+        ),
+      );
+      return events;
+    }
     if (!this.#epochOk(kid, b.epoch, nowMs, events)) return events;
     const st = this.#st(kid);
     if (
       b.epoch === st.epochHwm &&
       b.bseq <= st.bseq &&
-      st.lastBeacon !== undefined
+      // A kept mark (bseq > 0 with no beacon heard yet) counts too, after a restart (#175).
+      (st.lastBeacon !== undefined || st.bseq > 0n)
     ) {
       return events; // older or repeated beacon
     }
     st.bseq = b.bseq;
+    const floor = st.offsets.length > 0 ? Math.min(...st.offsets) : undefined;
     st.offsets.push(nowMs - b.wallclock);
     if (st.offsets.length > OFFSET_SAMPLES) st.offsets.shift();
+    // δ̂ moved: journal it now, as a raised guard, so a crash can't lose it (#175).
+    if (Math.min(...st.offsets) !== floor) this.#raise().kids.add(kid);
     st.lastBeacon = nowMs;
     st.signedOff = b.nextBeaconMs === 0;
     st.periodMs = b.nextBeaconMs || st.periodMs;
@@ -775,7 +862,12 @@ export class Listener {
       this.#heardOn(st, body.stream, nowMs);
       this.#restored.delete(ident);
       resurface = true;
-      retain = seen.retain;
+      // The entry may be kept past the item's local expiry (#175): work it out again with the δ̂ kept
+      // across the restart, never later than what was kept.
+      retain = Math.min(
+        seen.retain,
+        localExpiryMs(f, offsetMs(st), nowMs) + SKEW_MS,
+      );
     } else {
       if (f.kind === KIND_PLUCK) {
         // §9.7: a PLUCK carries its target's expires_at and scope. Checkable while the target's
@@ -816,11 +908,15 @@ export class Listener {
       }
       this.#epochOk(kid, body.epoch, nowMs, events);
       retain = localExpiryMs(f, offsetMs(st), nowMs) + SKEW_MS;
+      // An ITEM's entry is kept to its local expiry cap, the latest any δ̂ allows, so a later rise in
+      // δ̂ can't let its loop count as new (#175). A PLUCK keeps its own local expiry (§7.7).
       this.#remember(
         ident,
         kid,
         digest,
-        retain,
+        f.kind === KIND_ITEM
+          ? Math.max(retain, localExpiryCapMs(f, nowMs) + SKEW_MS)
+          : retain,
         f.kind === KIND_ITEM ? [f.body.expiresAt, f.body.scope] : undefined,
       );
       this.#heardOn(st, body.stream, nowMs);
@@ -1247,6 +1343,15 @@ export class Listener {
     this.#purgeDedup(nowMs);
     this.#purgeHwm(nowMs);
     events.push(...this.#releaseHeld(nowMs));
+    this.#nowSeen = nowMs;
+    if (nowMs - this.#marksSavedAt >= MARK_SAVE_MS) {
+      for (const [k, st] of this.stations) {
+        if (st.bseq !== (this.#marksSaved.get(k) ?? 0n)) {
+          this.#dirty = true;
+          break;
+        }
+      }
+    }
     for (const kid of this.stations.keys()) {
       events.push(...this.#presence(kid, nowMs));
     }
