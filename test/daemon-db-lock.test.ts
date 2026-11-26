@@ -128,14 +128,21 @@ function fixture(t: TestContext): Fixture {
   const databasePath = join(directory, "state", "ear.db");
   writeConfig(join(directory, "a.json"), CHANNEL);
   writeConfig(join(directory, "b.json"), ROOM);
-  const base: NodeJS.ProcessEnv = {
-    ...process.env,
+  // Nothing from the host's own ear reaches these daemons: every state path a daemon
+  // touches at start (its attachments sweep included) is pinned inside `directory`.
+  const base: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (!key.startsWith("FROND_EAR_") && !key.startsWith("DISCORD_")) {
+      base[key] = value;
+    }
+  }
+  Object.assign(base, {
+    XDG_STATE_HOME: join(directory, "state"),
+    XDG_RUNTIME_DIR: directory,
+    FROND_EAR_ATTACHMENTS: join(directory, "attachments"),
     FROND_EAR_DATABASE: databasePath,
     FROND_EAR_BOT_USER_ID: BOT,
-  };
-  delete base.DISCORD_BOT_TOKEN;
-  delete base.DISCORD_BOT_TOKEN_FILE;
-  delete base.FROND_EAR_TCP;
+  });
   return {
     directory,
     databasePath,
