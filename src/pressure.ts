@@ -744,7 +744,9 @@ export async function runPressureCommand(
   // notice, on PostToolUse and UserPromptSubmit only. Never changes the exit code.
   const event = report?.event ?? hookEventOf(io.stdin);
   if (event === "PostToolUse" || event === "UserPromptSubmit") {
-    const line = await quotaNotice(io.env, Date.now());
+    const sessionId =
+      report?.sessionId ?? pressureHookInput(io.stdin ?? "").sessionId ?? "";
+    const line = await quotaNotice(io.env, Date.now(), fetch, sessionId);
     if (line) out = withNotice(out, event, line);
   }
   io.stdout.write(out);

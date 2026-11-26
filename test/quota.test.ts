@@ -78,11 +78,13 @@ test("step: a first ok is silent, a first non-ok is said, each change is said on
   assert.equal(quotaStep({ at, reading: { level: "ok" } }).announce, false);
   assert.equal(quotaStep({ at, reading: { level: "burn" } }).announce, true);
   assert.equal(
-    quotaStep({ at, reading: { level: "burn" }, announced: "burn" }).announce,
+    quotaStep({ at, reading: { level: "burn" }, announced: { "": "burn" } })
+      .announce,
     false,
   );
   assert.equal(
-    quotaStep({ at, reading: { level: "ok" }, announced: "burn" }).announce,
+    quotaStep({ at, reading: { level: "ok" }, announced: { "": "burn" } })
+      .announce,
     true,
   );
 });
@@ -174,4 +176,52 @@ test("the pressure hook adds the quota line as added context on PostToolUse", as
     env: { ...seat() },
   });
   assert.equal(out, "", "never on Stop");
+});
+
+test("🌫 #129: each session hears its own first warning; one session can't consume another's", async () => {
+  const env = seat();
+  const api = server([body(2, 1.1)]);
+  assert.match(
+    (await quotaNotice(env, NOW, api.impl, "session-a")) ?? "",
+    /burn/u,
+  );
+  assert.match(
+    (await quotaNotice(env, NOW + 1_000, api.impl, "session-b")) ?? "",
+    /burn/u,
+    "session b still hears burn",
+  );
+  assert.equal(
+    await quotaNotice(env, NOW + 2_000, api.impl, "session-a"),
+    undefined,
+  );
+  assert.equal(api.calls.length, 1, "the reading itself stays shared");
+});
+
+test("🌫 #129: a slower, older read never overwrites a newer one", async () => {
+  const env = seat();
+  let releaseOld!: () => void;
+  const oldGate = new Promise<void>((resolve) => (releaseOld = resolve));
+  const slowNear: QuotaFetch = async () => {
+    await oldGate;
+    return new Response(JSON.stringify(body(90)), { status: 200 });
+  };
+  const fastExhausted = server([body(100)]);
+  const older = quotaNotice(env, NOW, slowNear, "session-a"); // starts first, answers last
+  const newer = await quotaNotice(
+    env,
+    NOW + 5_000,
+    fastExhausted.impl,
+    "session-b",
+  );
+  assert.match(newer ?? "", /exhausted/u);
+  releaseOld();
+  await older;
+  const cache = JSON.parse(readFileSync(quotaCacheFile(env), "utf8")) as {
+    reading: { level: string };
+  };
+  assert.equal(
+    cache.reading.level,
+    "exhausted",
+    "the older near did not replace it",
+  );
 });

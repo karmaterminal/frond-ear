@@ -42,9 +42,16 @@ export interface QuotaCache {
   /** When the reading was taken (epoch ms). */
   at: number;
   reading: QuotaReading;
-  /** The level last said in the session's context; absent for none yet. */
-  announced?: QuotaLevel;
+  /**
+   * The level last said in each session's context, by session id (🌫 on #129: one config can serve
+   * several sessions, and each must hear its own first warning). Bounded to MAX_SESSIONS, the most
+   * recently written kept.
+   */
+  announced?: Record<string, QuotaLevel>;
 }
+
+/** Sessions whose last-said level is kept per Claude config. */
+export const MAX_SESSIONS = 32;
 
 const percent = (value: unknown): number | undefined =>
   typeof value === "number" && Number.isFinite(value) && value >= 0
@@ -135,15 +142,24 @@ export function quotaLine(reading: QuotaReading, now: number): string {
  * Whether this reading is said now. The first reading says nothing when it is ok; after that, every
  * change of level is said once.
  */
-export function quotaStep(cache: QuotaCache): {
+export function quotaStep(
+  cache: QuotaCache,
+  sessionId = "",
+): {
   cache: QuotaCache;
   announce: boolean;
 } {
   const level = cache.reading.level;
-  const announce =
-    level !== cache.announced &&
-    !(cache.announced === undefined && level === "ok");
-  return { cache: { ...cache, announced: level }, announce };
+  const said = cache.announced?.[sessionId];
+  const announce = level !== said && !(said === undefined && level === "ok");
+  const others = Object.entries(cache.announced ?? {}).filter(
+    ([id]) => id !== sessionId,
+  );
+  const announced = Object.fromEntries([
+    ...others.slice(-(MAX_SESSIONS - 1)),
+    [sessionId, level],
+  ]) as Record<string, QuotaLevel>;
+  return { cache: { ...cache, announced }, announce };
 }
 
 export function quotaConfigDir(env: NodeJS.ProcessEnv): string {
@@ -167,7 +183,18 @@ export function loadQuotaCache(file: string): QuotaCache | undefined {
       parsed.reading &&
       typeof parsed.reading.level === "string"
     ) {
-      return parsed;
+      // A per-session map only; anything else (an older single level) starts the sessions again.
+      const announced =
+        parsed.announced &&
+        typeof parsed.announced === "object" &&
+        !Array.isArray(parsed.announced)
+          ? parsed.announced
+          : undefined;
+      return {
+        at: parsed.at,
+        reading: parsed.reading,
+        ...(announced ? { announced } : {}),
+      };
     }
   } catch {
     // None yet, or unreadable: read again.
@@ -237,20 +264,31 @@ export async function quotaNotice(
   env: NodeJS.ProcessEnv,
   now: number,
   fetchImpl: QuotaFetch = fetch,
+  sessionId = "",
 ): Promise<string | undefined> {
   if (env.FROND_EAR_QUOTA !== "claude") return undefined;
   try {
     const file = quotaCacheFile(env);
     const kept = loadQuotaCache(file);
     const fresh = kept && now - kept.at < QUOTA_TTL_MS && now >= kept.at;
-    const cache: QuotaCache = fresh
-      ? kept
-      : {
-          at: now,
-          reading: await readQuota(env, now, fetchImpl),
-          ...(kept?.announced ? { announced: kept.announced } : {}),
-        };
-    const { cache: next, announce } = quotaStep(cache);
+    let cache: QuotaCache;
+    if (fresh) {
+      cache = kept;
+    } else {
+      const reading = await readQuota(env, now, fetchImpl);
+      // Another hook may have written while this one waited (🌫 on #129): a reading taken earlier
+      // than the one now on disk never replaces it. Announcements always merge from the latest file.
+      const latest = loadQuotaCache(file);
+      cache =
+        latest && latest.at > now
+          ? latest
+          : {
+              at: now,
+              reading,
+              ...(latest?.announced ? { announced: latest.announced } : {}),
+            };
+    }
+    const { cache: next, announce } = quotaStep(cache, sessionId);
     if (!fresh || announce) saveQuotaCache(file, next);
     return announce ? quotaLine(next.reading, now) : undefined;
   } catch {
