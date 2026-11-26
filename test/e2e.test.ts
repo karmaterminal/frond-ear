@@ -188,6 +188,7 @@ test("dry-run daemon + channel shim + MCP client: inject → <channel> notificat
   const tools = await client.listTools();
   assert.deepEqual(tools.tools.map((tool) => tool.name).sort(), [
     "ack",
+    "canticle_custody",
     "ear_status",
     "edit_message",
     "fetch_attachment",
@@ -199,8 +200,12 @@ test("dry-run daemon + channel shim + MCP client: inject → <channel> notificat
     "letters",
     "react",
     "reply",
+    "schedule",
+    "schedules",
     "set_attention",
     "set_canticle_delivery",
+    "wake_grant",
+    "wake_on",
   ]);
 
   // Attach canary arrives; acking it registers the ear.

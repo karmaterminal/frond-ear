@@ -16,6 +16,7 @@ import {
   defaultSocketPath,
   loadConfigFile,
   readBotToken,
+  readGithubToken,
   runtimeOptions,
 } from "./config.ts";
 import { watchConfigFile } from "./config-watch.ts";
@@ -23,6 +24,7 @@ import {
   createCanticleSource,
   type CanticleSource,
 } from "./canticle/source.ts";
+import { runExposure } from "./canticle/exposure-cli.ts";
 import { Manifest } from "./canticle/manifest.ts";
 import { runConnectorEcho } from "./connector/echo.ts";
 import { Daemon } from "./daemon.ts";
@@ -43,7 +45,7 @@ import { EAR_PROTOCOL_VERSION, LineConnection } from "./protocol.ts";
 import { HttpDiscordRest, RecordingRest } from "./rest.ts";
 import { runSend } from "./send.ts";
 import { listenTcp, listenUnix } from "./server.ts";
-import { ChannelShim, TOOLS } from "./shim.ts";
+import { ancestorPids, ChannelShim, TOOLS } from "./shim.ts";
 import { EventStore } from "./store.ts";
 import type { DiscordMessage } from "./types.ts";
 
@@ -68,8 +70,9 @@ usage:
   frond-ear tap --ear <name>          stream the batches pushed to an ear's attached session (read-only;\n                                      wakes a session without channel push; a shim must be attached)
   frond-ear release --ear <name> [--source <s>] [--session <id>] [--hook]
                                       release an ear's letters (#88) to its attached session; for a
-                                      SessionStart hook (matcher startup|compact): --hook reads the hook's
-                                      JSON on stdin (session_id, source) and always exits 0
+                                      SessionStart hook (matcher startup|compact|clear|resume): --hook reads the
+                                      hook's JSON on stdin (session_id, source) and CLAUDE_PID, which ties
+                                      a /clear's new session to the shim (#111), and always exits 0
   frond-ear precompact --ear <name> [--session <id>] [--hook]
                                       print the session's unsettled letters (#102) as compaction-summary
                                       instructions; for a PreCompact hook: --hook reads session_id on
@@ -84,6 +87,11 @@ usage:
                                       a PostCompact hook only reports); always exits 0
   frond-ear pressure --transcript <path>
                                       print a transcript's latest context size
+  frond-ear exposure --ear <name> [--since <ISO time | epoch ms>] [--json]
+                                      print an ear's canticle exposure ledger (#117; config canticle.exposure,
+                                      off by default): one record per canticle push, fenced before it went out,
+                                      then offered, echoed or unknown. Reads the database read-only; hashes
+                                      and provenance only, never payload text; no network side
   frond-ear inject --chat <id> --author <id> [--guild <id>] [--name <n>] [--bot] [--mention] <text…>
                                       push a synthetic MESSAGE_CREATE (dry-run or FROND_EAR_ALLOW_INJECT=1)
   frond-ear connector-echo [--public-url https://<host>] [--auth none|bearer|oauth] …
@@ -108,6 +116,8 @@ async function runDaemon(argv: string[]): Promise<void> {
   const runtime = runtimeOptions(env, { dryRun: values["dry-run"] === true });
   const config = loadConfigFile(runtime.configPath);
   const token = runtime.dryRun ? "" : readBotToken(env);
+  // wake_on's read-only token (#111): only in the daemon, never logged or passed on.
+  const githubToken = readGithubToken(env);
   const logger = new StructuredLogger(undefined, token ? [token] : []);
   const store = new EventStore(runtime.databasePath);
   const pruned = store.prune(config.limits.retentionMs);
@@ -168,7 +178,11 @@ async function runDaemon(argv: string[]): Promise<void> {
       `${runtime.databasePath}-shm`,
       ...(env.DISCORD_BOT_TOKEN_FILE ? [env.DISCORD_BOT_TOKEN_FILE] : []),
       ...(env.FROND_EAR_TOKEN_FILE ? [env.FROND_EAR_TOKEN_FILE] : []),
+      ...(env.FROND_EAR_GITHUB_TOKEN_FILE
+        ? [env.FROND_EAR_GITHUB_TOKEN_FILE]
+        : []),
     ],
+    ...(githubToken ? { githubToken } : {}),
     allowInject: runtime.allowInject,
     ...(sharedToken ? { token: sharedToken } : {}),
     gatewayStatus: () =>
@@ -261,6 +275,7 @@ function runShim(): void {
     connect: connectToDaemon(env),
     ear: env.FROND_EAR_EAR || undefined,
     sessionId: env.CLAUDE_CODE_SESSION_ID || undefined,
+    hostPids: ancestorPids(),
     token: tcpTarget(env) ? tcpToken(env) : undefined,
   });
   shim.start();
@@ -312,6 +327,9 @@ async function runRelease(argv: string[]): Promise<void> {
     }
   }
   const ear = values.ear ?? process.env.FROND_EAR_EAR;
+  const hostPid = hook
+    ? Number(process.env.CLAUDE_PID) || undefined
+    : undefined;
   try {
     if (!ear) {
       throw new Error("release needs --ear <name> (or FROND_EAR_EAR)");
@@ -322,6 +340,9 @@ async function runRelease(argv: string[]): Promise<void> {
         ear,
         ...(source ? { source } : {}),
         ...(sessionId ? { sessionId } : {}),
+        // Claude Code gives its hooks CLAUDE_PID: the daemon ties this hook to the shim
+        // that process spawned, so a /clear's new session id reaches the ear (#111).
+        ...(hostPid ? { hostPid } : {}),
       },
       process.env,
       5_000,
@@ -724,9 +745,13 @@ function runTap(argv: string[]): void {
           return;
         }
         if (message.type === "event" && message.batchId !== null) {
-          const chat = message.meta.chat_id ?? "?";
+          // A canticle push is a batch too (binary-canticle#161), with no chat.
+          const where =
+            message.meta.chat_id !== undefined
+              ? `chat_id=${message.meta.chat_id}`
+              : `kind=${message.meta.kind ?? "?"}`;
           process.stdout.write(
-            `[frond-ear] ear=${ear} batch_id=${message.batchId} chat_id=${chat}\n${message.content}\n`,
+            `[frond-ear] ear=${ear} batch_id=${message.batchId} ${where}\n${message.content}\n`,
           );
         }
       },
@@ -888,6 +913,13 @@ async function main(): Promise<void> {
       return;
     case "copilot-extension":
       runCopilotExtension(rest);
+      return;
+    case "exposure":
+      process.exitCode = await runExposure(rest, {
+        stdout: process.stdout,
+        stderr: process.stderr,
+        env: process.env,
+      });
       return;
     case "connector-echo":
       process.exitCode = await runConnectorEcho(rest, {

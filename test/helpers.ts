@@ -1,3 +1,4 @@
+import type { DerivedRoute } from "../src/canticle/derived.ts";
 import type { HearView } from "../src/canticle/receptor.ts";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -139,8 +140,10 @@ export class MemoryConnection implements Connection {
   public readonly received: DaemonMessage[] = [];
   public closed = false;
 
-  public send(message: DaemonMessage | ClientMessage): void {
+  /** Takes every message, as a live socket would; a dead one is tested on a real socket. */
+  public send(message: DaemonMessage | ClientMessage): boolean {
     this.received.push(message as DaemonMessage);
+    return true;
   }
 
   public close(): void {
@@ -203,6 +206,11 @@ export function harness(
     history?: (channelId: string, limit: number) => DiscordMessage[];
     /** Paths a reply's files never include (the real daemon passes its own state). */
     protectedPaths?: string[];
+    /** The owner's derived-publication route: an issuer and a station's control socket. */
+    derivedRoute?: DerivedRoute;
+    /** A fake GitHub for wake_on (#111), and the token the daemon sends it. */
+    githubFetch?: (url: string, init: RequestInit) => Promise<Response>;
+    githubToken?: string;
   } = {},
 ): Harness {
   const clock = new FakeClock();
@@ -231,6 +239,9 @@ export function harness(
     ...(options.protectedPaths
       ? { protectedPaths: options.protectedPaths }
       : {}),
+    ...(options.derivedRoute ? { derivedRoute: options.derivedRoute } : {}),
+    ...(options.githubFetch ? { githubFetch: options.githubFetch } : {}),
+    ...(options.githubToken ? { githubToken: options.githubToken } : {}),
   });
   let callId = 0;
   const flush = () => new Promise<void>((resolve) => setImmediate(resolve));

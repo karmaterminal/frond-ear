@@ -14,9 +14,46 @@ import {
 import { join } from "node:path";
 
 import { DELIVERY_PROOF, targetAdvice } from "./advice.ts";
-import { CanticleDelivery } from "./canticle/delivery.ts";
+import {
+  custodyEntry,
+  custodyView,
+  derivedPublication,
+  type CustodyNow,
+  type CustodyView,
+  type PublicationDecision,
+} from "./canticle/custody.ts";
+import {
+  CanticleDelivery,
+  exposure,
+  MAX_WAKE_GRANT_MS,
+} from "./canticle/delivery.ts";
+import {
+  DERIVED_TEXT_MAX_BYTES,
+  ELECTION_ID,
+  derivedCapability,
+  derivedLineage,
+  derivedTextFits,
+  noAnswer,
+  payloadDigest,
+  publishRequest,
+  queryRequest,
+  receiptFor,
+  stationWords,
+  type DerivedLineage,
+  type DerivedOutcome,
+  type DerivedRoute,
+} from "./canticle/derived.ts";
 import { messageText } from "./components.ts";
 import { CANTICLE_KEY_ID, CANTICLE_STATION, type Config } from "./config.ts";
+import {
+  RoomEgress,
+  RoomRefused,
+  unplaced,
+  type DiscordReads,
+  type RoomOutput,
+  type RoomPermit,
+  type SpeakerCustody,
+} from "./egress.ts";
 import type { StructuredLogger } from "./logger.ts";
 import {
   WakeLimiter,
@@ -37,6 +74,7 @@ import {
   renderDigest,
   renderEvent,
   type CatchUpChat,
+  type Notification,
 } from "./render.ts";
 import type { DiscordRest } from "./rest.ts";
 import {
@@ -44,8 +82,9 @@ import {
   loadOutboundFiles,
   type OutboundFile,
 } from "./outbound-files.ts";
-import { chunkMessage, RestError } from "./rest.ts";
-import { renderHear } from "./canticle/hear.ts";
+import { chunkMessage, definitive, RestError } from "./rest.ts";
+import { hearResult, iso, type HeardItem } from "./canticle/hear.ts";
+import { CLASS_BY_NAME } from "./canticle/ids.ts";
 import {
   LETTER_LIMITS,
   leaveLetter,
@@ -57,7 +96,37 @@ import {
   summaryLetters,
 } from "./letters.ts";
 import type { HearView } from "./canticle/receptor.ts";
-import type { EventStore, ReplyPart } from "./store.ts";
+import {
+  WAKE_LIMITS,
+  attentionAt,
+  dueStep,
+  listSchedules,
+  parseNote,
+  parseSchedule,
+  parseTtl,
+  occurrenceList,
+  readSchedule,
+  renderHeld,
+  renderWake,
+  repushAt,
+  shortSession,
+  type WakeFacts,
+} from "./wakes.ts";
+import {
+  GITHUB_LIMITS,
+  GithubClient,
+  baseline,
+  describeTarget,
+  htmlUrl,
+  parseTarget,
+  poll,
+  type Admit,
+  type GithubCursor,
+  type GithubTarget,
+  type PollOutcome,
+} from "./github.ts";
+import type { Schedule, Wake } from "./wake-store.ts";
+import type { CompactionBoundary, EventStore, ReplyPart } from "./store.ts";
 import type {
   BatchKind,
   Clock,
@@ -99,6 +168,18 @@ export interface DaemonOptions {
    * reinstall must reach this daemon's socket). Default: process.env.
    */
   env?: NodeJS.ProcessEnv;
+  /**
+   * The owner's route for derived publication (binary-canticle#161 item 4): the issuer of
+   * capsules and a station's control socket. Absent (the CLI wires none): closed.
+   */
+  derivedRoute?: DerivedRoute;
+  /**
+   * `wake_on` GitHub's HTTP (#111): the global fetch by default; tests pass a fake. It is
+   * only ever called with GET to config.github.apiBase, redirects never followed.
+   */
+  githubFetch?: (url: string, init: RequestInit) => Promise<Response>;
+  /** The daemon's read-only GitHub token, from FROND_EAR_GITHUB_TOKEN_FILE. Never logged. */
+  githubToken?: string;
 }
 
 interface Client {
@@ -118,6 +199,16 @@ interface Client {
   deliveryWarned?: boolean;
   sessionId: string | undefined;
   pid: number | undefined;
+  /** The session id the client said hello with: the shim's spawn-time id (#111). */
+  spawnSessionId?: string | undefined;
+  /** The shim's ancestor pids, nearest first (#111): Claude Code's is among them. */
+  hostPids?: number[] | undefined;
+  /**
+   * Set when a SessionStart hook named another session than this attach's and frond-ear
+   * could not tie the hook to this shim (#111): a /clear it can't prove. While set, this
+   * client is nobody's session for wakes: nothing shown, settled, set or cancelled.
+   */
+  wakeDoubt?: { claimed: string; at: number; source: string };
 }
 
 /** A pressure hook's reading (#98), as the daemon keeps it. */
@@ -156,6 +247,14 @@ export const IDLE_COMPACT = {
   defaultFloor: 200_000,
   afterMs: 54 * 60 * 1_000,
 } as const;
+
+/** When a reading forecasts an idle compaction, or null. A forecast: any request moves it. */
+function idleCompactDue(report: PressureReport): number | null {
+  const floor = report.idleFloor ?? IDLE_COMPACT.defaultFloor;
+  return report.tokens !== null && report.tokens >= floor
+    ? report.at + IDLE_COMPACT.afterMs
+    : null;
+}
 
 /**
  * A session's hold on its own compaction (#107): while it stands, the PreCompact
@@ -254,6 +353,18 @@ function newerId(a: string, b: string): boolean {
   return a.length === b.length ? a > b : a.length > b.length;
 }
 
+/** Positive integer pids, at most 8; anything else names none. */
+function pidList(value: unknown): number[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const pids = value.filter(
+    (item): item is number =>
+      typeof item === "number" && Number.isSafeInteger(item) && item > 1,
+  );
+  return pids.length > 0 ? pids.slice(0, 8) : undefined;
+}
+
 function stringArg(
   args: Record<string, unknown>,
   name: string,
@@ -285,6 +396,21 @@ function stringArg(
 const SNOWFLAKE = /^\d{1,25}$/u;
 const CANTICLE_TUNE =
   /^(\*|[a-z][a-z0-9-]{0,30}):[a-z][a-z0-9-]{0,30}(\.[a-z][a-z0-9-]{0,30}){0,3}$/u;
+/** A stream name (RFC-0001 §5.4): up to four dot-separated segments. */
+const CANTICLE_STREAM = /^[a-z][a-z0-9-]{0,30}(\.[a-z][a-z0-9-]{0,30}){0,3}$/u;
+
+/** The window ear_status's canticle custody summary covers; canticle_custody's default. */
+const CUSTODY_WINDOW_MS = 60 * 60 * 1_000;
+
+/** Why naming a canticle push's batch_id echoed nothing, beyond the push's own state (#161). */
+const CANTICLE_REFUSED = {
+  forged:
+    "a canticle push is heard only by the batch_id its event carried, delivery token and all; this one's token is missing or wrong (pass the kind=\"canticle\" event's batch_id as it is)",
+  restarted:
+    "that push went out before frond-ear last restarted, so its delivery token can't be checked any more; hear shows its records again while they are live",
+  reverted:
+    "that push was given back unconfirmed when its connection went, and its records go out again under a new batch_id; name that one",
+} as const;
 
 const ATTACHMENT_RETENTION_MS = 24 * 60 * 60 * 1_000;
 /** How often the daemon sweeps every ear's saved attachments, fetching or not. */
@@ -415,6 +541,18 @@ function fileIdentity(files: readonly OutboundFile[]): string {
   return files.map((file) => `\nfile ${file.sha256} ${file.name}`).join("");
 }
 
+/** A reply's identity (#55): its chat, reply_to, whole text and files, hashed. */
+function replyKey(
+  chatId: string,
+  replyTo: string | undefined,
+  text: string,
+  files: readonly OutboundFile[],
+): string {
+  return createHash("sha256")
+    .update(`${chatId}\n${replyTo ?? ""}\n${text}${fileIdentity(files)}`)
+    .digest("hex");
+}
+
 /** Whole minutes and seconds, rounded down: "4 minutes 59 seconds". */
 function duration(ms: number): string {
   const seconds = Math.floor(ms / 1_000);
@@ -490,11 +628,14 @@ function replyFailure(
 export class Daemon {
   private config: Config;
   private readonly store: EventStore;
-  private readonly rest: DiscordRest;
+  /** Discord reads. Every write goes through `egress`, the room-output gate (#161). */
+  private readonly rest: DiscordReads;
+  private readonly egress: RoomEgress;
   private readonly logger: StructuredLogger;
   private readonly clock: Clock;
   private readonly timers: Timers;
-  private readonly options: DaemonOptions;
+  /** Without `rest`: the egress gate holds Discord's writes, and nothing else here. */
+  private readonly options: Omit<DaemonOptions, "rest">;
   private readonly clients = new Set<Client>();
   private readonly attached = new Map<string, Client>();
   /**
@@ -525,6 +666,11 @@ export class Daemon {
    * to a tap, so only the push itself carries a token.
    */
   private readonly pushSecret = randomBytes(16);
+  /**
+   * The highest batch id when this process started: a push up to it was named by another
+   * process's `pushSecret`, so its token can't be checked here.
+   */
+  private readonly batchesBefore: number;
   private botLimiter: WakeLimiter;
   private ambientLimiter: WakeLimiter;
   private timer: unknown;
@@ -548,20 +694,40 @@ export class Daemon {
   private lastCatchUp: CatchUpRun | undefined;
   /** Canticle's push to sessions (frond-ear#65); present whenever a receptor runs. */
   private readonly canticle: CanticleDelivery | undefined;
+  /** Derived publications this process is still working on, by row id (#161). */
+  private readonly derivedInFlight = new Set<number>();
+  /** The one timer for schedules, watches, orphans and re-pushes (#111). */
+  private wakeTimer: unknown;
+  private wakeTicking = false;
+  /** The one GitHub poll pass in flight, if any: polls never run concurrently (#111). */
+  private polling: Promise<void> | undefined;
 
   public constructor(options: DaemonOptions) {
-    this.options = options;
+    const { rest, ...kept } = options;
+    this.options = kept;
     this.config = options.config;
     this.store = options.store;
-    this.rest = options.rest;
+    this.rest = rest;
     this.logger = options.logger;
     this.clock = options.clock ?? systemClock;
     this.timers = options.timers ?? systemTimers;
+    this.egress = new RoomEgress(rest, this.store, this.clock);
     this.botLimiter = new WakeLimiter(options.config.botLoop);
     this.ambientLimiter = new WakeLimiter(options.config.ambientWake);
+    this.batchesBefore = this.store.batchHighWater();
     const repaired = this.store.repairUnscheduled(this.clock.now());
     if (repaired > 0) {
       this.logger.log("warn", "ear.repaired_unscheduled", { repaired });
+    }
+    // No publish of this process owns a row yet: one left issuing never reached the station.
+    const released = this.store.releaseIssuingDerived(this.clock.now());
+    if (released > 0) {
+      this.logger.log("warn", "canticle.derived_released", { released });
+    }
+    // Nor does any call own an egress row: one left pending was cut off mid-call.
+    const cutOff = this.store.releasePendingEgress(this.clock.now());
+    if (cutOff > 0) {
+      this.logger.log("warn", "room.egress_released", { rows: cutOff });
     }
     // The config may have changed while the daemon was down: re-check every
     // persisted queue against current routing and modes before any session
@@ -577,8 +743,18 @@ export class Daemon {
           clock: this.clock,
           timers: this.timers,
           logger: this.logger,
-          attached: (ear) => this.attached.has(ear),
-          push: (ear, notification) => this.pushNotice(ear, notification),
+          session: (ear) => {
+            const client = this.attached.get(ear);
+            if (!client) return undefined;
+            const holder = this.holderIdentity(ear);
+            return {
+              generation: client.attachGeneration,
+              sessionId: client.sessionId ?? null,
+              holder: holder === "detached" ? "unknown" : holder,
+            };
+          },
+          push: (ear, batchId, notification) =>
+            this.pushCanticle(ear, batchId, notification),
           silenced: (ear) =>
             this.store
               .attentionOverrides(ear, this.clock.now())
@@ -586,6 +762,8 @@ export class Daemon {
         })
       : undefined;
     this.canticle?.start();
+    // Schedules that came due while the daemon was down are owed now, coalesced.
+    this.wakeTick();
   }
 
   /**
@@ -601,6 +779,50 @@ export class Daemon {
     for (const tap of this.taps.get(ear) ?? []) {
       tap.connection.send(event);
     }
+  }
+
+  /**
+   * A canticle push, named as a Discord batch is (binary-canticle#161): the session's copy
+   * carries `<id>-<token>` as its batch_id and a tap's the bare id. The shim answers
+   * `offered` once it has handed the event to the session; only that makes its records
+   * offered, and only the session naming the whole id makes them echoed. Returns whether
+   * the session's connection took it: a socket already gone takes nothing, and one that
+   * goes after taking it reverts the push when its close is handled.
+   */
+  private pushCanticle(
+    ear: string,
+    batchId: number,
+    notification: Notification,
+  ): boolean {
+    const client = this.attached.get(ear);
+    if (!client) {
+      return false;
+    }
+    const token = this.pushToken(ear, client.attachGeneration, batchId);
+    if (
+      !client.connection.send({
+        type: "event",
+        batchId,
+        content: notification.content,
+        meta: { ...notification.meta, batch_id: `${batchId}-${token}` },
+      })
+    ) {
+      return false;
+    }
+    const tapped = {
+      type: "event",
+      batchId,
+      content: notification.content,
+      meta: { ...notification.meta, batch_id: String(batchId) },
+    } as const;
+    for (const tap of this.taps.get(ear) ?? []) {
+      try {
+        tap.connection.send(tapped);
+      } catch {
+        // A tap's failure never changes what the session was sent.
+      }
+    }
+    return true;
   }
 
   /**
@@ -654,10 +876,41 @@ export class Daemon {
     this.prune();
     this.tick();
     this.canticle?.reconfigured();
+    // An ear back in the config, or a lifted pause: what it is owed goes out now.
+    this.wakeTick();
   }
 
   /** Prunes against the *current* retention policy (it can change on reload). */
   public prune(): number {
+    const { droppedUnacked } = this.store.wakes.prune(
+      this.clock.now(),
+      WAKE_LIMITS,
+    );
+    for (const wake of droppedUnacked) {
+      // Never silently: counted per ear, and logged without its note.
+      this.store.increment(`wakes_dropped_unacked.${wake.ear}`);
+      this.logger.log("warn", "wake.dropped_unacked", {
+        ear: wake.ear,
+        scheduleId: wake.scheduleId,
+        wakeId: wake.id,
+      });
+    }
+    // The exposure ledger's own bounds (#117): only confirmed records go, counted. Fenced
+    // and unknown ones are never evicted, so an ear they alone keep past the bound warns.
+    const exposure = this.config.canticle?.exposure;
+    if (exposure) {
+      const pruned = this.store.pruneCanticleExposure(exposure);
+      for (const [ear, evicted] of Object.entries(pruned.evicted)) {
+        this.logger.log("info", "canticle.exposure_evicted", { ear, evicted });
+      }
+      for (const [ear, held] of Object.entries(pruned.overBound)) {
+        this.logger.log("warn", "canticle.exposure_over_bound", {
+          ear,
+          held,
+          maxRecords: exposure.maxRecords,
+        });
+      }
+    }
     return this.store.prune(this.config.limits.retentionMs);
   }
 
@@ -1259,15 +1512,39 @@ export class Daemon {
   private detach(client: Client): void {
     const ear = client.ear;
     if (ear && this.attached.get(ear) === client) {
+      // It held the ear until now: its schedules' orphan clock starts here, and their
+      // orphan deadline is armed below (#111).
+      this.touchHolder(ear, client);
       this.attached.delete(ear);
       // Socket close events can arrive after shutdown has handed the store
       // back to be closed; shutdown already reverted unconfirmed batches.
       if (!this.stopped) {
-        const reverted = this.store.revertUnconfirmed(ear);
+        const reverted = this.revertUnconfirmed(ear);
         this.logger.log("info", "ear.detached", { ear, reverted });
+        this.armWakes();
       }
     }
     client.ear = undefined;
+  }
+
+  /**
+   * Gives back every batch the host never confirmed to this ear: Discord events queue
+   * again, and a canticle push's claim goes back so its records wait again while they
+   * are on air (#161). Returns how many batches.
+   */
+  private revertUnconfirmed(ear: string): number {
+    const { batches, canticle } = this.store.revertUnconfirmed(ear);
+    try {
+      this.canticle?.reverted(ear, canticle);
+    } catch (error) {
+      // The store gave the claims back; until a restart reads it again, the delivery's
+      // own copy may hold those records as pushed.
+      this.logger.log("error", "canticle.revert_failed", {
+        ear,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    }
+    return batches;
   }
 
   private async handleMessage(client: Client, raw: unknown): Promise<void> {
@@ -1290,13 +1567,32 @@ export class Daemon {
         return;
       case "offered":
         // Only the currently attached session may confirm, and only a batch
-        // offered to its own ear and attach generation.
+        // offered to its own ear and attach generation. A canticle push's records
+        // are offered from here, under the session's boundary now (#161).
         if (client.ear && this.isAttachedSession(client, client.ear)) {
-          this.store.confirmBatch(
-            message.batchId,
-            client.ear,
-            client.attachGeneration,
-          );
+          const ear = client.ear;
+          const confirmed = this.store.atomically(() => {
+            if (
+              !this.store.confirmBatch(
+                message.batchId,
+                ear,
+                client.attachGeneration,
+              )
+            ) {
+              return false;
+            }
+            this.store.offerCanticleCustody(ear, message.batchId, {
+              at: this.clock.now(),
+              sessionId: client.sessionId ?? null,
+              boundary: this.boundary(ear),
+            });
+            return true;
+          });
+          // A canticle push is confirmed whether it carried records or only its
+          // coverage note; for a Discord batch's id this does nothing.
+          if (confirmed) {
+            this.canticle?.confirmed(ear, message.batchId);
+          }
         }
         return;
       case "release":
@@ -1343,24 +1639,7 @@ export class Daemon {
         return;
       case "session":
         if (client.ear && typeof message.sessionId === "string") {
-          // The same turnover rule as attach: a reading belongs to its session.
-          if (this.attached.get(client.ear) === client) {
-            if (
-              this.pressure.get(client.ear)?.sessionId !== message.sessionId
-            ) {
-              this.pressure.delete(client.ear);
-            }
-            if (this.holds.get(client.ear)?.sessionId !== message.sessionId) {
-              this.holds.delete(client.ear);
-            }
-            if (
-              this.holdNotices.get(client.ear)?.sessionId !== message.sessionId
-            ) {
-              this.holdNotices.delete(client.ear);
-            }
-          }
-          client.sessionId = message.sessionId;
-          this.store.updateEarSession(client.ear, message.sessionId);
+          this.turnSession(client, client.ear, message.sessionId);
         }
         return;
       case "status":
@@ -1456,6 +1735,8 @@ export class Daemon {
     client.role = message.role;
     client.pid = message.pid;
     client.sessionId = message.sessionId;
+    client.hostPids = pidList(message.hostPids);
+    client.spawnSessionId = message.sessionId;
     if (message.role === "tap") {
       const ear = message.ear;
       if (!ear || !this.config.ears[ear]) {
@@ -1507,20 +1788,24 @@ export class Daemon {
       previous.connection.send({ type: "detached", reason: "superseded" });
       this.detach(previous);
     }
-    this.store.revertUnconfirmed(ear);
+    this.revertUnconfirmed(ear);
     const nonce = this.config.ears[ear]?.attachCanary
       ? (this.options.nonce ?? (() => randomBytes(6).toString("hex")))()
       : null;
-    const record = this.store.attachEar(ear, message.sessionId ?? null, nonce);
+    // A turn or doubt kept for this shim's spawn-time id still holds (#111).
+    this.restoreTurn(client, ear);
+    const record = this.store.attachEar(ear, client.sessionId ?? null, nonce);
+    // Another holder's grants went in the attach's own transaction (#176).
+    this.canticle?.grantsDiscarded(ear, record.discardedWakeGrants);
     // A reading belongs to the session that reported it; a new session starts with none.
-    if (this.pressure.get(ear)?.sessionId !== message.sessionId) {
+    if (this.pressure.get(ear)?.sessionId !== client.sessionId) {
       this.pressure.delete(ear);
     }
     // So is a hold: another session never inherits one.
-    if (this.holds.get(ear)?.sessionId !== message.sessionId) {
+    if (this.holds.get(ear)?.sessionId !== client.sessionId) {
       this.holds.delete(ear);
     }
-    if (this.holdNotices.get(ear)?.sessionId !== message.sessionId) {
+    if (this.holdNotices.get(ear)?.sessionId !== client.sessionId) {
       this.holdNotices.delete(ear);
     }
     client.ear = ear;
@@ -1530,7 +1815,7 @@ export class Daemon {
     this.logger.log("info", "ear.attached", {
       ear,
       generation: record.generation,
-      sessionId: message.sessionId ?? null,
+      sessionId: client.sessionId ?? null,
     });
     client.connection.send({
       type: "welcome",
@@ -1575,8 +1860,50 @@ export class Daemon {
       const canary = renderCanary(ear, record.generation, nonce);
       client.connection.send({ type: "event", batchId: null, ...canary });
     }
+    // Every wake owed to this session comes back, one event per schedule; another
+    // session's are only named (#111).
+    this.touchHolder(ear, client);
+    this.deliverWakes(ear, { all: true, held: true });
     this.releaseArmed(ear);
     this.tick();
+    this.armWakes();
+  }
+
+  /**
+   * The attached client now speaks for `sessionId` (a `session` message, or a
+   * SessionStart hook proven to come from this shim's own Claude process): whatever
+   * belongs to a session follows the change, as at attach. A wake never moves: it stays
+   * its setter's, and the new session is told what is held (#111).
+   */
+  private turnSession(client: Client, ear: string, sessionId: string): void {
+    if (this.attached.get(ear) === client) {
+      if (this.pressure.get(ear)?.sessionId !== sessionId) {
+        this.pressure.delete(ear);
+      }
+      if (this.holds.get(ear)?.sessionId !== sessionId) {
+        this.holds.delete(ear);
+      }
+      if (this.holdNotices.get(ear)?.sessionId !== sessionId) {
+        this.holdNotices.delete(ear);
+      }
+    }
+    const changed = client.sessionId !== sessionId;
+    // The session leaving held the ear until now, and the one arriving holds it from now.
+    this.touchHolder(ear, client);
+    client.sessionId = sessionId;
+    delete client.wakeDoubt;
+    // The write runs whether or not canticle does: `?.` would skip its arguments too.
+    const discarded = this.store.updateEarSession(ear, sessionId);
+    this.canticle?.grantsDiscarded(ear, discarded);
+    this.touchHolder(ear, client);
+    if (this.attached.get(ear) === client && changed) {
+      this.logger.log("info", "ear.session_changed", {
+        ear,
+        sessionId,
+      });
+      this.deliverWakes(ear, { all: true, held: true });
+      this.armWakes();
+    }
   }
 
   // ---- letters (#88) -----------------------------------------------------------------
@@ -1591,6 +1918,7 @@ export class Daemon {
     ear: string;
     source?: string;
     sessionId?: string;
+    hostPid?: number;
   }): { ok: boolean; text: string } {
     const ear = typeof message.ear === "string" ? message.ear : "";
     if (!this.config.ears[ear]) {
@@ -1622,13 +1950,146 @@ export class Daemon {
       };
     }
     if (sessionId !== client.sessionId) {
-      return {
-        ok: false,
-        text: `ear ${ear} is held by ${client.sessionId ? `session ${client.sessionId.slice(0, 8)}` : "a session whose id frond-ear does not know"}, not ${sessionId.slice(0, 8)}; nothing released`,
-      };
+      const refusal = `ear ${ear} is held by ${client.sessionId ? `session ${client.sessionId.slice(0, 8)}` : "a session whose id frond-ear does not know"}, not ${sessionId.slice(0, 8)}; nothing released`;
+      const heard = this.hookNamesSession(
+        client,
+        ear,
+        sessionId,
+        message.hostPid,
+        source,
+      );
+      if (heard.kind === "other-process") {
+        return { ok: false, text: refusal };
+      }
+      if (heard.kind === "doubt") {
+        return { ok: false, text: `${refusal}. ${heard.text}` };
+      }
+    } else if (client.wakeDoubt) {
+      this.hookNamesSession(client, ear, sessionId, message.hostPid, source);
     }
     this.store.clearRuntimeState(`letters.armed.${ear}`);
     return { ok: true, text: this.deliverLetters(ear, client, source) };
+  }
+
+  /**
+   * A hook (a SessionStart release, or the pressure hook) names `sessionId` for the ear
+   * `client` holds (#111). Claude Code keeps its MCP servers across /clear and /resume, so
+   * the shim still names the session it was spawned for:
+   * - the holder's own session clears any doubt;
+   * - another session, from a hook whose CLAUDE_PID is one of the shim's ancestors, is
+   *   that change: the holder turns to it;
+   * - from a hook provably of another Claude process, it says nothing of this shim;
+   * - otherwise frond-ear can't tell, and fails closed: the shim's wake identity is in
+   *   doubt.
+   * A turn or a doubt is kept in the store, keyed by the id the shim says hello with, so
+   * a reconnect or a daemon restart can't hand the old session back (🍃 on #114).
+   */
+  private hookNamesSession(
+    client: Client,
+    ear: string,
+    sessionId: string,
+    rawPid: unknown,
+    source: string,
+  ):
+    | { kind: "same" | "turned" | "other-process" }
+    | { kind: "doubt"; text: string } {
+    if (sessionId === client.sessionId) {
+      if (client.wakeDoubt) {
+        delete client.wakeDoubt;
+        this.store.clearRuntimeState(`session.turn.${ear}`);
+        this.logger.log("info", "ear.wake_identity_known", { ear, source });
+        this.deliverWakes(ear, { all: true, held: false });
+        this.armWakes();
+      }
+      return { kind: "same" };
+    }
+    const hostPid = pidList([rawPid])?.[0];
+    const pids = client.hostPids ?? [];
+    const spawned = client.spawnSessionId;
+    if (hostPid !== undefined && pids.includes(hostPid)) {
+      if (spawned !== undefined && spawned !== sessionId) {
+        this.store.setRuntimeState(
+          `session.turn.${ear}`,
+          JSON.stringify({ spawned, current: sessionId, hostPid }),
+        );
+      } else {
+        this.store.clearRuntimeState(`session.turn.${ear}`);
+      }
+      // The session in the Claude Code process that spawned this shim changed under
+      // it. Its wakes stay their setter's.
+      this.turnSession(client, ear, sessionId);
+      return { kind: "turned" };
+    }
+    if (hostPid !== undefined && pids.length > 0) {
+      return { kind: "other-process" };
+    }
+    client.wakeDoubt = { claimed: sessionId, at: this.clock.now(), source };
+    // The ear's wake grants go with the doubt's own record, in one transaction (#176).
+    // (Kept apart from the `?.` below, so the doubt's record is written without canticle.)
+    const discarded = this.store.doubtEar(
+      ear,
+      spawned !== undefined
+        ? {
+            name: `session.turn.${ear}`,
+            value: JSON.stringify({ spawned, doubt: client.wakeDoubt }),
+          }
+        : undefined,
+    );
+    this.canticle?.grantsDiscarded(ear, discarded, "holder_in_doubt");
+    this.logger.log("warn", "ear.wake_identity_doubt", {
+      ear,
+      source,
+      hookPid: hostPid !== undefined,
+      shimPids: pids.length > 0,
+    });
+    this.deliverWakes(ear, { all: false, held: true });
+    return {
+      kind: "doubt",
+      text: `frond-ear can't tie this hook to the shim holding the ear (${hostPid === undefined ? "the hook gave no CLAUDE_PID" : "that shim gave no host pids"}), so the session it speaks for is in doubt: its wakes are held, not shown, settled, set or cancelled, until its own session's hook runs again`,
+    };
+  }
+
+  /**
+   * What a hello inherits from a turn or a doubt kept for its ear (#111): the same shim
+   * (its spawn-time id, and the turn's Claude process among its ancestors) speaks for the
+   * session it was turned to, and a doubt stands until its own session's hook runs. A
+   * new Claude process with that id is that session, and the record goes.
+   */
+  private restoreTurn(client: Client, ear: string): void {
+    const raw = this.store.runtimeState(`session.turn.${ear}`);
+    if (raw === undefined || client.sessionId === undefined) {
+      return;
+    }
+    let kept: {
+      spawned?: unknown;
+      current?: unknown;
+      hostPid?: unknown;
+      doubt?: { claimed: string; at: number; source: string };
+    };
+    try {
+      kept = JSON.parse(raw) as typeof kept;
+    } catch {
+      this.store.clearRuntimeState(`session.turn.${ear}`);
+      return;
+    }
+    if (kept.spawned !== client.sessionId) {
+      return;
+    }
+    if (kept.doubt) {
+      client.wakeDoubt = kept.doubt;
+      this.logger.log("warn", "ear.wake_identity_doubt_kept", { ear });
+      return;
+    }
+    if (
+      typeof kept.current === "string" &&
+      typeof kept.hostPid === "number" &&
+      (client.hostPids ?? []).includes(kept.hostPid)
+    ) {
+      client.sessionId = kept.current;
+      this.logger.log("info", "ear.session_restored", { ear });
+      return;
+    }
+    this.store.clearRuntimeState(`session.turn.${ear}`);
   }
 
   /**
@@ -1647,6 +2108,7 @@ export class Daemon {
     event?: unknown;
     boundaryAt?: unknown;
     unknown?: unknown;
+    hostPid?: unknown;
   }): { ok: boolean; text: string; notice?: string } {
     const ear = typeof message.ear === "string" ? message.ear : "";
     if (!this.config.ears[ear]) {
@@ -1663,7 +2125,19 @@ export class Daemon {
       };
     }
     const client = this.attached.get(ear);
-    if (!client || client.sessionId !== sessionId) {
+    // A session change only the pressure hook saw (a /resume the release matcher left
+    // out) turns the holder when it is proven, and fails closed when it isn't (#111).
+    if (
+      !client ||
+      (client.sessionId !== sessionId &&
+        this.hookNamesSession(
+          client,
+          ear,
+          sessionId,
+          message.hostPid,
+          "pressure",
+        ).kind !== "turned")
+    ) {
       return {
         ok: false,
         text: `ear ${ear} is not held by session ${sessionId.slice(0, 8)}; its pressure is not kept`,
@@ -1802,7 +2276,6 @@ export class Daemon {
     if (!report || !client || client.sessionId !== report.sessionId) {
       return null;
     }
-    const floor = report.idleFloor ?? IDLE_COMPACT.defaultFloor;
     return {
       tokens: report.tokens,
       band: report.band,
@@ -1810,11 +2283,34 @@ export class Daemon {
       at: report.at,
       ageMs: Math.max(0, this.clock.now() - report.at),
       receivedAt: report.receivedAt,
-      // A forecast, not a fact: any request before then moves it.
+      idleCompactDueAt: idleCompactDue(report),
+    };
+  }
+
+  /**
+   * The compaction boundary of the session holding the ear, as its pressure hook last
+   * reported it (#98): the marker's id, null when it read none yet, undefined when no
+   * reading from that session is kept. Custody stamps it on every step (#161).
+   */
+  private boundary(ear: string): CompactionBoundary {
+    const client = this.attached.get(ear);
+    const report = this.pressure.get(ear);
+    return client && report && client.sessionId === report.sessionId
+      ? report.boundary
+      : undefined;
+  }
+
+  /** What canticle custody is judged against now: the holder, its boundary, its forecast. */
+  private custodyNow(ear: string): CustodyNow {
+    const client = this.attached.get(ear);
+    const report = this.pressure.get(ear);
+    const boundary = this.boundary(ear);
+    return {
+      session: client ? { id: client.sessionId ?? null } : undefined,
+      boundary,
       idleCompactDueAt:
-        report.tokens !== null && report.tokens >= floor
-          ? report.at + IDLE_COMPACT.afterMs
-          : null,
+        boundary !== undefined && report ? idleCompactDue(report) : null,
+      now: this.clock.now(),
     };
   }
 
@@ -2093,6 +2589,931 @@ export class Daemon {
     return `letters for ear ${ear}: ${parts.join(", ")}; sent as ${events} channel event${events === 1 ? "" : "s"}`;
   }
 
+  // ---- schedules and wakes (#111) ---------------------------------------------------
+
+  /**
+   * The session a client speaks for as far as wakes go: the holder's known session, or
+   * null (not the holder, no id, or in doubt since a /clear frond-ear couldn't tie to
+   * it). Null is nobody: it is shown, settles, sets and cancels nothing.
+   */
+  private wakeSession(client: Client): string | null {
+    const ear = client.ear;
+    if (!ear || !this.isAttachedSession(client, ear) || client.wakeDoubt) {
+      return null;
+    }
+    return client.sessionId ?? null;
+  }
+
+  private requireWakeSession(client: Client, what: string): string {
+    const session = this.wakeSession(client);
+    if (session !== null) {
+      return session;
+    }
+    if (client.wakeDoubt) {
+      throw new Error(
+        `frond-ear can't tell which session this shim speaks for: a ${cleanName(client.wakeDoubt.source)} hook named session ${shortSession(client.wakeDoubt.claimed)}, and it could not tie that hook to this shim. It won't ${what} until this session is re-attached or its own hook runs again; nothing was changed`,
+      );
+    }
+    throw new Error(
+      `frond-ear does not know this session's id (its shim had no CLAUDE_CODE_SESSION_ID), so it cannot ${what} for it; nothing was changed`,
+    );
+  }
+
+  /**
+   * Refreshes the orphan clock of the schedules `client`'s session set, while it is the
+   * ear's holder: at attach, at a session change (both sides) and at detach, not only on
+   * a wake tick (🍃 on #114).
+   */
+  private touchHolder(ear: string, client: Client): void {
+    if (
+      this.attached.get(ear) === client &&
+      client.sessionId &&
+      !this.stopped
+    ) {
+      this.store.wakes.touchSetter(ear, client.sessionId, this.clock.now());
+    }
+  }
+
+  private holderIdentity(
+    ear: string,
+  ): "detached" | "in-doubt" | "known" | "unknown" {
+    const client = this.attached.get(ear);
+    if (!client) {
+      return "detached";
+    }
+    if (client.wakeDoubt) {
+      return "in-doubt";
+    }
+    return client.sessionId ? "known" : "unknown";
+  }
+
+  /** The holder's wake session per attached ear; touches each, so it is never orphaned. */
+  private wakeHolders(now: number): Map<string, string> {
+    const holders = new Map<string, string>();
+    for (const [ear, client] of this.attached) {
+      const session = this.wakeSession(client);
+      if (session !== null) {
+        holders.set(ear, session);
+        this.store.wakes.touchSetter(ear, session, now);
+      }
+    }
+    return holders;
+  }
+
+  /** What a watch targets, for its setter's eyes only. */
+  private targetText(schedule: Schedule): string | undefined {
+    const target = this.watchTarget(schedule);
+    return target ? describeTarget(target) : undefined;
+  }
+
+  private watchTarget(schedule: Schedule): GithubTarget | undefined {
+    if (schedule.target === null) {
+      return undefined;
+    }
+    try {
+      return JSON.parse(schedule.target) as GithubTarget;
+    } catch {
+      return undefined;
+    }
+  }
+
+  // ---- wake_on GitHub (#111) ---------------------------------------------------------
+
+  private githubClient(): GithubClient | undefined {
+    const github = this.config.github;
+    if (!github?.enabled) {
+      return undefined;
+    }
+    return new GithubClient({
+      apiBase: github.apiBase,
+      token: this.options.githubToken,
+      fetch: this.options.githubFetch ?? ((url, init) => fetch(url, init)),
+      now: () => this.clock.now(),
+    });
+  }
+
+  /** Until when GitHub asked every watch to wait (persisted: a restart still waits). */
+  private githubBackoffUntil(): number {
+    const value = Number(this.store.runtimeState("github.backoff_until") ?? 0);
+    return Number.isFinite(value) ? value : 0;
+  }
+
+  private githubWindow(
+    ear: string,
+    now: number,
+  ): { window: number; count: number } {
+    const window = Math.floor(now / 3_600_000) * 3_600_000;
+    try {
+      const kept = JSON.parse(
+        this.store.runtimeState(`github.requests.${ear}`) ?? "null",
+      ) as { window?: unknown; count?: unknown } | null;
+      if (kept && kept.window === window && typeof kept.count === "number") {
+        return { window, count: kept.count };
+      }
+    } catch {
+      // unreadable: a fresh window
+    }
+    return { window, count: 0 };
+  }
+
+  /** One HTTP attempt from this ear's hourly budget, or false when it is spent. */
+  private spendGithub(ear: string): boolean {
+    const limit = this.config.github?.maxRequestsPerHour ?? 0;
+    const { window, count } = this.githubWindow(ear, this.clock.now());
+    if (count >= limit) {
+      return false;
+    }
+    this.store.setRuntimeState(
+      `github.requests.${ear}`,
+      JSON.stringify({ window, count: count + 1 }),
+    );
+    return true;
+  }
+
+  /** Whether `repo` is in `ear`'s github.repos now. */
+  private githubAllows(ear: string, repo: string): boolean {
+    return (this.config.github?.repos[ear] ?? []).some(
+      (allowed) => allowed.toLowerCase() === repo.toLowerCase(),
+    );
+  }
+
+  /**
+   * The gate on every GitHub request for `ear`'s watch of `repo` (Admit): asked before
+   * each attempt, after every await, against the config as it is then.
+   */
+  private githubAdmit(
+    ear: string,
+    repo: string,
+    gh: GithubClient,
+    track: { pollAfterMs?: number } = {},
+  ): Admit {
+    return {
+      before: () => {
+        const github = this.config.github;
+        if (
+          this.stopped ||
+          !github?.enabled ||
+          github.apiBase.replace(/\/+$/u, "") !== gh.origin
+        ) {
+          return "paused";
+        }
+        if (!this.githubAllows(ear, repo)) {
+          return "revoked";
+        }
+        if (this.githubBackoffUntil() > this.clock.now()) {
+          return "rate";
+        }
+        return this.spendGithub(ear) ? "ok" : "budget";
+      },
+      after: (response) => {
+        // A rate limit is an instruction to the whole daemon: kept the moment it is
+        // read, whatever then becomes of this watch (retired, cancelled; 🌫 on #114).
+        if (response.rateLimited && !this.stopped) {
+          this.backOffGithub(this.clock.now(), response.retryAfterMs);
+        }
+        if (response.pollIntervalMs !== undefined) {
+          track.pollAfterMs = Math.max(
+            track.pollAfterMs ?? 0,
+            response.pollIntervalMs,
+          );
+        }
+      },
+    };
+  }
+
+  private async wakeOnTool(
+    client: Client,
+    args: Record<string, unknown>,
+  ): Promise<string> {
+    const ear = this.requireHolder(client, "set a watch");
+    const setter = this.requireWakeSession(client, "set a watch");
+    const github = this.config.github;
+    const gh = this.githubClient();
+    if (!github?.enabled || !gh) {
+      throw new Error(
+        "wake_on is not enabled on this daemon (config github.enabled); nothing was set",
+      );
+    }
+    const now = this.clock.now();
+    const note = parseNote(args);
+    const target = parseTarget(args);
+    if (!this.githubAllows(ear, target.repo)) {
+      throw new Error(
+        `repo ${target.repo} is not in this ear's github.repos (the daemon's config); nothing was set`,
+      );
+    }
+    const expiresAt = parseTtl(args, now);
+    this.checkWakeCaps(ear, setter);
+    const backoff = this.githubBackoffUntil();
+    if (backoff > now) {
+      throw new Error(
+        `GitHub asked frond-ear to wait until ${iso(backoff)} (a rate limit); nothing was set, try after it`,
+      );
+    }
+    // The greatest x-poll-interval any of the registration's answers gave (🌫 on #114).
+    const track: { pollAfterMs?: number } = {};
+    const first = await baseline(
+      gh,
+      this.githubAdmit(ear, target.repo, gh, track),
+      target,
+      now,
+    );
+    if (first.kind === "refused") {
+      // A rate limit in the answer is already kept, by the gate's `after`.
+      throw new Error(`nothing was set: ${first.reason}`);
+    }
+    // The ear may have changed hands while GitHub answered.
+    if (this.wakeSession(client) !== setter) {
+      throw new Error(
+        "this session no longer holds the ear (or frond-ear can no longer tell it is this session); nothing was set",
+      );
+    }
+    this.checkWakeCaps(ear, setter);
+    const at = this.clock.now();
+    const id = this.store.wakes.addSchedule({
+      ear,
+      setter,
+      kind: "github",
+      note,
+      periodMs: null,
+      firstDue: null,
+      nextDue: at + Math.max(github.pollMs, track.pollAfterMs ?? 0),
+      target: JSON.stringify(first.target),
+      cursor: JSON.stringify(first.cursor),
+      createdAt: at,
+      expiresAt,
+    });
+    this.logger.log("info", "wake.watch_set", { ear, scheduleId: id });
+    const what = describeTarget(first.target);
+    if (first.kind === "fire") {
+      const schedule = this.store.wakes.schedule(id)!;
+      this.store.wakes.recordWatch(
+        schedule,
+        "github",
+        JSON.stringify(first.facts),
+        null,
+        { end: "done", reason: "already held when set" },
+        at,
+      );
+      this.deliverWakes(ear, { all: false, held: false });
+      this.armWakes();
+      return `schedule ${id} set: ${what}; it already holds, so its wake was written at once and the watch retired. Ack the kind="wake" event's nonce to settle it.`;
+    }
+    this.armWakes();
+    return `schedule ${id} set: ${what}, polled every ${github.pollMs / 1_000} s with conditional requests until it fires once (then it retires) or expires ${iso(expiresAt)}. ${
+      first.target.on === "review" || first.target.on === "comment"
+        ? `Only ${first.target.on}s after now count: those already there are the baseline.`
+        : first.target.on === "ci_done" && first.target.kind === "pr"
+          ? `Bound to head ${first.target.head}: checks on any other commit never fire it.`
+          : first.target.kind === "run"
+            ? `Bound to attempt ${first.target.attempt}: a rerun is another attempt.`
+            : "A PR closed without merging fires it too."
+    } Its wake is owed to this session until you ack its nonce; a poll that keeps failing ends it with one wake saying so.`;
+  }
+
+  private backOffGithub(now: number, retryAfterMs: number | undefined): number {
+    const until = Math.max(
+      this.githubBackoffUntil(),
+      now + (retryAfterMs ?? GITHUB_LIMITS.defaultRateWaitMs),
+    );
+    this.store.setRuntimeState("github.backoff_until", String(until));
+    this.logger.log("warn", "wake.github_backoff", { until });
+    return until;
+  }
+
+  /** Starts a poll pass over the due watches, unless one is running or GitHub is off. */
+  private startPolls(): void {
+    if (this.polling || this.stopped || this.closing || !this.githubClient()) {
+      return;
+    }
+    const work = this.pollDue().catch((error: unknown) => {
+      this.logger.log("error", "wake.poll_pass_failed", {
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    });
+    const tracked = work.finally(() => {
+      this.polling = undefined;
+      this.inFlight.delete(tracked);
+      this.armWakes();
+    });
+    this.polling = tracked;
+    this.inFlight.add(tracked);
+  }
+
+  private dueWatches(now: number): Schedule[] {
+    return this.store.wakes
+      .active()
+      .filter(
+        (schedule) =>
+          schedule.kind === "github" &&
+          this.config.ears[schedule.ear] !== undefined &&
+          schedule.nextDue !== null &&
+          schedule.nextDue <= now &&
+          schedule.expiresAt > now,
+      );
+  }
+
+  /** One pass, one watch at a time: GitHub never sees concurrent polls from this daemon. */
+  private async pollDue(): Promise<void> {
+    const gh = this.githubClient();
+    if (!gh || this.githubBackoffUntil() > this.clock.now()) {
+      return;
+    }
+    for (const schedule of this.dueWatches(this.clock.now())) {
+      if (this.stopped || this.closing) {
+        return;
+      }
+      if (this.githubBackoffUntil() > this.clock.now()) {
+        return;
+      }
+      await this.pollOne(gh, schedule);
+    }
+  }
+
+  private async pollOne(gh: GithubClient, schedule: Schedule): Promise<void> {
+    const target = this.watchTarget(schedule);
+    let cursor: GithubCursor = { etags: {} };
+    try {
+      cursor = {
+        etags: {},
+        ...(JSON.parse(schedule.cursor ?? "{}") as object),
+      };
+    } catch {
+      // a fresh cursor: at worst one unconditional request
+    }
+    let outcome: PollOutcome;
+    // The greatest x-poll-interval of any answer this poll read.
+    const track: { pollAfterMs?: number } = {};
+    if (!target) {
+      outcome = { kind: "terminal", reason: "its target is unreadable" };
+    } else {
+      try {
+        outcome = await poll(
+          gh,
+          this.githubAdmit(schedule.ear, target.repo, gh, track),
+          target,
+          cursor,
+          this.clock.now(),
+        );
+      } catch (error) {
+        outcome = {
+          kind: "retry",
+          rate: false,
+          reason: error instanceof Error ? error.message : "poll failed",
+        };
+      }
+    }
+    if (this.stopped) {
+      return;
+    }
+    const now = this.clock.now();
+    // Cancelled or expired while GitHub answered: the outcome belongs to nobody.
+    const fresh = this.store.wakes.schedule(schedule.id);
+    if (!fresh || fresh.state !== "active") {
+      return;
+    }
+    const pollMs = this.config.github?.pollMs ?? 120_000;
+    this.logger.log("info", "wake.github_polled", {
+      ear: fresh.ear,
+      scheduleId: fresh.id,
+      outcome: outcome.kind,
+    });
+    const end = (reason: string): void => {
+      const facts: WakeFacts = {
+        lines: [
+          `${target ? describeTarget(target) : `watch ${fresh.id}`}: ${reason}. The watch retires and will not fire; set a new one once that is fixed.`,
+        ],
+        ...(target ? { url: htmlUrl(target) } : {}),
+      };
+      this.store.wakes.recordWatch(
+        fresh,
+        "ended",
+        JSON.stringify(facts),
+        null,
+        { end: "failed", reason },
+        now,
+      );
+      this.logger.log("warn", "wake.watch_failed", {
+        ear: fresh.ear,
+        scheduleId: fresh.id,
+      });
+    };
+    switch (outcome.kind) {
+      case "unchanged":
+        this.store.wakes.updateWatch(fresh.id, {
+          cursor: JSON.stringify(outcome.cursor),
+          nextDue:
+            now +
+            Math.max(pollMs, outcome.pollAfterMs ?? 0, track.pollAfterMs ?? 0),
+          failures: 0,
+          failingSince: null,
+        });
+        break;
+      case "fire":
+        this.store.wakes.recordWatch(
+          fresh,
+          "github",
+          JSON.stringify(outcome.facts),
+          JSON.stringify(outcome.cursor),
+          { end: "done", reason: "fired" },
+          now,
+        );
+        this.logger.log("info", "wake.watch_fired", {
+          ear: fresh.ear,
+          scheduleId: fresh.id,
+        });
+        break;
+      case "deferred":
+        // The ear's hourly budget is spent: wait for the next window, failing nothing.
+        this.store.wakes.updateWatch(fresh.id, {
+          cursor: null,
+          nextDue: Math.floor(now / 3_600_000) * 3_600_000 + 3_600_000,
+          failures: fresh.failures,
+          failingSince: fresh.failingSince,
+        });
+        break;
+      case "retry": {
+        const failingSince = fresh.failingSince ?? now;
+        const failures = outcome.rate ? fresh.failures : fresh.failures + 1;
+        if (failures >= GITHUB_LIMITS.maxFailures) {
+          end(
+            `gave up after ${failures} failed polls in a row (the last: ${outcome.reason})`,
+          );
+          break;
+        }
+        if (now - failingSince >= GITHUB_LIMITS.maxFailingMs) {
+          end(
+            `gave up after failing for ${Math.round((now - failingSince) / 3_600_000)} hours (the last: ${outcome.reason})`,
+          );
+          break;
+        }
+        const nextDue = outcome.rate
+          ? this.backOffGithub(now, outcome.retryAfterMs)
+          : now +
+            Math.max(
+              Math.min(pollMs * 2 ** failures, GITHUB_LIMITS.maxBackoffMs),
+              track.pollAfterMs ?? 0,
+            );
+        this.store.wakes.updateWatch(fresh.id, {
+          cursor: null,
+          nextDue,
+          failures,
+          failingSince,
+        });
+        break;
+      }
+      case "terminal":
+        end(outcome.reason);
+        break;
+    }
+    this.deliverWakes(fresh.ear, { all: false, held: false });
+  }
+
+  /**
+   * Pushes the attached session what it is owed: one event per schedule, carrying every
+   * owed occurrence of it under one fresh nonce. `all` replays everything (an attach or
+   * a session change); otherwise only schedules with an occurrence never pushed, or due
+   * a re-push (repushAt: 1 h after the first push, doubling to a day). `held` also names, without their text, the
+   * wakes owed to other sessions. Never to taps: a tap is another reader.
+   */
+  private deliverWakes(
+    ear: string,
+    options: { all: boolean; held: boolean },
+  ): void {
+    const client = this.attached.get(ear);
+    if (!client || this.config.paused || this.stopped) {
+      return;
+    }
+    const now = this.clock.now();
+    const session = this.wakeSession(client);
+    const owed = this.store.wakes.owed(ear);
+    if (session !== null) {
+      const bySchedule = new Map<number, Wake[]>();
+      for (const wake of owed) {
+        if (wake.setter === session) {
+          bySchedule.set(wake.scheduleId, [
+            ...(bySchedule.get(wake.scheduleId) ?? []),
+            wake,
+          ]);
+        }
+      }
+      for (const [scheduleId, wakes] of bySchedule) {
+        const due =
+          options.all || wakes.some((wake) => (repushAt(wake) ?? now) <= now);
+        const schedule = this.store.wakes.schedule(scheduleId);
+        if (!due || !schedule) {
+          continue;
+        }
+        const nonce = randomBytes(6).toString("hex");
+        const notification = renderWake(
+          schedule,
+          wakes,
+          nonce,
+          now,
+          this.targetText(schedule),
+        );
+        this.store.wakes.deliver(
+          {
+            nonce,
+            ear,
+            sessionId: session,
+            scheduleId,
+            throughWakeId: Math.max(...wakes.map((wake) => wake.id)),
+          },
+          now,
+        );
+        client.connection.send({
+          type: "event",
+          batchId: null,
+          content: notification.content,
+          meta: { ...notification.meta, ear },
+        });
+        this.logger.log("info", "wake.delivered", {
+          ear,
+          scheduleId,
+          wakes: wakes.length,
+        });
+      }
+    }
+    if (options.held) {
+      const held = renderHeld(
+        owed.filter((wake) => session === null || wake.setter !== session),
+        session !== null ? session : client.wakeDoubt ? "in-doubt" : "unknown",
+      );
+      if (held) {
+        client.connection.send({
+          type: "event",
+          batchId: null,
+          content: held.content,
+          meta: { ...held.meta, ear },
+        });
+      }
+    }
+  }
+
+  /**
+   * Every due step of every active schedule, each one transaction with the occurrence it
+   * owes; then orphans; then pushes. A removed ear's schedules wait untouched, their due
+   * times kept, and catch up coalesced if the ear comes back.
+   */
+  private wakeTick(): void {
+    if (this.wakeTimer !== undefined) {
+      this.timers.clearTimeout(this.wakeTimer);
+      this.wakeTimer = undefined;
+    }
+    if (this.stopped || this.closing) {
+      return;
+    }
+    const now = this.clock.now();
+    let failed = false;
+    try {
+      const holders = this.wakeHolders(now);
+      for (const schedule of this.store.wakes.active()) {
+        if (!this.config.ears[schedule.ear]) {
+          continue;
+        }
+        try {
+          if (schedule.kind === "github" && now >= schedule.expiresAt) {
+            const target = this.watchTarget(schedule);
+            this.store.wakes.recordWatch(
+              schedule,
+              "ended",
+              JSON.stringify({
+                lines: [
+                  `${target ? describeTarget(target) : `watch ${schedule.id}`}: expired at ${iso(schedule.expiresAt)} without firing; it reached its ttl and will not fire. Set a new one if you still want it.`,
+                ],
+                ...(target ? { url: htmlUrl(target) } : {}),
+              } satisfies WakeFacts),
+              null,
+              { end: "expired", reason: "reached its ttl" },
+              now,
+            );
+            continue;
+          }
+          const step = dueStep(schedule, now);
+          if (step) {
+            this.store.wakes.recordTicks(
+              schedule,
+              step.ticks,
+              step.advance,
+              now,
+              step.notice,
+            );
+            if ("end" in step.advance) {
+              this.logger.log("info", "wake.schedule_ended", {
+                ear: schedule.ear,
+                scheduleId: schedule.id,
+                state: step.advance.end,
+              });
+              continue;
+            }
+          }
+          if (
+            holders.get(schedule.ear) !== schedule.setter &&
+            now - schedule.setterSeenAt >= WAKE_LIMITS.orphanAfterMs
+          ) {
+            this.store.wakes.end(
+              schedule.id,
+              "orphaned",
+              "its setter had not held the ear for 7 days",
+              now,
+            );
+            this.logger.log("warn", "wake.schedule_orphaned", {
+              ear: schedule.ear,
+              scheduleId: schedule.id,
+            });
+          }
+        } catch (error) {
+          failed = true;
+          this.logger.log("error", "wake.step_failed", {
+            ear: schedule.ear,
+            scheduleId: schedule.id,
+            reason: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+      for (const ear of this.attached.keys()) {
+        this.deliverWakes(ear, { all: false, held: false });
+      }
+      if (this.dueWatches(now).length > 0) {
+        this.startPolls();
+      }
+    } catch (error) {
+      failed = true;
+      this.logger.log("error", "wake.tick_failed", {
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    }
+    this.armWakes(failed ? now + WAKE_LIMITS.retryMs : undefined);
+  }
+
+  /**
+   * Arms the one wake timer for the soonest thing that needs the daemon: a due time, an
+   * expiry, an orphan deadline or a re-push. After a failed step nothing runs before
+   * `retryAt`, and a deadline a tick left past waits WAKE_LIMITS.retryMs, so nothing spins.
+   */
+  private armWakes(retryAt?: number): void {
+    if (this.wakeTimer !== undefined) {
+      this.timers.clearTimeout(this.wakeTimer);
+      this.wakeTimer = undefined;
+    }
+    if (this.stopped || this.closing) {
+      return;
+    }
+    const now = this.clock.now();
+    let next: number | undefined;
+    const consider = (at: number | null): void => {
+      if (at !== null && (next === undefined || at < next)) {
+        next = at;
+      }
+    };
+    const holders = new Map<string, string>();
+    for (const [ear, client] of this.attached) {
+      const session = this.wakeSession(client);
+      if (session !== null) {
+        holders.set(ear, session);
+      }
+    }
+    const pollable = this.config.github?.enabled === true;
+    const backoff = this.githubBackoffUntil();
+    for (const schedule of this.store.wakes.active()) {
+      if (!this.config.ears[schedule.ear]) {
+        continue;
+      }
+      if (schedule.kind === "github") {
+        // Its expiry always; its next poll only while polling is on and none runs (a
+        // pass re-arms when it ends), and never inside GitHub's backoff.
+        consider(schedule.expiresAt);
+        if (pollable && !this.polling && schedule.nextDue !== null) {
+          consider(Math.max(schedule.nextDue, backoff));
+        }
+      } else {
+        consider(attentionAt(schedule));
+      }
+      if (holders.get(schedule.ear) !== schedule.setter) {
+        consider(schedule.setterSeenAt + WAKE_LIMITS.orphanAfterMs);
+      }
+    }
+    if (!this.config.paused) {
+      for (const [ear, session] of holders) {
+        for (const wake of this.store.wakes.owed(ear)) {
+          if (wake.setter === session) {
+            consider(repushAt(wake) ?? now);
+          }
+        }
+      }
+    }
+    if (retryAt !== undefined) {
+      // After a failed step nothing runs before the retry, however overdue.
+      next = Math.max(next ?? retryAt, retryAt);
+    }
+    if (next === undefined) {
+      return;
+    }
+    // A deadline further off than one timer can hold is slept in segments: each one
+    // ends in a tick that finds nothing due and arms the next, against the stored
+    // absolute deadline (Node clamps a delay over 2^31 - 1 ms to 1 ms; 🌫 on #114).
+    const delay = Math.min(
+      retryAt === undefined && next <= now && this.wakeTicking
+        ? WAKE_LIMITS.retryMs
+        : Math.max(0, next - now),
+      WAKE_LIMITS.maxTimerMs,
+    );
+    this.wakeTimer = this.timers.setTimeout(() => {
+      this.wakeTimer = undefined;
+      this.wakeTicking = true;
+      try {
+        this.wakeTick();
+      } finally {
+        this.wakeTicking = false;
+      }
+    }, delay);
+  }
+
+  private checkWakeCaps(ear: string, setter: string): void {
+    const active = this.store.wakes
+      .active()
+      .filter((schedule) => schedule.ear === ear);
+    const mine = active.filter((schedule) => schedule.setter === setter).length;
+    if (mine >= WAKE_LIMITS.maxPerSession) {
+      throw new Error(
+        `this session already has ${mine} active schedules (the limit per session is ${WAKE_LIMITS.maxPerSession}); cancel one with the schedules tool first`,
+      );
+    }
+    if (active.length >= WAKE_LIMITS.maxPerEar) {
+      throw new Error(
+        `ear ${ear} already holds ${active.length} active schedules (the limit per ear is ${WAKE_LIMITS.maxPerEar}); ear_status counts those of sessions that no longer hold it under schedules.orphaned`,
+      );
+    }
+  }
+
+  private scheduleTool(client: Client, args: Record<string, unknown>): string {
+    const ear = this.requireHolder(client, "set a schedule");
+    const setter = this.requireWakeSession(client, "set a schedule");
+    const now = this.clock.now();
+    const request = parseSchedule(args, now);
+    this.checkWakeCaps(ear, setter);
+    const id = this.store.wakes.addSchedule({
+      ear,
+      setter,
+      kind: request.kind,
+      note: request.note,
+      periodMs: request.periodMs,
+      firstDue: request.firstDue,
+      nextDue: request.firstDue,
+      target: null,
+      cursor: null,
+      createdAt: now,
+      expiresAt: request.expiresAt,
+    });
+    this.logger.log("info", "wake.schedule_set", {
+      ear,
+      scheduleId: id,
+      kind: request.kind,
+    });
+    this.armWakes();
+    const when =
+      request.kind === "at"
+        ? `due ${iso(request.firstDue)}`
+        : `every ${request.periodMs! / 60_000} minutes from ${iso(request.firstDue)} (a fixed cadence: delivery and ack never shift it)`;
+    return `schedule ${id} set: ${when}; expires ${iso(request.expiresAt)}. When it comes due, frond-ear writes a wake owed to this session and pushes it as a kind="wake" event; it comes back (on every attach, and hourly while you hold the ear) until you ack that event's nonce. Ticks missed meanwhile come as one event. Another session, after a /clear say, is told it exists, never shown it. The schedules tool lists, reads or cancels it.`;
+  }
+
+  private schedulesTool(client: Client, args: Record<string, unknown>): string {
+    const ear = this.requireHolder(client, "read its schedules");
+    const viewer = this.wakeSession(client);
+    const now = this.clock.now();
+    const pick = (value: unknown): Schedule => {
+      const id = Number(value);
+      const schedule = Number.isInteger(id)
+        ? this.store.wakes.schedule(id)
+        : undefined;
+      if (!schedule || schedule.ear !== ear) {
+        throw new Error(`no schedule ${String(value)} on ear ${ear}`);
+      }
+      return schedule;
+    };
+    if (args.cancel !== undefined && args.cancel !== null) {
+      const schedule = pick(args.cancel);
+      if (viewer === null || viewer !== schedule.setter) {
+        throw new Error(
+          `only the session that set schedule ${schedule.id} can cancel it${viewer === null ? " (frond-ear can't tell which session this is)" : ""}; nothing changed`,
+        );
+      }
+      if (!this.store.wakes.end(schedule.id, "cancelled", "cancelled", now)) {
+        throw new Error(
+          `schedule ${schedule.id} already ended (${schedule.state})`,
+        );
+      }
+      this.logger.log("info", "wake.schedule_cancelled", {
+        ear,
+        scheduleId: schedule.id,
+      });
+      this.armWakes();
+      const owed = this.store.wakes
+        .owed(ear)
+        .filter((wake) => wake.scheduleId === schedule.id).length;
+      return `schedule ${schedule.id} cancelled: it will not fire again. ${
+        owed === 0
+          ? "It owed nothing."
+          : `${owed === 1 ? "1 wake it already owes stays" : `${owed} wakes it already owes stay`} owed until you ack ${owed === 1 ? "it" : "them"}.`
+      }`;
+    }
+    if (args.read !== undefined && args.read !== null) {
+      const schedule = pick(args.read);
+      return readSchedule(
+        schedule,
+        this.store.wakes.wakesOf(schedule.id),
+        viewer,
+        viewer === schedule.setter ? this.targetText(schedule) : undefined,
+      );
+    }
+    return listSchedules(
+      this.store.wakes.schedules(ear),
+      this.store.wakes.owed(ear),
+      viewer,
+      (schedule) =>
+        viewer === schedule.setter ? this.targetText(schedule) : undefined,
+    );
+  }
+
+  /** An ack naming a wake delivery's nonce: only its own session settles it. */
+  private ackWake(
+    client: Client,
+    delivery: { nonce: string; sessionId: string; scheduleId: number },
+  ): string {
+    const viewer = this.wakeSession(client);
+    if (viewer === null || viewer !== delivery.sessionId) {
+      throw new Error(
+        `wake nonce "${delivery.nonce}" was delivered to session ${shortSession(delivery.sessionId)}, not this one; nothing settled${client.wakeDoubt ? " (frond-ear can't tell which session this shim speaks for since a /clear it could not tie to it)" : ""}`,
+      );
+    }
+    const settled = this.store.wakes.ack(delivery.nonce, this.clock.now());
+    this.armWakes();
+    if (settled.length === 0) {
+      return `0 wakes settled: already settled (schedule ${delivery.scheduleId}); nothing delivered later is touched`;
+    }
+    this.logger.log("info", "wake.settled", {
+      ear: client.ear,
+      scheduleId: delivery.scheduleId,
+      wakes: settled.length,
+    });
+    return `${settled.length} wake${settled.length === 1 ? "" : "s"} settled (schedule ${delivery.scheduleId}: occurrence${settled.length === 1 ? "" : "s"} ${occurrenceList(settled)}); anything delivered later stays owed`;
+  }
+
+  /** Counts, times and caps: a status read never shows a note or a target. */
+  private schedulesView(ear: string): object {
+    const all = this.store.wakes.schedules(ear);
+    const active = all.filter((schedule) => schedule.state === "active");
+    const client = this.attached.get(ear);
+    const holder = client ? this.wakeSession(client) : null;
+    const owed = this.store.wakes.owed(ear);
+    const dues = active
+      .map((schedule) => schedule.nextDue)
+      .filter((at): at is number => at !== null);
+    const kind = (name: Schedule["kind"]): number =>
+      active.filter((schedule) => schedule.kind === name).length;
+    return {
+      active: active.length,
+      byKind: { at: kind("at"), every: kind("every"), github: kind("github") },
+      nextDueAt: dues.length > 0 ? Math.min(...dues) : null,
+      owed: owed.length,
+      owedToHolder:
+        holder === null
+          ? 0
+          : owed.filter((wake) => wake.setter === holder).length,
+      lastDeliveredAt: this.store.wakes.lastDeliveredAt(ear),
+      lastAckedAt: this.store.wakes.lastAckedAt(ear),
+      orphaned: active.filter((schedule) => schedule.setter !== holder).length,
+      retiredOrphaned: all.filter((schedule) => schedule.state === "orphaned")
+        .length,
+      droppedUnacked:
+        this.store.counters()[`wakes_dropped_unacked.${ear}`] ?? 0,
+      holderIdentity: this.holderIdentity(ear),
+      github: {
+        enabled: this.config.github?.enabled === true,
+        token: this.options.githubToken !== undefined,
+        watches: kind("github"),
+        repos: this.config.github?.repos[ear]?.length ?? 0,
+        pollSeconds: (this.config.github?.pollMs ?? 120_000) / 1_000,
+        requestsThisHour: this.githubWindow(ear, this.clock.now()).count,
+        maxRequestsPerHour: this.config.github?.maxRequestsPerHour ?? 0,
+        backoffUntil:
+          this.githubBackoffUntil() > this.clock.now()
+            ? this.githubBackoffUntil()
+            : null,
+      },
+      caps: {
+        maxPerEar: WAKE_LIMITS.maxPerEar,
+        maxPerSession: WAKE_LIMITS.maxPerSession,
+        minPeriodSeconds: WAKE_LIMITS.minPeriodMs / 1_000,
+        maxTtlDays: WAKE_LIMITS.maxTtlDays,
+        orphanAfterDays: WAKE_LIMITS.orphanAfterMs / 86_400_000,
+        maxNoteBytes: WAKE_LIMITS.maxNoteBytes,
+      },
+    };
+  }
+
   private requireHolder(client: Client, what: string): string {
     const ear = client.ear;
     if (!ear || !this.isAttachedSession(client, ear)) {
@@ -2143,20 +3564,34 @@ export class Daemon {
    * The batch an action acknowledges, fixed *before* any awaited Discord call:
    * the batch_id the model passed (clamped to what was confirmed), else the
    * latest confirmed batch at call start. Anything offered later stays unseen.
+   * A named canticle push is echoed here, at the call (#161): `canticle` says the
+   * id was one, `echoed` how many of its records it echoed, and `refused` why it echoed
+   * nothing when that isn't the push's state: the id lacks the push's own delivery token,
+   * the push went out before this process started, or a revert gave it back. A canticle
+   * id names the canticle stream, never a chat, so it acknowledges no Discord batch in any
+   * tool, a reverted push's id included.
    */
   private seenHorizon(
     client: Client,
     ear: string,
     chatId: string | undefined,
     args: Record<string, unknown>,
-  ): number | undefined {
+    tool: string,
+  ): {
+    horizon: number | undefined;
+    canticle: boolean;
+    echoed: number;
+    refused?: "forged" | "restarted" | "reverted";
+    /** The push carried a coverage note and no record: nothing to echo. */
+    note?: true;
+  } {
     if (!this.isAttachedSession(client, ear)) {
-      return undefined;
+      return { horizon: undefined, canticle: false, echoed: 0 };
     }
     const latest = this.store.latestConfirmedBatch(ear, chatId);
     const requested = args.batch_id;
     if (requested === undefined || requested === null || requested === "") {
-      return latest;
+      return { horizon: latest, canticle: false, echoed: 0 };
     }
     const match = /^(\d+)(?:-([0-9a-f]+))?$/u.exec(String(requested));
     const batch = Number(match?.[1]);
@@ -2164,7 +3599,67 @@ export class Daemon {
       throw new Error("batch_id must be the batch_id from the event");
     }
     this.provenByUse(client, ear, batch, match[2]);
-    return Math.min(batch, latest);
+    const push = this.store.canticlePush(ear, batch);
+    if (push === "reverted") {
+      return {
+        horizon: undefined,
+        canticle: true,
+        echoed: 0,
+        refused: "reverted",
+      };
+    }
+    if (push !== undefined) {
+      // The echo is the session's word that it heard the push, so only the id the push
+      // carried counts (🍃 on #112): the bare id is in taps, logs and the store, and is
+      // sequential. The token is keyed by the push's own attach generation, so the same
+      // session behind a reconnected shim still holds it, and by this process's secret,
+      // so one from before a restart can't be checked and echoes nothing.
+      if (match[2] === this.pushToken(ear, push.generation, batch)) {
+        return {
+          horizon: undefined,
+          canticle: true,
+          echoed: this.echoCanticle(client, ear, batch, tool),
+          ...(push.empty === true ? { note: true as const } : {}),
+        };
+      }
+      return {
+        horizon: undefined,
+        canticle: true,
+        echoed: 0,
+        refused: batch <= this.batchesBefore ? "restarted" : "forged",
+      };
+    }
+    return { horizon: Math.min(batch, latest), canticle: false, echoed: 0 };
+  }
+
+  /**
+   * The session named a canticle push's whole batch_id in a tool call (#161): that
+   * push's records, and no other push's, are echoed now, under the session's boundary
+   * now. The id is the session's word that it heard them; a push, or a call that names
+   * no id, never is. Returns how many records it echoed.
+   */
+  private echoCanticle(
+    client: Client,
+    ear: string,
+    batch: number,
+    tool: string,
+  ): number {
+    const echoed = this.store.echoCanticleCustody(ear, batch, {
+      at: this.clock.now(),
+      kind: tool,
+      sessionId: client.sessionId ?? null,
+      generation: client.attachGeneration,
+      boundary: this.boundary(ear),
+    });
+    if (echoed > 0) {
+      this.logger.log("info", "canticle.echoed", {
+        ear,
+        batchId: batch,
+        records: echoed,
+        by: tool,
+      });
+    }
+    return echoed;
   }
 
   private markSeenThrough(
@@ -2221,7 +3716,13 @@ export class Daemon {
             ? stringArg(args, "text", true)
             : (stringArg(args, "text") ?? "");
         const replyTo = snowflakeArg(args, "reply_to");
-        const horizon = this.seenHorizon(client, ear, chatId, args);
+        const { horizon } = this.seenHorizon(
+          client,
+          ear,
+          chatId,
+          args,
+          "reply",
+        );
         // Read and checked before anything is posted: a refused file posts nothing.
         const files = await loadOutboundFiles(paths, {
           ear,
@@ -2231,12 +3732,17 @@ export class Daemon {
         });
         // Superseded sessions included; null for a script or a tools-only shim.
         const sessionEar = client.attachedAs ?? null;
-        const { ids, earlier } = await this.sendReply(
-          chatId,
-          text,
-          replyTo,
-          sessionEar,
-          files,
+        const { ids, earlier } = await this.roomOutput(
+          client,
+          ear,
+          {
+            tool: "reply",
+            chatId,
+            replyTo,
+            identity: replyKey(chatId, replyTo, text, files),
+          },
+          (permit) =>
+            this.sendReply(permit, chatId, text, replyTo, sessionEar, files),
         );
         this.markSeenThrough(client, ear, chatId, horizon);
         this.store.increment("replies_sent");
@@ -2257,8 +3763,19 @@ export class Daemon {
         const { chatId, ear } = this.requireChat(args);
         const messageId = snowflakeArg(args, "message_id", true);
         const emoji = stringArg(args, "emoji", true);
-        const horizon = this.seenHorizon(client, ear, chatId, args);
-        await this.rest.addReaction(chatId, messageId, emoji);
+        const { horizon } = this.seenHorizon(
+          client,
+          ear,
+          chatId,
+          args,
+          "react",
+        );
+        await this.roomOutput(
+          client,
+          ear,
+          { tool: "react", chatId, messageId, emoji },
+          (permit) => permit.apply(),
+        );
         this.markSeenThrough(client, ear, chatId, horizon);
         return "reacted";
       }
@@ -2274,8 +3791,19 @@ export class Daemon {
             `message ${messageId} was not sent by frond-ear in chat ${chatId}; only those can be edited`,
           );
         }
-        const horizon = this.seenHorizon(client, ear, chatId, args);
-        await this.rest.editMessage(chatId, messageId, text);
+        const { horizon } = this.seenHorizon(
+          client,
+          ear,
+          chatId,
+          args,
+          "edit_message",
+        );
+        await this.roomOutput(
+          client,
+          ear,
+          { tool: "edit_message", chatId, messageId, text },
+          (permit) => permit.apply(),
+        );
         this.markSeenThrough(client, ear, chatId, horizon);
         return "edited";
       }
@@ -2283,7 +3811,13 @@ export class Daemon {
         const { chatId, ear } = this.requireChat(args);
         const limit = numberArg(args, "limit", 20, 100);
         const before = snowflakeArg(args, "before");
-        const horizon = this.seenHorizon(client, ear, chatId, args);
+        const { horizon } = this.seenHorizon(
+          client,
+          ear,
+          chatId,
+          args,
+          "fetch_messages",
+        );
         const messages = await this.rest.fetchMessages(
           chatId,
           before ? { limit, before } : { limit },
@@ -2352,6 +3886,10 @@ export class Daemon {
             });
             return `${settled} letter${settled === 1 ? "" : "s"} settled`;
           }
+          const delivery = this.store.wakes.delivery(client.ear, nonce);
+          if (delivery) {
+            return this.ackWake(client, delivery);
+          }
         }
         if (nonce) {
           if (!client.ear || !this.store.registerEar(client.ear, nonce)) {
@@ -2364,18 +3902,27 @@ export class Daemon {
         const ear = chatId
           ? this.requireChat(args).ear
           : this.readableEar(client, args);
-        const marked = this.markSeenThrough(
-          client,
-          ear,
-          chatId,
-          this.seenHorizon(client, ear, chatId, args),
-        );
+        const seen = this.seenHorizon(client, ear, chatId, args, "ack");
+        if (seen.canticle) {
+          // A canticle push's batch_id echoes the push and marks no Discord event
+          // seen, with or without chat_id (#161).
+          return seen.refused !== undefined
+            ? `0 canticle records echoed: ${CANTICLE_REFUSED[seen.refused]}`
+            : seen.echoed > 0
+              ? `${seen.echoed} canticle record${seen.echoed === 1 ? "" : "s"} echoed as heard`
+              : seen.note === true
+                ? "0 canticle records echoed: that push was a coverage note and carried no record"
+                : "0 canticle records echoed: already echoed, or the push was never confirmed delivered to this session";
+        }
+        const marked = this.markSeenThrough(client, ear, chatId, seen.horizon);
         return `${marked} event${marked === 1 ? "" : "s"} marked seen`;
       }
       case "set_attention":
         return this.setAttention(client, args);
       case "set_canticle_delivery":
         return this.setCanticleDelivery(client, args);
+      case "wake_grant":
+        return this.wakeGrant(client, args);
       case "hear": {
         const ear = this.readableEar(client, args);
         if (!this.options.canticleHear) {
@@ -2385,13 +3932,21 @@ export class Daemon {
         if (stream !== undefined && !CANTICLE_TUNE.test(stream)) {
           throw new Error("stream must be station:stream (station may be *)");
         }
-        // A read, not a wake: it marks nothing seen and touches no ledger.
-        return renderHear(this.options.canticleHear(ear), {
+        // A read, not a wake: it marks no Discord event seen. What it shows this ear's
+        // own session is custody, an exposure echoed at its return (#161).
+        const { text, heard } = hearResult(this.options.canticleHear(ear), {
           stream,
           limit: numberArg(args, "limit", 10, 50),
           maxChars: this.config.limits.maxNotificationChars,
+          delivery: this.canticle?.hearNote(ear),
         });
+        if (heard.length > 0 && this.isAttachedSession(client, ear)) {
+          this.recordHear(client, ear, heard);
+        }
+        return text;
       }
+      case "canticle_custody":
+        return this.canticleCustody(client, args);
       case "fetch_attachment":
         return this.fetchAttachment(args);
       case "hold_compaction":
@@ -2443,6 +3998,12 @@ export class Daemon {
         }
         return listLetters(this.store, ear, now, client.sessionId ?? null);
       }
+      case "schedule":
+        return this.scheduleTool(client, args);
+      case "schedules":
+        return this.schedulesTool(client, args);
+      case "wake_on":
+        return this.wakeOnTool(client, args);
       case "ear_status":
         return JSON.stringify(
           this.status(client.ear ?? stringArg(args, "ear")),
@@ -2591,6 +4152,577 @@ export class Daemon {
     );
   }
 
+  /** `hear` showed these payloads to the ear's own session: custody, echoed at the return. */
+  private recordHear(
+    client: Client,
+    ear: string,
+    heard: readonly HeardItem[],
+  ): void {
+    this.store.recordCanticleHear(
+      ear,
+      {
+        generation: client.attachGeneration,
+        sessionId: client.sessionId ?? null,
+      },
+      heard.map(({ item, shown }) =>
+        exposure(
+          item,
+          "hear",
+          this.canticle?.modeOf(ear, item) ?? "off",
+          shown,
+        ),
+      ),
+      this.clock.now(),
+      this.boundary(ear),
+    );
+    this.logger.log("info", "canticle.heard", { ear, records: heard.length });
+  }
+
+  /**
+   * Custody over the ear's exposures claimed in the last `windowMs`, optionally for one
+   * `station:stream` (station may be *). A window reaching back before custody was kept
+   * (a new store, or the prune's cutoff) reads as unknown.
+   */
+  private custodyOver(
+    ear: string,
+    windowMs: number,
+    stream?: string,
+  ): { view: CustodyView; since: number; custodySince: number } {
+    const since = Math.max(0, this.clock.now() - windowMs);
+    const custodySince = this.store.canticleCustodySince();
+    let rows = this.store.canticleCustody(ear, since);
+    if (stream !== undefined) {
+      const at = stream.indexOf(":");
+      const [station, name] = [stream.slice(0, at), stream.slice(at + 1)];
+      rows = rows.filter(
+        (row) =>
+          (station === "*" || row.station === station) && row.stream === name,
+      );
+    }
+    const missing =
+      since < custodySince
+        ? [
+            `custody is kept only from ${iso(custodySince)}, after the window starts`,
+          ]
+        : [];
+    return {
+      view: custodyView(rows, this.custodyNow(ear), missing),
+      since,
+      custodySince,
+    };
+  }
+
+  /**
+   * The canticle_custody tool (#161): per record exposed to the ear's session, whether it
+   * was claimed, offered or echoed, and whether its echo is within the session's current
+   * compaction boundary; the `history` flag; and what the derived-publication seam would
+   * answer for the window. Read-only, and never a payload: identities and digests only.
+   */
+  private canticleCustody(
+    client: Client,
+    args: Record<string, unknown>,
+  ): string {
+    const ear = this.readableEar(client, args);
+    if (!this.options.canticleHear) {
+      return "canticle is not enabled on this daemon (config canticle.enabled).";
+    }
+    const stream = stringArg(args, "stream");
+    if (stream !== undefined && !CANTICLE_TUNE.test(stream)) {
+      throw new Error("stream must be station:stream (station may be *)");
+    }
+    const windowS = numberArg(
+      args,
+      "since_seconds",
+      CUSTODY_WINDOW_MS / 1_000,
+      366 * 24 * 60 * 60,
+    );
+    const limit = numberArg(args, "limit", 20, 100);
+    const { view, since, custodySince } = this.custodyOver(
+      ear,
+      windowS * 1_000,
+      stream,
+    );
+    const newest = [...view.records].sort(
+      (a, b) => b.exposure.claimedAt - a.exposure.claimedAt,
+    );
+    const gate = derivedPublication(
+      this.config.canticle?.derivedPublication === true,
+      view.records.map((record) => record.exposure.identity),
+      view,
+    );
+    const holder = this.attached.get(ear);
+    const boundary = this.boundary(ear);
+    const reading = this.pressure.get(ear);
+    return JSON.stringify(
+      {
+        ear,
+        history: view.history,
+        reasons: view.reasons,
+        window: { since, custodySince, ...(stream ? { stream } : {}) },
+        now: {
+          session: holder ? (holder.sessionId?.slice(0, 8) ?? null) : null,
+          boundary: boundary === undefined ? "unknown" : boundary,
+          // Custody is only as current as this reading: a compaction since it is unseen.
+          boundaryReportedAt:
+            boundary === undefined ? null : (reading?.receivedAt ?? null),
+        },
+        counts: view.counts,
+        records: newest.slice(0, limit).map(custodyEntry),
+        ...(newest.length > limit ? { omitted: newest.length - limit } : {}),
+        publication: gate.open
+          ? `open: the derived op may publish from these ${gate.sources.length} records`
+          : gate.reason,
+      },
+      null,
+      2,
+    );
+  }
+
+  /**
+   * The one way a tool writes to a Discord room (binary-canticle#161 item 3). The egress
+   * gate reads the speaking session's custody now, asks config canticle.roomPolicy, and
+   * records the row before anything is sent; a refusal throws, and nothing is sent.
+   * `write` gets the permit, the only thing that can make the Discord call, for this
+   * output alone, and how it went is recorded on the row. A retry or replay comes back
+   * through here, so it is checked again; an earlier allow is never reused.
+   */
+  private async roomOutput<T>(
+    client: Client,
+    chatEar: string,
+    output: RoomOutput,
+    write: (permit: RoomPermit) => Promise<T>,
+  ): Promise<T> {
+    const policy = this.config.canticle?.roomPolicy ?? "observe";
+    let permit: RoomPermit;
+    try {
+      permit = this.egress.open(
+        output,
+        policy,
+        this.speakerCustody(client, chatEar),
+      );
+    } catch (error) {
+      if (error instanceof RoomRefused) {
+        this.logger.log("warn", "room.refused", {
+          tool: output.tool,
+          chatId: output.chatId,
+          policy,
+          egressId: error.egressId,
+          reason: error.reason,
+        });
+      }
+      throw error;
+    }
+    try {
+      const result = await write(permit);
+      if (!this.stopped) permit.settle("sent");
+      return result;
+    } catch (error) {
+      // After shutdown the store may be closed: the row stays pending, settled when
+      // frond-ear next starts.
+      if (!this.stopped) permit.settle("failed");
+      throw error;
+    }
+  }
+
+  /**
+   * The custody a room output is judged by: the speaker's own. The session holding an ear
+   * is judged as canticle_custody and ear_status judge it, over the last CUSTODY_WINDOW_MS.
+   * A session it superseded, or whose ear was removed, keeps the exposures of its own
+   * attach, but frond-ear can't place them against a boundary; a CLI or tools-only
+   * connection has none. Both read as unknown.
+   */
+  private speakerCustody(client: Client, chatEar: string): SpeakerCustody {
+    const sessionId = client.sessionId ?? null;
+    if (
+      client.ear !== undefined &&
+      this.isAttachedSession(client, client.ear)
+    ) {
+      const { view, since } = this.custodyOver(client.ear, CUSTODY_WINDOW_MS);
+      return {
+        ear: client.ear,
+        speaker: "holder",
+        sessionId,
+        view,
+        boundary: this.boundary(client.ear),
+        since,
+      };
+    }
+    const now = this.clock.now();
+    const since = Math.max(0, now - CUSTODY_WINDOW_MS);
+    const unplacedNow: CustodyNow = {
+      session: { id: sessionId },
+      boundary: undefined,
+      idleCompactDueAt: null,
+      now,
+    };
+    if (client.attachedAs === undefined) {
+      return {
+        ear: chatEar,
+        speaker: "other",
+        sessionId,
+        view: unplaced(
+          custodyView([], unplacedNow),
+          "no ear's session is speaking (a CLI or tools-only connection): frond-ear holds no custody of its own for it",
+        ),
+        boundary: undefined,
+        since,
+      };
+    }
+    const ear = client.attachedAs;
+    const own = this.store
+      .canticleCustody(ear, since)
+      .filter((row) => row.generation === client.attachGeneration);
+    return {
+      ear,
+      speaker: "superseded",
+      sessionId,
+      view: unplaced(
+        custodyView(own, unplacedNow),
+        `this session no longer holds ear ${ear}, so frond-ear can't place what it was shown against its compaction boundary`,
+      ),
+      boundary: undefined,
+      since,
+    };
+  }
+
+  /** ear_status's custody summary: the last CUSTODY_WINDOW_MS, counts and history only. */
+  private custodySummary(ear: string): object {
+    const { view } = this.custodyOver(ear, CUSTODY_WINDOW_MS);
+    return {
+      windowMs: CUSTODY_WINDOW_MS,
+      history: view.history,
+      reasons: view.reasons,
+      counts: view.counts,
+    };
+  }
+
+  /**
+   * The derived-publication seam (binary-canticle#161), for a path that would publish
+   * something derived from these heard records (`key:epoch:stream:seq` each). Closed
+   * unless config canticle.derivedPublication is on and every one was heard whole and
+   * echoed within the current compaction boundary of the session holding the ear; a
+   * record custody doesn't hold reads as unknown. It decides only: no station call, and
+   * never the `sing` route. `derivedPublish` asks it before anything else.
+   */
+  public derivedPublicationGate(
+    ear: string,
+    sources: readonly string[],
+  ): PublicationDecision {
+    return derivedPublication(
+      this.config.canticle?.derivedPublication === true,
+      sources,
+      this.sourceCustody(ear, sources),
+    );
+  }
+
+  /** Custody of these source records, judged now; one custody doesn't hold reads as unknown. */
+  private sourceCustody(ear: string, sources: readonly string[]): CustodyView {
+    const rows = this.store.canticleCustodyOf(ear, sources);
+    const held = new Set(rows.map((row) => row.identity));
+    const absent = [...new Set(sources)].filter((id) => !held.has(id));
+    return custodyView(
+      rows,
+      this.custodyNow(ear),
+      absent.length > 0
+        ? [
+            `no custody for ${absent.length} source record${absent.length === 1 ? "" : "s"}`,
+          ]
+        : [],
+    );
+  }
+
+  /**
+   * Publishes `text`, derived from these heard records, by a station's derived op
+   * (binary-canticle#161 item 4; the op is #159, assembled in #162). Closed unless the
+   * seam is open (`derivedPublicationGate`), the owner's route is wired, the text is
+   * within #162's bound, custody kept each source's lineage, and the station's control
+   * socket offers the op; that is judged again after every wait, so custody that moved
+   * meanwhile (a compaction, a new session) stops it before anything is published. Then
+   * the owner's issuer gets the lineage and returns the capsule, and the station gets
+   * exactly `derived_publish`, never `sing`. An unanswered publish stays unknown: only
+   * `derivedQuery` for the same election settles it, and no publication of the same text
+   * from the same sources is made while one is in flight, unknown or accepted (#162:
+   * never a new election to retry an uncertain effect). Each issued attempt is recorded by
+   * ids and digests, never the text. No model tool calls this (#162 adds none, and the
+   * capsule stays out of any model's sight): it is the owner's integration's call. Like a
+   * tool call, shutdown drains it, and nothing starts or reaches the station once
+   * frond-ear is shutting down.
+   */
+  public derivedPublish(
+    ear: string,
+    sources: readonly string[],
+    text: string,
+  ): Promise<DerivedOutcome> {
+    const work = this.publishDerived(ear, sources, text);
+    this.inFlight.add(work);
+    const settled = () => this.inFlight.delete(work);
+    work.then(settled, settled);
+    return work;
+  }
+
+  private async publishDerived(
+    ear: string,
+    sources: readonly string[],
+    text: string,
+  ): Promise<DerivedOutcome> {
+    const route = this.options.derivedRoute;
+    const judge = (): { lineage: DerivedLineage } | { reason: string } => {
+      if (this.closing) {
+        return { reason: "closed: frond-ear is shutting down" };
+      }
+      const view = this.sourceCustody(ear, sources);
+      const gate = derivedPublication(
+        this.config.canticle?.derivedPublication === true,
+        sources,
+        view,
+      );
+      if (!gate.open) return { reason: gate.reason };
+      if (!route) {
+        return {
+          reason:
+            "closed: no derived-publication route: the owner's issuer and station control socket aren't wired into this daemon",
+        };
+      }
+      if (!derivedTextFits(text)) {
+        return {
+          reason: `closed: the derived text must be 1 to ${DERIVED_TEXT_MAX_BYTES} UTF-8 bytes (binary-canticle#162)`,
+        };
+      }
+      // An open seam means the session holding the ear echoed every source under its id.
+      const sessionId = this.attached.get(ear)?.sessionId;
+      if (!sessionId) {
+        return { reason: "closed: the session holding the ear has no id" };
+      }
+      const traced = derivedLineage(
+        ear,
+        sessionId,
+        sources,
+        view.records.map((record) => record.exposure),
+        text,
+      );
+      return "blocked" in traced
+        ? { reason: `closed: ${traced.blocked}` }
+        : traced;
+    };
+    const closed = (reason: string): DerivedOutcome => {
+      this.logger.log("info", "canticle.derived_closed", { ear, reason });
+      return { state: "closed", reason };
+    };
+    // A publication in flight, unknown or accepted is never published again (#162: never
+    // a new election to retry an uncertain effect); only derivedQuery goes on from it.
+    const payloadSha256 = payloadDigest(text);
+    const standing = (): string | undefined => {
+      const prior = this.store.standingDerived(ear, sources, payloadSha256);
+      return prior
+        ? `closed: a publication of this text from these sources is already ${prior.state}${prior.electionId ? ` (election ${prior.electionId})` : ""}; derivedQuery it rather than publish again`
+        : undefined;
+    };
+
+    const before = standing();
+    if (before !== undefined) return closed(before);
+    let judged = judge();
+    if ("reason" in judged) return closed(judged.reason);
+    const capability = await derivedCapability(route!.control);
+    if (!capability.derived) {
+      return closed(
+        `closed: the station's control socket doesn't offer derived publication: ${capability.reason}`,
+      );
+    }
+    const meanwhile = standing();
+    if (meanwhile !== undefined) return closed(meanwhile);
+    judged = judge();
+    if ("reason" in judged) return closed(judged.reason);
+    const { lineage } = judged;
+    const id = this.store.openDerived({
+      ear,
+      sessionId: lineage.author.sessionId,
+      sources: lineage.sources.map(({ identity, digest }) => ({
+        identity,
+        digest,
+      })),
+      audience: lineage.audience.scope,
+      payloadSha256: lineage.payloadSha256,
+      createdAt: this.clock.now(),
+    });
+    this.derivedInFlight.add(id);
+    try {
+      return await this.issueAndPublish(ear, id, lineage, text, route!, judge);
+    } finally {
+      this.derivedInFlight.delete(id);
+    }
+  }
+
+  /** The issued part of `publishDerived`: the row `id` exists, `issuing`, and this owns it. */
+  private async issueAndPublish(
+    ear: string,
+    id: number,
+    lineage: DerivedLineage,
+    text: string,
+    route: DerivedRoute,
+    judge: () => { lineage: DerivedLineage } | { reason: string },
+  ): Promise<DerivedOutcome> {
+    const settle = (outcome: DerivedOutcome): DerivedOutcome => {
+      if (!this.stopped) {
+        this.store.updateDerived(id, {
+          state: outcome.state === "closed" ? "refused" : outcome.state,
+          ...("electionId" in outcome && outcome.electionId !== null
+            ? { electionId: outcome.electionId }
+            : {}),
+          reason: "reason" in outcome ? outcome.reason : null,
+          ...(outcome.state === "accepted"
+            ? { acceptance: outcome.acceptance }
+            : {}),
+          ...(outcome.state === "unknown"
+            ? {}
+            : { settledAt: this.clock.now() }),
+          from: ["issuing", "claimed"],
+        });
+      }
+      this.logger.log("info", "canticle.derived", {
+        ear,
+        state: outcome.state,
+        electionId: "electionId" in outcome ? outcome.electionId : null,
+      });
+      return outcome;
+    };
+
+    let issued: { capsule: Uint8Array; electionId: string };
+    try {
+      issued = await route.issuer.issue(lineage, text);
+    } catch (error) {
+      return settle({
+        state: "refused",
+        electionId: null,
+        reason: `the issuer refused: ${error instanceof Error ? error.message : String(error)}`,
+      });
+    }
+    if (!ELECTION_ID.test(issued.electionId)) {
+      return settle({
+        state: "refused",
+        electionId: null,
+        reason:
+          "the issuer returned no election id (32 lowercase hex digits) to query; nothing was published",
+      });
+    }
+    const electionId = issued.electionId;
+    if (!this.stopped) {
+      this.store.updateDerived(id, {
+        state: "claimed",
+        electionId,
+        from: ["issuing"],
+      });
+    }
+    const again = judge();
+    if ("reason" in again) {
+      return settle({
+        state: "refused",
+        electionId,
+        reason: `stopped after the capsule was issued (${again.reason}); election ${electionId} is left unpublished`,
+      });
+    }
+    let answer: Record<string, unknown>;
+    try {
+      answer = await route.control.request(
+        publishRequest(issued.capsule, text),
+      );
+    } catch (error) {
+      return settle({
+        state: "unknown",
+        electionId,
+        reason: `${noAnswer(error)}; query election ${electionId}, never publish it again`,
+      });
+    }
+    if (answer.ok === true) {
+      const taken = receiptFor(
+        answer.acceptance,
+        electionId,
+        lineage.payloadSha256,
+      );
+      return settle(
+        "receipt" in taken
+          ? { state: "accepted", electionId, acceptance: taken.receipt }
+          : {
+              state: "unknown",
+              electionId,
+              reason: `${taken.why}; query election ${electionId}, never publish it again`,
+            },
+      );
+    }
+    return settle({
+      state: "refused",
+      electionId,
+      reason: `the station refused: ${stationWords(answer)}`,
+    });
+  }
+
+  /**
+   * #162's `derived_query` for an election frond-ear asked about: the station's answer,
+   * with no send, refresh or retry. An unknown attempt, or a claimed one no publish in
+   * this process still owns (a crash left it), that the station reports accepted with a
+   * receipt naming this election and payload is settled from it. It is the station's
+   * derived op too, so it makes no station call with config canticle.derivedPublication
+   * off, or once frond-ear is shutting down; shutdown drains one in flight, as it drains
+   * a publish.
+   */
+  public derivedQuery(
+    ear: string,
+    electionId: string,
+  ): Promise<Record<string, unknown>> {
+    const work = this.queryDerived(ear, electionId);
+    this.inFlight.add(work);
+    const settled = () => this.inFlight.delete(work);
+    work.then(settled, settled);
+    return work;
+  }
+
+  private async queryDerived(
+    ear: string,
+    electionId: string,
+  ): Promise<Record<string, unknown>> {
+    if (!ELECTION_ID.test(electionId)) {
+      throw new Error("election_id is 32 lowercase hex digits");
+    }
+    if (this.closing) {
+      throw new Error("closed: frond-ear is shutting down; no station call");
+    }
+    if (this.config.canticle?.derivedPublication !== true) {
+      throw new Error(
+        "closed: derived publication is off (config canticle.derivedPublication); no station call",
+      );
+    }
+    const route = this.options.derivedRoute;
+    if (!route) {
+      throw new Error(
+        "no derived-publication route: the owner's issuer and station control socket aren't wired into this daemon",
+      );
+    }
+    const answer = await route.control.request(queryRequest(electionId));
+    const row = this.store.derivedByElection(ear, electionId);
+    if (
+      row &&
+      (row.state === "unknown" ||
+        (row.state === "claimed" && !this.derivedInFlight.has(row.id))) &&
+      answer.ok === true &&
+      answer.state === "accepted"
+    ) {
+      const taken = receiptFor(
+        answer.acceptance,
+        electionId,
+        row.payloadSha256,
+      );
+      if ("receipt" in taken && !this.stopped) {
+        this.store.updateDerived(row.id, {
+          state: "accepted",
+          acceptance: taken.receipt,
+          reason: null,
+          settledAt: this.clock.now(),
+          from: ["claimed", "unknown"],
+        });
+      }
+    }
+    return answer;
+  }
+
   /**
    * The attached session chooses how canticle reaches it (frond-ear#65), as with
    * set_attention: the config's delivery is the ceiling, so it can only narrow, down to
@@ -2670,6 +4802,103 @@ export class Daemon {
     return JSON.stringify(view, null, 2);
   }
 
+  /**
+   * `wake_grant` (binary-canticle#176 decision 1): the attached session's own opt-in to be
+   * woken by more classes of record on one station:stream, for a TTL it must give. Only
+   * the session holding the ear, and only one frond-ear knows the id of, since a grant
+   * holds only for the session that made it. Nothing a station sends reaches this.
+   */
+  private wakeGrant(client: Client, args: Record<string, unknown>): string {
+    const ear = this.requireHolder(client, "grant itself canticle wakes");
+    if (!this.canticle || !this.config.canticle?.enabled) {
+      return "canticle is not enabled on this daemon (config canticle.enabled).";
+    }
+    if (!client.sessionId) {
+      throw new Error(
+        "frond-ear does not know this session's id (its shim had no CLAUDE_CODE_SESSION_ID), so it could not prove a grant is this session's own; nothing was granted",
+      );
+    }
+    if (client.wakeDoubt && args.revoke !== true) {
+      throw new Error(
+        "the session holding this ear is in doubt (a hook named another session frond-ear can't tie to this shim), so it could not prove a grant is this session's own; nothing was granted. This session's own SessionStart hook ends the doubt",
+      );
+    }
+    const named = stringArg(args, "stream");
+    let station: string | undefined;
+    let stream: string | undefined;
+    if (named !== undefined) {
+      const at = named.indexOf(":");
+      station = named.slice(0, at);
+      stream = named.slice(at + 1);
+      if (
+        at < 1 ||
+        (!CANTICLE_STATION.test(station) && !CANTICLE_KEY_ID.test(station)) ||
+        !CANTICLE_STREAM.test(stream)
+      ) {
+        throw new Error(
+          "stream must be one station:stream, the station by the name hear shows or its key id (16 hex digits); no *",
+        );
+      }
+      // A key id is kept in lowercase, as config keeps it.
+      if (CANTICLE_KEY_ID.test(station)) station = station.toLowerCase();
+    }
+    let result: object;
+    if (args.revoke === true) {
+      result = this.canticle.grant(ear, client.sessionId, {
+        revoke: true,
+        ...(station !== undefined && stream !== undefined
+          ? { station, stream }
+          : {}),
+      });
+    } else {
+      if (station === undefined || stream === undefined) {
+        throw new Error("stream is required (one station:stream)");
+      }
+      const classes = args.classes;
+      if (
+        !Array.isArray(classes) ||
+        classes.length === 0 ||
+        classes.some(
+          (cls) => typeof cls !== "string" || !CLASS_BY_NAME.has(cls),
+        )
+      ) {
+        throw new Error(
+          `classes must be a non-empty array of class names (${[...CLASS_BY_NAME.keys()].join(", ")})`,
+        );
+      }
+      const seconds = Number(args.ttl_seconds);
+      if (
+        args.ttl_seconds === undefined ||
+        args.ttl_seconds === null ||
+        !Number.isSafeInteger(seconds) ||
+        seconds < 1 ||
+        seconds * 1_000 > MAX_WAKE_GRANT_MS
+      ) {
+        throw new Error(
+          `ttl_seconds is required: a whole number of seconds, 1 to ${MAX_WAKE_GRANT_MS / 1_000}; a grant always lapses`,
+        );
+      }
+      result = this.canticle.grant(ear, client.sessionId, {
+        revoke: false,
+        station,
+        stream,
+        classes: [...new Set(classes as string[])],
+        ttlMs: seconds * 1_000,
+      });
+    }
+    // The request committed whole (its counter with it): nothing after may report it failed.
+    try {
+      this.logger.log("info", "canticle.wake_granted", {
+        ear,
+        ...(named !== undefined ? { stream: `${station}:${stream}` } : {}),
+        revoke: args.revoke === true,
+      });
+    } catch {
+      // A log line that can't be written is no reason to say the grant wasn't made.
+    }
+    return JSON.stringify(result, null, 2);
+  }
+
   /** Configured ceiling narrowed by the session's own choice. */
   private effectiveMode(ear: string, chatId: string): Mode | undefined {
     const ceiling = this.chatMode(chatId);
@@ -2721,9 +4950,11 @@ export class Daemon {
    * and an unconfirmed part reuses its nonce. When a part fails, the error says
    * which parts went out. `files` ride on the last part, so they follow the text;
    * their digests are part of the reply's identity, so the same text with other
-   * files is a new reply, not a retry.
+   * files is a new reply, not a retry. Each part goes out through `permit`, the egress
+   * gate's for this reply alone.
    */
   private async sendReply(
+    permit: RoomPermit,
     chatId: string,
     text: string,
     replyTo: string | undefined,
@@ -2731,9 +4962,7 @@ export class Daemon {
     files: readonly OutboundFile[] = [],
   ): Promise<{ ids: string[]; earlier: number[] }> {
     const chunks = chunkMessage(text);
-    const key = createHash("sha256")
-      .update(`${chatId}\n${replyTo ?? ""}\n${text}${fileIdentity(files)}`)
-      .digest("hex");
+    const key = replyKey(chatId, replyTo, text, files);
     const id = this.store.resumeReply(
       key,
       chunks.length,
@@ -2753,6 +4982,7 @@ export class Daemon {
       try {
         ids.push(
           await this.sendOnce(
+            permit,
             chatId,
             chunk,
             index === 0 ? replyTo : undefined,
@@ -2786,6 +5016,7 @@ export class Daemon {
    * is told if the send stays ambiguous.
    */
   private async sendOnce(
+    permit: RoomPermit,
     chatId: string,
     content: string,
     replyTo: string | undefined,
@@ -2806,15 +5037,16 @@ export class Daemon {
       SEND_DEDUPE_WINDOW_MS,
       sessionEar,
       reply,
+      permit.egressId,
     );
     this.sendsInFlight.add(intent.nonce);
     try {
-      const sent = await this.rest.sendMessage(
-        chatId,
+      const sent = await permit.send(
         content,
         replyTo,
         intent.nonce,
         files,
+        intent.owner,
       );
       if (!this.stopped) {
         this.store.completeSend(intent.nonce, sent.id, chatId);
@@ -2824,12 +5056,7 @@ export class Daemon {
       }
       return sent.id;
     } catch (error) {
-      if (
-        error instanceof RestError &&
-        error.status >= 400 &&
-        error.status < 500 &&
-        error.status !== 429
-      ) {
+      if (definitive(error)) {
         if (!this.stopped) {
           this.store.failSend(intent.nonce);
         }
@@ -2988,6 +5215,29 @@ export class Daemon {
     };
   }
 
+  /**
+   * The exposure ledger's summary for ear_status (#117): its records by phase, how many
+   * were evicted, how many prunes found it past its bound, and why it is degraded: fenced
+   * and unknown records are never evicted, so they alone can hold it past `maxRecords`.
+   */
+  private exposureSummary(ear: string, bounds: { maxRecords: number }): object {
+    const counts = this.store.canticleExposureCounts(ear);
+    const counters = this.store.counters();
+    const held = counts.fenced + counts.unknown;
+    return {
+      enabled: true,
+      ...counts,
+      evicted: counters[`canticle_exposure_evicted.${ear}`] ?? 0,
+      overBound: counters[`canticle_exposure_over_bound.${ear}`] ?? 0,
+      reasons:
+        held > bounds.maxRecords
+          ? [
+              `${held} fenced or unknown records over maxRecords ${bounds.maxRecords}; they are never evicted`,
+            ]
+          : [],
+    };
+  }
+
   public status(onlyEar?: string): object {
     const ears = Object.entries(this.config.ears)
       .filter(([name]) => onlyEar === undefined || name === onlyEar)
@@ -2995,6 +5245,13 @@ export class Daemon {
         const record = this.store.ear(name);
         const client = this.attached.get(name);
         const canticleDelivery = this.canticle?.status(name);
+        const canticleCustody = this.options.canticleHear
+          ? this.custodySummary(name)
+          : undefined;
+        // The exposure ledger (#117), by phase; read-only, and only while it is on.
+        const canticleExposure = this.config.canticle?.exposure.enabled
+          ? this.exposureSummary(name, this.config.canticle.exposure)
+          : undefined;
         return {
           name,
           target: ear.target,
@@ -3017,9 +5274,20 @@ export class Daemon {
           nextFlushAt: this.store.nextDue(name) ?? null,
           attention: this.attentionView(name),
           letters: this.lettersView(name),
+          schedules: this.schedulesView(name),
           pressure: this.pressureView(name),
           hold: this.holdView(name),
           ...(canticleDelivery ? { canticleDelivery } : {}),
+          ...(canticleCustody ? { canticleCustody } : {}),
+          ...(canticleExposure ? { canticleExposure } : {}),
+          roomEgress: {
+            policy: this.config.canticle?.roomPolicy ?? "observe",
+            windowMs: CUSTODY_WINDOW_MS,
+            ...this.store.roomEgressSummary(
+              name,
+              Math.max(0, this.clock.now() - CUSTODY_WINDOW_MS),
+            ),
+          },
         };
       });
     return {
@@ -3070,6 +5338,10 @@ export class Daemon {
       this.timers.clearTimeout(this.sweepTimer);
       this.sweepTimer = undefined;
     }
+    if (this.wakeTimer !== undefined) {
+      this.timers.clearTimeout(this.wakeTimer);
+      this.wakeTimer = undefined;
+    }
     this.canticle?.stop();
     let drained = true;
     if (this.inFlight.size > 0) {
@@ -3091,7 +5363,7 @@ export class Daemon {
     // then stop all further ledger writes before closing connections (their
     // close events arrive asynchronously, after the store may be closed).
     for (const ear of this.attached.keys()) {
-      this.store.revertUnconfirmed(ear);
+      this.revertUnconfirmed(ear);
     }
     this.stopped = true;
     for (const client of this.clients) {

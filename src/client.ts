@@ -62,6 +62,8 @@ export type CliRequest =
       idleFloor?: number;
       event?: string;
       unknown?: true;
+      /** The hook's CLAUDE_PID, as on a release (#111). */
+      hostPid?: number;
     };
 
 /**

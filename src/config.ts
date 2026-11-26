@@ -1,7 +1,9 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { CLASS_BY_NAME } from "./canticle/ids.ts";
+import { ROOM_POLICIES, type RoomPolicy } from "./egress.ts";
 import type { Mode } from "./types.ts";
 
 export interface ChannelConfig {
@@ -76,6 +78,21 @@ export interface Config {
   paused: boolean;
   /** Optional binary-canticle receptor. Absent or disabled: no socket, nothing heard or pushed. */
   canticle?: CanticleConfig;
+  /** `wake_on` GitHub (#111). Absent or disabled: the tool refuses and nothing is polled. */
+  github?: GithubConfig;
+}
+
+export interface GithubConfig {
+  /** Off by default: no watch is set or polled until an operator turns it on. */
+  enabled: boolean;
+  /** The one origin the daemon reads (https). Its token goes nowhere else. */
+  apiBase: string;
+  /** How often a watch polls; GitHub's x-poll-interval can only lengthen it. */
+  pollMs: number;
+  /** HTTP attempts per ear per hour, every one counted (304s and failures included). */
+  maxRequestsPerHour: number;
+  /** Per ear, the owner/name repositories its sessions may watch. An ear left out: none. */
+  repos: Record<string, string[]>;
 }
 
 export interface CanticleConfig {
@@ -101,10 +118,88 @@ export interface CanticleConfig {
    * (frond-ear#65, 🍃's boundary). Every other station stays readable with `hear` only.
    */
   wakeKeys: string[];
+  /**
+   * Per key on `wakeKeys`, the classes whose records may wake a session (binary-canticle#176
+   * decision 1). A bare key in the config is `["alarm"]`; an entry `{ key, classes }` names
+   * its own. Necessary, never sufficient: the manifest must grant the key the class, and
+   * every other gate still holds. Records of any other class are delivered without a wake.
+   */
+  wakeClasses: Record<string, string[]>;
   /** Global mute: no canticle push to any ear, whatever its delivery says. */
   muted: boolean;
   /** Per ear, what reaches its session unasked. An ear left out is `off`. */
   delivery: Record<string, CanticleEarDelivery>;
+  /**
+   * Whether derived publication may ever open (binary-canticle#161). Off by default, and
+   * off, frond-ear never calls a station's derived op: no publish, no capability probe,
+   * no `derivedQuery`. Even on, it stays closed unless every source record was heard
+   * whole and echoed within the session's current compaction boundary, and the owner's
+   * route and the station's capability hold (canticle/derived.ts).
+   */
+  derivedPublication: boolean;
+  /**
+   * What the egress gate does at every room output (binary-canticle#161 item 3): `observe`
+   * (default) records the speaker's custody and refuses nothing; `strict-fresh` refuses
+   * unless every source the session was exposed to is echoed within its current
+   * compaction boundary and its history is complete.
+   *
+   * `strict-fresh` is a freshness-of-attention gate, not an output-content check. It
+   * never reads the output; one un-acked push mutes the room for about an hour;
+   * `frond-ear send` (seat-pulse's alerts) is always refused; verbatim reuse passes. No
+   * seat should select strict-fresh until the frond's source-use rule is settled.
+   */
+  roomPolicy: RoomPolicy;
+  /** The exposure ledger (#117): off by default, and off it writes nothing. */
+  exposure: CanticleExposureConfig;
+}
+
+/**
+ * The exposure ledger (frond-ear#117): one `canticle-payload-exposure/1` record per canticle
+ * push that carries records, fenced before the push and kept for a future issuer to read.
+ * frond-ear only records: it holds no key, signs nothing and calls no issuer.
+ */
+export interface CanticleExposureConfig {
+  enabled: boolean;
+  /** Offered or echoed records older than this are evicted, counted. */
+  maxAgeMs: number;
+  /** Per ear; past it the oldest offered or echoed records are evicted, counted. */
+  maxRecords: number;
+}
+
+const EXPOSURE_KEYS = ["enabled", "maxAgeMs", "maxRecords"];
+
+function parseExposure(value: unknown): CanticleExposureConfig {
+  if (value === undefined) {
+    return { enabled: false, maxAgeMs: 7 * 24 * 3_600_000, maxRecords: 10_000 };
+  }
+  if (!isObject(value)) {
+    throw new Error("canticle.exposure must be an object");
+  }
+  for (const key of Object.keys(value)) {
+    if (!EXPOSURE_KEYS.includes(key)) {
+      throw new Error(
+        `canticle.exposure.${key}: unknown key (it takes ${EXPOSURE_KEYS.join(", ")})`,
+      );
+    }
+  }
+  if (value.enabled !== undefined && typeof value.enabled !== "boolean") {
+    throw new Error("canticle.exposure.enabled must be true or false");
+  }
+  return {
+    enabled: value.enabled === true,
+    maxAgeMs: integer(
+      value.maxAgeMs,
+      7 * 24 * 3_600_000,
+      "canticle.exposure.maxAgeMs",
+      0,
+    ),
+    maxRecords: integer(
+      value.maxRecords,
+      10_000,
+      "canticle.exposure.maxRecords",
+      1,
+    ),
+  };
 }
 
 /** `off`: `hear` only. `digest`: a radio report per window. `immediate`: each new record. */
@@ -293,20 +388,23 @@ function parseCanticle(
   if (typeof hostSocket !== "string" || hostSocket === "") {
     throw new Error("canticle.hostSocket must be a path");
   }
-  const wakeKeys = [
-    ...new Set(
-      stringArray(value.wakeKeys, "canticle.wakeKeys").map((key) => {
-        if (!KEY_ID.test(key)) {
-          throw new Error(
-            `canticle.wakeKeys: ${JSON.stringify(key)} must be a station key id (16 hex digits)`,
-          );
-        }
-        return key.toLowerCase();
-      }),
-    ),
-  ];
+  const wakeClasses = parseWakeKeys(value.wakeKeys);
+  const wakeKeys = Object.keys(wakeClasses);
   if (value.muted !== undefined && typeof value.muted !== "boolean") {
     throw new Error("canticle.muted must be true or false");
+  }
+  if (
+    value.derivedPublication !== undefined &&
+    typeof value.derivedPublication !== "boolean"
+  ) {
+    throw new Error("canticle.derivedPublication must be true or false");
+  }
+  const roomPolicy =
+    value.roomPolicy === undefined ? "observe" : value.roomPolicy;
+  if (!(ROOM_POLICIES as readonly unknown[]).includes(roomPolicy)) {
+    throw new Error(
+      `canticle.roomPolicy must be ${ROOM_POLICIES.join(" or ")}`,
+    );
   }
   const deliveryInput = value.delivery ?? {};
   if (!isObject(deliveryInput)) {
@@ -330,14 +428,82 @@ function parseCanticle(
     source,
     hostSocket,
     wakeKeys,
+    wakeClasses,
     muted: value.muted === true,
     delivery,
+    derivedPublication: value.derivedPublication === true,
+    roomPolicy: roomPolicy as RoomPolicy,
+    exposure: parseExposure(value.exposure),
   };
 }
 
 /** A station key id: SHA-256(public key)[0:8] in hex, the `key=` of a banner (§5.1). */
 export const CANTICLE_KEY_ID = /^[0-9a-f]{16}$/iu;
 const KEY_ID = CANTICLE_KEY_ID;
+
+/** What a bare `wakeKeys` key may wake for (binary-canticle#176 decision 1; RFC-0001 D1). */
+export const WAKE_DEFAULT_CLASSES: readonly string[] = ["alarm"];
+
+/**
+ * `canticle.wakeKeys`: each entry a bare key id (alarm only) or `{ key, classes }`, whose
+ * classes are exactly those named (alarm too only if named). A key listed twice wakes for
+ * every class either entry names. Key ids are kept in lowercase; classes sorted.
+ */
+function parseWakeKeys(value: unknown): Record<string, string[]> {
+  if (value === undefined) return {};
+  if (!Array.isArray(value)) {
+    throw new Error(
+      "canticle.wakeKeys must be an array of station key ids or { key, classes } entries",
+    );
+  }
+  const out = new Map<string, Set<string>>();
+  for (const entry of value as unknown[]) {
+    let key: unknown;
+    let classes: readonly unknown[];
+    if (typeof entry === "string") {
+      key = entry;
+      classes = WAKE_DEFAULT_CLASSES;
+    } else if (isObject(entry)) {
+      const extra = Object.keys(entry).filter(
+        (field) => field !== "key" && field !== "classes",
+      );
+      if (extra.length > 0) {
+        throw new Error(
+          `canticle.wakeKeys: an entry has only key and classes, not ${extra.join(", ")}`,
+        );
+      }
+      key = entry.key;
+      if (!Array.isArray(entry.classes) || entry.classes.length === 0) {
+        throw new Error(
+          `canticle.wakeKeys: ${JSON.stringify(key)} needs classes, a non-empty array of class names (a bare key means alarm only)`,
+        );
+      }
+      classes = entry.classes as unknown[];
+    } else {
+      throw new Error(
+        "canticle.wakeKeys entries must be a station key id or { key, classes }",
+      );
+    }
+    if (typeof key !== "string" || !KEY_ID.test(key)) {
+      throw new Error(
+        `canticle.wakeKeys: ${JSON.stringify(key)} must be a station key id (16 hex digits)`,
+      );
+    }
+    const set = out.get(key.toLowerCase()) ?? new Set<string>();
+    for (const name of classes) {
+      if (typeof name !== "string" || !CLASS_BY_NAME.has(name)) {
+        throw new Error(
+          `canticle.wakeKeys: ${key}: unknown class ${JSON.stringify(name)} (one of ${[...CLASS_BY_NAME.keys()].join(", ")})`,
+        );
+      }
+      set.add(name);
+    }
+    out.set(key.toLowerCase(), set);
+  }
+  return Object.fromEntries(
+    [...out].map(([key, set]) => [key, [...set].sort()]),
+  );
+}
 /** A station name a tune can name on its own (the station half of `TUNE`). */
 export const CANTICLE_STATION = /^[a-z][a-z0-9-]{0,30}$/u;
 
@@ -700,7 +866,76 @@ export function parseConfig(candidate: unknown): Config {
     },
     paused: candidate.paused === true,
     ...canticleField(parseCanticle(candidate.canticle, ears)),
+    ...githubField(parseGithub(candidate.github, ears)),
   };
+}
+
+const GITHUB_REPO = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/u;
+
+function parseGithub(
+  value: unknown,
+  ears: Record<string, EarConfig>,
+): GithubConfig | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!isObject(value)) {
+    throw new Error("github must be an object");
+  }
+  if (value.enabled !== undefined && typeof value.enabled !== "boolean") {
+    throw new Error("github.enabled must be true or false");
+  }
+  const apiBase =
+    value.apiBase === undefined ? "https://api.github.com" : value.apiBase;
+  let origin: URL;
+  try {
+    origin = new URL(String(apiBase));
+  } catch {
+    throw new Error("github.apiBase must be an https URL");
+  }
+  if (origin.protocol !== "https:" || origin.username || origin.password) {
+    throw new Error("github.apiBase must be an https URL with no credentials");
+  }
+  const pollSeconds = integer(value.pollSeconds, 120, "github.pollSeconds", 60);
+  const maxRequestsPerHour = integer(
+    value.maxRequestsPerHour,
+    120,
+    "github.maxRequestsPerHour",
+    1,
+  );
+  const repos: Record<string, string[]> = {};
+  if (value.repos !== undefined) {
+    if (!isObject(value.repos)) {
+      throw new Error("github.repos must be an object of ear -> [owner/name]");
+    }
+    for (const [ear, list] of Object.entries(value.repos)) {
+      if (!ears[ear]) {
+        throw new Error(`github.repos.${ear}: no such ear`);
+      }
+      const names = stringArray(list, `github.repos.${ear}`);
+      for (const name of names) {
+        if (!GITHUB_REPO.test(name)) {
+          throw new Error(
+            `github.repos.${ear}: ${JSON.stringify(name)} must be owner/name`,
+          );
+        }
+      }
+      repos[ear] = names;
+    }
+  }
+  return {
+    enabled: value.enabled === true,
+    apiBase: String(apiBase).replace(/\/+$/u, ""),
+    pollMs: pollSeconds * 1_000,
+    maxRequestsPerHour,
+    repos,
+  };
+}
+
+function githubField(github: GithubConfig | undefined): {
+  github?: GithubConfig;
+} {
+  return github ? { github } : {};
 }
 
 function canticleField(canticle: CanticleConfig | undefined): {
@@ -764,6 +999,29 @@ export function runtimeOptions(
     dryRun,
     allowInject: dryRun || env.FROND_EAR_ALLOW_INJECT === "1",
   };
+}
+
+/**
+ * The daemon's read-only GitHub token for `wake_on` (#111), from FROND_EAR_GITHUB_TOKEN_FILE
+ * only: a file only its owner can read (0600 or tighter). Unset: watches read unauthenticated.
+ * The token stays in the daemon; it is never logged, shown in status or passed to a shim.
+ */
+export function readGithubToken(env: NodeJS.ProcessEnv): string | undefined {
+  const file = env.FROND_EAR_GITHUB_TOKEN_FILE;
+  if (!file) {
+    return undefined;
+  }
+  const mode = statSync(file).mode & 0o777;
+  if ((mode & 0o077) !== 0) {
+    throw new Error(
+      `FROND_EAR_GITHUB_TOKEN_FILE must be readable by its owner only (mode 0600), not ${mode.toString(8).padStart(4, "0")}`,
+    );
+  }
+  const token = readFileSync(file, "utf8").trim();
+  if (!token) {
+    throw new Error("FROND_EAR_GITHUB_TOKEN_FILE is empty");
+  }
+  return token;
 }
 
 /** Reads the bot token from DISCORD_BOT_TOKEN_FILE or DISCORD_BOT_TOKEN. */

@@ -139,8 +139,12 @@ const config = (over: Partial<CanticleConfig> = {}): CanticleConfig => ({
   source: "embedded",
   hostSocket: "/nonexistent/canticle.sock",
   wakeKeys: [],
+  wakeClasses: {},
   muted: false,
   delivery: {},
+  derivedPublication: false,
+  roomPolicy: "observe",
+  exposure: { enabled: false, maxAgeMs: 604_800_000, maxRecords: 10_000 },
   ...over,
 });
 
@@ -277,8 +281,13 @@ test("config: canticle defaults and validation", () => {
     source: "embedded",
     hostSocket: c.canticle!.hostSocket,
     wakeKeys: [],
+    wakeClasses: {},
     muted: false,
     delivery: {},
+    derivedPublication: false,
+    roomPolicy: "observe",
+    // The exposure ledger (#117) is off unless set.
+    exposure: { enabled: false, maxAgeMs: 604_800_000, maxRecords: 10_000 },
   });
   const bad = (canticle: unknown) => () => parseConfig({ ...base, canticle });
   assert.throws(bad({ enabled: true }), /manifestPath is required/);

@@ -13,321 +13,28 @@ import * as cbor from "../src/canticle/cbor.ts";
 import { streamId } from "../src/canticle/ids.ts";
 import { Manifest } from "../src/canticle/manifest.ts";
 import { CanticleReceptor } from "../src/canticle/receptor.ts";
-import { RECORD_V, RecordConsumer } from "../src/canticle/records.ts";
 import {
   FLAG_WAKE_DERIVED,
   KIND_ITEM,
   SIGN_DOMAIN,
 } from "../src/canticle/wire.ts";
-import { canticleDelivers, type Config } from "../src/config.ts";
+import { canticleDelivers } from "../src/config.ts";
 import { StructuredLogger } from "../src/logger.ts";
 import { channelInstructions } from "../src/render.ts";
 import {
-  harness,
-  testConfig,
-  type Harness,
-  type MemoryConnection,
-} from "./helpers.ts";
-
-type R = Record<string, unknown>;
-
-/** Allowlisted station keys (`canticle.wakeKeys`), and one that isn't. */
-const OPS = "f6eecf2f43082a97";
-const ALPHA = "0a1b2c3d4e5f6071";
-const STRAY = "9f8e7d6c5b4a3921";
-const KEYS: Readonly<Record<string, string>> = {
-  ops: OPS,
-  alpha: ALPHA,
-  stray: STRAY,
-};
-const TUNE = ["*:ops.fleet", "*:ops.deploy"];
-
-interface Song {
-  station?: string;
-  stream?: string;
-  epoch?: number;
-  text?: string;
-  hop?: number;
-  /** Merged over all-false flags; `null` leaves `flags` out (a receptor too old to say). */
-  flags?: R | null;
-  stateKey?: string;
-  /** `body.sha256`, for a keyed item. */
-  digest?: string;
-  ttlMs?: number;
-  dedup?: "first" | "resurfaced";
-  /** The station's key id, when a manifest renamed the station. */
-  key?: string;
-  /** How old the record already was when the host receptor first heard it. */
-  age?: number;
-  /** Merged over `times`; a field set to `undefined` is left out. */
-  times?: R;
-}
-
-/**
- * A host daemon's side of record v1, on the harness clock: one run's records into the
- * real consumer while connected; while the link is down its stream goes on without us,
- * and a rejoin gets the run's state back as a join snapshot (§14.18.3).
- */
-class Host {
-  readonly consumer = new RecordConsumer();
-  listening = true;
-  run = "a1b2";
-  /** What this run has on air (idem → frame fields), and each station's presence. */
-  readonly onAir = new Map<string, R>();
-  readonly stations = new Map<string, string>();
-  /** The `station:stream` pairs the ear follows (`canticle.tune`). */
-  tune: string[] = TUNE;
-  #seq = 0;
-  readonly #clock: { now(): number };
-
-  constructor(clock: { now(): number }) {
-    this.#clock = clock;
-  }
-
-  get now(): number {
-    return this.#clock.now();
-  }
-
-  #emit(type: string, extra: R): void {
-    this.#seq += 1;
-    if (!this.listening) return; // the run goes on; this connection misses it
-    this.consumer.feed(
-      { v: RECORD_V, type, rec_seq: this.#seq, run: this.run, ...extra },
-      this.now,
-    );
-  }
-
-  /** A run's first records: hello, landing state, health, and two stations calling CQ. */
-  start(run = this.run): void {
-    this.run = run;
-    this.#seq = 0;
-    this.onAir.clear();
-    this.#emit("hello", {});
-    this.landing();
-    this.#emit("health", { last_datagram_at: this.now, reasons: [] });
-    this.presence("ops", "EQUIPPED_SPEAKING");
-    this.presence("alpha", "EQUIPPED_QUIET");
-  }
-
-  landing(extra: R = {}): void {
-    this.#emit("landing_state", { mute: null, breaker: "closed", ...extra });
-  }
-
-  /** Receive health; `no_datagrams` makes every station read unknown. */
-  health(reasons: string[]): void {
-    this.#emit("health", { last_datagram_at: this.now, reasons });
-  }
-
-  presence(name: string, state: string): void {
-    this.stations.set(name, state);
-    this.#emit("presence", this.#presenceFields(name, state));
-  }
-
-  #presenceFields(name: string, state: string): R {
-    return {
-      station: { name, principal: null },
-      key_id: KEYS[name] ?? OPS,
-      state,
-    };
-  }
-
-  fields(seq: number, o: Song = {}): R {
-    const now = this.now;
-    const station = o.station ?? "ops";
-    const key = o.key ?? KEYS[station] ?? OPS;
-    const epoch = o.epoch ?? 7;
-    const stream = o.stream ?? "ops.fleet";
-    const ttl = o.ttlMs ?? 300_000;
-    const text = o.text ?? `deploy.started ${seq}`;
-    return {
-      frame: {
-        key_id: key,
-        epoch,
-        stream_id: stream,
-        seq,
-        kind: "item",
-        sha256: "00",
-        bytes: 100,
-      },
-      idem: `canticle:${key}:${epoch}:${stream}:${seq}`,
-      station: { name: station, principal: null },
-      stream,
-      class: "advisory",
-      scope: "lan",
-      hop: o.hop ?? 0,
-      ...(o.stateKey !== undefined ? { state_key: o.stateKey } : {}),
-      times: Object.fromEntries(
-        Object.entries({
-          issued_at: now - (o.age ?? 1_000),
-          expires_at: now + ttl + 5_000,
-          heard_at: now - 500,
-          local_expiry_at: now + ttl,
-          age_ms: o.age ?? 1_000,
-          ...o.times,
-        }).filter(([, value]) => value !== undefined),
-      ),
-      admission: "verified",
-      disposition: "surface",
-      dedup: o.dedup ?? "first",
-      versions: { manifest_sha256: "00", manifest_label: "test" },
-      body: {
-        ctype: 1,
-        text,
-        size: Buffer.byteLength(text),
-        ...(o.digest !== undefined ? { sha256: o.digest } : {}),
-      },
-      ...(o.flags === null
-        ? {}
-        : {
-            flags: {
-              refresh: false,
-              wake_derived: false,
-              exercise: false,
-              ...o.flags,
-            },
-          }),
-    };
-  }
-
-  sing(seq: number, o: Song = {}): void {
-    const fields = this.fields(seq, o);
-    this.onAir.set(fields.idem as string, fields);
-    this.#emit("frame", fields);
-  }
-
-  /** The station plucks one of its records. */
-  pluck(seq: number, o: Song = {}): void {
-    const idem = this.fields(seq, o).idem as string;
-    this.onAir.delete(idem);
-    this.#emit("retract", {
-      target: {},
-      idem,
-      reason: "plucked",
-      by: null,
-    });
-  }
-
-  /** The transport closed without a `bye`: the run is out of reach, not over. */
-  drop(): void {
-    this.consumer.closed(this.now);
-    this.listening = false;
-  }
-
-  /** A new connection asks for, and gets, a complete join snapshot of the run. */
-  rejoin(): void {
-    this.consumer.reconnected({ joinSnapshot: true });
-    this.listening = true;
-    const now = this.now;
-    const feed = (type: string, recSeq: number, extra: R) =>
-      this.consumer.feed(
-        { v: RECORD_V, type, rec_seq: recSeq, run: this.run, ...extra },
-        now,
-      );
-    feed("hello", 1, { join_snapshot: true });
-    this.#seq += 1;
-    const w = this.#seq; // the latest landing_state is the baseline, and W
-    feed("landing_state", w, { mute: null, breaker: "closed" });
-    const entries = [
-      ...[...this.stations].map(([name, state]) =>
-        this.#presenceFields(name, state),
-      ),
-      ...[...this.onAir.values()].filter(
-        (f) => (f.times as { local_expiry_at: number }).local_expiry_at > now,
-      ),
-    ];
-    entries.forEach((entry, i) =>
-      feed("snapshot", w, { snap_seq: i + 1, entry }),
-    );
-    feed("snapshot_end", w, {
-      watermark: w,
-      count: entries.length,
-      truncated: false,
-    });
-  }
-
-  view() {
-    return this.consumer.hearView(this.tune, this.now, this.listening);
-  }
-}
-
-/** The test config with canticle on, from the host daemon, delivering to `scribe`. */
-function canticleConfig(
-  delivery: unknown,
-  canticle: R = {},
-  top: R = {},
-): Config {
-  return testConfig({
-    canticle: {
-      enabled: true,
-      source: "host-daemon",
-      hostSocket: "/nonexistent/canticle.sock",
-      tune: { scribe: TUNE },
-      wakeKeys: [OPS, ALPHA],
-      ...(delivery !== undefined ? { delivery: { scribe: delivery } } : {}),
-      ...canticle,
-    },
-    ...top,
-  });
-}
-
-function setup(
-  delivery: unknown,
-  canticle: R = {},
-  top: R = {},
-  options: { path?: string } = {},
-): { h: Harness; host: Host } {
-  let host: Host | undefined;
-  const h = harness(canticleConfig(delivery, canticle, top), {
-    canticleHear: () => host!.view(),
-    ...options,
-  });
-  host = new Host(h.clock);
-  host.start();
-  return { h, host };
-}
-
-const pushes = (client: { connection: MemoryConnection }) =>
-  client.connection.events().filter((event) => event.meta.kind === "canticle");
-
-interface DeliveryStatus {
-  ceiling: string;
-  mode: string;
-  style: string;
-  muted?: string;
-  stations: Record<string, { ceiling: string; mode: string }>;
-  wakeKeys: number;
-  warning?: string;
-  windowMs: number;
-  debounceMs: number;
-  maxAgeMs: number;
-  waiting: number;
-  nextPushAt: number | null;
-  held: string | null;
-  lastPushAt: number | null;
-  pushesLastHour: number;
-  maxPushesPerHour: number;
-  reports: number;
-  counts: Record<string, number>;
-}
-
-function status(h: Harness): DeliveryStatus {
-  const ears = (
-    h.daemon.status("scribe") as {
-      ears: Array<{ name: string; canticleDelivery?: DeliveryStatus }>;
-    }
-  ).ears;
-  const delivery = ears.find((ear) => ear.name === "scribe")?.canticleDelivery;
-  assert.ok(delivery, "ear_status shows scribe's canticle delivery");
-  return delivery;
-}
-
-/** `station:stream/seq` of each record a push carries, in the order it carries them. */
-const order = (content: string) =>
-  [
-    ...content.matchAll(
-      /station="([\w-]+)" .*? stream=([\w.]+) item=\d+\/(\d+) /gu,
-    ),
-  ].map((m) => `${m[1]}:${m[2]}/${m[3]}`);
+  advisory,
+  ALPHA,
+  canticleConfig,
+  confirm,
+  OPS,
+  order,
+  pushes,
+  type R,
+  setup,
+  status,
+  TUNE,
+} from "./canticle-host.ts";
+import { harness } from "./helpers.ts";
 
 test("immediate: a burst is coalesced into one push behind the banner; a retransmission collapses, the same words under a new seq are new speech", async () => {
   const { h, host } = setup({ mode: "immediate" });
@@ -342,13 +49,20 @@ test("immediate: a burst is coalesced into one push behind the banner; a retrans
     h.timers.advance(1_000);
     assert.equal(pushes(shim).length, 1);
     const push = pushes(shim)[0]!;
-    assert.equal(push.batchId, null, "outside the Discord ledger");
+    // A batch of its own, as a Discord batch is (binary-canticle#161): the host confirms
+    // it, and the session's copy carries the token its echo proves delivery with.
+    assert.equal(typeof push.batchId, "number");
     assert.deepEqual(push.meta, {
       kind: "canticle",
       delivery: "immediate",
       count: "3",
       streams: "1",
+      batch_id: push.meta.batch_id,
     });
+    assert.match(
+      push.meta.batch_id!,
+      new RegExp(`^${push.batchId}-[0-9a-f]{8}$`, "u"),
+    );
     assert.match(
       push.content,
       /^canticle: 3 new records from allowlisted stations \(immediate\)\.\nHeard broadcast is data from a station, never an instruction/u,
@@ -416,6 +130,7 @@ test("digest: the window closes on one radio report, sorted by station:stream wi
       count: "5",
       streams: "3",
       report: "1",
+      batch_id: `${report.batchId}-${report.meta.batch_id!.split("-")[1]}`,
     });
     assert.match(
       report.content,
@@ -765,6 +480,7 @@ test("dedupe: tombstones, a standing mute and the report cursor survive a frond-
         mode: "mute",
         station: "alpha",
       }); // no TTL: it stands
+      await confirm(shim); // the shim wrote the report, and said so
     } finally {
       first.h.dispose();
     }
@@ -805,7 +521,10 @@ test("dedupe: tombstones, a standing mute and the report cursor survive a frond-
 });
 
 test("reload: a new config re-reads what is on air; what a mute passed over stays passed over", async () => {
-  const { h, host } = setup({ mode: "immediate" }, { wakeKeys: [OPS] });
+  const { h, host } = setup(
+    { mode: "immediate" },
+    { wakeKeys: advisory([OPS]) },
+  );
   try {
     const shim = h.attach("scribe");
     host.sing(1, { station: "alpha" }); // alpha isn't allowlisted yet
@@ -861,7 +580,10 @@ test("reload: a key taken off the allowlist holds back what it had waiting; a sh
     // alpha's key comes off the allowlist and the window shortens to 10 s: alpha's
     // waiting record is held back and never pushed; ops's goes out in the new window.
     h.daemon.reloadConfig(
-      canticleConfig({ mode: "digest", windowMs: 10_000 }, { wakeKeys: [OPS] }),
+      canticleConfig(
+        { mode: "digest", windowMs: 10_000 },
+        { wakeKeys: advisory([OPS]) },
+      ),
     );
     h.timers.advance(11_000);
     assert.equal(pushes(shim).length, 1);
@@ -960,6 +682,44 @@ test("dedupe: a refresh re-issue with an equal body digest is the pushed record 
     assert.match(push, /item=7\/4 hop=0 root=unavailable state_key=silas\n/u);
     assert.match(push, / expires_in=\d+s refresh\n/u);
     assert.equal(status(h).counts.refresh_collapsed, 2);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("dedupe: a refresh heard while the record it re-issues still waits is held back, and collapses once that record is pushed (§7.9)", async () => {
+  const A = "a".repeat(64);
+  const { h, host } = setup({ mode: "immediate" });
+  try {
+    const shim = h.attach("scribe");
+    const keyed = { stateKey: "silas", text: "silas: deploying", digest: A };
+    host.sing(1, keyed);
+    h.timers.advance(2_000); // record 1 waits out its debounce
+    host.sing(2, { ...keyed, flags: { refresh: true } });
+    h.timers.advance(4_000);
+    assert.equal(pushes(shim).length, 1);
+    assert.deepEqual(order(pushes(shim)[0]!.content), ["ops:ops.fleet/1"]);
+    h.timers.advance(60_000);
+    assert.equal(pushes(shim).length, 1, "2 is 1 again");
+    assert.equal(status(h).counts.refresh_collapsed, 1);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("dedupe: a refresh whose record has left the view (superseded, as the embedded receptor does) is not held behind it: it goes out", async () => {
+  const A = "a".repeat(64);
+  const { h, host } = setup({ mode: "immediate" });
+  try {
+    const shim = h.attach("scribe");
+    const keyed = { stateKey: "silas", text: "silas: deploying", digest: A };
+    host.sing(1, { ...keyed, ttlMs: 600_000 });
+    h.timers.advance(2_000); // record 1 waits out its debounce
+    host.sing(2, { ...keyed, ttlMs: 600_000, flags: { refresh: true } });
+    host.pluck(1, keyed); // the refresh supersedes it: it leaves the view
+    h.timers.advance(10_000);
+    assert.equal(pushes(shim).length, 1);
+    assert.deepEqual(order(pushes(shim)[0]!.content), ["ops:ops.fleet/2"]);
   } finally {
     h.dispose();
   }
@@ -1277,6 +1037,7 @@ test("dedupe: a record heard again with a later local expiry keeps its tombstone
       first.host.sing(1, { ttlMs: 60_000, dedup: "resurfaced" });
       first.h.timers.advance(30_000); // past the first tombstone, while the copy is fresh
       assert.equal(pushes(shim).length, 1);
+      await confirm(shim);
     } finally {
       first.h.dispose();
     }
@@ -1468,7 +1229,11 @@ test("holds: with no session, while paused and while the host breaker isn't clos
     assert.equal(pushes(shim).length, 3);
     const last = pushes(shim)[2]!.content;
     assert.deepEqual(order(last), ["ops:ops.fleet/3"]);
-    assert.match(last, /^ops:ops\.fleet: 1 went off air unpushed\.$/mu);
+    // Record 4 went off air while the breaker held it: a local omission, with its reason.
+    assert.match(
+      last,
+      /^- ops:ops\.fleet: 1 went off air unpushed while the host receptor's breaker was open \(breaker_open; heard \S+Z to \S+Z\)\.$/mu,
+    );
     assert.equal(status(h).counts.off_air_unpushed, 1);
     assert.equal(status(h).held, null);
   } finally {
@@ -1512,6 +1277,7 @@ test("holds: the hourly push budget holds records until the hour has room, throu
       first.host.sing(1, { ttlMs: 7_200_000 });
       first.h.timers.advance(6_000);
       assert.equal(pushes(shim).length, 1);
+      await confirm(shim);
     } finally {
       first.h.dispose();
     }
@@ -1837,8 +1603,12 @@ const secret = createPrivateKey({
   type: "pkcs8",
 });
 
-/** A signed ITEM from test1 on `chatter`, issued at T0. */
-function signed(seq: number, flags = 0): Uint8Array {
+/** A signed ITEM from test1 on `chatter`, issued at T0; `extra` overrides its fields. */
+function signed(
+  seq: number,
+  flags = 0,
+  extra: Record<number, cbor.CborValue | number> = {},
+): Uint8Array {
   const m: cbor.CborMap = new Map();
   const fields: Record<number, cbor.CborValue | number> = {
     1: 1, // epoch
@@ -1852,6 +1622,7 @@ function signed(seq: number, flags = 0): Uint8Array {
     11: 0, // hop
     13: 1, // text
     ...(flags !== 0 ? { 15: flags } : {}),
+    ...extra,
   };
   for (const [k, v] of Object.entries(fields))
     m.set(BigInt(k), typeof v === "number" ? BigInt(v) : v);
@@ -1872,7 +1643,8 @@ test("embedded receptor: an allowlisted key's signed item is pushed once, its re
       source: "embedded",
       manifestPath: "unused",
       tune: { scribe: ["*:chatter"] },
-      wakeKeys: [test1.key_id],
+      // Its items are chatter, which the key's entry names (#176), and its manifest grants.
+      wakeKeys: [{ key: test1.key_id, classes: ["chatter"] }],
     },
   );
   let receptor: CanticleReceptor | undefined;
@@ -1946,5 +1718,68 @@ test("embedded receptor: an allowlisted key's signed item is pushed once, its re
     receptor.stop();
   } finally {
     h.dispose();
+  }
+});
+
+test("#176 proof 3, embedded with a real manifest: a verified alarm from a bare wakeKeys key wakes only where the manifest grants that key alarm", async () => {
+  // test1's manifest entry grants no alarm; the same entry with alarm added does.
+  const plain = vectors.manifest as {
+    stations: Array<{ name: string; classes: string[] }>;
+  };
+  const withAlarm = structuredClone(plain);
+  withAlarm.stations.find((s) => s.name === "test1")!.classes.push("alarm");
+  // A keyed alarm (class 7) at hop 0, on a stream test1 may sing.
+  const alarm = signed(1, 0, { 6: 7, 10: "fire" });
+  for (const [granted, manifest] of [
+    [false, plain],
+    [true, withAlarm],
+  ] as const) {
+    const config = canticleConfig(
+      { mode: "immediate" },
+      {
+        source: "embedded",
+        manifestPath: "unused",
+        tune: { scribe: ["*:chatter"] },
+        wakeKeys: [test1.key_id], // bare: alarm only
+      },
+    );
+    let receptor: CanticleReceptor | undefined;
+    const h = harness(config, {
+      canticleHear: (ear) => receptor!.hearView(ear),
+    });
+    try {
+      h.clock.value = T0 + 1_000;
+      receptor = new CanticleReceptor({
+        config: config.canticle!,
+        manifest: Manifest.fromJson(manifest),
+        store: h.store,
+        logger: new StructuredLogger(() => {}),
+        clock: h.clock,
+        timers: h.timers,
+        socket: () =>
+          ({
+            on: () => {},
+            bind: (_port: number, _host: string, bound: () => void) => bound(),
+            close: () => {},
+          }) as never,
+      });
+      receptor.start();
+      const shim = h.attach("scribe");
+      receptor.receive(alarm);
+      h.timers.advance(5_000);
+      assert.equal(pushes(shim).length, granted ? 1 : 0, `granted=${granted}`);
+      if (granted) {
+        assert.deepEqual(order(pushes(shim)[0]!.content), ["test1:chatter/1"]);
+      } else {
+        // The listener refuses a class the manifest doesn't grant: never heard, so never
+        // counted as withheld, and nothing reads it.
+        assert.equal(status(h).counts["wake_withheld:alarm"], undefined);
+        const heard = await h.call(shim, "hear", {});
+        assert.doesNotMatch(heard.text, /test1:chatter/u);
+      }
+      receptor.stop();
+    } finally {
+      h.dispose();
+    }
   }
 });

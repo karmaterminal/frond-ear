@@ -74,6 +74,17 @@
         "bufferPerStream": 32,
         "maxPushesPerHour": 60
       }
+    },
+    "derivedPublication": false,
+    "roomPolicy": "observe",
+    "exposure": { "enabled": false }
+  },
+  "github": {
+    "enabled": false,
+    "pollSeconds": 120,
+    "maxRequestsPerHour": 120,
+    "repos": {
+      "my-ear": ["owner/repo"]
     }
   }
 }
