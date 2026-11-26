@@ -870,7 +870,7 @@ test("q21: state v3 keeps a mark's class; a v2 mark learns it when its own item 
     T0,
   );
   const snap = l.snapshot();
-  assert.equal(snap.version, 3);
+  assert.equal(snap.version, 4);
   assert.equal(snap.hwm[0]![5], 3);
   // Downgrade the snapshot to v2 (marks without a class).
   const v2 = {
@@ -972,7 +972,7 @@ test("q21 + journal: a mark's journal record carries its class and replay keeps 
   const hkey = `${kid.toString("hex")}:${THREAT}:s`;
   l.hear(item({ seq: 1, cls: 3, stateKey: "s", stream: THREAT }), T0);
   const rec = l.takeJournal()!;
-  assert.equal(rec.version, 3);
+  assert.equal(rec.version, 4);
   assert.equal(rec.hwm.length, 1);
   assert.equal(rec.hwm[0]![5], 3, "the journaled mark carries its class");
   const r = new Listener(manifest, { restore: null, journal: [rec, rec] });
@@ -1062,4 +1062,207 @@ test("q21 + journal: a class change is still dropped after a crash and journal r
   );
   assert.equal(r.hwm.get(hkey)!.order[2], 1n, "the mark did not move");
   assert.equal(r.hwm.get(hkey)!.cls, 3);
+});
+
+// ---- binary-canticle#175 / frond-ear#122: what a restart keeps so a captured old stream can't
+// land as fresh, and why a rise in δ̂ can't re-admit an item already heard.
+
+const HOUR = 3_600_000;
+const ENTRY = [[CHATTER, 1, 1, 1, 10_000, 10_000, 60, 300, 4_000]];
+const offsetOf = (l: Listener) =>
+  Math.min(...(l.stations.get(kid.toString("hex"))?.offsets ?? [0]));
+
+/** Heard at T0, then two quiet minutes; returns the listener to restart from. */
+function heardThenQuiet(frames: Uint8Array[], at = T0): Listener {
+  const l = new Listener(manifest, { warmup: false, restore: null });
+  for (const f of frames) l.hear(f, at);
+  for (let t = at; t < at + 120_000; t += 1_000) l.tick(t);
+  return l;
+}
+
+test("#175: a captured beacon and item do not land fresh after a restart", () => {
+  const captured = [beacon(1, 1, ENTRY, T0), item({ seq: 1, ttlMs: 60_000 })];
+  const l = heardThenQuiet(captured);
+  const before = offsetOf(l);
+  const r = restarted(l);
+  const evs = captured.flatMap((f) => kinds(r.hear(f, T0 + HOUR)));
+  assert.ok(!evs.includes("item"), `admitted: ${evs.join(",")}`);
+  assert.equal(offsetOf(r), before, "the replay did not move δ̂");
+});
+
+test("#175: a restart keeps the beacon mark, and a replayed beacon doesn't make the station present", () => {
+  const l = heardThenQuiet([beacon(1, 3, ENTRY, T0)]);
+  const r = restarted(l);
+  const st = r.stations.get(kid.toString("hex"))!;
+  assert.equal(st.bseq, 3n);
+  r.hear(beacon(1, 3, ENTRY, T0), T0 + HOUR);
+  assert.equal(st.lastBeacon, undefined);
+});
+
+test("#175: a beacon of an epoch it missed cannot raise δ̂", () => {
+  const l = heardThenQuiet([beacon(1, 1, ENTRY, T0)]);
+  const r = restarted(l);
+  const t = T0 + 200_000; // the station restarted while the receiver was down
+  const evs = [
+    beacon(2, 1, ENTRY, t),
+    item({ epoch: 2, seq: 1, issued: t, ttlMs: 60_000 }),
+  ].flatMap((f) => kinds(r.hear(f, T0 + HOUR)));
+  assert.ok(!evs.includes("item"), `admitted: ${evs.join(",")}`);
+  assert.equal(offsetOf(r), 0);
+});
+
+test("#175: the δ̂ floor is journaled at once, so a crash before the checkpoint keeps it", () => {
+  const l = new Listener(manifest, { warmup: false, restore: null });
+  const base = JSON.parse(JSON.stringify(l.snapshot()));
+  l.hear(beacon(1, 1, ENTRY, T0), T0);
+  assert.equal(l.urgent, true);
+  const record = l.takeJournal()!;
+  const r = new Listener(manifest, {
+    warmup: false,
+    restore: base,
+    journal: [JSON.parse(JSON.stringify(record))],
+  });
+  const evs = [beacon(1, 1, ENTRY, T0), item({ seq: 1 })].flatMap((f) =>
+    kinds(r.hear(f, T0 + HOUR)),
+  );
+  assert.ok(!evs.includes("item"), `admitted: ${evs.join(",")}`);
+});
+
+test("#175: journal records merge monotone: twice changes nothing, the floor only goes down", () => {
+  const l = new Listener(manifest, { warmup: false, restore: null });
+  l.hear(beacon(1, 1, ENTRY, T0 - 2_000), T0); // a sample of 2 s
+  const a = JSON.parse(JSON.stringify(l.takeJournal()!));
+  l.hear(beacon(1, 2, ENTRY, T0 + 1_000), T0 + 1_500); // 500 ms: the floor moves down
+  const b = JSON.parse(JSON.stringify(l.takeJournal()!));
+  const r = new Listener(manifest, {
+    warmup: false,
+    restore: null,
+    journal: [a, b, a, b],
+  });
+  const st = r.stations.get(kid.toString("hex"))!;
+  assert.equal(Math.min(...st.offsets), 500);
+  assert.equal(st.offsets.length, 2);
+});
+
+test("#175: a crash loses at most the last MARK_SAVE_MS of the beacon mark", () => {
+  const l = new Listener(manifest, { warmup: false, restore: null });
+  let saved: SafetyState | undefined;
+  for (let n = 1, t = T0; t < T0 + 30_000; n++, t += 1_000) {
+    l.hear(beacon(1, n, ENTRY, t), t);
+    l.takeJournal();
+    l.tick(t);
+    if (l.dirty) {
+      saved = JSON.parse(JSON.stringify(l.snapshot()));
+      l.markSaved();
+    }
+  }
+  const r = new Listener(manifest, { warmup: false, restore: saved! });
+  assert.ok(r.stations.get(kid.toString("hex"))!.bseq >= 19n);
+});
+
+test("#175: state without beacon marks still loads, and says so", () => {
+  const l = heardThenQuiet([beacon(1, 1, ENTRY, T0)]);
+  const state = JSON.parse(JSON.stringify(l.snapshot())) as SafetyState;
+  state.version = 3;
+  delete state.beacons;
+  const r = new Listener(manifest, { warmup: false, restore: state });
+  assert.equal(r.loadedWithoutMarks, true);
+  assert.equal(r.stations.get(kid.toString("hex"))!.bseq, 0n);
+});
+
+test("#175 residual: a full run of a missed epoch rolls the floor out (🪨)", () => {
+  // δ̂ is the minimum of the last 16 samples: 16 captured beacons of an epoch never heard push the
+  // honest floor out, and with no skew bound an old item lands, as on a first join. If this ever
+  // fails, the residual is closed: say so on binary-canticle#175.
+  const l = heardThenQuiet([beacon(1, 1, ENTRY, T0)]);
+  const r = restarted(l);
+  const t = T0 + 200_000;
+  const frames = [
+    ...Array.from({ length: 17 }, (_, n) =>
+      beacon(2, n + 1, ENTRY, t + n * 1_000),
+    ),
+    item({ epoch: 2, seq: 1, issued: t + 16_000, ttlMs: 60_000 }),
+  ];
+  const evs = frames.flatMap((f, n) =>
+    kinds(r.hear(f, T0 + HOUR + Math.min(n, 16) * 1_000)),
+  );
+  assert.ok(evs.includes("item"));
+  assert.ok(offsetOf(r) > HOUR - 300_000);
+});
+
+test("#175: a rise in δ̂ does not re-admit an item it heard (🌿's 20 s case)", () => {
+  const behind = 20_000;
+  const l = listener();
+  const it = item({ seq: 1, ttlMs: 60_000 });
+  assert.deepEqual(kinds(l.hear(it, T0 + behind)), ["item"]); // δ̂ 0: expires 20 s early here
+  l.hear(beacon(1, 1, ENTRY, T0 + 1_000), T0 + behind + 1_000); // δ̂ rises to 20 s
+  assert.ok(offsetOf(l) >= behind);
+  const evs: string[] = [];
+  for (let t = T0 + behind + 1_000; t < T0 + behind + 55_000; t += 1_000)
+    evs.push(...kinds(l.tick(t)));
+  assert.ok(evs.includes("expired"));
+  assert.ok(!kinds(l.hear(it, T0 + behind + 50_000)).includes("item"));
+});
+
+test("#175: maxSkewMs is off by default, so a clock an hour wrong still delivers", () => {
+  const l = listener();
+  const evs = [beacon(1, 1, ENTRY, T0), item({ seq: 1 })].flatMap((f) =>
+    kinds(l.hear(f, T0 + HOUR)),
+  );
+  assert.ok(evs.includes("item"));
+});
+
+test("#175: maxSkewMs refuses an older stream on a first join, before any state moves", () => {
+  const l = new Listener(manifest, {
+    ephemeral: true,
+    warmup: false,
+    maxSkewMs: 300_000,
+  });
+  const evs = [beacon(1, 1, ENTRY, T0), item({ seq: 1 })].flatMap((f) =>
+    kinds(l.hear(f, T0 + HOUR)),
+  );
+  assert.ok(!evs.includes("item"));
+  assert.ok(evs.includes("evidence:clock-skew"));
+  const st = l.stations.get(kid.toString("hex"));
+  assert.ok(
+    st === undefined ||
+      (st.epochHwm === 0 &&
+        st.bseq === 0n &&
+        st.offsets.length === 0 &&
+        st.lastBeacon === undefined),
+  );
+  const inside = new Listener(manifest, {
+    ephemeral: true,
+    warmup: false,
+    maxSkewMs: 300_000,
+  });
+  const ok = [beacon(1, 1, ENTRY, T0), item({ seq: 1 })].flatMap((f) =>
+    kinds(inside.hear(f, T0 + 120_000)),
+  );
+  assert.ok(ok.includes("item"));
+  assert.throws(
+    () => new Listener(manifest, { ephemeral: true, maxSkewMs: -1 }),
+    /maxSkewMs/,
+  );
+});
+
+test("#175 (🌿 F-B1): a journal record that raises the epoch resets the kept bseq", () => {
+  // Snapshot at epoch 1, bseq 500; a later journal record at epoch 2, bseq 1. The live #epochOk
+  // resets bseq on an epoch advance, so #load must too, or epoch 2's honest beacons 2..500 drop.
+  const l = new Listener(manifest, { warmup: false, restore: null });
+  for (let n = 1; n <= 500; n += 1) l.hear(beacon(1, n, ENTRY, T0 + n), T0 + n);
+  const snap = JSON.parse(JSON.stringify(l.snapshot()));
+  l.markSaved();
+  l.hear(beacon(2, 1, ENTRY, T0 + 600), T0 + 600);
+  const record = JSON.parse(JSON.stringify(l.takeJournal()!));
+  const r = new Listener(manifest, {
+    warmup: false,
+    restore: snap,
+    journal: [record],
+  });
+  const st = r.stations.get(kid.toString("hex"))!;
+  assert.equal(st.epochHwm, 2);
+  assert.equal(st.bseq, 1n);
+  r.hear(beacon(2, 2, ENTRY, T0 + 700), T0 + 700);
+  assert.equal(st.bseq, 2n, "epoch 2's next beacon is new, not a duplicate");
 });

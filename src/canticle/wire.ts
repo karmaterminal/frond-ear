@@ -439,6 +439,18 @@ export function localExpiryMs(
 }
 
 /**
+ * The latest a receiver may hold a frame, whatever δ̂ is or becomes: first hearing plus its
+ * signed life (§14.6.3). `localExpiryMs` never exceeds it, so state kept until then outlives the
+ * frame under any later δ̂ (binary-canticle#175).
+ */
+export function localExpiryCapMs(
+  frame: { kind: number; body: Item | Pluck },
+  firstHeardMs: number,
+): number {
+  return localExpiryMs(frame, Number.MAX_SAFE_INTEGER / 2, firstHeardMs);
+}
+
+/**
  * Admit one datagram or throw `Reject`: size, header, key, CBOR, fields, time
  * window, then signature (cheap checks first, §12.2).
  */
