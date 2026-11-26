@@ -1245,3 +1245,24 @@ test("#175: maxSkewMs refuses an older stream on a first join, before any state 
     /maxSkewMs/,
   );
 });
+
+test("#175 (🌿 F-B1): a journal record that raises the epoch resets the kept bseq", () => {
+  // Snapshot at epoch 1, bseq 500; a later journal record at epoch 2, bseq 1. The live #epochOk
+  // resets bseq on an epoch advance, so #load must too, or epoch 2's honest beacons 2..500 drop.
+  const l = new Listener(manifest, { warmup: false, restore: null });
+  for (let n = 1; n <= 500; n += 1) l.hear(beacon(1, n, ENTRY, T0 + n), T0 + n);
+  const snap = JSON.parse(JSON.stringify(l.snapshot()));
+  l.markSaved();
+  l.hear(beacon(2, 1, ENTRY, T0 + 600), T0 + 600);
+  const record = JSON.parse(JSON.stringify(l.takeJournal()!));
+  const r = new Listener(manifest, {
+    warmup: false,
+    restore: snap,
+    journal: [record],
+  });
+  const st = r.stations.get(kid.toString("hex"))!;
+  assert.equal(st.epochHwm, 2);
+  assert.equal(st.bseq, 1n);
+  r.hear(beacon(2, 2, ENTRY, T0 + 700), T0 + 700);
+  assert.equal(st.bseq, 2n, "epoch 2's next beacon is new, not a duplicate");
+});

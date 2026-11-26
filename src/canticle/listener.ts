@@ -522,6 +522,9 @@ export class Listener {
       if (epoch > st.epochHwm) {
         st.epochHwm = epoch;
         st.epochSeenAt = seenAt;
+        // As the live #epochOk does: a new epoch counts beacons from 1 again, so a kept mark of the
+        // old epoch must not survive the raise (🌿, F-B1 on #128).
+        st.bseq = 0n;
       }
     }
     // Monotone too: bseq max within the epoch held, and the δ̂ floor only ever goes down, so a record
