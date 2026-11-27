@@ -251,8 +251,35 @@ export type GuideMetadata = Pick<LiveItem, GuideField>;
  * What `canticle_guide` reads from a source: the `hear` view's metadata, its items as
  * `GuideItem`s, and what holds the board empty that `hear`'s view leaves unsaid.
  */
-export interface GuideSourceView
-  extends Omit<HearView, "items" | "capability"> {
+/**
+ * The `HearView` fields a guide view carries: a whitelist, so a field added to `HearView` later
+ * stays out of the guide until someone names it here (#138, 🍃's review). Every other `HearView`
+ * field is `never` in a `GuideSourceView`, so spreading a view that carries one fails tsc.
+ */
+export type GuideViewField =
+  | "now"
+  | "tuned"
+  | "listening"
+  | "ended"
+  | "blind"
+  | "joinedLate"
+  | "breaker"
+  | "lastDatagramAt"
+  | "stations"
+  | "omitted"
+  | "otherOmitted"
+  | "withdrawn"
+  | "untunedOmitted"
+  | "retuned";
+
+export type GuideSourceView = Pick<HearView, GuideViewField> & {
+  [K in Exclude<
+    keyof HearView,
+    GuideViewField | "items" | "capability"
+  >]?: never;
+} & GuideSourceExtras;
+
+interface GuideSourceExtras {
   items: GuideItem[];
   /**
    * Never here: every `HearView` declares it, so a whole `HearView` spread into a guide
@@ -828,7 +855,9 @@ export class CanticleReceptor {
 
   /** `hearView` for the guide: metadata only, no body read (RFC-0002 §3.3). */
   guideView(ear: string): GuideSourceView {
-    return { ...this.#viewOf(ear), items: this.#guideItems(ear) };
+    // `withdrawals` is the note evidence `hear` keeps (#134), not guide metadata (#138).
+    const { withdrawals: _hearOnly, ...view } = this.#viewOf(ear);
+    return { ...view, items: this.#guideItems(ear) };
   }
 
   #viewOf(ear: string): Omit<HearView, "items" | "capability"> {

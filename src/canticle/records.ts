@@ -1698,8 +1698,10 @@ export class RecordConsumer {
       };
     });
     const live = this.health !== "failed" && this.health !== "stopped";
+    // `withdrawals` is the note evidence `hear` keeps (#134), not guide metadata (#138).
+    const { withdrawals: _hearOnly, ...guideView } = view;
     return {
-      ...view,
+      ...guideView,
       ...(this.mute !== null ? { hostMute: { ...this.mute } } : {}),
       ...(this.healthReasons.includes("records_lost")
         ? { recordsLost: true }
