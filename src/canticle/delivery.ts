@@ -1422,7 +1422,7 @@ export class CanticleDelivery {
    * Withdrawn notes (#67, RFC-0001 §14.14): a record already pushed to the session that
    * is withdrawn while its tombstone holds gets one short line, behind the daemon's own
    * header, with no payload: where it was (`station:stream`, `epoch/seq`) and why. A
-   * withdrawal is what the source saw happen to a record it held (`HearView.withdrawn`):
+   * withdrawal is what the source saw happen to a record it held (`HearView.withdrawals`):
    * a `retract` for plucked, revoked or quarantined (the embedded receptor: a PLUCK), or,
    * for a class whose expiry is news (alarm), a `retract` for its expiry or its running
    * out while still in the source's live set. Nothing here infers an expiry from a record
@@ -1596,7 +1596,7 @@ export class CanticleDelivery {
     for (const [id, until] of state.told) {
       if (until <= now) state.told.delete(id);
     }
-    for (const w of view.withdrawn ?? []) {
+    for (const w of view.withdrawals ?? []) {
       const id = identity(w);
       if (state.told.has(id)) continue;
       // Not held here: never pushed, passed over or settled.
@@ -2825,12 +2825,15 @@ export class CanticleDelivery {
 
   /**
    * The ear's effective mode for this record's station now, for custody of a `hear`
-   * (binary-canticle#161): `off` where the ear has no delivery.
+   * (binary-canticle#161) and the guide's rows; for the ear as a whole with no station.
+   * `off` where the ear has no delivery.
    */
-  modeOf(ear: string, item: LiveItem): DeliveryMode {
+  modeOf(ear: string, item?: Pick<LiveItem, "key" | "station">): DeliveryMode {
     const config = this.#deps.config();
     if (config.canticle?.delivery[ear] === undefined) return "off";
-    return this.#modes(ear, config, this.#deps.clock.now()).of(item);
+    return this.#modes(ear, config, this.#deps.clock.now()).of(
+      item === undefined ? undefined : { key: item.key, station: item.station },
+    );
   }
 
   /** The ear's modes: config ceilings, the session's choices, and the effective result. */

@@ -55,6 +55,7 @@ const REFUSED = /refused by canticle\.roomPolicy strict-fresh: /u;
 const NOT_ROOM_OUTPUT = [
   "ack",
   "canticle_custody",
+  "canticle_guide",
   "ear_status",
   "fetch_attachment",
   "fetch_messages",
