@@ -59,7 +59,8 @@
 // a push promised its records to, or the one holding the ear (or that held it last) when it
 // became owed, by session id, or with no id on either side by attach, as a withdrawn note.
 // Another session holding the ear (a `/clear`, a new attach) drops it, counted, before any
-// push: it is neither pushed on its own nor carried. See `#disown`.
+// push and as each later note is made: it is neither pushed on its own nor carried, and
+// notes owed to different sessions never merge. See `#disown`, `#miss` and `clash`.
 //
 // A record already pushed and offered to the session that its station withdraws while its
 // tombstone holds (plucked, revoked, quarantined; an alarm, also when it runs out on view)
@@ -419,6 +420,32 @@ function owe(
   into.owed = true;
 }
 
+/** Whether two owners are the same session (`sameSession`), or both none. */
+const sameOwner = (a: Owner | undefined, b: Owner | undefined): boolean =>
+  a === undefined || b === undefined ? a === b : sameSession(a, b);
+
+/**
+ * Whether `from` and `into` are both owed, to different sessions (#140). Such notes never
+ * merge: a note owed to one session is never told inside a note owed to another.
+ */
+const clash = (
+  into: { owed: boolean; owedTo?: Owner },
+  from: { owed: boolean; owedTo?: Owner },
+): boolean => into.owed && from.owed && !sameOwner(into.owedTo, from.owedTo);
+
+/**
+ * What `addNote` refused to merge because the note clashed with the one there (`clash`):
+ * `dropped`, a note left out whole (its records); `unowed`, a stream a kept `FOLDED`
+ * brought back whose count can't be split, so it stays counted but owed nothing.
+ */
+type Refused = (kind: "dropped" | "unowed", count: number) => void;
+
+/** The records a note tells. */
+const recordsOf = (note: Missed): number =>
+  note.offAir +
+  note.dropped +
+  [...note.withheld.values()].reduce((sum, span) => sum + span.count, 0);
+
 interface Missed {
   /** Left the view (retracted, superseded, the link went) and then went off air unpushed. */
   offAir: number;
@@ -643,7 +670,13 @@ function fold(
   note: Missed,
   latest: boolean,
   before?: ReadonlyMap<string, Keyed>,
+  refused?: Refused,
 ): void {
+  const place = folded.streams?.get(stream);
+  if (place !== undefined && clash(place, note)) {
+    refused?.("dropped", recordsOf(note));
+    return;
+  }
   addMissed(folded, note);
   const f = slot(folded, stream, note.owed, before);
   if (f === undefined) return;
@@ -663,7 +696,9 @@ function fold(
  * key) becomes the stream's; merged back in, only if a later push carried it than the key
  * already here (`later`), whatever order pushes are given back in. `before` is the key
  * each stream had (`keysOf`) as a give-back began: one that loses its place as the notes
- * merge, and gets one back, starts from that key again.
+ * merge, and gets one back, starts from that key again. A note owed to another session
+ * than the one the stream's note here is owed to never merges into it (#140, `clash`):
+ * it is left out, and `refused` told.
  */
 function addNote(
   notes: Map<string, Missed>,
@@ -671,9 +706,10 @@ function addNote(
   note: Missed,
   latest: boolean,
   before?: ReadonlyMap<string, Keyed>,
+  refused?: Refused,
 ): void {
   if (stream === FOLDED) {
-    mergeFolded(notes, note, before);
+    mergeFolded(notes, note, before, refused);
     return;
   }
   let entry = notes.get(stream);
@@ -685,11 +721,14 @@ function addNote(
       stream !== OTHER &&
       (folded?.streams?.has(stream) === true || named >= MAX_CURSOR_STREAMS)
     ) {
-      fold(foldedOf(notes), stream, note, latest, before);
+      fold(foldedOf(notes), stream, note, latest, before, refused);
       return;
     }
     notes.set(stream, (entry = blankMissed("")));
     takeKey(entry, before?.get(stream) ?? NO_KEY);
+  } else if (clash(entry, note)) {
+    refused?.("dropped", recordsOf(note));
+    return;
   }
   if (latest || later(note, entry)) takeKey(entry, note);
   addMissed(entry, note);
@@ -700,16 +739,26 @@ function addNote(
  * names keeps or gets a place here, as when it was folded. One that has an entry of its
  * own here now is folded into that place, so no stream is named and kept both; with no
  * place to be had, its entry stays named, owed if either was, so it keeps its push, and
- * its kept records are counted with the streams the count can't name.
+ * its kept records are counted with the streams the count can't name. A kept stream owed
+ * to another session than the one its entry or place here is owed to (#140, `clash`)
+ * can't be taken out of the count it came back in: it comes back owed nothing.
  */
 function mergeFolded(
   notes: Map<string, Missed>,
   from: Missed,
   before?: ReadonlyMap<string, Keyed>,
+  refused?: Refused,
 ): void {
   const folded = foldedOf(notes);
   addMissed(folded, from);
-  for (const [stream, f] of from.streams ?? []) {
+  for (const [stream, kept] of from.streams ?? []) {
+    const here = notes.get(stream) ?? folded.streams?.get(stream);
+    let f = kept;
+    if (here !== undefined && clash(here, kept)) {
+      f = { ...kept, owed: false };
+      delete f.owedTo;
+      refused?.("unowed", 1);
+    }
     const named = notes.get(stream);
     const owed = f.owed || named?.owed === true;
     const mine = slot(folded, stream, owed, before);
@@ -728,13 +777,15 @@ function mergeFolded(
     if (named !== undefined) {
       // The entry here keeps its key, unless the kept one's is the later.
       notes.delete(stream);
-      fold(folded, stream, named, !later(mine, named));
+      fold(folded, stream, named, !later(mine, named), undefined, refused);
     }
   }
   if (from.more === true) folded.more = true;
 }
 
 interface EarState {
+  /** The ear this is the state of. */
+  ear: string;
   /**
    * What the record source's manifest grants each key, from the ear's latest poll (absent
    * where the source can't say): the wake gate's capability check, for `#owes` too.
@@ -1346,7 +1397,7 @@ export class CanticleDelivery {
         sessionId: holding.sessionId,
         generation: holding.generation,
       };
-      this.#disown(ear, state, state.missed, state.holder);
+      this.#disown(state, state.missed, state.holder);
     }
 
     for (const [id, seen] of state.seen) {
@@ -1904,7 +1955,14 @@ export class CanticleDelivery {
           same ? Math.max(o.from, before.at) : o.from,
           o.to,
         );
-        addNote(state.missed, OTHER, note, false);
+        addNote(
+          state.missed,
+          OTHER,
+          note,
+          false,
+          undefined,
+          this.#refused(state),
+        );
       } else {
         const mode = modes.of({ key: o.key, station: o.station });
         if (!keys.has(o.key.toLowerCase()) || mode === "off" || mode === "mute")
@@ -1921,7 +1979,14 @@ export class CanticleDelivery {
         // Dropped after the last pass looked: from then, or this window's start if later.
         const from = same ? Math.max(o.from, before.at) : o.from;
         widen(note.withheld, "live_overflow", told, from, o.to);
-        addNote(state.missed, stream, note, true);
+        addNote(
+          state.missed,
+          stream,
+          note,
+          true,
+          undefined,
+          this.#refused(state),
+        );
       }
       for (const d of fresh) {
         this.#report(state, identity(d), d.until + SETTLE_SKEW_MS);
@@ -1945,7 +2010,14 @@ export class CanticleDelivery {
       state.holder,
     );
     widen(note.withheld, "live_overflow", 1, at, at);
-    addNote(state.missed, waiting.stream, note, true);
+    addNote(
+      state.missed,
+      waiting.stream,
+      note,
+      true,
+      undefined,
+      this.#refused(state),
+    );
     state.dirty = true;
   }
 
@@ -2350,15 +2422,25 @@ export class CanticleDelivery {
       // before the connection went) is dropped first (#140), so it never merges into a
       // note owed to that one.
       const holding = this.#deps.session(ear);
-      const holder =
-        holding !== undefined
-          ? { sessionId: holding.sessionId, generation: holding.generation }
-          : state.holder;
-      if (push !== undefined && holder !== undefined) {
-        this.#disown(ear, state, push.missed, holder);
+      if (holding !== undefined) {
+        state.holder = {
+          sessionId: holding.sessionId,
+          generation: holding.generation,
+        };
+      }
+      if (state.holder !== undefined) {
+        this.#disown(state, state.missed, state.holder);
+        if (push !== undefined) this.#disown(state, push.missed, state.holder);
       }
       for (const [stream, missed] of push?.missed ?? []) {
-        addNote(state.missed, stream, missed, false, before);
+        addNote(
+          state.missed,
+          stream,
+          missed,
+          false,
+          before,
+          this.#refused(state),
+        );
       }
       for (const id of identities) {
         const waiting = push?.records.find((record) => record.id === id);
@@ -2390,6 +2472,7 @@ export class CanticleDelivery {
     if (state === undefined) {
       const cursor = this.#loadCursor(ear);
       state = {
+        ear,
         seen: new Map(),
         gen: 0,
         waiting: new Map(),
@@ -2447,7 +2530,7 @@ export class CanticleDelivery {
         // Given back already (the first attach after a crash reverts before this
         // reads): the session never got its notes, so they wait again, owed as before.
         for (const [stream, m] of missed)
-          addNote(state.missed, stream, m, false, before);
+          addNote(state.missed, stream, m, false, before, this.#refused(state));
         state.dirty = true;
       } else if (outcome === "unconfirmed" && kept.size < MAX_UNCONFIRMED) {
         // A revert may still give it back; its notes go with it then.
@@ -2594,7 +2677,14 @@ export class CanticleDelivery {
     if (!reason.startsWith(WAKE_WITHHELD)) return;
     const note = blankMissed(item.key);
     widen(note.withheld, reason, 1, item.heardAt, item.heardAt);
-    addNote(state.missed, streamOf(item), note, true);
+    addNote(
+      state.missed,
+      streamOf(item),
+      note,
+      true,
+      undefined,
+      this.#refused(state),
+    );
     state.dirty = true;
   }
 
@@ -2710,7 +2800,24 @@ export class CanticleDelivery {
       const heard = waiting.item.heardAt;
       widen(note.withheld, reason, 1, heard, heard);
     }
-    addNote(state.missed, waiting.stream, note, true);
+    // Owed to a session other than the one holding the ear (or that held it last): decided
+    // here, as it is made, so no pass's push or merge can carry it to that one (#140).
+    if (
+      note.owed &&
+      state.holder !== undefined &&
+      !sameSession(note.owedTo, state.holder)
+    ) {
+      this.#dropNotes(state, "session_changed", 1, 1);
+      return;
+    }
+    addNote(
+      state.missed,
+      waiting.stream,
+      note,
+      true,
+      undefined,
+      this.#refused(state),
+    );
     state.dirty = true;
   }
 
@@ -2719,18 +2826,17 @@ export class CanticleDelivery {
    * ear now (#140, RFC-0002 §7.5): the coverage note may start a turn on the session it is
    * owed to only. Dropped, not held: the session it is owed to may never come back (a
    * `/clear` never does), and a note held for it would wait for good; a drop is counted
-   * (`coverage_note_dropped`, the records it would have told) and logged with its reason.
-   * A stream `FOLDED` holds can't be taken out of the count it shares: it stops being
-   * owed, so it never asks for a push of its own (`coverage_note_unowed`), and its records
-   * stay in the count, unnamed, for a push that goes anyway.
+   * (`coverage_note_dropped`, the records it would have told) and logged with its reason:
+   * `session_changed`, or `no_owner` for a note that names no session (saved by a build
+   * before #140). A stream `FOLDED` holds can't be taken out of the count it shares: it
+   * stops being owed, so it never asks for a push of its own (`coverage_note_unowed`),
+   * and its records stay in the count, unnamed, for a push that goes anyway. A note made
+   * after this, in the same pass or a give-back, meets the same check as it is made
+   * (`#miss`), and never merges into one owed to another session (`clash`).
    */
-  #disown(
-    ear: string,
-    state: EarState,
-    notes: Map<string, Missed>,
-    session: Owner,
-  ): void {
-    let [streams, records, folded] = [0, 0, 0];
+  #disown(state: EarState, notes: Map<string, Missed>, session: Owner): void {
+    const dropped = new Map<string, { streams: number; records: number }>();
+    let folded = 0;
     for (const [stream, missed] of [...notes]) {
       if (stream === FOLDED) {
         for (const f of missed.streams?.values() ?? []) {
@@ -2743,21 +2849,53 @@ export class CanticleDelivery {
       }
       if (!missed.owed || sameSession(missed.owedTo, session)) continue;
       notes.delete(stream);
-      streams += 1;
-      records += missed.offAir + missed.dropped;
-      for (const span of missed.withheld.values()) records += span.count;
+      const reason =
+        missed.owedTo === undefined ? "no_owner" : "session_changed";
+      const tally = dropped.get(reason) ?? { streams: 0, records: 0 };
+      tally.streams += 1;
+      tally.records += recordsOf(missed);
+      dropped.set(reason, tally);
     }
-    if (streams + folded === 0) return;
+    for (const [reason, { streams, records }] of dropped) {
+      this.#dropNotes(state, reason, streams, records);
+    }
+    if (folded > 0) this.#unowe(state, "session_changed", folded);
+  }
+
+  /** Notes of `streams` streams dropped (#140): counted, logged, and saved so. */
+  #dropNotes(
+    state: EarState,
+    reason: string,
+    streams: number,
+    records: number,
+  ): void {
     if (records > 0) this.#count(state, "coverage_note_dropped", records);
-    if (folded > 0) this.#count(state, "coverage_note_unowed", folded);
     state.dirty = true;
     this.#deps.logger.log("info", "canticle.coverage_note_dropped", {
-      ear,
-      reason: "session_changed",
+      ear: state.ear,
+      reason,
       streams,
       records,
-      ...(folded > 0 ? { folded } : {}),
     });
+  }
+
+  /** Folded streams that stopped being owed (#140): counted, logged, and saved so. */
+  #unowe(state: EarState, reason: string, folded: number): void {
+    this.#count(state, "coverage_note_unowed", folded);
+    state.dirty = true;
+    this.#deps.logger.log("info", "canticle.coverage_note_unowed", {
+      ear: state.ear,
+      reason,
+      folded,
+    });
+  }
+
+  /** What `addNote` refuses to merge into `state.missed` (`clash`), counted as a drop. */
+  #refused(state: EarState): Refused {
+    return (kind, count) => {
+      if (kind === "dropped") this.#dropNotes(state, "owner_clash", 1, count);
+      else this.#unowe(state, "owner_clash", count);
+    };
   }
 
   #count(state: EarState, name: string, by = 1): void {

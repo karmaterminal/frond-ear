@@ -990,15 +990,21 @@ findings 3 and 5). It goes only to the session it is owed to, at most once (#140
 session a push promised its records to, or the one the budget held them from (for a `live_overflow` drop, the one
 holding the ear then, or with none, the one that held it last; with no session since frond-ear started, it is owed to
 none and only rides with a push). That session is named as the withdrawn note's is: by its session id, or with no id on
-either side, by the same attach. A re-attach of the same session gets it, a frond-ear restart included. When another
+either side, by the same attach. A session with an id that re-attaches gets it, a frond-ear restart and a `--resume`
+included; a shim with no session id is a new attach each time, so a re-attach without an id doesn't. When another
 session holds the ear (a `/clear`, a new attach with a new id), the note is dropped before anything is pushed, neither
-pushed on its own nor carried by that session's pushes, and counted (`coverage_note_dropped`, the records it would have
-told) and logged (`canticle.coverage_note_dropped`, `reason=session_changed`). A note given back from an unconfirmed
-push is dropped the same way as it comes back, so it never merges into one owed to the session after. Dropped, not
-held: the session it was owed to may never come back (a `/clear`'d session doesn't), and a note held for it would
-wait for good. A stream counted together past the 256 can't be taken out of the shared count: it stops being owed
-(`coverage_note_unowed`), so it never asks for a push of its own, and rides counted with a push that goes anyway. A
-note saved owed by a build before #140 names no session, so the first session to hold the ear drops it, counted.
+pushed on its own nor carried by that session's pushes. A note made later, in the same pass (a record promised to the
+session before goes off air just after the new one attached) or as an unconfirmed push is given back, meets the same
+check as it is made, and is dropped then. Notes owed to different sessions never merge: a stream's note owed to one
+session is never told inside a note owed to another. Every drop is counted (`coverage_note_dropped`, the records it
+would have told) and logged (`canticle.coverage_note_dropped`, with `reason=session_changed`, `owner_clash` for a merge
+refused, or `no_owner`). Dropped, not held: the session it was owed to may never come back (a `/clear`'d session
+doesn't), and a note held for it would wait for good. The price is a stray attach: a second `claude` in the seat's
+directory, or `claude mcp list` / `get`, takes the ear for a few seconds under another id, and any note owed to the seat's
+own session that falls due or is made meanwhile is dropped, counted, never pushed to the stray. A stream counted together
+past the 256 can't be taken out of the shared count: it stops being owed (`coverage_note_unowed`), so it never asks for a
+push of its own, and rides counted with a push that goes anyway. A note saved owed by a build before #140 names no
+session, so the first session to hold the ear drops it, counted (`reason=no_owner`).
 While records wait under a hold, `hear` says why and until when.
 
 **Withdrawn notes (#67, RFC-0001 §14.14).** A channel event can't be recalled, so a record already pushed to the

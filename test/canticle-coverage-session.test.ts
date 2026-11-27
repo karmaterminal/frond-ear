@@ -250,3 +250,104 @@ test("#140: a note pushed to a session, given back after a /clear, is dropped as
     h.dispose();
   }
 });
+
+// 🌿's review of #141 (B1a, his race probe): a record promised to A goes off air in the pass
+// in which B first holds the ear and a push to B falls due. Decided as the note is made.
+for (const lead of [900, 500, 100]) {
+  test(`#141 B1a: B attaches ${lead} ms before a record promised to A goes off air: nothing owed to A reaches B, and the drop is counted`, async () => {
+    const { h, host } = setup({ mode: "immediate", maxItems: 1 });
+    try {
+      const t0 = h.clock.now();
+      const a = h.attach("scribe", { sessionId: SESSION });
+      host.sing(1);
+      host.sing(2, { ttlMs: 30_000 });
+      h.timers.advance(6_000);
+      assert.equal(pushes(a).length, 1);
+      assert.match(pushes(a)[0]!.content, /1 more record waits/u);
+      await confirm(a);
+      a.close(); // no session: 2 waits, held no_session, past its due
+      h.timers.advance(t0 + 30_000 - lead - h.clock.now());
+      const b = h.attach("scribe", { sessionId: OTHER_SESSION });
+      h.timers.advance(3_000);
+      assert.equal(status(h).counts.off_air_unpushed, 1);
+      assert.deepEqual(pushes(b), [], "nothing owed to A reaches B");
+      assert.equal(status(h).counts.coverage_note_dropped, 1);
+    } finally {
+      h.dispose();
+    }
+  });
+}
+
+test("#141 B1b (🌿's merge probe): a record promised to A that goes off air while B holds the ear never merges into B's own note on the same stream", async () => {
+  const { h, host } = setup({
+    mode: "immediate",
+    maxItems: 1,
+    maxPushesPerHour: 1,
+  });
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    host.sing(1);
+    host.sing(2, { ttlMs: 120_000 });
+    h.timers.advance(6_000);
+    assert.equal(pushes(shim).length, 1);
+    assert.match(pushes(shim)[0]!.content, /1 more record waits/u); // 2: A's
+    await confirm(shim);
+    const frees = status(h).lastPushAt! + 3_600_000;
+    await shim.send({ type: "session", sessionId: OTHER_SESSION }); // /clear
+    host.sing(3, { ttlMs: 30_000 }); // B's own, held by the spent budget
+    h.timers.advance(60_000); // 3 off air: owed to B
+    h.timers.advance(120_000); // 2 off air: owed to A
+    assert.equal(status(h).counts.off_air_unpushed, 2);
+    h.timers.advance(frees + 6_000 - h.clock.now());
+    const got = pushes(shim).slice(1);
+    assert.equal(got.length, 1, "B's own note");
+    assert.match(got[0]!.content, NOTE, "B's own record only: 1, not 2");
+    assert.equal(status(h).counts.coverage_note_dropped, 1, "A's, counted");
+  } finally {
+    h.dispose();
+  }
+});
+
+test("#141: across a crash, A's note in a push never confirmed and B's own note on the same stream never merge: B is told its own, A's is dropped, counted", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "frond-ear-coverage-crash-"));
+  const path = join(directory, "ear.db");
+  const delivery = { mode: "immediate", maxPushesPerHour: 1 };
+  try {
+    let at: number;
+    const first = setup(delivery, {}, {}, { path });
+    try {
+      const shim = first.h.attach("scribe", { sessionId: SESSION });
+      first.host.sing(1);
+      first.h.timers.advance(6_000);
+      await confirm(shim);
+      const frees = status(first.h).lastPushAt! + 3_600_000;
+      first.host.sing(2, { ttlMs: 60_000 });
+      first.h.timers.advance(120_000); // 2 off air: owed to A
+      first.h.timers.advance(frees + 6_000 - first.h.clock.now());
+      assert.equal(pushes(shim).length, 2, "A's note, never confirmed");
+      await shim.send({ type: "session", sessionId: OTHER_SESSION });
+      first.host.sing(3, { ttlMs: 60_000 });
+      first.h.timers.advance(120_000); // 3 off air under the spent budget: B's
+      at = first.h.clock.now();
+      // The process dies: A's note is carried by an unconfirmed push, B's waits.
+      first.h.store.close();
+      rmSync(first.h.directory, { recursive: true, force: true });
+    } catch (error) {
+      first.h.dispose();
+      throw error;
+    }
+    const second = setup(delivery, {}, {}, { path });
+    try {
+      second.h.clock.value = at + 3_600_000;
+      const shim = second.h.attach("scribe", { sessionId: OTHER_SESSION });
+      second.h.timers.advance(6_000);
+      assert.equal(pushes(shim).length, 1, "B's own note");
+      assert.match(pushes(shim)[0]!.content, NOTE, "1, not 2");
+      assert.equal(status(second.h).counts.coverage_note_dropped, 1);
+    } finally {
+      second.h.dispose();
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
