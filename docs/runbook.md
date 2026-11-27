@@ -48,16 +48,16 @@ filename is git-ignored) and fill in the fields below.
 
 **Ears**
 
-| Field                       | Meaning                                                                                                                                                                                         |
-| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ears.<name>`               | One ear per session.                                                                                                                                                                            |
-| `ears.<name>.target`        | `claude-channel` (the default, which `init` writes) or `copilot-extension`. This runbook attaches Claude Code; the [README](../README.md#github-copilot-cli) has the Copilot CLI steps.         |
-| `ears.<name>.channels`      | Channel IDs to modes: `silent`, `mentions` (the default) or `room`. Per-channel `quietWindowMs`, `maxDelayMs` and `historyLimit` are optional. Threads inherit their parent channel's settings. |
-| `ears.<name>.dms`           | Whether this ear receives DMs from principals and peers.                                                                                                                                        |
-| `ears.<name>.dmMode`        | `mentions` (the default: every DM wakes the session) or `silent` (DMs are stored for `inbox` only).                                                                                             |
-| `ears.<name>.attachCanary`  | Asks Claude to `ack` a nonce each time a session attaches. This proves the channel is actually registered, because a notification can otherwise be dropped with no error.                       |
-| `ears.<name>.instructions`  | Extra text you write, appended to the channel instructions.                                                                                                                                     |
-| `ears.<name>.sendFileRoots` | Absolute directories a `reply`'s `files` may come from. Empty (the default): this ear sends no files. See **Sending files** below.                                                              |
+| Field                       | Meaning                                                                                                                                                                                              |
+| --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ears.<name>`               | One ear per session.                                                                                                                                                                                 |
+| `ears.<name>.target`        | `claude-channel` (the default, which `init` writes) or `copilot-extension`. This runbook attaches Claude Code; the [README](../README.md#github-copilot-cli) has the Copilot CLI steps.              |
+| `ears.<name>.channels`      | Channel IDs to modes: `silent`, `mentions` (the default) or `room`. Per-channel `quietWindowMs`, `maxDelayMs` and `historyLimit` are optional. Threads inherit their parent channel's settings.      |
+| `ears.<name>.dms`           | Whether this ear receives DMs from principals and peers.                                                                                                                                             |
+| `ears.<name>.dmMode`        | `mentions` (the default: every DM wakes the session) or `silent` (DMs are stored for `inbox` only).                                                                                                  |
+| `ears.<name>.attachCanary`  | Asks Claude to `ack` a nonce each time a session attaches. This proves the channel is actually registered, because a notification can otherwise be dropped with no error.                            |
+| `ears.<name>.instructions`  | Extra text you write, placed after frond-ear's trust rules and before its tool guidance. Claude Code cuts the instructions past 4,096 characters: keep it within about 600, and check with `doctor`. |
+| `ears.<name>.sendFileRoots` | Absolute directories a `reply`'s `files` may come from. Empty (the default): this ear sends no files. See **Sending files** below.                                                                   |
 
 **Modes**
 
