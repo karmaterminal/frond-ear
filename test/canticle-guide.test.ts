@@ -725,3 +725,80 @@ test("guide: names come out as single tokens, labelled data; every gap branch sa
     ),
   );
 });
+
+test("guide: local omissions and coverage marks lapse with the records they name; a live row carries its own omission", async () => {
+  const { h, host } = setup(undefined);
+  try {
+    const shim = h.attach("scribe");
+    fill(host);
+    host.sing(9_000, { station: "quiet", ttlMs: 30_000 });
+    assert.equal(
+      row((await guide(h, shim, { query: "quiet" })).view, "quiet", "ops.fleet")
+        .localOmissions?.count,
+      1,
+    );
+    h.clock.advance(31_000); // the dropped record would have left the air by now
+    const lapsed = (await guide(h, shim, { query: "quiet" })).view;
+    assert.equal(lapsed.streams, 0, "a lapsed omission is not kept as a row");
+    assert.equal(lapsed.gaps, undefined);
+  } finally {
+    h.dispose();
+  }
+  const out = guideView(
+    metaView({
+      omitted: [
+        {
+          station: "silas",
+          stream: "ops.fleet",
+          key: "aaaaaaaaaaaaaaaa",
+          count: 2,
+          from: 1_000_000,
+          to: 1_000_100,
+          until: 1_500_000,
+          total: 2,
+          pushable: 0,
+          pushableTotal: 0,
+          serial: 1,
+        },
+        {
+          station: "rune",
+          stream: "ops.fleet",
+          key: "bbbbbbbbbbbbbbbb",
+          count: 5, // a source that leaves the count: the guide checks until itself
+          from: 1_000_000,
+          to: 1_000_100,
+          until: 1_000_700, // lapsed before now (1_001_000)
+          total: 5,
+          pushable: 0,
+          pushableTotal: 0,
+          serial: 3,
+        },
+      ],
+      otherOmitted: {
+        station: "",
+        stream: "",
+        key: "",
+        count: 3,
+        from: 1_000_000,
+        to: 1_000_100,
+        until: 1_000_500, // lapsed before now (1_001_000)
+        total: 3,
+        pushable: 0,
+        pushableTotal: 0,
+        serial: 2,
+      },
+      retuned: [
+        { pattern: "*:ops.fleet", at: 1_000_200, dropped: 4, until: 1_000_900 },
+      ],
+    }),
+    { ear: "scribe", limit: 20, mode: () => "off" },
+  );
+  assert.equal(out.rows.length, 1, "a lapsed omission makes no row");
+  assert.equal(out.rows[0]!.live, 1, "the surviving live row");
+  assert.deepEqual(out.rows[0]!.localOmissions, {
+    reason: "live_overflow",
+    count: 2,
+  });
+  assert.equal(out.rows[0]!.coverageUnknown, undefined, "a lapsed retune");
+  assert.equal(out.gaps, undefined, "a lapsed shared count and retune");
+});
