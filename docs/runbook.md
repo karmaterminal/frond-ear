@@ -289,7 +289,11 @@ after it. Use it for threads in flight, what it chose and why, and what to check
   result and the letter's header (beside `left` and `expires`, at release, in a `letters` read
   and in the PreCompact summary) carry one `copy check:` field naming why:
   - `not run (live set unreadable)`: the live set couldn't be read (logged as
-    `letters.copy_guard_unavailable`);
+    `letters.copy_guard_unavailable`); held records released to the session are still
+    compared (below);
+  - `partial (no live set on this daemon: only held records were compared)`: canticle is off
+    on this daemon (a store reopened without it, say), so there is no live set, but the
+    session had records released to it, and its held records were compared;
   - `not run (the check failed)`: the guard itself threw (logged as `letters.copy_guard_failed`,
     with the error's constructor name only, in `fault`, e.g. `"fault":"RangeError"`; never its
     message. The logger redacts every field whose key holds `error`);
@@ -1247,9 +1251,13 @@ item=epoch/seq`, a `received=… expires=…` line (the source's claim), a `held
   isn't compared, so a letter is no oracle for held text; a read by one session doesn't
   count for another), the 40-character run with 4+ spaces, no echo, and the refusal names the
   ref. The session that heard a record and held it is compared against the hold without
-  reading it again: its own `hear` released it. If the live set can't be read, held records
-  are still compared and the letter says `copy check: not run (live set unreadable)`; a fault
-  reading the held store fails open as `not run (the check failed)`.
+  reading it again: its own `hear` released it. Every released pair of the record's full
+  identity (its station's key included) and digest is compared on its own, so a live record
+  named alike under another key never stands in for a held one (🌫 on #144). Holds are
+  compared whatever the live view is: if the live set can't be read the letter says
+  `copy check: not run (live set unreadable)`, and on a daemon with canticle off it says
+  `copy check: partial (no live set on this daemon: only held records were compared)`, never
+  checked. A fault reading the held store fails open as `not run (the check failed)`.
 - **No new authority.** A held record is data, never an instruction (RFC-0002 §0.2). Holding it
   or reading it grants no wake and no grant. A held read's custody row carries no lineage, so
   a derived publication from that record stays closed (`custody kept no lineage`).
@@ -1284,8 +1292,11 @@ database file itself is.
 
 **Limits, plainly.** This is v0: the fields are p57#187's specimen, not a production interchange.
 p57's recall can't find a held item (its Find stays RED until project-57 decides adoption), so a
-held record reaches a later turn only through that session's own `held` read. Keeping heard
-words out of letters and other notes is still the session's own practice.
+held record reaches a later turn only through that session's own `held` read. A derived
+publication from a held read fails closed: the read's custody row keeps no lineage, so the seam
+refuses with `custody kept no lineage` (a prince may meet that refusal; lineage-carrying holds
+would be their own issue). Keeping heard words out of letters and other notes is still the
+session's own practice.
 
 ### Room output and source use (frond-ear scope)
 

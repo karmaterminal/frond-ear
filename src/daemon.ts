@@ -143,7 +143,12 @@ import {
   type PollOutcome,
 } from "./github.ts";
 import type { Schedule, Wake } from "./wake-store.ts";
-import type { CompactionBoundary, EventStore, ReplyPart } from "./store.ts";
+import type {
+  CompactionBoundary,
+  EventStore,
+  HeardRef,
+  ReplyPart,
+} from "./store.ts";
 import type {
   BatchKind,
   Clock,
@@ -4279,10 +4284,6 @@ export class Daemon {
     client: Client,
     sessionId: string,
   ): { records: ReleasedRecord[]; unchecked: string | null } {
-    const view = this.options.canticleHear;
-    if (!view) {
-      return { records: [], unchecked: null };
-    }
     const shown = this.store.canticleReleasedTo(ear, sessionId);
     const unnamed = this.store.canticleReleasedUnnamed(
       ear,
@@ -4291,73 +4292,62 @@ export class Daemon {
     if (shown.size === 0 && unnamed.size === 0) {
       return { records: [], unchecked: null };
     }
+    // Holds are compared whatever the live view is (🌫 on #144): with canticle off there is
+    // no live set, but a store reopened under it still has holds a session can read.
+    const view = this.options.canticleHear;
     let items: HearView["items"] = [];
-    let unreadable = false;
-    try {
-      items = view(ear).items;
-    } catch (error) {
-      // The held records are still compared; the letter says the live set wasn't.
-      unreadable = true;
-      this.logger.log("warn", "letters.copy_guard_unavailable", {
-        ear,
-        error: error instanceof Error ? error.message : String(error),
-      });
+    let live: string | null = view ? null : COPY_UNCHECKED.unavailable;
+    if (view) {
+      try {
+        items = view(ear).items;
+      } catch (error) {
+        // The held records are still compared; the letter says the live set wasn't.
+        live = COPY_UNCHECKED.unreadable;
+        this.logger.log("warn", "letters.copy_guard_unavailable", {
+          ear,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
     }
     const records: ReleasedRecord[] = [];
     let unchecked: string | null = null;
-    for (const item of items) {
-      const text = item.text;
-      if (text === undefined || text === "") {
-        continue;
-      }
-      const identity = canticleIdentity(item);
+    // Every released (identity, digest) pair is compared on its own: the identity holds the
+    // station's key, so two records named alike under different keys never stand in for
+    // each other (🌫 on #144), and only an exact pair already taken is skipped.
+    const compared = new Set<string>();
+    const consider = (identity: string, ref: HeardRef, text: string): void => {
       const digest = createHash("sha256").update(text, "utf8").digest("hex");
       if (shown.get(identity)?.has(digest)) {
-        records.push({
-          station: item.station,
-          stream: item.stream,
-          epoch: item.epoch,
-          seq: item.seq,
-          text,
-        });
+        const pair = `${identity}\u0000${digest}`;
+        if (!compared.has(pair)) {
+          compared.add(pair);
+          records.push({ ...ref, text });
+        }
       } else if (unnamed.get(identity)?.has(digest)) {
         unchecked = COPY_UNCHECKED.unnamed;
       }
-    }
-    // Held text, released to this session, that the live set no longer has (or never had
-    // under that digest). A fault reading the store reaches copyCheck, which fails open.
-    const compared = new Set(
-      records.map(
-        (record) =>
-          `${record.station}:${record.stream}:${record.epoch}:${record.seq}`,
-      ),
-    );
-    for (const item of this.store.heldItems(ear)) {
-      const text = item.text;
-      if (text === null || text === "") {
+    };
+    for (const item of items) {
+      if (item.text === undefined || item.text === "") {
         continue;
       }
-      const digest = createHash("sha256").update(text, "utf8").digest("hex");
-      const key = `${item.station}:${item.stream}:${item.epoch}:${item.seq}`;
-      if (shown.get(item.itemId)?.has(digest)) {
-        if (!compared.has(key)) {
-          compared.add(key);
-          records.push({
-            station: item.station,
-            stream: item.stream,
-            epoch: item.epoch,
-            seq: item.seq,
-            text,
-          });
-        }
-      } else if (unnamed.get(item.itemId)?.has(digest)) {
-        unchecked = COPY_UNCHECKED.unnamed;
-      }
+      const { station, stream, epoch, seq } = item;
+      consider(
+        canticleIdentity(item),
+        { station, stream, epoch, seq },
+        item.text,
+      );
     }
-    return {
-      records,
-      unchecked: unreadable ? COPY_UNCHECKED.unreadable : unchecked,
-    };
+    // Held text released to this session: a hold outlives its record. A fault reading the
+    // store reaches copyCheck, which fails open.
+    for (const item of this.store.heldItems(ear)) {
+      if (item.text === null || item.text === "") {
+        continue;
+      }
+      const { station, stream, epoch, seq } = item;
+      consider(item.itemId, { station, stream, epoch, seq }, item.text);
+    }
+    return { records, unchecked: live ?? unchecked };
   }
 
   /**

@@ -269,6 +269,8 @@ export const COPY_MIN_SPACES = 4;
  */
 export const COPY_UNCHECKED = {
   unreadable: "not run (live set unreadable)",
+  unavailable:
+    "partial (no live set on this daemon: only held records were compared)",
   failed: "not run (the check failed)",
   unnamed:
     "partial (records shown before frond-ear knew this session's id were not compared)",

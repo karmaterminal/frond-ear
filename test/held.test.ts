@@ -1068,3 +1068,50 @@ test("copy guard (🌫 on #144): a live record under another key with the same s
     h.dispose();
   }
 });
+
+test("copy guard (🌫 on #144): every released (identity, digest) pair is compared on its own: same text under two names, or two texts under one name", async () => {
+  const { h, host } = setup(undefined);
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    host.sing(2, { text: RECORD, ttlMs: 60_000 });
+    h.timers.advance(1_000);
+    await h.call(shim, "hear", {});
+    assert.equal(
+      (await h.call(shim, "hold", { ref: REF, keep_for: 7_200 })).ok,
+      true,
+    );
+    h.clock.advance(120_000); // the held record is off air
+    // The same words from another station's record: both are named.
+    host.sing(5, {
+      text: RECORD,
+      station: "alpha",
+      stream: "ops.deploy",
+      epoch: 3,
+    });
+    // Other words under the held record's own name (a station that sang seq 2 again).
+    host.sing(2, { text: SECOND });
+    h.timers.advance(1_000);
+    const heard = (await h.call(shim, "hear", {})).text;
+    assert.match(heard, /alpha/u);
+    assert.match(
+      heard,
+      /elliott canary/u,
+      "the second text under 7/2 was shown",
+    );
+    const same = await h.call(shim, "leave_letter", {
+      reason: "r",
+      body: RECORD,
+    });
+    assert.equal(same.ok, false);
+    assert.match(same.text, /ops:ops\.fleet 7\/2/u, "the held record is named");
+    assert.match(same.text, /alpha:ops\.deploy 3\/5/u, "and the live one");
+    const held = await h.call(shim, "leave_letter", {
+      reason: "r",
+      body: `${SECOND} and nothing more`,
+    });
+    assert.equal(held.ok, false, "the live text under the held name");
+    assert.match(held.text, /ops:ops\.fleet 7\/2/u);
+  } finally {
+    h.dispose();
+  }
+});
