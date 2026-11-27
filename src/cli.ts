@@ -28,6 +28,7 @@ import { runExposure } from "./canticle/exposure-cli.ts";
 import { Manifest } from "./canticle/manifest.ts";
 import { runConnectorEcho } from "./connector/echo.ts";
 import { Daemon } from "./daemon.ts";
+import { databaseLockPath, lockDatabase } from "./db-lock.ts";
 import { LETTER_HINT, hookInput } from "./letters.ts";
 import { DiscordGateway } from "./gateway.ts";
 import { watchdogOutcome } from "./watchdog.ts";
@@ -123,7 +124,13 @@ async function runDaemon(argv: string[]): Promise<void> {
   // wake_on's read-only token (#111): only in the daemon, never logged or passed on.
   const githubToken = readGithubToken(env);
   const logger = new StructuredLogger(undefined, token ? [token] : []);
-  const store = new EventStore(runtime.databasePath);
+  // Before the first write (F1): opening the store migrates, prunes, and the daemon
+  // repairs and reconciles. A second daemon must refuse here, not at the socket.
+  const databaseLock = lockDatabase(runtime.databasePath);
+  // The real path the lock was taken for: the store, its sidecars and the lock agree on
+  // one name for the ledger.
+  const databasePath = databaseLock?.database ?? runtime.databasePath;
+  const store = new EventStore(databasePath);
   const pruned = store.prune(config.limits.retentionMs);
 
   let gateway: DiscordGateway | undefined;
@@ -180,6 +187,11 @@ async function runDaemon(argv: string[]): Promise<void> {
       runtime.databasePath,
       `${runtime.databasePath}-wal`,
       `${runtime.databasePath}-shm`,
+      databaseLockPath(runtime.databasePath),
+      ...(databasePath === runtime.databasePath
+        ? []
+        : [databasePath, `${databasePath}-wal`, `${databasePath}-shm`]),
+      ...(databaseLock ? [databaseLock.path] : []),
       ...(env.DISCORD_BOT_TOKEN_FILE ? [env.DISCORD_BOT_TOKEN_FILE] : []),
       ...(env.FROND_EAR_TOKEN_FILE ? [env.FROND_EAR_TOKEN_FILE] : []),
       ...(env.FROND_EAR_GITHUB_TOKEN_FILE
@@ -281,6 +293,7 @@ async function runDaemon(argv: string[]): Promise<void> {
     server.close();
     void daemon.shutdown().then(({ drained }) => {
       store.close();
+      databaseLock?.release();
       logger.log("info", "daemon.stopped", { code, drained });
       process.exitCode = code;
       setTimeout(() => process.exit(code), 500).unref();
