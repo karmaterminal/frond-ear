@@ -25,7 +25,7 @@ Discord ──ws──▶ frond-ear daemon ──unix socket──▶ frond-ear 
 ```
 
 - **Trust comes from the verified author ID, never from message text.** Each message is classed as `principal`, `peer_agent` or `ambient`. The class travels in channel attributes that message content cannot forge, and operator-authored channel instructions tell Claude how to weigh each one.
-- **Nothing is lost while a session is away.** A durable ledger tracks every event through `queued → offered → seen`, and anything still waiting is delivered when the session reattaches.
+- **What arrives while a session is away waits for it, within bounds.** A durable ledger tracks each event through `queued → offered → seen`. When a session reattaches, what is still queued is delivered, and what an earlier attach was offered but never acted on is counted in a digest for `inbox` to read. Past `limits.maxPendingPerEar` (500 by default) unseen events, an ear drops its oldest, room context first, and counts the drops in `status`. After a Gateway outage the read-back is capped, and a `catch_up` event says what it couldn't read back. [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) has what is promised and what isn't.
 - **No Anthropic credentials needed.** The shim rides on the Claude Code session's own login.
 - **No runtime dependencies.** Node ≥ 22.18 runs the TypeScript directly.
 
@@ -112,7 +112,9 @@ session wakes, and its answer appears in the channel.
 
 For a Copilot CLI session, steps 3 and 4 are the three steps under
 [GitHub Copilot CLI](#github-copilot-cli) instead. That path is covered by tests against a fake
-session, but no live Copilot CLI attach has been proved yet.
+session, and a live Copilot CLI attach was proved once, on 2026-11-08, with Copilot CLI 1.0.106
+and frond-ear at `3ccfdc6`: the canary acked, a mention came in and a reply went out
+([#92](https://github.com/karmaterminal/frond-ear/issues/92#issuecomment-6728770048)).
 
 **If a step fails,** start with `doctor` and the `fix:` lines it prints. The failures a new
 install usually meets:
@@ -166,5 +168,6 @@ auth mode, and the proof steps for the seat and figs. The Discord facade is a la
 
 - [`docs/spike/2026-09-claude-channel-gateway.md`](docs/spike/2026-09-claude-channel-gateway.md) explains the design: an assessment of prior work, Claude Code channels, the OpenClaw patterns it borrows, and the trust model and its limits.
 - [`docs/runbook.md`](docs/runbook.md) covers setup and operation.
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) maps the parts and how a message moves, and lists what is promised and what isn't, with the code that keeps each promise.
 - [`docs/connector.md`](docs/connector.md) covers the claude.ai connector's echo step (#53).
 - The roadmap is epic karmaterminal/frond-ear#2.
