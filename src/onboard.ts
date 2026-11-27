@@ -780,7 +780,7 @@ function instructionsChecks(config: Config, env: NodeJS.ProcessEnv): Check[] {
     const seatLength = seat ? seat.end - seat.start : 0;
     const lost =
       cap < trustEnd
-        ? `from inside frond-ear's trust rules: the session misses some of them, ${seat ? field : "the seat text"} and all the tool guidance`
+        ? `from inside frond-ear's trust rules: the session misses some of them${seat ? `, ${field}` : ""} and all the tool guidance`
         : seat && cap < seat.end
           ? `${seat.end - Math.max(cap, seat.start)} of the ${seatLength} in ${field} and all the tool guidance after it`
           : `tool guidance only; ${seat ? `${field} reaches the session whole` : `there is no ${field}`}`;

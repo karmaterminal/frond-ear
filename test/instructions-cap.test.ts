@@ -19,7 +19,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 
 import { parseConfig } from "../src/config.ts";
 import { doctorChecks } from "../src/onboard.ts";
-import { channelInstructions } from "../src/render.ts";
+import { channelInstructions, instructionsLayout } from "../src/render.ts";
 import { ChannelShim, TOOLS } from "../src/shim.ts";
 import { advisory, OPS, TUNE } from "./canticle-host.ts";
 import { BOT, CHANNEL } from "./helpers.ts";
@@ -373,6 +373,64 @@ test("doctor warns when the instructions are over the cap, and says whether the 
   assert.ok(lowered);
   assert.equal(lowered.ok, false);
   assert.match(lowered.detail, / of 1000 characters/u);
+  // It says the cut reaches the trust rules, and names no seat text the ear lacks.
+  assert.match(
+    lowered.detail,
+    /from inside frond-ear's trust rules: the session misses some of them and all the tool guidance$/u,
+  );
+  assert.doesNotMatch(lowered.detail, /seat text|ears\.scribe\.instructions/u);
+  assert.match(
+    lowered.hint ?? "",
+    /^raise CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH where the seat's claude runs$/u,
+  );
+
+  // Where the cut lands, by the numbers: inside the seat text, and past it.
+  const { seat } = instructionsLayout(parseConfig(raw), "scribe");
+  assert.ok(seat);
+  assert.match(
+    check.detail,
+    new RegExp(
+      `drops the last ${length - CUT}, ${seat.end - CUT} of the 6000 in ears\\.scribe\\.instructions and all the tool guidance after it$`,
+      "u",
+    ),
+  );
+  assert.match(
+    check.hint ?? "",
+    new RegExp(
+      `^shorten ears\\.scribe\\.instructions by ${length - CUT} characters \\(to ${6_000 - (length - CUT)} or fewer\\)`,
+      "u",
+    ),
+  );
+  // Past the seat text: the cut takes guidance only. Shortening a 300-unit seat text
+  // can make up a 100-unit cut, not one longer than the text itself.
+  const whole = worstCaseJson(seatText(300), 8, "scribe");
+  const layout = instructionsLayout(parseConfig(whole), "scribe");
+  assert.ok(layout.seat);
+  const near = await instructionsCheck(whole, "scribe", {
+    CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH: String(layout.text.length - 100),
+  });
+  assert.ok(near);
+  assert.equal(near.ok, false);
+  assert.match(
+    near.detail,
+    /drops the last 100, tool guidance only; ears\.scribe\.instructions reaches the session whole$/u,
+  );
+  assert.match(
+    near.hint ?? "",
+    /^shorten ears\.scribe\.instructions by 100 characters \(to 200 or fewer\)/u,
+  );
+  const past = await instructionsCheck(whole, "scribe", {
+    CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH: String(layout.seat.end + 10),
+  });
+  assert.ok(past);
+  assert.match(
+    past.detail,
+    /tool guidance only; ears\.scribe\.instructions reaches the session whole$/u,
+  );
+  assert.equal(
+    past.hint,
+    "raise CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH where the seat's claude runs, or shorten ears.scribe.instructions",
+  );
 
   // Not a positive integer: the default stands, as in Claude Code.
   const junk = await instructionsCheck(raw, "scribe", {
