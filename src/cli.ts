@@ -21,6 +21,7 @@ import {
 } from "./config.ts";
 import { watchConfigFile } from "./config-watch.ts";
 import {
+  canticleViews,
   createCanticleSource,
   type CanticleSource,
 } from "./canticle/source.ts";
@@ -192,12 +193,7 @@ async function runDaemon(argv: string[]): Promise<void> {
     gatewayStatus: () =>
       gateway?.status() ?? { state: runtime.dryRun ? "dry-run" : "disabled" },
     canticleStatus: () => canticle?.status() ?? { state: "disabled" },
-    ...(canticle
-      ? {
-          canticleHear: (ear: string) => canticle!.hearView(ear),
-          canticleGuide: (ear: string) => canticle!.guideView(ear),
-        }
-      : {}),
+    ...(canticle ? canticleViews(canticle) : {}),
   });
   // Signal handlers go in before the socket can be seen: a SIGTERM from a
   // supervisor that saw it would otherwise meet the default disposition and

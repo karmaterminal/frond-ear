@@ -1,5 +1,6 @@
 import type { DerivedRoute } from "../src/canticle/derived.ts";
 import type { GuideSourceView, HearView } from "../src/canticle/receptor.ts";
+import { canticleViews, type CanticleSource } from "../src/canticle/source.ts";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -173,6 +174,8 @@ export interface Harness {
   daemon: Daemon;
   logs: string[];
   directory: string;
+  /** The source `canticleSource` built, unstarted; `dispose` stops it. */
+  canticle: CanticleSource | undefined;
   attach(
     ear?: string,
     extra?: Partial<Extract<ClientMessage, { type: "hello" }>>,
@@ -200,6 +203,11 @@ export function harness(
     canticleHear?: (ear: string) => HearView;
     /** The metadata-only view `canticle_guide` reads (RFC-0002 §3.3). */
     canticleGuide?: (ear: string) => GuideSourceView;
+    /**
+     * A canticle source on the daemon's own store, read through `canticleViews` as cli.ts
+     * wires it (#138), in place of `canticleHear` and `canticleGuide`.
+     */
+    canticleSource?: (store: EventStore) => CanticleSource;
     gatewayStatus?: () => { state: string; closeCode?: number };
     env?: NodeJS.ProcessEnv;
     /** The TCP shared token, for a test that serves this daemon over listenTcp. */
@@ -224,6 +232,7 @@ export function harness(
   );
   const rest = new RecordingRest(options.history);
   const logs: string[] = [];
+  const canticle = options.canticleSource?.(store);
   const daemon = new Daemon({
     config,
     store,
@@ -235,6 +244,7 @@ export function harness(
     nonce: () => options.nonce ?? "nonce-1",
     ...(options.canticleHear ? { canticleHear: options.canticleHear } : {}),
     ...(options.canticleGuide ? { canticleGuide: options.canticleGuide } : {}),
+    ...(canticle ? canticleViews(canticle) : {}),
     ...(options.gatewayStatus ? { gatewayStatus: options.gatewayStatus } : {}),
     attachmentsDir: join(directory, "attachments"),
     ...(options.env ? { env: options.env } : {}),
@@ -256,6 +266,7 @@ export function harness(
     daemon,
     logs,
     directory,
+    canticle,
     attach(ear, extra = {}) {
       const connection = new MemoryConnection();
       const handlers = daemon.connect(connection, { requireToken: false });
@@ -282,6 +293,7 @@ export function harness(
       return result;
     },
     dispose() {
+      canticle?.stop(); // before the store it saves to closes, as cli.ts does
       daemon.shutdown();
       store.close();
       rmSync(directory, { recursive: true, force: true });

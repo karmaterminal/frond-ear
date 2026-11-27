@@ -25,7 +25,9 @@ import {
   type CanticleSource,
 } from "../src/canticle/source.ts";
 import { KIND_ITEM, SIGN_DOMAIN } from "../src/canticle/wire.ts";
+import type { Config } from "../src/config.ts";
 import { StructuredLogger } from "../src/logger.ts";
+import type { EventStore } from "../src/store.ts";
 import { canticleConfig, Host, OPS, setup, type R } from "./canticle-host.ts";
 import { harness, type Harness } from "./helpers.ts";
 
@@ -261,12 +263,20 @@ test("adapters: a guide call reads no body from the embedded listener; hear does
 });
 
 // ---- #138: through the production adapters, not the record holders under them (🌿 SF1 on
-// #133). Each source comes from `createCanticleSource`, the way cli.ts builds it, and the
-// daemon reads it the way cli.ts wires it; the counter sits on the records the real source
-// holds. Pointing any adapter on the guide's path back at `hearView` reads them.
+// #133). Each source comes from `createCanticleSource`, the way cli.ts builds it, on the
+// daemon's own store, and the daemon reads it through `canticleViews`, the way cli.ts wires
+// it; the counter sits on the records the real source holds. Pointing any adapter on the
+// guide's path back at `hearView` reads them.
 
-const logger = new StructuredLogger(() => {});
-const manifest = () => Manifest.fromJson(vectors.manifest);
+/** The source cli.ts builds for this config, on the daemon's store. */
+const source =
+  (config: Config) =>
+  (store: EventStore): CanticleSource =>
+    createCanticleSource(config.canticle!, {
+      manifest: () => Manifest.fromJson(vectors.manifest),
+      store,
+      logger: new StructuredLogger(() => {}),
+    });
 
 /**
  * A canticle host daemon's record v1 side on a real unix socket (RFC-0001 §14.18.3): it
@@ -348,23 +358,13 @@ test("adapters (#138): through the production host-daemon adapter (a RecordClien
     ],
   );
   const config = canticleConfig(undefined, { hostSocket });
-  let source: CanticleSource | undefined;
-  const h = harness(config, {
-    // cli.ts's canticle deps, as it writes them
-    canticleHear: (ear) => source!.hearView(ear),
-    canticleGuide: (ear) => source!.guideView(ear),
-  });
+  const h = harness(config, { canticleSource: source(config) });
   try {
-    source = createCanticleSource(config.canticle!, {
-      manifest,
-      store: h.store,
-      logger,
-    });
     const shim = h.attach("scribe");
     const onAir = () =>
-      (source!.status() as { liveSet?: { size: number } }).liveSet?.size;
+      (h.canticle!.status() as { liveSet?: { size: number } }).liveSet?.size;
     const held = await captured(heldRecordItem, async () => {
-      source!.start();
+      h.canticle!.start();
       await until(() => onAir() === 2, "both records on the live set");
     });
     assert.deepEqual(
@@ -391,7 +391,6 @@ test("adapters (#138): through the production host-daemon adapter (a RecordClien
     await h.call(shim, "hear", {});
     assert.ok(reads.includes("text"), "the control: hear reads the payload");
   } finally {
-    source?.stop();
     h.dispose();
     await daemon.close();
     rmSync(directory, { recursive: true, force: true });
@@ -416,23 +415,17 @@ test("adapters (#138): through the production embedded adapter (GuardedEmbedded 
     port,
     tune: { scribe: ["*:chatter"] },
   });
-  let source: CanticleSource | undefined;
-  const h = harness(config, {
-    // cli.ts's canticle deps, as it writes them
-    canticleHear: (ear) => source!.hearView(ear),
-    canticleGuide: (ear) => source!.guideView(ear),
-  });
+  const h = harness(config, { canticleSource: source(config) });
   const station = createSocket("udp4");
   try {
-    source = createCanticleSource(config.canticle!, {
-      manifest,
-      store: h.store,
-      logger,
-    });
     const shim = h.attach("scribe");
     const status = () =>
-      source!.status() as { source: string; state?: string; onAir?: number };
-    source.start(); // probes the host socket first: nothing answers, so it binds
+      h.canticle!.status() as {
+        source: string;
+        state?: string;
+        onAir?: number;
+      };
+    h.canticle!.start(); // probes the host socket first: nothing answers, so it binds
     await until(() => status().state === "listening", "the listener bound");
     assert.equal(status().source, "embedded");
     const issued = Date.now() - 1_000; // the real receptor's clock is the system's
@@ -457,7 +450,6 @@ test("adapters (#138): through the production embedded adapter (GuardedEmbedded 
     assert.ok(reads.includes("body"), "the control: hear decodes the body");
   } finally {
     station.close();
-    source?.stop();
     h.dispose();
   }
 });
