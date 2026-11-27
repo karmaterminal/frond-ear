@@ -810,7 +810,7 @@ function instructionsChecks(config: Config, env: NodeJS.ProcessEnv): Check[] {
           : seat && cut <= saving
             ? `remove ${field} (with the line that introduces it, ${units(saving)}), or ${raise}`
             : seat
-              ? `${raise}: even without ${field} the instructions are ${length - saving}`
+              ? `${raise}: even without ${field} the instructions are ${units(length - saving)}`
               : raise;
     }
     checks.push({

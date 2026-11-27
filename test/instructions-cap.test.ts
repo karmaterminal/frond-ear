@@ -246,6 +246,10 @@ test("no label length, list size or empty list the config accepts takes the inst
       measure(principals, 0, peers, 0);
     }
   }
+  // A list too long to name anyone says how many: each digit of that count is a unit.
+  for (const peers of [1_000, 100_000]) {
+    measure(1, 372, peers, 0);
+  }
   assert.ok(
     longest.length <= BUDGET,
     `${longest.length} units for ${longest.case}`,
@@ -557,7 +561,7 @@ test("doctor warns when the instructions are over the cap, and says whether the 
   const saving = layout.seat.end - layout.trustEnd;
   assert.equal(
     past.hint,
-    `raise CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH where the seat's claude runs: even without ears.scribe.instructions the instructions are ${layout.text.length - saving}`,
+    `raise CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH where the seat's claude runs: even without ears.scribe.instructions the instructions are ${layout.text.length - saving} UTF-16 units`,
   );
   for (const cut of [301, saving]) {
     const removable = await instructionsCheck(whole, "scribe", {
