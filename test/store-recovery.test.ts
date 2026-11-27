@@ -930,3 +930,124 @@ for (const [label, fake] of [
     }
   });
 }
+
+// 🌫's review of fbef9c2: a pending marker that parses to something other than a marker
+// object must never block the start of a healthy store. It is not believed, not
+// crashed on, and is reported (EventStore.ignoredMarkers, logged by the daemon).
+
+for (const [label, bytes, reason] of [
+  ["null", () => "null", /null/u],
+  ["an array", () => "[]", /an array/u],
+  ["a string", () => '"store-reset-marker"', /string/u],
+  ["a number", () => "0", /number/u],
+  [
+    "an object with wrong field types",
+    () =>
+      JSON.stringify({
+        frondEar: 1,
+        version: "1",
+        at: "2026-11-26",
+        atIso: 5,
+        store: null,
+        keptAt: ["x"],
+        moving: "ear.db.corrupt-x",
+        error: { message: "x" },
+      }),
+    /field frondEar/u,
+  ],
+  [
+    // Every other field right: only the moving check stands between it and `.at()`.
+    "an object whose moving is not a list",
+    (path: string) =>
+      JSON.stringify({
+        frondEar: "store-reset-marker",
+        version: 1,
+        at: AT,
+        atIso: new Date(AT).toISOString(),
+        store: path,
+        keptAt: `${path}.corrupt-${STAMP}`,
+        moving: {},
+        error: "file is not a database",
+      }),
+    /field moving/u,
+  ],
+] as const) {
+  test(`a healthy store with a pending marker that is ${label} opens unchanged: the marker is not believed, and is reported`, () => {
+    const directory = scratch();
+    const path = join(directory, "ear.db");
+    try {
+      healthyStore(path);
+      const healthy = new EventStore(path, new FakeClock(AT));
+      const custodyBefore = healthy.canticleCustodySince();
+      healthy.close();
+      const file = marker(path).pending;
+      const content = bytes(path);
+      writeFileSync(file, content);
+      const store = new EventStore(path, new FakeClock(AT));
+      try {
+        assert.deepEqual(store.storeResets(), [], "no reset row");
+        assert.equal(
+          store.canticleCustodySince(),
+          custodyBefore,
+          "the custody boundary unchanged",
+        );
+        assert.deepEqual(store.recovered, []);
+        assert.equal(store.letters("scribe").length, 1, "the ledger as it was");
+        assert.equal(store.ignoredMarkers.length, 1, "reported");
+        assert.equal(store.ignoredMarkers[0]?.marker, file);
+        assert.match(store.ignoredMarkers[0]?.reason ?? "", reason);
+      } finally {
+        store.close();
+      }
+      assert.deepEqual(quarantined(directory), [], "nothing moved");
+      assert.equal(
+        readFileSync(file, "utf8"),
+        content,
+        "the marker left as it was",
+      );
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+}
+
+test("a malformed marker beside a valid one: the valid reset is still recovered, the malformed one only reported", () => {
+  const directory = scratch();
+  const path = join(directory, "ear.db");
+  try {
+    writeFileSync(path, "garbage ".repeat(600));
+    const reset = setStoreAside(path, new Error("file is not a database"), AT);
+    const junk = marker(path, "20261126T000000.000Z").pending;
+    writeFileSync(junk, "null");
+    const store = new EventStore(path, new FakeClock(AT + 5_000));
+    try {
+      assert.deepEqual(
+        store.storeResets().map((row) => row.keptAt),
+        [reset.keptAt],
+      );
+      assert.equal(store.recovered.length, 1);
+      assert.deepEqual(
+        store.ignoredMarkers.map((item) => item.marker),
+        [junk],
+      );
+      assert.equal(
+        store.canticleCustodySince(),
+        AT,
+        "the valid reset's boundary",
+      );
+    } finally {
+      store.close();
+    }
+    // Recovered exactly once: a later start records nothing new.
+    const again = new EventStore(path, new FakeClock(AT + 10_000));
+    try {
+      assert.equal(again.storeResets().length, 1);
+      assert.deepEqual(again.recovered, []);
+      assert.equal(again.canticleCustodySince(), AT);
+    } finally {
+      again.close();
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});

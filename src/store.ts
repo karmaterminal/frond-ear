@@ -13,7 +13,9 @@ import {
   pendingIdOf,
 } from "./canticle/exposure.ts";
 import {
+  type IgnoredMarker,
   markRecorded,
+  type PendingReset,
   pendingResets,
   probeStore,
   setStoreAside,
@@ -741,6 +743,8 @@ export class EventStore {
    * died), recorded by this open from their markers (Deep Dive No. 2 §08).
    */
   public readonly recovered: StoreReset[];
+  /** Pending reset markers this open did not believe, and why (never acted on). */
+  public readonly ignoredMarkers: IgnoredMarker[];
 
   public constructor(path: string, clock: Clock = systemClock) {
     if (path !== ":memory:") {
@@ -761,8 +765,10 @@ export class EventStore {
     this.database = new DatabaseSync(path);
     this.wakes = this.migrate();
     this.reset = reset;
-    this.recovered =
-      path === ":memory:" ? [] : this.recordResets(path, reset?.keptAt);
+    const markers =
+      path === ":memory:" ? { pending: [], ignored: [] } : pendingResets(path);
+    this.ignoredMarkers = markers.ignored;
+    this.recovered = this.recordResets(markers.pending, reset?.keptAt);
   }
 
   /**
@@ -772,12 +778,12 @@ export class EventStore {
    * recorded. Returns the earlier ones.
    */
   private recordResets(
-    path: string,
+    pending: PendingReset[],
     ownKeptAt: string | undefined,
   ): StoreReset[] {
     const recovered: StoreReset[] = [];
     const known = new Set(this.storeResets().map((reset) => reset.keptAt));
-    for (const { marker, reset } of pendingResets(path)) {
+    for (const { marker, reset } of pending) {
       if (!known.has(reset.keptAt)) {
         const own = reset.keptAt === ownKeptAt;
         const row: StoreReset = own

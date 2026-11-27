@@ -82,7 +82,11 @@ database"), or a quick_check finding. Then it starts a fresh store and keeps goi
   quarantined database itself is there. A set-aside cut off after the sidecars moved but before
   the database did is not a reset: the database was still in place, so that start found it again
   and set it aside itself (the sidecars moved first stay under the earlier stamp; copy both stamps'
-  files when you read the old store). Once the live store holds the record, the marker is renamed
+  files when you read the old store). A marker that is not believed (unreadable, not a marker object,
+  a field of the wrong type, or naming no moved database) never stops a healthy store's start and
+  never makes a reset or moves custody: the journal lists each with why
+  (`"event":"store.reset_markers_ignored"`, with a count), and it is left where it is for you to
+  look at or remove. Once the live store holds the record, the marker is renamed
   `….reset-<stamp>.recorded.json` and never read again; like the quarantine, it is never deleted.
 - `frond-ear.db.lock` (one daemon per database, #130) is not the store's and stays where it is.
 - The journal says it once (`"event":"store.set_aside"`, with `keptAt` and what SQLite found).

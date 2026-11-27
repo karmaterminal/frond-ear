@@ -57,6 +57,12 @@ export interface PendingReset {
   reset: StoreReset;
 }
 
+/** A pending marker that is not believed, and why: reported, never acted on. */
+export interface IgnoredMarker {
+  marker: string;
+  reason: string;
+}
+
 /**
  * SQLite's primary result codes that mean the file itself is damaged (SQLITE_CORRUPT, 11)
  * or is not a database at all (SQLITE_NOTADB, 26). Nothing else sets a store aside: BUSY
@@ -279,7 +285,7 @@ function writeMarker(path: string, marker: string, content: ResetMarker): void {
     closeSync(fd);
   }
   const back = readFileSync(marker);
-  if (!back.equals(bytes) || readMarker(path, marker) === undefined) {
+  if (!back.equals(bytes) || "reason" in readMarker(path, marker)) {
     throw new Error(
       `the reset marker reads back ${back.length} bytes, not the ${bytes.length} written`,
     );
@@ -313,10 +319,14 @@ function writeMarker(path: string, marker: string, content: ResetMarker): void {
  * cut off after its sidecars moved but before the database did, whose store was then
  * found again where it was and set aside by that start.
  */
-export function pendingResets(path: string): PendingReset[] {
+export function pendingResets(path: string): {
+  pending: PendingReset[];
+  ignored: IgnoredMarker[];
+} {
   const directory = dirname(path);
   const prefix = `${basename(path)}.reset-`;
   const pending: PendingReset[] = [];
+  const ignored: IgnoredMarker[] = [];
   for (const name of readdirSync(directory)) {
     if (
       !name.startsWith(prefix) ||
@@ -326,12 +336,18 @@ export function pendingResets(path: string): PendingReset[] {
       continue;
     }
     const marker = join(directory, name);
-    const content = readMarker(path, marker);
-    if (content === undefined) {
+    const read = readMarker(path, marker);
+    if ("reason" in read) {
+      ignored.push({ marker, reason: read.reason });
       continue;
     }
+    const content = read.marker;
     const { keptAt } = content;
     if (statSync(keptAt, { throwIfNoEntry: false })?.isFile() !== true) {
+      ignored.push({
+        marker,
+        reason: `its quarantined database ${keptAt} is not there (a set-aside cut off before the database moved)`,
+      });
       continue;
     }
     pending.push({
@@ -344,48 +360,89 @@ export function pendingResets(path: string): PendingReset[] {
       },
     });
   }
-  return pending.sort((a, b) => a.reset.at - b.reset.at);
+  return { pending: pending.sort((a, b) => a.reset.at - b.reset.at), ignored };
 }
 
-/** The marker at `marker` for the store at `path`, if it is whole and agrees with itself. */
-function readMarker(path: string, marker: string): ResetMarker | undefined {
-  let content: Partial<Record<keyof ResetMarker, unknown>>;
+/**
+ * The marker at `marker` for the store at `path`, if it is whole, is a marker object
+ * with every field of the right type, and agrees with itself; otherwise why not. Never
+ * throws on what the file holds (🌫's review of fbef9c2: `null` read a property of null
+ * and stopped a healthy store's start).
+ */
+function readMarker(
+  path: string,
+  marker: string,
+): { marker: ResetMarker } | { reason: string } {
+  let parsed: unknown;
   try {
-    content = JSON.parse(readFileSync(marker, "utf8")) as typeof content;
-  } catch {
-    return undefined;
+    parsed = JSON.parse(readFileSync(marker, "utf8")) as unknown;
+  } catch (error) {
+    return { reason: `not readable as JSON (${errorText(error)})` };
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return {
+      reason: `not a marker object (${parsed === null ? "null" : Array.isArray(parsed) ? "an array" : typeof parsed})`,
+    };
+  }
+  const content = parsed as Record<string, unknown>;
+  const types: Array<[keyof ResetMarker, string]> = [
+    ["frondEar", "string"],
+    ["version", "number"],
+    ["at", "number"],
+    ["atIso", "string"],
+    ["store", "string"],
+    ["keptAt", "string"],
+    ["error", "string"],
+  ];
+  for (const [field, type] of types) {
+    if (typeof content[field] !== type) {
+      return { reason: `field ${field} is not a ${type}` };
+    }
+  }
+  const moving = content.moving;
+  if (
+    !Array.isArray(moving) ||
+    !moving.every((file): file is string => typeof file === "string")
+  ) {
+    return { reason: "field moving is not a list of paths" };
   }
   const name = basename(marker);
   const prefix = `${basename(path)}.reset-`;
   if (!name.startsWith(prefix) || !name.endsWith(MARKER_SUFFIX)) {
-    return undefined;
+    return { reason: "not named as a marker for this store" };
   }
   const keptAt = `${path}.corrupt-${name.slice(prefix.length, -MARKER_SUFFIX.length)}`;
-  const moving = content.moving;
   const allowed = [...SIDECARS, ""].map((suffix) => `${keptAt}${suffix}`);
   if (
     content.frondEar !== "store-reset-marker" ||
     content.version !== 1 ||
-    typeof content.at !== "number" ||
-    !Number.isFinite(content.at) ||
-    typeof content.error !== "string" ||
-    content.store !== path ||
-    content.keptAt !== keptAt ||
-    !Array.isArray(moving) ||
+    !Number.isFinite(content.at)
+  ) {
+    return { reason: "not a version 1 store-reset marker" };
+  }
+  if (content.store !== path) {
+    return { reason: "names another store" };
+  }
+  if (content.keptAt !== keptAt) {
+    return { reason: "its keptAt is not the quarantine its name says" };
+  }
+  if (
     moving.length === 0 ||
     moving.at(-1) !== keptAt ||
     !moving.every(
       (file, index) =>
-        typeof file === "string" &&
         allowed.includes(file) &&
         // In the order they move: each later in the list than the one before.
         (index === 0 ||
-          allowed.indexOf(file) > allowed.indexOf(moving[index - 1])),
+          allowed.indexOf(file) > allowed.indexOf(moving[index - 1]!)),
     )
   ) {
-    return undefined;
+    return {
+      reason:
+        "its moving list is not its quarantine's files in move order, database last",
+    };
   }
-  return content as ResetMarker;
+  return { marker: content as unknown as ResetMarker };
 }
 
 /**

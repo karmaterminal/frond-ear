@@ -134,6 +134,14 @@ async function runDaemon(argv: string[]): Promise<void> {
       found: store.reset.error,
     });
   }
+  if (store.ignoredMarkers.length > 0) {
+    // Pending reset markers not believed (malformed, or naming no moved database):
+    // reported, never acted on, and they never stop a healthy store's start.
+    logger.log("warn", "store.reset_markers_ignored", {
+      count: store.ignoredMarkers.length,
+      markers: store.ignoredMarkers,
+    });
+  }
   for (const reset of store.recovered) {
     // A reset an earlier start set aside but never recorded, read back from its marker.
     logger.log("warn", "store.reset_recovered", {
