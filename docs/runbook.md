@@ -267,9 +267,13 @@ after it. Use it for threads in flight, what it chose and why, and what to check
   written weeks apart, share two 40-character runs with three spaces (a stock phrase around an
   issue ref) and none with four; five would miss nearly twice as many copied sentences. Three
   identical words beside a shared SHA (`to silas at <sha>`) still match. The
-  refusal names a matching record for each copied run as `station:stream epoch/seq` (two
-  records with the same text: only the first is named), and offers the `heard` reference
-  instead. It never echoes the matched text.
+  refusal names, for each field, every released record it copies, as
+  `station:stream epoch/seq` (two records with the same text: both are named), and offers
+  their `heard` references instead. Each suggested reference is one `leave_letter` takes
+  back as it is. A record's names come from its station's frame, which the reference grammar
+  doesn't bind, so a record named outside it (`Ops_Fleet`, a 40-character station, an epoch
+  past u32) is named but not suggested, and the refusal says `heard can't carry` it. It never
+  echoes the matched text.
 - **The comparison's memory is bounded by the letter, not by what was released.** It indexes
   the letter's own windows (its fields are capped, so about 10,000 at most) and reads each
   released record once with a rolling hash. Time is linear in the released text: about 0.6 s
@@ -286,7 +290,8 @@ after it. Use it for threads in flight, what it chose and why, and what to check
   - `not run (live set unreadable)`: the live set couldn't be read (logged as
     `letters.copy_guard_unavailable`);
   - `not run (the check failed)`: the guard itself threw (logged as `letters.copy_guard_failed`,
-    with the error's name only);
+    with the error's constructor name only, in `fault`, e.g. `"fault":"RangeError"`; never its
+    message. The logger redacts every field whose key holds `error`);
   - `partial (records shown before frond-ear knew this session's id were not compared)`: a
     record still live was shown to this shim while it had no session id. Custody can't tie it
     to the session now holding the ear, so it isn't compared. (A session with no id at all
