@@ -15,7 +15,7 @@ import type { StructuredLogger } from "../logger.ts";
 import type { Clock, Timers } from "../types.ts";
 import type { HeardProvenance, SourceTuple } from "./exposure.ts";
 import { systemClock, systemTimers } from "../types.ts";
-import { CLASSES, SCOPE_NAMES } from "./ids.ts";
+import { CLASSES, EXPIRED_SHOWN_MS, expiryIsNews, SCOPE_NAMES } from "./ids.ts";
 import { Listener, type ListenerEvent, type SafetyState } from "./listener.ts";
 import type { Manifest } from "./manifest.ts";
 import {
@@ -111,6 +111,28 @@ export interface LiveItem {
   provenance: () => HeardProvenance;
 }
 
+/**
+ * A record this ear's tuned streams had on view that its station withdrew (#67): plucked,
+ * or over record v1 revoked, quarantined or retracted for its expiry. What a session it
+ * was pushed to is told in a withdrawn note: never its payload, only where it was.
+ */
+export interface Withdrawal {
+  station: string;
+  key: string;
+  stream: string;
+  epoch: number;
+  seq: string;
+  class: string;
+  reason: string;
+  /** When this binding heard the withdrawal. */
+  at: number;
+  /** The record's local expiry: after it, no tombstone of it holds and nothing is owed. */
+  until: number;
+}
+
+/** Withdrawals a source keeps for delivery to read, newest kept; each until its `until`. */
+export const MAX_WITHDRAWALS = 4_096;
+
 export interface HearView {
   now: number;
   /** Whether this ear tunes any station:stream at all. */
@@ -154,6 +176,14 @@ export interface HearView {
    * manifest there, and the host admits as `verified` only a class the key is granted.
    */
   capability?: (key: string) => ReadonlySet<string> | undefined;
+  /**
+   * Records withdrawn from this ear's tuned streams while on view (#67): what delivery
+   * tells a session they were pushed to, until their local expiry. Plucked, revoked or
+   * quarantined, and for a class whose expiry is news, run out on view; from either source.
+   * Superseded, lapsed or lost records are not withdrawals. Not the guide's `withdrawn`
+   * marks below (#133), which exclude expiry; `hearView` only, never the guide's view.
+   */
+  withdrawals?: Withdrawal[];
   /**
    * Record v1: tuned records the host daemon withdrew from this ear's live set (a PLUCK, a
    * revocation or a quarantine: `retract` reasons other than supersession and expiry),
@@ -355,6 +385,8 @@ export class CanticleReceptor {
   #tickHandle: unknown;
   #retryHandle: unknown;
   #lastDatagramAt: number | undefined;
+  /** Identity → a pluck of a record that was on view (#67), until its local expiry. */
+  readonly #withdrawals = new Map<string, Withdrawal>();
   #journalRecords = 0;
   #journalBytes = 0;
   /** Set while a raised guard isn't durable; cleared by the next checkpoint that lands. */
@@ -567,10 +599,14 @@ export class CanticleReceptor {
   #apply(events: ListenerEvent[]): void {
     for (const e of events) {
       if (e.event === "item") this.#counts.items += 1;
-      else if (e.event === "withdrawn") this.#counts.withdrawn += 1;
-      else if (e.event === "superseded") this.#counts.superseded += 1;
-      else if (e.event === "expired") this.#counts.expired += 1;
-      else if (e.event === "evidence") {
+      else if (e.event === "withdrawn") {
+        this.#counts.withdrawn += 1;
+        this.#keepWithdrawn(e, "plucked");
+      } else if (e.event === "superseded") this.#counts.superseded += 1;
+      else if (e.event === "expired") {
+        this.#counts.expired += 1;
+        this.#keepWithdrawn(e, "expired");
+      } else if (e.event === "evidence") {
         this.#counts.evidence += 1;
         this.#options.logger.log("debug", "canticle.evidence", {
           station: e.station,
@@ -578,6 +614,52 @@ export class CanticleReceptor {
         });
       }
     }
+  }
+
+  /**
+   * A record that was current, plucked or run out (the listener's own expiry: the
+   * positive evidence it ran out on view), kept for delivery's withdrawn notes (#67).
+   * An expiry only for a class whose expiry is news, shown for `EXPIRED_SHOWN_MS`.
+   */
+  #keepWithdrawn(e: ListenerEvent, reason: "plucked" | "expired"): void {
+    const { epoch, cls, localExpiry } = e.data as {
+      epoch?: number;
+      cls?: string;
+      localExpiry?: number;
+    };
+    if (
+      e.stream === undefined ||
+      e.seq === undefined ||
+      epoch === undefined ||
+      cls === undefined ||
+      localExpiry === undefined ||
+      (reason === "expired" && !expiryIsNews(cls))
+    ) {
+      return;
+    }
+    const now = this.#clock.now();
+    for (const [id, w] of this.#withdrawals) {
+      if (w.until <= now) this.#withdrawals.delete(id);
+    }
+    if (this.#withdrawals.size >= MAX_WITHDRAWALS) {
+      this.#withdrawals.delete(this.#withdrawals.keys().next().value!);
+    }
+    const station =
+      this.#options.manifest.entry(Buffer.from(e.keyId, "hex"))?.name ??
+      e.keyId;
+    const seq = e.seq.toString();
+    this.#withdrawals.set(`${e.keyId}:${epoch}:${e.stream}:${seq}`, {
+      station,
+      key: e.keyId,
+      stream: e.stream,
+      epoch,
+      seq,
+      class: cls,
+      reason,
+      at: reason === "expired" ? localExpiry : now,
+      until:
+        reason === "expired" ? localExpiry + EXPIRED_SHOWN_MS : localExpiry,
+    });
   }
 
   /** Checkpoint: the full snapshot replaces the old one and empties the journal. */
@@ -706,9 +788,12 @@ export class CanticleReceptor {
    * station going quiet together (station silence ≠ transport blindness).
    */
   hearView(ear: string): HearView {
+    const tune = this.#options.config.tune;
+    const patterns = Object.hasOwn(tune, ear) ? (tune[ear] ?? []) : [];
     return {
       ...this.#viewOf(ear),
       items: this.live(ear),
+      ...this.#withdrawalsFor(patterns, this.#clock.now()),
       capability: (key) => {
         if (!CANTICLE_KEY_HEX.test(key)) return undefined;
         const entry = this.#options.manifest.entry(Buffer.from(key, "hex"));
@@ -756,6 +841,17 @@ export class CanticleReceptor {
       lastDatagramAt: this.#lastDatagramAt,
       stations,
     };
+  }
+
+  /** This ear's share of what was withdrawn, while it holds (#67). */
+  #withdrawalsFor(
+    patterns: readonly string[],
+    now: number,
+  ): { withdrawals?: Withdrawal[] } {
+    const withdrawals = [...this.#withdrawals.values()].filter(
+      (w) => w.until > now && tuned(patterns, w.station, w.stream),
+    );
+    return withdrawals.length > 0 ? { withdrawals } : {};
   }
 
   status(): object {

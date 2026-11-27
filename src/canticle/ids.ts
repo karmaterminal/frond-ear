@@ -104,6 +104,20 @@ export const CLASS_BY_NAME: ReadonlyMap<string, ClassSpec> = new Map(
   [...CLASSES.values()].map((c) => [c.name, c]),
 );
 
+/**
+ * Whether a pushed record of this class running out is news to the session it woke
+ * (frond-ear#67): a class that may wake (v1: alarm, §14.10). Chatter running out is what
+ * chatter does, and a note each would be noise.
+ */
+export const expiryIsNews = (cls: string): boolean =>
+  CLASS_BY_NAME.get(cls)?.wakeEligible === true;
+
+/**
+ * How long a source shows a record's expiry as a withdrawal after it (frond-ear#67):
+ * delivery's tombstone holds the record this long past its local expiry (§14.18.5).
+ */
+export const EXPIRED_SHOWN_MS = 5_000;
+
 export const SCOPES: ReadonlyMap<string, number> = new Map([
   ["host", 0],
   ["lan", 1],

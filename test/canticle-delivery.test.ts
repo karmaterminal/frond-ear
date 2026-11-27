@@ -1321,6 +1321,7 @@ test("config: delivery entries, wakeKeys and muted parse with their defaults and
       maxItems: 5,
       bufferPerStream: 32,
       maxPushesPerHour: 60,
+      maxWithdrawnPerHour: 30,
     },
   });
   // The push budget follows a window shorter than a minute, as far as its cap allows, so

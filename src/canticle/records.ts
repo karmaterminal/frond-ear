@@ -48,11 +48,14 @@
 import { createHash } from "node:crypto";
 
 import type { HeardProvenance, SourceTuple } from "./exposure.ts";
-import type {
-  GuideItem,
-  GuideSourceView,
-  HearView,
-  LiveItem,
+import { EXPIRED_SHOWN_MS, expiryIsNews } from "./ids.ts";
+import {
+  type GuideItem,
+  type GuideSourceView,
+  type HearView,
+  type LiveItem,
+  MAX_WITHDRAWALS,
+  type Withdrawal,
 } from "./receptor.ts";
 import { MAX_CLAMP_TTL_S } from "./wire.ts";
 
@@ -98,6 +101,12 @@ const ADMISSIONS = new Set([
   "equivocation",
 ]);
 const BREAKER = new Set(["closed", "open", "half_open"]);
+/**
+ * The `retract` reasons that withdraw a pushed record for delivery's notes (#67): the
+ * guide's, and the host's `expired` (kept only for a class whose expiry is news). A
+ * supersession's successor speaks for it, and a held item was never surfaced.
+ */
+const NOTED_REASONS = new Set(["plucked", "revoked", "quarantined", "expired"]);
 /**
  * `retract` reasons that withdraw a record (RFC-0002 §2.2): the guide keeps a mark of each
  * while the record would still be on air. A supersession is a newer value, and an expiry
@@ -193,13 +202,18 @@ class LiveSet {
     this.#soonest = Infinity;
   }
 
-  /** Drops every record past its local expiry; a full set under a flood calls it often. */
-  expire(nowMs: number): void {
+  /**
+   * Drops every record past its local expiry, each told to `ranOut`; a full set under a
+   * flood calls it often.
+   */
+  expire(nowMs: number, ranOut: (record: LiveRecord) => void): void {
     if (nowMs < this.#soonest) return;
     let soonest = Infinity;
     for (const [idem, { record }] of this.#all) {
-      if (record.localExpiryAt <= nowMs) this.delete(idem);
-      else soonest = Math.min(soonest, record.localExpiryAt);
+      if (record.localExpiryAt <= nowMs) {
+        this.delete(idem);
+        ranOut(record);
+      } else soonest = Math.min(soonest, record.localExpiryAt);
     }
     this.#soonest = soonest;
   }
@@ -564,6 +578,11 @@ export class RecordConsumer {
   readonly presence = new Map<string, string>();
   readonly #live = new LiveSet();
   /**
+   * Idem → a withdrawal for delivery's notes (#67): a `retract`, or a record that ran out
+   * on view, until `until`. Not the guide's marks (`#withdrawn`, #133).
+   */
+  readonly #withdrawals = new Map<string, Withdrawal>();
+  /**
    * What the host daemon withdrew from the live set, by idem, each until the record would
    * have left anyway; at most `MAX_LIVE`, the oldest going first. Facts, not live state:
    * a lost connection or a new run leaves them be.
@@ -728,6 +747,7 @@ export class RecordConsumer {
         if (str(rec.reason) && WITHDRAWN_REASONS.has(rec.reason)) {
           this.#markWithdrawn(rec.idem, rec.reason, nowMs);
         }
+        this.#retracted(rec.idem, rec.reason, nowMs);
         this.#live.delete(rec.idem);
         return;
       case "presence":
@@ -1469,6 +1489,75 @@ export class RecordConsumer {
   }
 
   /**
+   * A `retract` of a record in the live set, for a reason that withdraws it (#67): kept
+   * for delivery's withdrawn notes until the record's local expiry (one already past it
+   * is never shown). The host's `expired` counts only for a class whose expiry is news.
+   */
+  #retracted(idem: string, reason: Json | undefined, nowMs: number): void {
+    const r = this.#live.get(idem);
+    if (
+      r === undefined ||
+      typeof reason !== "string" ||
+      !NOTED_REASONS.has(reason) ||
+      (reason === "expired" && !expiryIsNews(r.item.class))
+    ) {
+      return;
+    }
+    this.#keepWithdrawn(r, reason, nowMs, r.localExpiryAt, nowMs);
+  }
+
+  /**
+   * A record still in the live set reached its local expiry (#67): the positive evidence
+   * that it ran out on view, kept as an `expired` withdrawal for `EXPIRED_SHOWN_MS`, for a
+   * class whose expiry is news. One a `retract` or a dropped link took out of the set
+   * first never gets here, and neither does one that runs out while the link is down or
+   * carried from an earlier connection that no snapshot confirmed: its `retract` may
+   * have been missed.
+   */
+  #ranOut(r: LiveRecord, nowMs: number): void {
+    if (r.carried === true || !expiryIsNews(r.item.class)) return;
+    // Heard to its end only over a connection that is open, of a run that hasn't failed:
+    // with the link down, a `retract` may be on its way unread.
+    if (!this.#receiving || this.health === "failed") return;
+    this.#keepWithdrawn(
+      r,
+      "expired",
+      r.localExpiryAt,
+      r.localExpiryAt + EXPIRED_SHOWN_MS,
+      nowMs,
+    );
+  }
+
+  /** One withdrawal for delivery to read until `until`, the newest `MAX_WITHDRAWALS` kept. */
+  #keepWithdrawn(
+    r: LiveRecord,
+    reason: string,
+    at: number,
+    until: number,
+    nowMs: number,
+  ): void {
+    for (const [id, w] of this.#withdrawals) {
+      if (w.until <= nowMs) this.#withdrawals.delete(id);
+    }
+    this.#withdrawals.delete(r.idem);
+    if (this.#withdrawals.size >= MAX_WITHDRAWALS) {
+      this.#withdrawals.delete(this.#withdrawals.keys().next().value!);
+    }
+    const { station, key, stream, epoch, seq, class: cls } = r.item;
+    this.#withdrawals.set(r.idem, {
+      station,
+      key,
+      stream,
+      epoch,
+      seq,
+      class: cls,
+      reason,
+      at,
+      until,
+    });
+  }
+
+  /**
    * Drop everything the previous run vouched for. A new run can't retract what the
    * last one heard, so its items, presence and datagram clock end with it; anything
    * still live comes back only through the new run's own frames (`dedup: resurfaced`),
@@ -1484,7 +1573,7 @@ export class RecordConsumer {
   }
 
   #prune(nowMs: number): void {
-    this.#live.expire(nowMs);
+    this.#live.expire(nowMs, (r) => this.#ranOut(r, nowMs));
   }
 
   #degrade(reason: string): void {
@@ -1572,11 +1661,16 @@ export class RecordConsumer {
     nowMs: number,
     listening: boolean,
   ): HearView {
-    return this.#view(patterns, nowMs, listening, (r) => ({
+    const view = this.#view(patterns, nowMs, listening, (r) => ({
       ...r.item,
       expiresInMs: r.localExpiryAt - nowMs,
       ageMs: Math.max(r.item.ageMs, nowMs - r.item.issuedAt),
     }));
+    // Delivery's withdrawals (#67), after `#view` has kept what ran out this read.
+    const withdrawals = [...this.#withdrawals.values()].filter(
+      (w) => w.until > nowMs && tunes(patterns, w.station, w.stream),
+    );
+    return withdrawals.length > 0 ? { ...view, withdrawals } : view;
   }
 
   /**
@@ -1653,6 +1747,7 @@ export class RecordConsumer {
     for (const [idem, r] of this.#live.entries()) {
       if (r.localExpiryAt <= nowMs) {
         this.#live.delete(idem);
+        this.#ranOut(r, nowMs);
         continue;
       }
       if (r.carried || !deliverable || !tuned(r.item.station, r.item.stream))
