@@ -86,6 +86,15 @@ import {
 import { chunkMessage, definitive, RestError } from "./rest.ts";
 import { guideView } from "./canticle/guide.ts";
 import { hearResult, iso, type HeardItem } from "./canticle/hear.ts";
+import {
+  HOLD_REFUSED,
+  heldCount,
+  heldReleaseNote,
+  heldTool,
+  holdRecord,
+  parseHold,
+  releasedLive,
+} from "./canticle/held.ts";
 import { CLASS_BY_NAME } from "./canticle/ids.ts";
 import {
   COPY_UNCHECKED,
@@ -2594,8 +2603,11 @@ export class Daemon {
       held: release.held,
       expired: release.expired,
     });
+    // Counts only, never text: a held record comes back by the session's own held read.
+    const held = heldReleaseNote(heldCount(this.store, ear, this.clock.now()));
+    const also = held === "" ? "" : `; ${held}`;
     if (release.notifications.length === 0) {
-      return `no letters for ear ${ear}`;
+      return `no letters for ear ${ear}${also}`;
     }
     const parts = [`${release.delivered} delivered`];
     if (release.held > 0) {
@@ -2605,7 +2617,7 @@ export class Daemon {
       parts.push(`${release.expired} expired`);
     }
     const events = release.notifications.length;
-    return `letters for ear ${ear}: ${parts.join(", ")}; sent as ${events} channel event${events === 1 ? "" : "s"}`;
+    return `letters for ear ${ear}: ${parts.join(", ")}; sent as ${events} channel event${events === 1 ? "" : "s"}${also}`;
   }
 
   // ---- schedules and wakes (#111) ---------------------------------------------------
@@ -4029,6 +4041,25 @@ export class Daemon {
         }
         return listLetters(this.store, ear, now, client.sessionId ?? null);
       }
+      case "hold": {
+        const ear = this.requireHolder(client, "hold a canticle record");
+        if (!client.sessionId) {
+          throw new Error(
+            "frond-ear does not know this session's id (its shim had no CLAUDE_CODE_SESSION_ID), so it cannot tell what was shown to this session; nothing was held",
+          );
+        }
+        return this.holdCanticle(ear, client.sessionId, args);
+      }
+      case "held": {
+        const ear = this.requireHolder(client, "read its held records");
+        return heldTool(
+          this.store,
+          ear,
+          client.sessionId ?? null,
+          this.clock.now(),
+          args,
+        );
+      }
       case "schedule":
         return this.scheduleTool(client, args);
       case "schedules":
@@ -4275,6 +4306,54 @@ export class Daemon {
       }
     }
     return { records, unchecked };
+  }
+
+  /**
+   * The hold tool (the held state): keeps the live record `ref` names only if custody says it
+   * was released whole to `sessionId`, by the copy guard's own predicate (`canticleReleasedTo`:
+   * a push the host confirmed to that session, or its own `hear`, shown whole), with the live
+   * item's identity and digest matching. Every other case, an unknown record included, gets
+   * `HOLD_REFUSED` and nothing else, so a hold is no oracle for text the session never
+   * received. Caps are checked only after that, so they tell nothing either.
+   */
+  private holdCanticle(
+    ear: string,
+    sessionId: string,
+    args: Record<string, unknown>,
+  ): string {
+    const request = parseHold(args);
+    const view = this.options.canticleHear;
+    if (!view) {
+      throw new Error(
+        "canticle is not enabled on this daemon (config canticle.enabled); nothing was held",
+      );
+    }
+    let items: HearView["items"];
+    try {
+      items = view(ear).items;
+    } catch {
+      throw new Error(
+        "not held: canticle's live set can't be read right now (see ear_status); nothing was stored",
+      );
+    }
+    const item = releasedLive(
+      request.ref,
+      items,
+      this.store.canticleReleasedTo(ear, sessionId),
+    );
+    if (item === undefined) {
+      throw new Error(HOLD_REFUSED);
+    }
+    const text = holdRecord(
+      this.store,
+      ear,
+      sessionId,
+      this.clock.now(),
+      request,
+      item,
+    );
+    this.logger.log("info", "canticle.held", { ear });
+    return text;
   }
 
   /** `hear` showed these payloads to the ear's own session: custody, echoed at the return. */

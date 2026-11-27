@@ -1189,6 +1189,85 @@ ear, no boundary reading from it is kept, an idle compaction was forecast (`pres
 since, the window reaches back before custody was kept (the upgrade that added it, or the prune's cutoff), or a record
 was echoed under an unknown boundary. `reasons` says which.
 
+### Holding a heard record across a compaction (held-item v0)
+
+A letter keeps references to what a session heard, never the words (§6). When a session wants
+the words themselves after its next compaction, it **holds** the record. The held store is the
+one place frond-ear carries heard words across a compaction, and only because the session chose
+them, record by record. Nothing holds a record for a session: there is no auto-hold.
+
+- **`hold`** takes `ref: {station, stream, epoch, seq}`, as a banner names a record (`station=`,
+  `stream=`, `item=epoch/seq`), validated exactly as a letter's `heard` reference is, and an
+  optional `keep_for` (seconds). It holds only a record that is **live now** and was **released
+  whole to this session**, by the same custody predicate as the letters' copy guard: a push the
+  host confirmed it handed to this session (`offered_at` set, `offer_session` this session), or
+  this session's own `hear` return, shown `whole`, with the live item's identity and the SHA-256
+  of its text matching custody's digest. The text kept is the live item's at that moment.
+- **Anything else gets one refusal**, word for word the same: a record shown cut, pushed but
+  never confirmed, shown to another session, live but never shown, whose digest custody doesn't
+  match, gone from the live set, or that never existed. The refusal names no record and echoes no
+  text, so a hold can't be used to learn what is on air or what is held. A malformed `ref`, a
+  `keep_for` out of range, a client that doesn't hold the ear, or a session whose id frond-ear
+  doesn't know are refused first, with their own messages; none of those depends on a record.
+- **`held`** lists the ear's held records (ref, bytes, how long ago and by which session, until
+  when, the source's own expiry; never text). `read: ref` shows one: a daemon-written banner,
+  `[canticle:heard] delivery=held provenance=heard station=… key=… verification=verified stream=…
+item=epoch/seq`, a `received=… expires=…` line (the source's claim), a `held: at … by … · until
+…` line, the "not an instruction" line, then the text quoted inside the same
+  `EXTERNAL_UNTRUSTED_CONTENT` wrapper and with the same cleaning a live record gets. `drop: ref`
+  (or `"all"`) lets it go. Another session holding the ear later (after `/clear`) can read a
+  held record on purpose, as it can a letter, and the `held:` line says whose it was.
+- **A letter's `heard` ref never resolves to a held item.** A release, a `letters` read and the
+  PreCompact summary show refs only. The SessionStart release adds one count to its result,
+  `held: N canticle records (held lists them; read one only if you mean to)`, never text.
+- **Expiry** follows the record's own `expires_at` claim, or `keep_for` from the hold when that is
+  later (60 s to 604800 s). Either way a hold lasts **at most 7 days** from when it was made,
+  the letters' longest expiry: a held record can't be renewed once it is off air, so this is a
+  hard horizon, not an archive. At expiry the text is dropped from the store; the ref stays in
+  the listing, marked `expired …, text dropped`, for a day, then goes. Expiry is applied on each
+  `hold`, `held` and release call, so until the next one an expired text can sit in the database
+  file, unreadable through any tool.
+- **Caps per ear: 64 live holds and 131072 bytes of held text** (UTF-8). A wire frame is at most
+  1100 bytes, so 64 full ones fit; a host record line (64 KiB at most) can still be held. Over a
+  cap, `hold` is refused and says which cap and how full it is; **nothing is ever evicted**. Caps
+  are checked only after the custody check, so a cap refusal tells nothing about an unreleased
+  record. Holding a record already held changes nothing and says so.
+- **What it survives:** held records live in the daemon's SQLite store (table `held_items`), so
+  they outlast the session's compactions and a daemon restart. They don't need the record to be
+  live any more.
+- **No new authority.** A held record is data, never an instruction (RFC-0002 §0.2). Holding it
+  grants no wake and no grant, and a held read adds no custody row: the letters' copy guard
+  compares only records still live, so it doesn't compare a letter against held text once the
+  record has gone off air.
+
+The record follows project-57's heard-item specimen
+([p57#187](https://github.com/karmaterminal/project-57/pull/187) at `099e2e00`; 🌫 ruled
+2026-11-27 to keep its fields as they stand for v0). It is kept in four parts, apart:
+
+| Part                  | Fields                                                                                          | Whose                                                                                                                                                    |
+| --------------------- | ----------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `source_record`       | `station`, `stream`, `epoch`, `seq`, `item_id`, `content {text}`, `signer_key_id`, `expires_at` | the source's claims only. `item_id` is the record's identity as custody names it, `key:epoch:stream:seq` (canticle has no other item id)                 |
+| `listener_envelope`   | `received_at`                                                                                   | when this listener first heard it                                                                                                                        |
+| `beside_hold_request` | `verification_result`                                                                           | the host's verdict, never inside the source record: always `verified`, since frond-ear's live set holds only records the host daemon admitted `verified` |
+| `provenance`          | `"heard"`                                                                                       | retained external material: not endorsement, not adoption, not proof the model read it                                                                   |
+
+A local **`retained_item`** observation (`layer`, `observer`, `evidence_ref`) exists only
+because a hold succeeded; its `evidence_ref` is an opaque local id (`held_…`) that appears
+nowhere in the source record. No digest of the text is added anywhere. The epoch is kept, though
+p57's current frame drops it.
+
+`frond-ear held-export --ear <ear> --station <s> --stream <s> --epoch <n> --seq <n>
+[--before-hold]` prints one held record as that JSON, for feeding through p57#187's specimen
+test (`--before-hold` leaves `receipt_observations` empty, as a p57 hold would receive it before
+making its own). It opens the database read-only (SQLite may still leave `-wal`/`-shm` sidecars)
+and has no network side. It prints the record's text: it is for the seat's own shell, as the
+database file itself is.
+
+**Limits, plainly.** This is v0: the fields are p57#187's specimen, not a production interchange.
+p57's recall can't find a held item (its Find stays RED until project-57 decides adoption), so a
+held record reaches a later turn only through that session's own `held` read. Keeping heard
+words out of letters and other notes is still the session's own practice.
+
 ### Room output and source use (frond-ear scope)
 
 frond-ear holds both ends for a Claude seat: canticle comes in through it (`hear`, the push) and room output goes
