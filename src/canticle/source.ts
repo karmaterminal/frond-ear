@@ -12,6 +12,7 @@ import type { Manifest } from "./manifest.ts";
 import { RecordClient } from "./record-client.ts";
 import {
   CanticleReceptor,
+  type GuideSourceView,
   type HearView,
   type StateStore,
 } from "./receptor.ts";
@@ -21,6 +22,8 @@ export interface CanticleSource {
   stop(): void;
   status(): object;
   hearView(ear: string): HearView;
+  /** The metadata-only view `canticle_guide` reads: no payload is read for it. */
+  guideView(ear: string): GuideSourceView;
 }
 
 /** Does something accept connections on the host socket? Resolves within `timeoutMs`. */
@@ -105,6 +108,13 @@ export class GuardedEmbedded implements CanticleSource {
 
   hearView(ear: string): HearView {
     const view = this.#receptor.hearView(ear);
+    return this.#refused
+      ? { ...view, listening: false, blind: true, items: [] }
+      : view;
+  }
+
+  guideView(ear: string): GuideSourceView {
+    const view = this.#receptor.guideView(ear);
     return this.#refused
       ? { ...view, listening: false, blind: true, items: [] }
       : view;

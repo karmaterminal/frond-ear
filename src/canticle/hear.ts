@@ -14,7 +14,7 @@ import { cleanName, cleanText } from "../render.ts";
 import type { HearView, LiveItem } from "./receptor.ts";
 
 /** Receiver-measured age (now − issued_at − δ̂) above which an item is marked `aged` (§6.3). */
-const STALE_AFTER_MS: Readonly<Record<string, number>> = {
+export const STALE_AFTER_MS: Readonly<Record<string, number>> = {
   "live-state": 60_000,
   alarm: 120_000,
   advisory: 300_000,

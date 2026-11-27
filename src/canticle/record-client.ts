@@ -21,7 +21,7 @@ import {
   MAX_LINE_BYTES,
   RecordConsumer,
 } from "./records.ts";
-import type { HearView } from "./receptor.ts";
+import type { GuideSourceView, HearView } from "./receptor.ts";
 
 export interface RecordClientOptions {
   socketPath: string;
@@ -147,6 +147,14 @@ export class RecordClient {
 
   hearView(ear: string): HearView {
     return this.consumer.hearView(
+      this.#options.tune[ear] ?? [],
+      this.#clock.now(),
+      this.#state === "connected",
+    );
+  }
+
+  guideView(ear: string): GuideSourceView {
+    return this.consumer.guideView(
       this.#options.tune[ear] ?? [],
       this.#clock.now(),
       this.#state === "connected",

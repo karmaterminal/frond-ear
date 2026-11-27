@@ -48,7 +48,12 @@
 import { createHash } from "node:crypto";
 
 import type { HeardProvenance, SourceTuple } from "./exposure.ts";
-import type { HearView, LiveItem } from "./receptor.ts";
+import type {
+  GuideItem,
+  GuideSourceView,
+  HearView,
+  LiveItem,
+} from "./receptor.ts";
 import { MAX_CLAMP_TTL_S } from "./wire.ts";
 
 export const RECORD_V = "canticle-receptor-record/1";
@@ -93,6 +98,14 @@ const ADMISSIONS = new Set([
   "equivocation",
 ]);
 const BREAKER = new Set(["closed", "open", "half_open"]);
+/**
+ * `retract` reasons that withdraw a record (RFC-0002 §2.2): the guide keeps a mark of each
+ * while the record would still be on air. A supersession is a newer value, and an expiry
+ * is the record's own end; neither is a withdrawal.
+ */
+const WITHDRAWN_REASONS = new Set(["plucked", "revoked", "quarantined"]);
+
+type WithdrawnMark = NonNullable<HearView["withdrawn"]>[number];
 
 type Json = null | boolean | number | string | Json[] | { [k: string]: Json };
 type Obj = { [k: string]: Json };
@@ -139,6 +152,10 @@ class LiveSet {
 
   has(idem: string): boolean {
     return this.#all.has(idem);
+  }
+
+  get(idem: string): LiveRecord | undefined {
+    return this.#all.get(idem)?.record;
   }
 
   /** In admission order; a record put again keeps its place. */
@@ -546,6 +563,12 @@ export class RecordConsumer {
   noDatagrams = false;
   readonly presence = new Map<string, string>();
   readonly #live = new LiveSet();
+  /**
+   * What the host daemon withdrew from the live set, by idem, each until the record would
+   * have left anyway; at most `MAX_LIVE`, the oldest going first. Facts, not live state:
+   * a lost connection or a new run leaves them be.
+   */
+  readonly #withdrawn = new Map<string, WithdrawnMark>();
   /** Every ear's `station:stream` patterns together: what admission counts as tuned. */
   #tune: readonly string[];
   /** Per share, what the live set dropped (tuned streams, at most `MAX_OMITTED_STREAMS`). */
@@ -701,6 +724,9 @@ export class RecordConsumer {
         if (!str(rec.idem)) {
           this.#count("malformed_record");
           return;
+        }
+        if (str(rec.reason) && WITHDRAWN_REASONS.has(rec.reason)) {
+          this.#markWithdrawn(rec.idem, rec.reason, nowMs);
         }
         this.#live.delete(rec.idem);
         return;
@@ -1008,6 +1034,9 @@ export class RecordConsumer {
         return;
     }
     this.#live.set(r, share);
+    // The host vouches for it again (a revoke undone, a restart that resurfaced it): a
+    // withdrawal mark from before must not hide a record that is live (🌿 N2 on #133).
+    this.#withdrawn.delete(r.idem);
   }
 
   /** A tuned record's share is its own `station:stream`; every untuned one shares one. */
@@ -1170,6 +1199,28 @@ export class RecordConsumer {
     this.#omitted.delete(lapsed);
     this.#forgetDrops(lapsed);
     return share;
+  }
+
+  /** A record of the live set was withdrawn: keep a mark of it while it would be on air. */
+  #markWithdrawn(idem: string, reason: string, nowMs: number): void {
+    const held = this.#live.get(idem);
+    if (held === undefined || held.localExpiryAt <= nowMs) return;
+    const item = held.item;
+    this.#withdrawn.delete(idem);
+    if (this.#withdrawn.size >= MAX_LIVE) {
+      const oldest = this.#withdrawn.keys().next().value;
+      if (oldest !== undefined) this.#withdrawn.delete(oldest);
+    }
+    this.#withdrawn.set(idem, {
+      station: item.station,
+      stream: item.stream,
+      key: item.key,
+      class: item.class,
+      identity: `${item.key.toLowerCase()}:${item.epoch}:${item.stream}:${item.seq}`,
+      reason,
+      at: nowMs,
+      until: held.localExpiryAt,
+    });
   }
 
   /**
@@ -1521,6 +1572,56 @@ export class RecordConsumer {
     nowMs: number,
     listening: boolean,
   ): HearView {
+    return this.#view(patterns, nowMs, listening, (r) => ({
+      ...r.item,
+      expiresInMs: r.localExpiryAt - nowMs,
+      ageMs: Math.max(r.item.ageMs, nowMs - r.item.issuedAt),
+    }));
+  }
+
+  /**
+   * `hearView` for the guide (binary-canticle RFC-0002 §3.3): the same records, metadata
+   * only, read field by field so no payload, purpose, state key, body ref or provenance is
+   * touched; and what holds the board empty (a host MUTE, records lost, no landing state).
+   */
+  guideView(
+    patterns: readonly string[],
+    nowMs: number,
+    listening: boolean,
+  ): GuideSourceView {
+    const view = this.#view(patterns, nowMs, listening, (r): GuideItem => {
+      const it = r.item;
+      return {
+        station: it.station,
+        key: it.key,
+        stream: it.stream,
+        seq: it.seq,
+        epoch: it.epoch,
+        class: it.class,
+        heardAt: it.heardAt,
+        ageMs: Math.max(it.ageMs, nowMs - it.issuedAt),
+        expiresInMs: r.localExpiryAt - nowMs,
+      };
+    });
+    const live = this.health !== "failed" && this.health !== "stopped";
+    return {
+      ...view,
+      ...(this.mute !== null ? { hostMute: { ...this.mute } } : {}),
+      ...(this.healthReasons.includes("records_lost")
+        ? { recordsLost: true }
+        : {}),
+      ...(listening && live && !this.#landingSeen
+        ? { awaitingLanding: true }
+        : {}),
+    };
+  }
+
+  #view<T>(
+    patterns: readonly string[],
+    nowMs: number,
+    listening: boolean,
+    project: (r: LiveRecord) => T,
+  ): Omit<HearView, "items" | "capability"> & { items: T[] } {
     const tuned = (station: string, stream: string) =>
       tunes(patterns, station, stream);
     this.#syncOverflow(nowMs);
@@ -1548,7 +1649,7 @@ export class RecordConsumer {
     const live = this.health !== "failed" && this.health !== "stopped";
     const deliverable =
       listening && live && this.#landingSeen && this.mute === null;
-    const items: LiveItem[] = [];
+    const items: T[] = [];
     for (const [idem, r] of this.#live.entries()) {
       if (r.localExpiryAt <= nowMs) {
         this.#live.delete(idem);
@@ -1556,11 +1657,12 @@ export class RecordConsumer {
       }
       if (r.carried || !deliverable || !tuned(r.item.station, r.item.stream))
         continue;
-      items.push({
-        ...r.item,
-        expiresInMs: r.localExpiryAt - nowMs,
-        ageMs: Math.max(r.item.ageMs, nowMs - r.item.issuedAt),
-      });
+      items.push(project(r));
+    }
+    const withdrawn: WithdrawnMark[] = [];
+    for (const [idem, mark] of this.#withdrawn) {
+      if (mark.until <= nowMs) this.#withdrawn.delete(idem);
+      else if (tuned(mark.station, mark.stream)) withdrawn.push({ ...mark });
     }
     const blind =
       !listening || this.noDatagrams || this.lastDatagramAt === undefined;
@@ -1600,6 +1702,7 @@ export class RecordConsumer {
           }
         : {}),
       ...(retuned.length > 0 ? { retuned } : {}),
+      ...(withdrawn.length > 0 ? { withdrawn } : {}),
     };
   }
 }

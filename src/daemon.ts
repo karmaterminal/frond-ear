@@ -83,6 +83,7 @@ import {
   type OutboundFile,
 } from "./outbound-files.ts";
 import { chunkMessage, definitive, RestError } from "./rest.ts";
+import { guideView } from "./canticle/guide.ts";
 import { hearResult, iso, type HeardItem } from "./canticle/hear.ts";
 import { CLASS_BY_NAME } from "./canticle/ids.ts";
 import {
@@ -95,7 +96,7 @@ import {
   renderLetter,
   summaryLetters,
 } from "./letters.ts";
-import type { HearView } from "./canticle/receptor.ts";
+import type { GuideSourceView, HearView } from "./canticle/receptor.ts";
 import {
   WAKE_LIMITS,
   attentionAt,
@@ -156,6 +157,11 @@ export interface DaemonOptions {
    * tool reads it, and so do the delivery modes that push to a session (frond-ear#65).
    */
   canticleHear?: (ear: string) => HearView;
+  /**
+   * The same records as `canticleHear`, metadata only (binary-canticle RFC-0002 §3.3):
+   * `canticle_guide` reads this, so a guide call touches no payload in any source.
+   */
+  canticleGuide?: (ear: string) => GuideSourceView;
   /** Directory for `fetch_attachment` (one subdirectory per ear). Absent: the tool is off. */
   attachmentsDir?: string;
   /**
@@ -3946,6 +3952,8 @@ export class Daemon {
       }
       case "canticle_custody":
         return this.canticleCustody(client, args);
+      case "canticle_guide":
+        return this.canticleGuide(client, args);
       case "fetch_attachment":
         return this.fetchAttachment(args);
       case "hold_compaction":
@@ -4272,6 +4280,41 @@ export class Daemon {
           ? `open: the derived op may publish from these ${gate.sources.length} records`
           : gate.reason,
       },
+      null,
+      2,
+    );
+  }
+
+  /**
+   * The canticle_guide tool (binary-canticle RFC-0002 §3.3, the trainboard's first slice):
+   * what is on air now, one row per tuned station:stream, from the listener's own view.
+   * A look, not an arrival: it reads the source's metadata-only view (no payload is read,
+   * decoded or copied for it) and the ear's delivery modes. It records no custody or
+   * exposure, marks no event seen, echoes no push, tunes or mutes nothing, wakes no one,
+   * and reaches no network. Reading the modes purges attention rows whose TTL has already
+   * lapsed, as every read of them does; no live choice changes.
+   */
+  private canticleGuide(client: Client, args: Record<string, unknown>): string {
+    const ear = this.readableEar(client, args);
+    if (!this.options.canticleGuide) {
+      return "canticle is not enabled on this daemon (config canticle.enabled).";
+    }
+    const query = stringArg(args, "query");
+    const cursor = stringArg(args, "cursor");
+    const limit = numberArg(args, "limit", 20, 100);
+    const view = this.options.canticleGuide(ear);
+    if (!view.tuned) {
+      return "canticle: this ear tunes no station:stream (config canticle.tune).";
+    }
+    const delivery = this.canticle;
+    return JSON.stringify(
+      guideView(view, {
+        ear,
+        query,
+        cursor,
+        limit,
+        mode: (target) => delivery?.modeOf(ear, target) ?? "off",
+      }),
       null,
       2,
     );

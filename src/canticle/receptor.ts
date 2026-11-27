@@ -154,6 +154,24 @@ export interface HearView {
    * manifest there, and the host admits as `verified` only a class the key is granted.
    */
   capability?: (key: string) => ReadonlySet<string> | undefined;
+  /**
+   * Record v1: tuned records the host daemon withdrew from this ear's live set (a PLUCK, a
+   * revocation or a quarantine: `retract` reasons other than supersession and expiry),
+   * each kept until the record would have left anyway, so the guide shows them withdrawn
+   * and never live (RFC-0002 §2.2). Not set by the embedded receptor, whose listener drops
+   * a plucked item from its live set at once.
+   */
+  withdrawn?: Array<{
+    station: string;
+    stream: string;
+    key: string;
+    class: string;
+    /** `key:epoch:stream:seq`, as delivery's `identity` spells it. */
+    identity: string;
+    reason: string;
+    at: number;
+    until: number;
+  }>;
   /** Record v1: the untuned share's drops, while any of them would still be on air. */
   untunedOmitted?: { count: number; from: number; to: number; until: number };
   /**
@@ -167,6 +185,39 @@ export interface HearView {
     dropped: number;
     until: number;
   }>;
+}
+
+/**
+ * One record as the guide sees it (binary-canticle RFC-0002 §3.3): metadata only. A source
+ * builds it without reading, decoding, copying or hashing the record's body, text,
+ * purpose, state key, body ref or provenance, so a guide call touches no payload at all.
+ */
+export type GuideItem = Pick<
+  LiveItem,
+  | "station"
+  | "key"
+  | "stream"
+  | "seq"
+  | "epoch"
+  | "class"
+  | "heardAt"
+  | "ageMs"
+  | "expiresInMs"
+>;
+
+/**
+ * What `canticle_guide` reads from a source: the `hear` view's metadata, its items as
+ * `GuideItem`s, and what holds the board empty that `hear`'s view leaves unsaid.
+ */
+export interface GuideSourceView
+  extends Omit<HearView, "items" | "capability"> {
+  items: GuideItem[];
+  /** Record v1: the host daemon's receptor-wide MUTE (§14.8), while it holds. */
+  hostMute?: { until: number | null; by: string | null };
+  /** Record v1: records were lost on the host socket, and the live set was cleared. */
+  recordsLost?: boolean;
+  /** Record v1: this connection's `landing_state` hasn't come yet, so nothing is deliverable. */
+  awaitingLanding?: boolean;
 }
 
 export interface ReceptorOptions {
@@ -556,6 +607,38 @@ export class CanticleReceptor {
         };
   }
 
+  /**
+   * What one ear's guide lists now: the same records as `live`, metadata only. It never
+   * reads a record's body, purpose, state key or body ref (RFC-0002 §3.3).
+   */
+  #guideItems(ear: string): GuideItem[] {
+    if (this.#notDurable !== undefined) return [];
+    const tune = this.#options.config.tune;
+    const patterns = Object.hasOwn(tune, ear) ? (tune[ear] ?? []) : [];
+    const now = this.#clock.now();
+    const out: GuideItem[] = [];
+    for (const h of this.#listener.current.values()) {
+      const entry = this.#options.manifest.entry(Buffer.from(h.kid, "hex"));
+      const station = entry?.name ?? h.kid;
+      const it = h.item;
+      const stream = entry?.streamNames.get(it.stream);
+      if (stream === undefined || !tuned(patterns, station, stream)) continue;
+      const offset = this.#listener.clockOffset(h.kid);
+      out.push({
+        station,
+        key: h.kid,
+        stream,
+        seq: it.seq.toString(),
+        epoch: it.epoch,
+        class: CLASSES.get(it.cls)?.name ?? String(it.cls),
+        heardAt: h.firstHeard,
+        ageMs: Math.max(0, now - it.issuedAt - offset),
+        expiresInMs: Math.max(0, h.localExpiry - now),
+      });
+    }
+    return out;
+  }
+
   /** What one ear hears right now: live items on its tuned station:streams. */
   live(ear: string): LiveItem[] {
     if (this.#notDurable !== undefined) return [];
@@ -623,6 +706,29 @@ export class CanticleReceptor {
    * station going quiet together (station silence ≠ transport blindness).
    */
   hearView(ear: string): HearView {
+    return {
+      ...this.#viewOf(ear),
+      items: this.live(ear),
+      capability: (key) => {
+        if (!CANTICLE_KEY_HEX.test(key)) return undefined;
+        const entry = this.#options.manifest.entry(Buffer.from(key, "hex"));
+        if (entry === undefined || entry.revoked) return undefined;
+        return new Set(
+          [...entry.classes].flatMap((code) => {
+            const name = CLASSES.get(code)?.name;
+            return name === undefined ? [] : [name];
+          }),
+        );
+      },
+    };
+  }
+
+  /** `hearView` for the guide: metadata only, no body read (RFC-0002 §3.3). */
+  guideView(ear: string): GuideSourceView {
+    return { ...this.#viewOf(ear), items: this.#guideItems(ear) };
+  }
+
+  #viewOf(ear: string): Omit<HearView, "items" | "capability"> {
     const now = this.#clock.now();
     const blind =
       this.#state !== "listening" ||
@@ -649,18 +755,6 @@ export class CanticleReceptor {
       blind,
       lastDatagramAt: this.#lastDatagramAt,
       stations,
-      items: this.live(ear),
-      capability: (key) => {
-        if (!CANTICLE_KEY_HEX.test(key)) return undefined;
-        const entry = this.#options.manifest.entry(Buffer.from(key, "hex"));
-        if (entry === undefined || entry.revoked) return undefined;
-        return new Set(
-          [...entry.classes].flatMap((code) => {
-            const name = CLASSES.get(code)?.name;
-            return name === undefined ? [] : [name];
-          }),
-        );
-      },
     };
   }
 
