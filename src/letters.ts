@@ -103,8 +103,11 @@ function parseHeard(raw: unknown): HeardRef[] {
   return refs;
 }
 
-/** One `heard` reference, validated and with seq in canonical digits; throws naming `which`. */
-function heardItem(item: unknown, which: string): HeardRef {
+/**
+ * One `heard` reference, validated and with seq in canonical digits; throws naming `which`.
+ * A hold (held.ts) names its record the same way.
+ */
+export function heardItem(item: unknown, which: string): HeardRef {
   if (typeof item !== "object" || item === null || Array.isArray(item)) {
     throw new Error(`${which} must be {station, stream, epoch, seq}`);
   }

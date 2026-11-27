@@ -600,7 +600,7 @@ test("export: a held item comes out in p57#187's heard-item.v0 shape, key for ke
     assert.ok(item);
     const record = heldItemRecord(item, { observer: "frond-ear:scribe" });
 
-    const sections = (value: Record<string, unknown>) =>
+    const sections = (value: object) =>
       Object.fromEntries(
         Object.entries(value).map(([key, part]) => [
           key,
@@ -681,6 +681,7 @@ test("export: a held item comes out in p57#187's heard-item.v0 shape, key for ke
     // The CLI prints the same record from the database, read-only.
     const out: string[] = [];
     const err: string[] = [];
+    const clock = () => h.clock.now();
     const io = {
       stdout: { write: (text: string) => out.push(text) },
       stderr: { write: (text: string) => err.push(text) },
@@ -700,6 +701,7 @@ test("export: a held item comes out in p57#187's heard-item.v0 shape, key for ke
         "2",
       ],
       io,
+      clock,
     );
     assert.equal(code, 0, err.join(""));
     assert.deepEqual(JSON.parse(out.join("")), record);
@@ -719,6 +721,7 @@ test("export: a held item comes out in p57#187's heard-item.v0 shape, key for ke
         "--before-hold",
       ],
       io,
+      clock,
     );
     assert.equal(before, 0);
     assert.deepEqual(JSON.parse(out.join("")), request);
@@ -736,6 +739,7 @@ test("export: a held item comes out in p57#187's heard-item.v0 shape, key for ke
         "3",
       ],
       io,
+      clock,
     );
     assert.equal(none, 1);
     assert.match(err.join(""), /no held record ops:ops\.fleet 7\/3/u);
