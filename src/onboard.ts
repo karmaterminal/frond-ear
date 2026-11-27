@@ -31,7 +31,9 @@ import {
   defaultSocketPath,
   loadConfigFile,
   parseConfig,
+  type Config,
 } from "./config.ts";
+import { instructionsLayout, MCP_INSTRUCTIONS_CAP } from "./render.ts";
 import type { Mode } from "./types.ts";
 
 export interface Io {
@@ -677,7 +679,7 @@ function strandedConfig(
 function configCheck(
   source: ConfigSource,
   env: NodeJS.ProcessEnv,
-): { check: Check; ears: string[] } {
+): { check: Check; ears: string[]; config?: Config } {
   const { path, from } = source;
   if (!existsSync(path)) {
     const stranded = strandedConfig(source, env);
@@ -707,6 +709,7 @@ function configCheck(
         detail: `${path} (${from}): ${ears.length} ear(s): ${ears.join(", ")}`,
       },
       ears,
+      config,
     };
   } catch (error) {
     return {
@@ -720,6 +723,79 @@ function configCheck(
       ears: [],
     };
   }
+}
+
+/**
+ * Claude Code's cut for an MCP server's instructions as this environment sets it:
+ * CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH when it is a positive integer, else the default.
+ * The seat's claude may run with another environment, so the detail says which applied.
+ */
+function instructionsCap(env: NodeJS.ProcessEnv): {
+  cap: number;
+  from: string;
+} {
+  const raw = env.CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH;
+  if (raw === undefined || raw === "") {
+    return {
+      cap: MCP_INSTRUCTIONS_CAP,
+      from: "Claude Code's default; CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH is unset here",
+    };
+  }
+  if (/^\d+$/u.test(raw) && Number(raw) >= 1) {
+    return {
+      cap: Number(raw),
+      from: "CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH, as set here",
+    };
+  }
+  return {
+    cap: MCP_INSTRUCTIONS_CAP,
+    from: "Claude Code's default: CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH here is not a positive integer",
+  };
+}
+
+/**
+ * What a claude-channel ear's session reads of its channel instructions: Claude Code keeps
+ * the first `cap` UTF-16 units. A Copilot extension prefixes them to a push, uncut.
+ */
+function instructionsChecks(config: Config, env: NodeJS.ProcessEnv): Check[] {
+  const { cap, from } = instructionsCap(env);
+  const checks: Check[] = [];
+  for (const [name, ear] of Object.entries(config.ears)) {
+    if (ear.target !== "claude-channel") {
+      continue;
+    }
+    const { text, trustEnd, seat } = instructionsLayout(config, name);
+    const field = `ears.${name}.instructions`;
+    const length = text.length;
+    if (length <= cap) {
+      checks.push({
+        name: `ear ${name}: instructions`,
+        ok: true,
+        required: false,
+        detail: `${length} of ${cap} characters (UTF-16 units, as Claude Code counts; ${from}): the session reads them whole`,
+      });
+      continue;
+    }
+    const cut = length - cap;
+    const seatLength = seat ? seat.end - seat.start : 0;
+    const lost =
+      cap < trustEnd
+        ? `from inside frond-ear's trust rules: the session misses some of them, ${seat ? field : "the seat text"} and all the tool guidance`
+        : seat && cap < seat.end
+          ? `${seat.end - Math.max(cap, seat.start)} of the ${seatLength} in ${field} and all the tool guidance after it`
+          : `tool guidance only; ${seat ? `${field} reaches the session whole` : `there is no ${field}`}`;
+    checks.push({
+      name: `ear ${name}: instructions`,
+      ok: false,
+      required: false,
+      detail: `${length} of ${cap} characters (UTF-16 units, as Claude Code counts; ${from}): Claude Code drops the last ${cut}, ${lost}`,
+      hint:
+        cap >= trustEnd && seatLength >= cut
+          ? `shorten ${field} by ${cut} characters (to ${seatLength - cut} or fewer), or raise CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH where the seat's claude runs`
+          : `raise CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH where the seat's claude runs${seat ? `, or shorten ${field}` : ""}`,
+    });
+  }
+  return checks;
 }
 
 function tokenCheck(flag: string | undefined, env: NodeJS.ProcessEnv): Check {
@@ -945,8 +1021,15 @@ export async function doctorChecks(
 ): Promise<Check[]> {
   const checks: Check[] = [nodeCheck()];
   const source = resolveConfigPath(values.config, env, cwd);
-  const { check: config, ears: configuredEars } = configCheck(source, env);
+  const {
+    check: config,
+    ears: configuredEars,
+    config: loaded,
+  } = configCheck(source, env);
   checks.push(config);
+  if (loaded) {
+    checks.push(...instructionsChecks(loaded, env));
+  }
   const token = tokenCheck(values["token-file"], env);
   checks.push(token);
   const tokenPath = resolve(
