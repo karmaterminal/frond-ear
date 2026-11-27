@@ -19,7 +19,12 @@
 import { createHash, randomBytes } from "node:crypto";
 
 import { age, heardItem, heardName } from "../letters.ts";
-import type { EventStore, HeardRef, HeldItem } from "../store.ts";
+import type {
+  CanticleExposure,
+  EventStore,
+  HeardRef,
+  HeldItem,
+} from "../store.ts";
 import { identity } from "./delivery.ts";
 import { hex, iso, quoted, token, wrapped } from "./hear.ts";
 import type { LiveItem } from "./receptor.ts";
@@ -271,13 +276,41 @@ export function listHeld(
   ].join("\n");
 }
 
-/** The `held` tool: list, `read: ref` or `drop: ref | "all"`. */
+/**
+ * A held read as custody keeps it (🌿 on #144): a whole release of the held text to the
+ * reading session, like a whole `hear` (path `hear`), marked `mode: held`. With it the
+ * letters' copy guard compares that session's letters against the hold, whatever the live
+ * set still has; without it a hold would carry heard words past the guard. It keeps no
+ * lineage (the hold has none), so a derived publication from it stays closed.
+ */
+export function heldExposure(
+  item: HeldItem & { text: string },
+): CanticleExposure {
+  return {
+    path: "hear",
+    mode: "held",
+    identity: item.itemId,
+    station: item.station,
+    stream: item.stream,
+    keyId: item.signerKeyId,
+    epoch: item.epoch,
+    seq: item.seq,
+    digest: sha256(item.text),
+    shown: "whole",
+  };
+}
+
+/**
+ * The `held` tool: list, `read: ref` or `drop: ref | "all"`. `onRead` is told of each
+ * record a read shows, before the result returns, so the caller can record it as custody.
+ */
 export function heldTool(
   store: EventStore,
   ear: string,
   attachedSessionId: string | null,
   now: number,
   args: Record<string, unknown>,
+  onRead: (item: HeldItem & { text: string }) => void = () => {},
 ): string {
   pruneHeld(store, ear, now);
   const { read, drop } = args;
@@ -292,7 +325,9 @@ export function heldTool(
         `held record ${heardName(ref)} expired at ${iso(item.expiresAt)}; its text is dropped`,
       );
     }
-    return renderHeld(item, attachedSessionId);
+    const shown = renderHeld(item, attachedSessionId);
+    onRead({ ...item, text: item.text });
+    return shown;
   }
   if (drop !== undefined && drop !== null) {
     const items = store.heldItems(ear);
@@ -349,11 +384,16 @@ export interface HeldItemRecord {
 /**
  * One held record in p57#187's heard-item.v0 shape (🌫, 2026-11-27 16:37Z: keep its fields
  * for v0), key for key and in its order. The source record carries the source's claims only,
- * the epoch included (p57's frame drops it; this record does not). The listener's envelope,
- * the host's verdict and `provenance: "heard"` sit outside it. `receipt_observations` holds
- * the `retained_item` observation this ear made by holding it, pointing at the hold's opaque
- * local evidence ref; `beforeHold` leaves it empty, the record as a p57 hold would receive it
- * before making its own. No digest is added anywhere. Throws for an expired hold.
+ * the epoch included as its own field (p57's frame drops it; this record does not).
+ * `item_id` is `key:epoch:stream:seq`, the adapter's deterministic identity for the source
+ * record, not an additional id minted by the station (🌫, 18:55Z). p57 carrying that
+ * composite as an opaque string does not close p57's missing-epoch contract; that stays RED.
+ * The listener's envelope, the host's verdict and `provenance: "heard"` sit outside it.
+ * `receipt_observations` holds the `retained_item` observation this ear made by holding it,
+ * pointing at the hold's opaque local evidence ref. `beforeHold` means before p57's hold, not
+ * that the ear never held it: it leaves the list empty, the record as p57 receives it before
+ * making its own observation (🌫, 18:55Z). Neither form proves model encounter or adoption.
+ * No digest is added anywhere. Throws for an expired hold.
  */
 export function heldItemRecord(
   item: HeldItem,

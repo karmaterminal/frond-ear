@@ -89,6 +89,7 @@ import { hearResult, iso, type HeardItem } from "./canticle/hear.ts";
 import {
   HOLD_REFUSED,
   heldCount,
+  heldExposure,
   heldReleaseNote,
   heldTool,
   holdRecord,
@@ -4052,12 +4053,26 @@ export class Daemon {
       }
       case "held": {
         const ear = this.requireHolder(client, "read its held records");
+        const now = this.clock.now();
+        // A read shows the session heard text: custody, a whole release to the reader,
+        // so the letters' copy guard compares its letters against the hold (🌿 on #144).
         return heldTool(
           this.store,
           ear,
           client.sessionId ?? null,
-          this.clock.now(),
+          now,
           args,
+          (item) =>
+            this.store.recordCanticleHear(
+              ear,
+              {
+                generation: client.attachGeneration,
+                sessionId: client.sessionId ?? null,
+              },
+              [heldExposure(item)],
+              now,
+              this.boundary(ear),
+            ),
         );
       }
       case "schedule":
@@ -4249,13 +4264,15 @@ export class Daemon {
   /**
    * The canticle records already released to `sessionId` on this ear, with the text it was
    * shown, for the letters' copy guard: custody's whole exposures to that session (a push
-   * the host confirmed, its own `hear`), joined to the live set by identity and payload
-   * digest. Never the held buffer or the rest of the live set: comparing a letter against
-   * text the session hasn't elected to receive would make the write an oracle for it. A
-   * record gone from the live set has no text here, so it can't be compared. `unchecked`
-   * says when what it returns isn't all there was to compare: the live set couldn't be
-   * read, or a record still live was shown to this shim before frond-ear knew the
-   * session's id.
+   * the host confirmed, its own `hear`, its own `held` read), joined by identity and payload
+   * digest to the text frond-ear still has: the live set, and the ear's held records (🌿 on
+   * #144: a hold outlives its record, so the live set alone would let held words past the
+   * guard). Never the delivery buffer, the rest of the live set, or a hold not released to
+   * this session: comparing a letter against text the session hasn't elected to receive
+   * would make the write an oracle for it. A record neither live nor held has no text here,
+   * so it can't be compared. `unchecked` says when what it returns isn't all there was to
+   * compare: the live set couldn't be read, or a record was shown to this shim before
+   * frond-ear knew the session's id.
    */
   private releasedCanticle(
     ear: string,
@@ -4274,15 +4291,17 @@ export class Daemon {
     if (shown.size === 0 && unnamed.size === 0) {
       return { records: [], unchecked: null };
     }
-    let items: HearView["items"];
+    let items: HearView["items"] = [];
+    let unreadable = false;
     try {
       items = view(ear).items;
     } catch (error) {
+      // The held records are still compared; the letter says the live set wasn't.
+      unreadable = true;
       this.logger.log("warn", "letters.copy_guard_unavailable", {
         ear,
         error: error instanceof Error ? error.message : String(error),
       });
-      return { records: [], unchecked: COPY_UNCHECKED.unreadable };
     }
     const records: ReleasedRecord[] = [];
     let unchecked: string | null = null;
@@ -4305,7 +4324,40 @@ export class Daemon {
         unchecked = COPY_UNCHECKED.unnamed;
       }
     }
-    return { records, unchecked };
+    // Held text, released to this session, that the live set no longer has (or never had
+    // under that digest). A fault reading the store reaches copyCheck, which fails open.
+    const compared = new Set(
+      records.map(
+        (record) =>
+          `${record.station}:${record.stream}:${record.epoch}:${record.seq}`,
+      ),
+    );
+    for (const item of this.store.heldItems(ear)) {
+      const text = item.text;
+      if (text === null || text === "") {
+        continue;
+      }
+      const digest = createHash("sha256").update(text, "utf8").digest("hex");
+      const key = `${item.station}:${item.stream}:${item.epoch}:${item.seq}`;
+      if (shown.get(item.itemId)?.has(digest)) {
+        if (!compared.has(key)) {
+          compared.add(key);
+          records.push({
+            station: item.station,
+            stream: item.stream,
+            epoch: item.epoch,
+            seq: item.seq,
+            text,
+          });
+        }
+      } else if (unnamed.get(item.itemId)?.has(digest)) {
+        unchecked = COPY_UNCHECKED.unnamed;
+      }
+    }
+    return {
+      records,
+      unchecked: unreadable ? COPY_UNCHECKED.unreadable : unchecked,
+    };
   }
 
   /**

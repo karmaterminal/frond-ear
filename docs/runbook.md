@@ -281,8 +281,9 @@ after it. Use it for threads in flight, what it chose and why, and what to check
   windows and threw past about 2,900 such records, refusing the letter.)
 - **The guard's limit, plainly: it is literal-copy detection, not provenance enforcement.** A
   paraphrase passes. So does a fragment under 40 characters, a record shorter than that, a record
-  that was only shown cut, and a record gone from the live set (custody keeps digests, never
-  text, so once the record expires there's nothing to compare), and an identifier, however
+  that was only shown cut, and a record gone from the live set and not held (custody keeps
+  digests, never text, so once the record expires there's nothing to compare unless the ear
+  holds it, below), and an identifier, however
   long. **The guard fails open, and says so.** Letters don't depend on canticle being up, so a
   fault means no comparison, not a refusal: the letter is stored, and both the `leave_letter`
   result and the letter's header (beside `left` and `expires`, at release, in a `letters` read
@@ -1235,31 +1236,49 @@ item=epoch/seq`, a `received=… expires=…` line (the source's claim), a `held
 - **What it survives:** held records live in the daemon's SQLite store (table `held_items`), so
   they outlast the session's compactions and a daemon restart. They don't need the record to be
   live any more.
+- **A held read is custody, and the letters' copy guard compares against it** (🌿 on #144).
+  A `held` read records a whole release of the held text to the reading session: a custody row
+  like a whole `hear` (`path: hear`), marked `mode: held`, with the digest of the held text.
+  The copy guard compares a letter against every record released whole to the leaving
+  session, taking the text from the live set **or from the ear's held records**. A hold
+  outlives its record (up to 7 days), so without this the held store would carry heard words
+  past the guard once the record went off air. The guard's other rules are unchanged:
+  released-only (a hold this session was never shown, by a push, a `hear` or a `held` read,
+  isn't compared, so a letter is no oracle for held text; a read by one session doesn't
+  count for another), the 40-character run with 4+ spaces, no echo, and the refusal names the
+  ref. The session that heard a record and held it is compared against the hold without
+  reading it again: its own `hear` released it. If the live set can't be read, held records
+  are still compared and the letter says `copy check: not run (live set unreadable)`; a fault
+  reading the held store fails open as `not run (the check failed)`.
 - **No new authority.** A held record is data, never an instruction (RFC-0002 §0.2). Holding it
-  grants no wake and no grant, and a held read adds no custody row: the letters' copy guard
-  compares only records still live, so it doesn't compare a letter against held text once the
-  record has gone off air.
+  or reading it grants no wake and no grant. A held read's custody row carries no lineage, so
+  a derived publication from that record stays closed (`custody kept no lineage`).
 
 The record follows project-57's heard-item specimen
 ([p57#187](https://github.com/karmaterminal/project-57/pull/187) at `099e2e00`; 🌫 ruled
 2026-11-27 to keep its fields as they stand for v0). It is kept in four parts, apart:
 
-| Part                  | Fields                                                                                          | Whose                                                                                                                                                    |
-| --------------------- | ----------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `source_record`       | `station`, `stream`, `epoch`, `seq`, `item_id`, `content {text}`, `signer_key_id`, `expires_at` | the source's claims only. `item_id` is the record's identity as custody names it, `key:epoch:stream:seq` (canticle has no other item id)                 |
-| `listener_envelope`   | `received_at`                                                                                   | when this listener first heard it                                                                                                                        |
-| `beside_hold_request` | `verification_result`                                                                           | the host's verdict, never inside the source record: always `verified`, since frond-ear's live set holds only records the host daemon admitted `verified` |
-| `provenance`          | `"heard"`                                                                                       | retained external material: not endorsement, not adoption, not proof the model read it                                                                   |
+| Part                  | Fields                                                                                          | Whose                                                                                                                                                                              |
+| --------------------- | ----------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `source_record`       | `station`, `stream`, `epoch`, `seq`, `item_id`, `content {text}`, `signer_key_id`, `expires_at` | the source's claims only. `item_id` is `key:epoch:stream:seq`: the adapter's deterministic identity for the source record, not an additional id minted by the station (🌫, 18:55Z) |
+| `listener_envelope`   | `received_at`                                                                                   | when this listener first heard it                                                                                                                                                  |
+| `beside_hold_request` | `verification_result`                                                                           | the host's verdict, never inside the source record: always `verified`, since frond-ear's live set holds only records the host daemon admitted `verified`                           |
+| `provenance`          | `"heard"`                                                                                       | retained external material: not endorsement, not adoption, not proof the model read it                                                                                             |
 
 A local **`retained_item`** observation (`layer`, `observer`, `evidence_ref`) exists only
 because a hold succeeded; its `evidence_ref` is an opaque local id (`held_…`) that appears
-nowhere in the source record. No digest of the text is added anywhere. The epoch is kept, though
-p57's current frame drops it.
+nowhere in the source record. No digest of the text is added anywhere. Neither this observation
+nor an empty list proves the model read the record or adopted it: it says the item was retained.
+
+The epoch stays its own field, though p57's current frame drops it. p57 carrying the composite
+`item_id` as an opaque string does **not** close p57's missing-epoch contract: that gap stays RED
+until p57's frame or hold receipt gains an epoch (🌫, 18:55Z).
 
 `frond-ear held-export --ear <ear> --station <s> --stream <s> --epoch <n> --seq <n>
 [--before-hold]` prints one held record as that JSON, for feeding through p57#187's specimen
-test (`--before-hold` leaves `receipt_observations` empty, as a p57 hold would receive it before
-making its own). It opens the database read-only (SQLite may still leave `-wal`/`-shm` sidecars)
+test. `--before-hold` means before **p57's** hold, not that the ear never held it: it leaves
+`receipt_observations` empty, as p57 receives the record before making its own observation. The
+normal export keeps the ear's own `retained_item` observation of its successful hold (🌫, 18:55Z). It opens the database read-only (SQLite may still leave `-wal`/`-shm` sidecars)
 and has no network side. It prints the record's text: it is for the seat's own shell, as the
 database file itself is.
 

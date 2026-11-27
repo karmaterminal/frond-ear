@@ -865,9 +865,13 @@ test("copy guard: a hold this session read is compared after its record leaves t
 });
 
 test("copy guard: a hold this session never read is not compared, so a letter is no oracle for held text", async () => {
-  const { h } = await heldOffAir();
+  const { h, host } = await heldOffAir();
   try {
     const shim = h.attach("scribe", { sessionId: SESSION });
+    // It was shown another record, so the guard does compare: only not against the hold.
+    host.sing(8, { text: SECOND });
+    h.timers.advance(1_000);
+    await h.call(shim, "hear", {});
     const listed = (await h.call(shim, "held", {})).text;
     assert.match(listed, /ops:ops\.fleet 7\/2/u, "it knows a hold exists");
     const letter = await h.call(shim, "leave_letter", {
@@ -876,17 +880,26 @@ test("copy guard: a hold this session never read is not compared, so a letter is
     });
     assert.equal(letter.ok, true, letter.text);
     assert.doesNotMatch(letter.text, /canticle|ops:ops|copy check/u);
+    const second = await h.call(shim, "leave_letter", {
+      reason: "r",
+      body: SECOND,
+    });
+    assert.equal(second.ok, false, "the record it was shown is compared");
+    assert.match(second.text, /ops:ops\.fleet 7\/8/u);
   } finally {
     h.dispose();
   }
 });
 
 test("copy guard: a held read by one session doesn't count for another", async () => {
-  const { h } = await heldOffAir();
+  const { h, host } = await heldOffAir();
   try {
     const reader = h.attach("scribe", { sessionId: OTHER });
     assert.equal((await h.call(reader, "held", { read: REF })).ok, true);
     const other = h.attach("scribe", { sessionId: SESSION });
+    host.sing(8, { text: SECOND });
+    h.timers.advance(1_000);
+    await h.call(other, "hear", {}); // shown something else, so its guard runs
     const unread = await h.call(other, "leave_letter", {
       reason: "r",
       body: RECORD,
@@ -920,6 +933,53 @@ test("copy guard: the hearer who held a record is compared against the hold afte
       "released by its own hear, text from the hold",
     );
     assert.match(copied.text, /ops:ops\.fleet 7\/2/u);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("copy guard: with the live set unreadable, a read hold is still compared, and the letter says the live set wasn't", async () => {
+  const { h, host } = await heldOffAir();
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    assert.equal((await h.call(shim, "held", { read: REF })).ok, true);
+    host.view = () => {
+      throw new Error("socket gone");
+    };
+    const copied = await h.call(shim, "leave_letter", {
+      reason: "r",
+      body: RECORD,
+    });
+    assert.equal(copied.ok, false, "the hold is compared without the live set");
+    assert.match(copied.text, /ops:ops\.fleet 7\/2/u);
+    const own = await h.call(shim, "leave_letter", {
+      reason: "r",
+      body: "in my own words: rune came back and lost some room events",
+    });
+    assert.equal(own.ok, true, own.text);
+    assert.match(own.text, /copy check: not run \(live set unreadable\)/u);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("copy guard: a held read counts only under the digest custody recorded for it", async () => {
+  const { h } = await heldOffAir();
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    assert.equal((await h.call(shim, "held", { read: REF })).ok, true);
+    // Custody of the read names another text: the hold's own text was not what it released.
+    const db = new DatabaseSync(join(h.directory, "ear.db"));
+    db.prepare(
+      "UPDATE canticle_custody SET digest = ? WHERE offer_session = ? AND mode = 'held'",
+    ).run("0".repeat(64), SESSION);
+    db.close();
+    const letter = await h.call(shim, "leave_letter", {
+      reason: "r",
+      body: RECORD,
+    });
+    assert.equal(letter.ok, true, letter.text);
+    assert.doesNotMatch(letter.text, /ops:ops/u);
   } finally {
     h.dispose();
   }
