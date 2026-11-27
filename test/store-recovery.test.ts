@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import {
+import fs, {
   chmodSync,
   copyFileSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
@@ -12,6 +13,7 @@ import {
   truncateSync,
   writeFileSync,
 } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -683,6 +685,120 @@ for (const [label, damage] of [
         parsed.error,
         found instanceof Error ? found.message : String(found),
       );
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+}
+
+// 🌫's and 🕯's review of 4723d24: the marker must be whole and durable before anything
+// moves, and a reset is only a reset when the quarantined database itself is there.
+
+const RECOVERY_URL = new URL("../src/store-recovery.ts", import.meta.url).href;
+const PRLIMIT = LINUX && spawnSync("prlimit", ["--version"]).status === 0;
+
+/** setStoreAside in a child under a file-size limit of `bytes` (prlimit, Linux). */
+function setAsideUnderLimit(path: string, bytes: number) {
+  return spawnSync(
+    "prlimit",
+    [
+      `--fsize=${bytes}:${bytes}`,
+      "--",
+      process.execPath,
+      "--input-type=module",
+      "-e",
+      `import { setStoreAside } from ${JSON.stringify(RECOVERY_URL)};
+       setStoreAside(process.env.FROND_EAR_TEST_DB, new Error("file is not a database"), ${AT});
+       console.log("returned");`,
+    ],
+    { env: { ...process.env, FROND_EAR_TEST_DB: path }, encoding: "utf8" },
+  );
+}
+
+test(
+  "a short marker write (a 512-byte file-size limit) refuses before any rename; with room, the same set-aside writes a whole marker",
+  { skip: PRLIMIT ? false : "needs Linux prlimit" },
+  () => {
+    const root = scratch();
+    // A long directory name, so the marker is well over 512 bytes.
+    const deep = join(root, "a-state-directory-with-a-long-name-".repeat(4));
+    const garbage = Buffer.from("not sqlite ".repeat(600));
+    try {
+      for (const name of ["short", "room"]) {
+        mkdirSync(join(deep, name), { recursive: true });
+        writeFileSync(join(deep, name, "ear.db"), garbage);
+      }
+      // Control: room for the marker, so it is written whole and the store moves.
+      const roomy = join(deep, "room", "ear.db");
+      const control = setAsideUnderLimit(roomy, 1 << 20);
+      assert.equal(control.status, 0, control.stderr);
+      const whole = readFileSync(marker(roomy).pending);
+      assert.ok(whole.length > 512, `marker is ${whole.length} bytes`);
+      assert.equal(
+        JSON.parse(whole.toString("utf8")).frondEar,
+        "store-reset-marker",
+      );
+      assert.deepEqual(readFileSync(`${roomy}.corrupt-${STAMP}`), garbage);
+
+      const path = join(deep, "short", "ear.db");
+      const child = setAsideUnderLimit(path, 512);
+      assert.notEqual(
+        child.status,
+        0,
+        "setStoreAside returned on a short marker",
+      );
+      assert.match(child.stderr, /refusing to start/);
+      assert.match(child.stderr, /reset marker/);
+      assert.deepEqual(
+        readFileSync(path),
+        garbage,
+        "the store stays where it was",
+      );
+      assert.deepEqual(quarantined(join(deep, "short")), [], "nothing moved");
+      // The next start finds the same store and sets it aside then, with a whole marker.
+      const next = new EventStore(path, new FakeClock(AT + 1_000));
+      try {
+        assert.equal(next.storeResets().length, 1);
+      } finally {
+        next.close();
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
+
+for (const [label, fake] of [
+  ["a write that makes no progress", () => 0],
+  [
+    "a write that reports every byte and writes none",
+    (_fd: number, _buffer: Uint8Array, _offset: number, length: number) =>
+      length,
+  ],
+] as const) {
+  test(`${label} refuses before any rename (the marker is checked, not trusted)`, () => {
+    const directory = scratch();
+    const path = join(directory, "ear.db");
+    const garbage = Buffer.from("garbage ".repeat(600));
+    const real = fs.writeSync;
+    try {
+      writeFileSync(path, garbage);
+      (fs as { writeSync: unknown }).writeSync = fake;
+      syncBuiltinESMExports();
+      assert.throws(
+        () => setStoreAside(path, new Error("file is not a database"), AT),
+        (error: Error) =>
+          error.message.includes("refusing to start") &&
+          error.message.includes("the reset marker") &&
+          error.message.includes("Nothing was moved"),
+      );
+    } finally {
+      fs.writeSync = real;
+      syncBuiltinESMExports();
+    }
+    try {
+      assert.deepEqual(readFileSync(path), garbage);
+      assert.deepEqual(quarantined(directory), []);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }

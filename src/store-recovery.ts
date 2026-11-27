@@ -242,14 +242,40 @@ function recordedPath(marker: string): string {
   return `${marker.slice(0, -MARKER_SUFFIX.length)}${RECORDED_SUFFIX}`;
 }
 
-/** Written whole and synced, file and directory, before the first rename. Never overwrites. */
+/**
+ * Written whole, read back whole and synced, file and directory, before the first
+ * rename; never overwrites. Throws if any of that fails, so nothing moves: a short write
+ * (writeSync returns fewer bytes than asked, as under a file-size limit) is written on
+ * from where it stopped, and one that makes no progress or reads back different throws.
+ */
 function writeMarker(marker: string, content: ResetMarker): void {
+  const bytes = Buffer.from(`${JSON.stringify(content, null, 2)}\n`, "utf8");
   const fd = openSync(marker, "wx", 0o600);
   try {
-    writeSync(fd, `${JSON.stringify(content, null, 2)}\n`);
+    for (let offset = 0; offset < bytes.length; ) {
+      const written = writeSync(
+        fd,
+        bytes,
+        offset,
+        bytes.length - offset,
+        offset,
+      );
+      if (written <= 0) {
+        throw new Error(
+          `the reset marker took ${offset} of ${bytes.length} bytes, then none`,
+        );
+      }
+      offset += written;
+    }
     fsyncSync(fd);
   } finally {
     closeSync(fd);
+  }
+  const back = readFileSync(marker);
+  if (!back.equals(bytes) || readMarker(marker) === undefined) {
+    throw new Error(
+      `the reset marker reads back ${back.length} bytes, not the ${bytes.length} written`,
+    );
   }
   try {
     const directory = openSync(dirname(marker), "r");
