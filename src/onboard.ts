@@ -31,7 +31,9 @@ import {
   defaultSocketPath,
   loadConfigFile,
   parseConfig,
+  type Config,
 } from "./config.ts";
+import { instructionsLayout, MCP_INSTRUCTIONS_CAP } from "./render.ts";
 import type { Mode } from "./types.ts";
 
 export interface Io {
@@ -677,7 +679,7 @@ function strandedConfig(
 function configCheck(
   source: ConfigSource,
   env: NodeJS.ProcessEnv,
-): { check: Check; ears: string[] } {
+): { check: Check; ears: string[]; config?: Config } {
   const { path, from } = source;
   if (!existsSync(path)) {
     const stranded = strandedConfig(source, env);
@@ -707,6 +709,7 @@ function configCheck(
         detail: `${path} (${from}): ${ears.length} ear(s): ${ears.join(", ")}`,
       },
       ears,
+      config,
     };
   } catch (error) {
     return {
@@ -720,6 +723,105 @@ function configCheck(
       ears: [],
     };
   }
+}
+
+/**
+ * Claude Code's cut for an MCP server's instructions as this environment sets it. Its env
+ * getter (2.1.314, `int({min: 1, digitsOnly: true})`) takes the trimmed value if it is
+ * digits with an optional sign, finite and at least 1; anything else leaves the default.
+ * The seat's claude may run with another environment, so the detail says which applied.
+ */
+function instructionsCap(env: NodeJS.ProcessEnv): {
+  cap: number;
+  from: string;
+} {
+  const raw = env.CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH;
+  if (raw === undefined) {
+    return {
+      cap: MCP_INSTRUCTIONS_CAP,
+      from: "Claude Code's default; CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH is unset here",
+    };
+  }
+  const value = raw.trim();
+  const cap = Number(value);
+  if (/^[+-]?\d+$/u.test(value) && Number.isFinite(cap) && cap >= 1) {
+    return {
+      cap,
+      from: "CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH, as set here",
+    };
+  }
+  return {
+    cap: MCP_INSTRUCTIONS_CAP,
+    from: "Claude Code's default: CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH here is not a whole number of at least 1",
+  };
+}
+
+const units = (count: number): string =>
+  `${count} UTF-16 unit${count === 1 ? "" : "s"}`;
+
+/**
+ * What a claude-channel ear's session reads of its channel instructions: Claude Code keeps
+ * the first `cap` UTF-16 units. A Copilot extension prefixes them to a push, uncut.
+ */
+function instructionsChecks(config: Config, env: NodeJS.ProcessEnv): Check[] {
+  const { cap, from } = instructionsCap(env);
+  // A cap past 2^53 prints as 1e+23; every such cap is "more than this text".
+  const shown = Number.isSafeInteger(cap) ? String(cap) : "more than 2^53";
+  const raise =
+    "raise CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH where the seat's claude runs";
+  const checks: Check[] = [];
+  for (const [name, ear] of Object.entries(config.ears)) {
+    if (ear.target !== "claude-channel") {
+      continue;
+    }
+    const { text, trustEnd, seat } = instructionsLayout(config, name);
+    const field = `ears.${name}.instructions`;
+    const length = text.length;
+    const measured = `${length} of ${shown} characters (UTF-16 units, as Claude Code counts; ${from})`;
+    if (length <= cap) {
+      checks.push({
+        name: `ear ${name}: instructions`,
+        ok: true,
+        required: false,
+        detail: `${measured}: the session reads them whole`,
+      });
+      continue;
+    }
+    const cut = length - cap;
+    const seatLength = seat ? seat.end - seat.start : 0;
+    let lost: string;
+    let hint: string;
+    if (cap < trustEnd) {
+      // The seat text comes after the trust rules: shortening it gives none of them back.
+      lost = `from inside frond-ear's trust rules: the session misses some of them${seat ? `, ${field}` : ""} and all the tool guidance`;
+      hint = seat
+        ? `${raise}: the cut is inside frond-ear's own text, ahead of ${field}, so shortening ${field} cannot help`
+        : raise;
+    } else {
+      lost =
+        seat && cap < seat.end
+          ? `${seat.end - Math.max(cap, seat.start)} of the ${seatLength} in ${field} and all the tool guidance after it`
+          : `tool guidance only; ${seat ? `${field} reaches the session whole` : `there is no ${field}`}`;
+      // Without the seat text its lead line and breaks go too.
+      const saving = seat ? seat.end - trustEnd : 0;
+      hint =
+        seatLength > cut
+          ? `shorten ${field} by ${units(cut)} (to ${seatLength - cut} or fewer; most emoji count 2), or ${raise}`
+          : seat && cut <= saving
+            ? `remove ${field} (with the line that introduces it, ${units(saving)}), or ${raise}`
+            : seat
+              ? `${raise}: even without ${field} the instructions are ${units(length - saving)}`
+              : raise;
+    }
+    checks.push({
+      name: `ear ${name}: instructions`,
+      ok: false,
+      required: false,
+      detail: `${measured}: Claude Code drops the last ${cut}, ${lost}`,
+      hint,
+    });
+  }
+  return checks;
 }
 
 function tokenCheck(flag: string | undefined, env: NodeJS.ProcessEnv): Check {
@@ -945,8 +1047,15 @@ export async function doctorChecks(
 ): Promise<Check[]> {
   const checks: Check[] = [nodeCheck()];
   const source = resolveConfigPath(values.config, env, cwd);
-  const { check: config, ears: configuredEars } = configCheck(source, env);
+  const {
+    check: config,
+    ears: configuredEars,
+    config: loaded,
+  } = configCheck(source, env);
   checks.push(config);
+  if (loaded) {
+    checks.push(...instructionsChecks(loaded, env));
+  }
   const token = tokenCheck(values["token-file"], env);
   checks.push(token);
   const tokenPath = resolve(

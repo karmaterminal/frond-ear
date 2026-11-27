@@ -198,7 +198,10 @@ async function runDaemon(argv: string[]): Promise<void> {
       gateway?.status() ?? { state: runtime.dryRun ? "dry-run" : "disabled" },
     canticleStatus: () => canticle?.status() ?? { state: "disabled" },
     ...(canticle
-      ? { canticleHear: (ear: string) => canticle!.hearView(ear) }
+      ? {
+          canticleHear: (ear: string) => canticle!.hearView(ear),
+          canticleGuide: (ear: string) => canticle!.guideView(ear),
+        }
       : {}),
   });
   // Signal handlers go in before the socket can be seen: a SIGTERM from a

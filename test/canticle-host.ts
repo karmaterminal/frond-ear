@@ -218,12 +218,20 @@ export class Host {
 
   /** The station plucks one of its records. */
   pluck(seq: number, o: Song = {}): void {
+    this.retract(seq, "plucked", o);
+  }
+
+  /**
+   * The host retracts one of its records for `reason` (record v1 `retract`, RFC-0001
+   * §14.18.3): `plucked`, `revoked`, `quarantined`, `expired` or `superseded`.
+   */
+  retract(seq: number, reason: string, o: Song = {}): void {
     const idem = this.fields(seq, o).idem as string;
     this.onAir.delete(idem);
     this.#emit("retract", {
       target: {},
       idem,
-      reason: "plucked",
+      reason,
       by: null,
     });
   }
@@ -287,6 +295,11 @@ export class Host {
   view() {
     return this.consumer.hearView(this.tune, this.now, this.listening);
   }
+
+  /** The metadata-only view the guide reads (RFC-0002 §3.3). */
+  guideView() {
+    return this.consumer.guideView(this.tune, this.now, this.listening);
+  }
 }
 
 /** The test config with canticle on, from the host daemon, delivering to `scribe`. */
@@ -320,6 +333,7 @@ export function setup(
   let host: Host | undefined;
   const h = harness(canticleConfig(delivery, canticle, top), {
     canticleHear: () => host!.view(),
+    canticleGuide: () => host!.guideView(),
     ...options,
   });
   host = new Host(h.clock);
@@ -327,8 +341,23 @@ export function setup(
   return { h, host };
 }
 
+/** The canticle pushes the client was sent; a withdrawn note (#67) is not one. */
 export const pushes = (client: { connection: MemoryConnection }) =>
-  client.connection.events().filter((event) => event.meta.kind === "canticle");
+  client.connection
+    .events()
+    .filter(
+      (event) =>
+        event.meta.kind === "canticle" && event.meta.delivery !== "withdrawn",
+    );
+
+/** The withdrawn notes (#67) the client was sent. */
+export const notes = (client: { connection: MemoryConnection }) =>
+  client.connection
+    .events()
+    .filter(
+      (event) =>
+        event.meta.kind === "canticle" && event.meta.delivery === "withdrawn",
+    );
 
 /**
  * Answers `offered` for each canticle push the client was sent, as a shim does once it
@@ -361,6 +390,14 @@ export interface DeliveryStatus {
   maxPushesPerHour: number;
   reports: number;
   counts: Record<string, number>;
+  /** Withdrawn notes (#67): owed, when the next is due, why held, the hour's budget. */
+  withdrawn: {
+    owed: number;
+    nextAt: number | null;
+    held: string | null;
+    notesLastHour: number;
+    maxWithdrawnPerHour: number;
+  };
 }
 
 export function status(h: Harness): DeliveryStatus {

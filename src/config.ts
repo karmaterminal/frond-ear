@@ -27,7 +27,7 @@ export interface EarConfig {
   dmMode: "mentions" | "silent";
   /** Ask Claude to ack a nonce on attach, proving the channel is registered. */
   attachCanary: boolean;
-  /** Operator-authored text appended to the channel instructions. */
+  /** The seat's own text in the channel instructions: after the trust rules, before the guidance. */
   instructions: string;
   /**
    * Absolute directories a reply's `files` must resolve under (frond-ear#99). Empty, the
@@ -235,6 +235,12 @@ export interface CanticleEarDelivery {
    * window when `windowMs` is under a minute (at most 360), so a busy band's reports fit.
    */
   maxPushesPerHour: number;
+  /**
+   * Withdrawn notes per rolling hour, at most (#67): their own budget, apart from
+   * `maxPushesPerHour`, so a burst of plucks can't hold back a real push, nor a busy band
+   * a note. Past it, notes wait while their tombstones hold.
+   */
+  maxWithdrawnPerHour: number;
 }
 
 /** RFC-0001 §14.10: wakes are coalesced over at least 5 s. */
@@ -585,6 +591,12 @@ function parseDelivery(value: unknown, name: string): CanticleEarDelivery {
         CANTICLE_MAX_PUSHES_PER_HOUR,
         Math.max(60, Math.ceil(3_600_000 / windowMs)),
       ),
+      1,
+      CANTICLE_MAX_PUSHES_PER_HOUR,
+    ),
+    maxWithdrawnPerHour: bounded(
+      "maxWithdrawnPerHour",
+      30,
       1,
       CANTICLE_MAX_PUSHES_PER_HOUR,
     ),

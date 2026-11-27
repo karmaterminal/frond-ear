@@ -72,7 +72,8 @@
         "style": "records",
         "maxItems": 5,
         "bufferPerStream": 32,
-        "maxPushesPerHour": 60
+        "maxPushesPerHour": 60,
+        "maxWithdrawnPerHour": 30
       }
     },
     "derivedPublication": false,

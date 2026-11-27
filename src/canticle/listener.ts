@@ -835,14 +835,22 @@ export class Listener {
       for (const [k, h] of this.held) {
         if (h.ident === target) this.held.delete(k);
       }
-      if (this.current.delete(target)) {
+      const was = this.current.get(target);
+      if (was !== undefined && this.current.delete(target)) {
         events.push({
           event: "withdrawn",
           station: this.#name(kid),
           keyId: kid,
           stream: sname,
           seq: p.targetSeq,
-          data: { by_seq: p.seq, reason: p.reason ?? null },
+          // What the binding needs to tell a session it was pushed to (#67).
+          data: {
+            by_seq: p.seq,
+            reason: p.reason ?? null,
+            epoch: p.epoch,
+            cls: CLASSES.get(was.item.cls)?.name ?? String(was.item.cls),
+            localExpiry: was.localExpiry,
+          },
         });
       }
       return events;
@@ -1240,7 +1248,12 @@ export class Listener {
           keyId: h.kid,
           stream: this.#streamName(h.kid, h.item.stream),
           seq: h.item.seq,
-          data: {},
+          // It ran out while current (#67): what a binding tells a session it woke.
+          data: {
+            epoch: h.item.epoch,
+            cls: CLASSES.get(h.item.cls)?.name ?? String(h.item.cls),
+            localExpiry: h.localExpiry,
+          },
         });
       }
     }
