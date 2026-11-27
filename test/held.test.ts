@@ -19,8 +19,8 @@ import {
 } from "../src/canticle/held.ts";
 import { TOOLS } from "../src/shim.ts";
 import type { HeldItem } from "../src/store.ts";
-import { confirm, pushes, SESSION, setup } from "./canticle-host.ts";
-import type { Harness } from "./helpers.ts";
+import { ALPHA, confirm, pushes, SESSION, setup } from "./canticle-host.ts";
+import { harness, testConfig, type Harness } from "./helpers.ts";
 
 const OTHER = "22222222-bbbb-4bbb-8bbb-000000000002";
 
@@ -980,6 +980,90 @@ test("copy guard: a held read counts only under the digest custody recorded for 
     });
     assert.equal(letter.ok, true, letter.text);
     assert.doesNotMatch(letter.text, /ops:ops/u);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("copy guard (🌫 on #144): with no live view at all (canticle off after a reopen), a read hold is still compared, and a stored letter says only held records were", async () => {
+  const first = await heldOffAir();
+  const path = join(first.h.directory, "ear.db");
+  const directory = first.h.directory;
+  const at = first.h.clock.now();
+  first.h.daemon.shutdown();
+  first.h.store.close();
+  // The same store under a daemon with canticle disabled: no live-view callback.
+  const h = harness(testConfig(), { path });
+  try {
+    h.clock.value = at;
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    const read = await h.call(shim, "held", { read: REF });
+    assert.equal(read.ok, true, read.text);
+    const copied = await h.call(shim, "leave_letter", {
+      reason: "r",
+      body: RECORD,
+    });
+    assert.equal(copied.ok, false, "the read hold is compared");
+    assert.match(copied.text, /ops:ops\.fleet 7\/2/u);
+    assert.ok(echoesNone(copied.text, RECORD));
+    const own = await h.call(shim, "leave_letter", {
+      reason: "r",
+      body: "in my own words: rune came back and lost some room events",
+    });
+    assert.equal(own.ok, true, own.text);
+    assert.match(
+      own.text,
+      /copy check: partial \(no live set on this daemon: only held records were compared\)/u,
+      "never reads as checked",
+    );
+    // A session with nothing released is checked against nothing, and says nothing.
+    const fresh = h.attach("scribe", { sessionId: OTHER });
+    const plain = await h.call(fresh, "leave_letter", {
+      reason: "r",
+      body: RECORD,
+    });
+    assert.equal(plain.ok, true, plain.text);
+    assert.doesNotMatch(plain.text, /copy check/u);
+  } finally {
+    h.dispose();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("copy guard (🌫 on #144): a live record under another key with the same station:stream epoch/seq doesn't stand in for the held one", async () => {
+  const { h, host } = setup(undefined);
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    host.sing(2, { text: RECORD, ttlMs: 60_000 });
+    h.timers.advance(1_000);
+    await h.call(shim, "hear", {});
+    assert.equal(
+      (await h.call(shim, "hold", { ref: REF, keep_for: 7_200 })).ok,
+      true,
+    );
+    h.clock.advance(120_000); // A is off air
+    // B: the same station name, stream, epoch and seq, under another admitted key.
+    host.sing(2, { text: SECOND, key: ALPHA });
+    h.timers.advance(1_000);
+    const heard = (await h.call(shim, "hear", {})).text;
+    assert.match(heard, /elliott canary/u, "B was shown whole");
+    assert.match(heard, new RegExp(`key=${ALPHA}`, "u"));
+    const copiedB = await h.call(shim, "leave_letter", {
+      reason: "r",
+      body: SECOND,
+    });
+    assert.equal(copiedB.ok, false, "B is compared");
+    const copiedA = await h.call(shim, "leave_letter", {
+      reason: "r",
+      body: RECORD,
+    });
+    assert.equal(
+      copiedA.ok,
+      false,
+      "held A is compared too, B doesn't suppress it",
+    );
+    assert.match(copiedA.text, /ops:ops\.fleet 7\/2/u);
+    assert.ok(echoesNone(copiedA.text, RECORD));
   } finally {
     h.dispose();
   }
