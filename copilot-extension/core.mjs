@@ -52,7 +52,7 @@ function attr(value) {
 
 /**
  * The same `<channel>` element Claude Code builds from a channel notification, so the
- * daemon's instructions ("Discord activity arrives as <channel> events") hold verbatim.
+ * daemon's instructions about its <channel> events hold verbatim.
  * The daemon already neutralises `<channel`/`</channel` inside message text.
  * @param {EarEvent} event
  */

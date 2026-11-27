@@ -726,8 +726,9 @@ function configCheck(
 }
 
 /**
- * Claude Code's cut for an MCP server's instructions as this environment sets it:
- * CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH when it is a positive integer, else the default.
+ * Claude Code's cut for an MCP server's instructions as this environment sets it. Its env
+ * getter (2.1.314, `int({min: 1, digitsOnly: true})`) takes the trimmed value if it is
+ * digits with an optional sign, finite and at least 1; anything else leaves the default.
  * The seat's claude may run with another environment, so the detail says which applied.
  */
 function instructionsCap(env: NodeJS.ProcessEnv): {
@@ -735,23 +736,28 @@ function instructionsCap(env: NodeJS.ProcessEnv): {
   from: string;
 } {
   const raw = env.CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH;
-  if (raw === undefined || raw === "") {
+  if (raw === undefined) {
     return {
       cap: MCP_INSTRUCTIONS_CAP,
       from: "Claude Code's default; CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH is unset here",
     };
   }
-  if (/^\d+$/u.test(raw) && Number(raw) >= 1) {
+  const value = raw.trim();
+  const cap = Number(value);
+  if (/^[+-]?\d+$/u.test(value) && Number.isFinite(cap) && cap >= 1) {
     return {
-      cap: Number(raw),
+      cap,
       from: "CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH, as set here",
     };
   }
   return {
     cap: MCP_INSTRUCTIONS_CAP,
-    from: "Claude Code's default: CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH here is not a positive integer",
+    from: "Claude Code's default: CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH here is not a whole number of at least 1",
   };
 }
+
+const units = (count: number): string =>
+  `${count} UTF-16 unit${count === 1 ? "" : "s"}`;
 
 /**
  * What a claude-channel ear's session reads of its channel instructions: Claude Code keeps
@@ -759,6 +765,10 @@ function instructionsCap(env: NodeJS.ProcessEnv): {
  */
 function instructionsChecks(config: Config, env: NodeJS.ProcessEnv): Check[] {
   const { cap, from } = instructionsCap(env);
+  // A cap past 2^53 prints as 1e+23; every such cap is "more than this text".
+  const shown = Number.isSafeInteger(cap) ? String(cap) : "more than 2^53";
+  const raise =
+    "raise CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH where the seat's claude runs";
   const checks: Check[] = [];
   for (const [name, ear] of Object.entries(config.ears)) {
     if (ear.target !== "claude-channel") {
@@ -767,32 +777,44 @@ function instructionsChecks(config: Config, env: NodeJS.ProcessEnv): Check[] {
     const { text, trustEnd, seat } = instructionsLayout(config, name);
     const field = `ears.${name}.instructions`;
     const length = text.length;
+    const measured = `${length} of ${shown} characters (UTF-16 units, as Claude Code counts; ${from})`;
     if (length <= cap) {
       checks.push({
         name: `ear ${name}: instructions`,
         ok: true,
         required: false,
-        detail: `${length} of ${cap} characters (UTF-16 units, as Claude Code counts; ${from}): the session reads them whole`,
+        detail: `${measured}: the session reads them whole`,
       });
       continue;
     }
     const cut = length - cap;
     const seatLength = seat ? seat.end - seat.start : 0;
-    const lost =
-      cap < trustEnd
-        ? `from inside frond-ear's trust rules: the session misses some of them${seat ? `, ${field}` : ""} and all the tool guidance`
-        : seat && cap < seat.end
+    let lost: string;
+    let hint: string;
+    if (cap < trustEnd) {
+      // The seat text comes after the trust rules: shortening it gives none of them back.
+      lost = `from inside frond-ear's trust rules: the session misses some of them${seat ? `, ${field}` : ""} and all the tool guidance`;
+      hint = seat
+        ? `${raise}: the cut is inside frond-ear's own text, ahead of ${field}, so shortening ${field} cannot help; fewer or shorter labels, or a shorter ear name, can`
+        : `${raise}; fewer or shorter labels, or a shorter ear name, also help`;
+    } else {
+      lost =
+        seat && cap < seat.end
           ? `${seat.end - Math.max(cap, seat.start)} of the ${seatLength} in ${field} and all the tool guidance after it`
           : `tool guidance only; ${seat ? `${field} reaches the session whole` : `there is no ${field}`}`;
+      hint =
+        seatLength > cut
+          ? `shorten ${field} by ${units(cut)} (to ${seatLength - cut} or fewer; most emoji count 2), or ${raise}`
+          : seatLength === cut
+            ? `remove ${field} (all ${units(cut)} of it), or ${raise}`
+            : `${raise}${seat ? `, or shorten ${field}` : ""}`;
+    }
     checks.push({
       name: `ear ${name}: instructions`,
       ok: false,
       required: false,
-      detail: `${length} of ${cap} characters (UTF-16 units, as Claude Code counts; ${from}): Claude Code drops the last ${cut}, ${lost}`,
-      hint:
-        cap >= trustEnd && seatLength >= cut
-          ? `shorten ${field} by ${cut} characters (to ${seatLength - cut} or fewer), or raise CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH where the seat's claude runs`
-          : `raise CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH where the seat's claude runs${seat ? `, or shorten ${field}` : ""}`,
+      detail: `${measured}: Claude Code drops the last ${cut}, ${lost}`,
+      hint,
     });
   }
   return checks;

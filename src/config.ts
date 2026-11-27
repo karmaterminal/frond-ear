@@ -27,7 +27,7 @@ export interface EarConfig {
   dmMode: "mentions" | "silent";
   /** Ask Claude to ack a nonce on attach, proving the channel is registered. */
   attachCanary: boolean;
-  /** Operator-authored text appended to the channel instructions. */
+  /** The seat's own text in the channel instructions: after the trust rules, before the guidance. */
   instructions: string;
   /**
    * Absolute directories a reply's `files` must resolve under (frond-ear#99). Empty, the
