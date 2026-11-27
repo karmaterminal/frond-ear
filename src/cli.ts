@@ -124,6 +124,33 @@ async function runDaemon(argv: string[]): Promise<void> {
   const githubToken = readGithubToken(env);
   const logger = new StructuredLogger(undefined, token ? [token] : []);
   const store = new EventStore(runtime.databasePath);
+  if (store.reset) {
+    // #115: said once here, and in ear_status for as long as the record stands.
+    logger.log("warn", "store.set_aside", {
+      keptAt: store.reset.keptAt,
+      moved: store.reset.moved,
+      // SQLite's own words or quick_check's page findings, never ledger text ("error"
+      // is a key the logger redacts wholesale).
+      found: store.reset.error,
+    });
+  }
+  if (store.ignoredMarkers.length > 0) {
+    // Pending reset markers not believed (malformed, or naming no moved database):
+    // reported, never acted on, and they never stop a healthy store's start.
+    logger.log("warn", "store.reset_markers_ignored", {
+      count: store.ignoredMarkers.length,
+      markers: store.ignoredMarkers,
+    });
+  }
+  for (const reset of store.recovered) {
+    // A reset an earlier start set aside but never recorded, read back from its marker.
+    logger.log("warn", "store.reset_recovered", {
+      keptAt: reset.keptAt,
+      marker: reset.recoveredFrom,
+      setAsideAt: new Date(reset.at).toISOString(),
+      found: reset.error,
+    });
+  }
   const pruned = store.prune(config.limits.retentionMs);
 
   let gateway: DiscordGateway | undefined;

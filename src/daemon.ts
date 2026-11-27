@@ -128,6 +128,7 @@ import {
 } from "./github.ts";
 import type { Schedule, Wake } from "./wake-store.ts";
 import type { CompactionBoundary, EventStore, ReplyPart } from "./store.ts";
+import type { StoreReset } from "./store-recovery.ts";
 import type {
   BatchKind,
   Clock,
@@ -5288,6 +5289,44 @@ export class Daemon {
     };
   }
 
+  /**
+   * A corrupt store set aside at start (#115), said plainly: what is not in the live
+   * store, since when, and where the old file is kept. Said for as long as the fresh
+   * store holds the record.
+   */
+  private storeResetView(): {
+    storeReset?: {
+      said: string;
+      resets: Array<StoreReset & { atIso: string }>;
+    };
+  } {
+    const resets = this.store.storeResets();
+    const latest = resets.at(-1);
+    if (latest === undefined) {
+      return {};
+    }
+    const at = new Date(latest.at).toISOString();
+    // Deep Dive No. 2 §08: the start that set it aside never recorded it; a later one
+    // did, from the marker left beside it before anything moved.
+    const started =
+      latest.recoveredFrom === undefined
+        ? "frond-ear started a fresh store then."
+        : `the fresh store that start began did not complete, and this record was read back from ${latest.recoveredFrom} at ${new Date(latest.recoveredAt ?? latest.at).toISOString()}.`;
+    const earlier =
+      resets.length > 1
+        ? ` It has been set aside ${resets.length} times; resets lists each.`
+        : "";
+    return {
+      storeReset: {
+        said: `the ledger store was corrupt at start and was set aside at ${at}; ${started} Owed letters and wakes from before ${at} (and everything else the store held: queued events, schedules, canticle custody) are not in the live store. The old file is kept, never deleted, at ${latest.keptAt}; an owner can read it by hand (sqlite3 .recover, docs/recovery.md).${earlier}`,
+        resets: resets.map((reset) => ({
+          ...reset,
+          atIso: new Date(reset.at).toISOString(),
+        })),
+      },
+    };
+  }
+
   public status(onlyEar?: string): object {
     const ears = Object.entries(this.config.ears)
       .filter(([name]) => onlyEar === undefined || name === onlyEar)
@@ -5341,6 +5380,7 @@ export class Daemon {
         };
       });
     return {
+      ...this.storeResetView(),
       paused: this.config.paused,
       gateway: this.options.gatewayStatus?.() ?? { state: "disabled" },
       canticle: this.options.canticleStatus?.() ?? { state: "disabled" },
