@@ -5,9 +5,11 @@ import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 import {
   existsSync,
+  linkSync,
   mkdirSync,
   mkdtempSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -16,7 +18,11 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test, { type TestContext } from "node:test";
 
-import { lockDatabase } from "../src/db-lock.ts";
+import {
+  DatabaseHeldError,
+  DatabaseLinkedError,
+  lockDatabase,
+} from "../src/db-lock.ts";
 import { BOT, CHANNEL, GUILD, PRINCIPAL, ROOM } from "./helpers.ts";
 
 const CLI = join(import.meta.dirname, "..", "src", "cli.ts");
@@ -368,4 +374,99 @@ test("the database guard is released by the OS: a SIGKILLed daemon leaves nothin
     "the restarted daemon's socket",
   );
   assert.equal((await run(["status"], setup.envB)).code, 0);
+});
+
+// 🌫's and 🕯's review of 3461655: the lock was named by the spelling of the database
+// path, so a second name for the same file took a different lock. A file symlink and a
+// hard link both let daemon B start on A's ledger and drop A's queued mention.
+
+async function refusesOnAlias(
+  t: TestContext,
+  setup: Fixture,
+  alias: string,
+  refusal: RegExp,
+): Promise<void> {
+  const before = readLedger(setup.databasePath);
+  assert.deepEqual(before.states, ["queued"]);
+  const second = spawnDaemon(t, { ...setup.envB, FROND_EAR_DATABASE: alias });
+  const code = await exitWithin(second, 8_000);
+  const after = readLedger(setup.databasePath);
+  assert.deepEqual(after.states, ["queued"], "A's queued mention was touched");
+  assert.equal(after.revoked, 0);
+  assert.equal(after.content, before.content, "B wrote to A's database");
+  assert.doesNotMatch(second.stderr(), /ear\.routing_revoked/u);
+  assert.notEqual(code, undefined, "daemon B is still running on A's database");
+  assert.notEqual(code, 0);
+  assert.match(second.stderr(), refusal);
+  assert.doesNotMatch(second.stderr(), /daemon\.listening/u);
+  assert.equal(existsSync(setup.envB.FROND_EAR_SOCKET!), false);
+}
+
+test("the database guard follows a symlink to the database file itself: B on alias.db -> ear.db refuses (🌫's two-daemon reproduction)", async (t) => {
+  const setup = fixture(t);
+  await startA(t, setup);
+  const alias = join(setup.directory, "state", "alias.db");
+  symlinkSync("ear.db", alias, "file");
+  await refusesOnAlias(
+    t,
+    setup,
+    alias,
+    /another frond-ear daemon already holds the database/u,
+  );
+});
+
+test("a hard-linked database (two names, one device and inode) is refused before the store opens", async (t) => {
+  const setup = fixture(t);
+  await startA(t, setup);
+  const hard = join(setup.directory, "hard.db");
+  linkSync(setup.databasePath, hard);
+  const [one, two] = [statSync(setup.databasePath), statSync(hard)];
+  assert.notEqual(hard, setup.databasePath, "two distinct names");
+  assert.equal(one.dev, two.dev, "the same device");
+  assert.equal(one.ino, two.ino, "the same inode");
+  await refusesOnAlias(t, setup, hard, /has 2 hard links/u);
+  assert.equal(existsSync(`${hard}.lock`), false, "B wrote no lock sidecar");
+});
+
+test("lockDatabase: every name for one database takes the one lock, and a multiply-linked one is refused", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "frond-ear-dblock-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const real = join(directory, "state", "ear.db");
+  mkdirSync(join(directory, "state"), { mode: 0o700 });
+
+  // Not yet created: a dangling symlink names the file SQLite would create through it.
+  const early = join(directory, "early.db");
+  symlinkSync(real, early, "file");
+  const first = lockDatabase(early);
+  t.after(() => first?.release());
+  assert.equal(first?.path, `${real}.lock`);
+  assert.equal(first?.database, real);
+  assert.throws(() => lockDatabase(real), DatabaseHeldError);
+  first?.release();
+
+  new DatabaseSync(real).close();
+  const held = lockDatabase(real);
+  t.after(() => held?.release());
+  const fileLink = join(directory, "file-link.db");
+  symlinkSync(join("state", "ear.db"), fileLink, "file");
+  const directoryLink = join(directory, "dir-link");
+  symlinkSync(join(directory, "state"), directoryLink, "dir");
+  for (const alias of [fileLink, join(directoryLink, "ear.db")]) {
+    assert.throws(() => lockDatabase(alias), DatabaseHeldError, alias);
+  }
+  held?.release();
+
+  const hard = join(directory, "hard.db");
+  linkSync(real, hard);
+  for (const name of [real, hard, fileLink]) {
+    assert.throws(
+      () => lockDatabase(name),
+      (error: Error) =>
+        error instanceof DatabaseLinkedError &&
+        error.message.includes("has 2 hard links") &&
+        error.message.includes("refusing to start, nothing was written"),
+      name,
+    );
+  }
+  assert.equal(existsSync(`${hard}.lock`), false);
 });

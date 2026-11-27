@@ -127,7 +127,10 @@ async function runDaemon(argv: string[]): Promise<void> {
   // Before the first write (F1): opening the store migrates, prunes, and the daemon
   // repairs and reconciles. A second daemon must refuse here, not at the socket.
   const databaseLock = lockDatabase(runtime.databasePath);
-  const store = new EventStore(runtime.databasePath);
+  // The real path the lock was taken for: the store, its sidecars and the lock agree on
+  // one name for the ledger.
+  const databasePath = databaseLock?.database ?? runtime.databasePath;
+  const store = new EventStore(databasePath);
   const pruned = store.prune(config.limits.retentionMs);
 
   let gateway: DiscordGateway | undefined;
@@ -185,6 +188,10 @@ async function runDaemon(argv: string[]): Promise<void> {
       `${runtime.databasePath}-wal`,
       `${runtime.databasePath}-shm`,
       databaseLockPath(runtime.databasePath),
+      ...(databasePath === runtime.databasePath
+        ? []
+        : [databasePath, `${databasePath}-wal`, `${databasePath}-shm`]),
+      ...(databaseLock ? [databaseLock.path] : []),
       ...(env.DISCORD_BOT_TOKEN_FILE ? [env.DISCORD_BOT_TOKEN_FILE] : []),
       ...(env.FROND_EAR_TOKEN_FILE ? [env.FROND_EAR_TOKEN_FILE] : []),
       ...(env.FROND_EAR_GITHUB_TOKEN_FILE

@@ -127,6 +127,11 @@ beside a live daemon its own `FROND_EAR_DATABASE` and `FROND_EAR_SOCKET`. The lo
 advisory lock on that empty file, held by the running process; the kernel drops it when the
 process exits, however it exits, so the file left behind never blocks a restart. Don't delete it
 while a daemon runs: a daemon started after that would lock a new file and share the database.
+The lock sits beside the database's real path, so a symlink to the file or to a directory on the
+way is the same database and the same lock, and the store is opened at that real path. A
+hard-linked database (more than one name for the file) is refused before anything opens: SQLite
+keeps a `-wal` per name, so a second name is a second ledger. Give the daemon a database with one
+name.
 
 Register the shim for a throwaway directory only, with `local` scope, so no other session claims the ear.
 `<ear>` is the ear's name in the config, the one you gave `init` (which prints this line filled in):
