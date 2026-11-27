@@ -11,10 +11,24 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
-import { COPY_FLOOR } from "../src/letters.ts";
+import {
+  COPY_FLOOR,
+  COPY_MIN_SPACES,
+  COPY_UNCHECKED,
+  copiedRecords,
+  refuseCopies,
+  type ReleasedRecord,
+} from "../src/letters.ts";
 import { EventStore } from "../src/store.ts";
-import { confirm, pushes, SESSION, setup } from "./canticle-host.ts";
-import type { Harness } from "./helpers.ts";
+import {
+  canticleConfig,
+  confirm,
+  Host,
+  pushes,
+  SESSION,
+  setup,
+} from "./canticle-host.ts";
+import { harness, type Harness } from "./helpers.ts";
 
 const OTHER = "22222222-bbbb-4bbb-8bbb-000000000002";
 
@@ -423,6 +437,347 @@ test("letter heard refs: a store from before heard refs opens, and its letters n
       assert.deepEqual(letter.heard, []);
     } finally {
       store.close();
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+/** A record that cites identifiers the way beacons do, then says something in words. */
+const CITES =
+  "deployed 759883e483cd100de07402321db99dcf6d1c0585 per https://github.com/karmaterminal/openclaw/pull/1501 and rune lane drained cleanly after the restart";
+
+test("copy guard: an identifier the record shares (a full SHA, a URL prefix) is not a copy; a sentence still is", async () => {
+  const { h, host } = setup(undefined);
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    host.sing(2, { text: CITES });
+    h.timers.advance(1_000);
+    assert.match((await h.call(shim, "hear", {})).text, /759883e4/u);
+    // The same 40-hex SHA, cited from the session's own git log.
+    const sha = await h.call(shim, "leave_letter", {
+      reason: "the head to check",
+      body: "my git log says 759883e483cd100de07402321db99dcf6d1c0585 is the head; re-read CI there",
+    });
+    assert.equal(sha.ok, true, sha.text);
+    assert.doesNotMatch(sha.text, /copy check/u, "checked, so nothing extra");
+    // Another PR under the same 48-character repository prefix.
+    const url = await h.call(shim, "leave_letter", {
+      reason: "the follow-up",
+      body: "the follow-up is https://github.com/karmaterminal/openclaw/pull/1777, not merged yet",
+      assumed: ["https://github.com/karmaterminal/openclaw/pull/1501"],
+    });
+    assert.equal(url.ok, true, url.text);
+    // A sentence from the same record is still the record.
+    const said = await h.call(shim, "leave_letter", {
+      reason: "r",
+      body: "the radio: rune lane drained cleanly after the restart, so trust it",
+    });
+    assert.equal(said.ok, false, "a copied sentence is refused");
+    assert.match(said.text, /ops:ops\.fleet 7\/2/u);
+    assert.ok(echoesNone(said.text, CITES));
+  } finally {
+    h.dispose();
+  }
+});
+
+/** A released record carrying `text`, for the guard's own unit tests. */
+const released = (text: string, seq = "1"): ReleasedRecord => ({
+  station: "ops",
+  stream: "ops.fleet",
+  epoch: 7,
+  seq,
+  text,
+});
+const letterOf = (body: string) => ({ body, reason: "r", assumed: [] });
+
+test("copy guard: a shared run counts only with natural-language shape, at least COPY_MIN_SPACES spaces", () => {
+  assert.equal(COPY_MIN_SPACES, 4);
+  // Exactly the floor long, both sides; nothing longer is shared.
+  const four = "aaaaaaaa bbbbbbb ccccccc ddddddd eeeeeee";
+  const three = "aaaaaaaaa bbbbbbbbb ccccccccc dddddddddd";
+  const none = "0123456789abcdef0123456789abcdef01234567";
+  for (const run of [four, three, none]) {
+    assert.equal(run.length, COPY_FLOOR);
+  }
+  assert.equal(four.split(" ").length - 1, COPY_MIN_SPACES);
+  assert.equal(three.split(" ").length - 1, COPY_MIN_SPACES - 1);
+  const hit = (run: string) =>
+    copiedRecords(letterOf(`Q${run}Z`), [released(`X${run}Y`)]).length;
+  assert.equal(hit(four), 1, "four spaces: a copy");
+  assert.equal(hit(three), 0, "three spaces: not yet a copy");
+  assert.equal(hit(none), 0, "no whitespace: an identifier, never a copy");
+  // A run one character under the floor is no copy, however many spaces it has.
+  const short = "a b c d e f g h i j k l m n o p q r s t";
+  assert.equal(short.length, COPY_FLOOR - 1);
+  assert.equal(hit(short), 0);
+  // Whitespace is counted after it collapses to one space: a run of blanks is one.
+  assert.equal(hit("aaaaaaaaa  bbbbbbbbb\n\nccccccccc \t dddddddddd"), 0);
+});
+
+/** Deterministic word salad: no 40-character run of it recurs by chance. */
+function salad(seed: number, length: number): string {
+  let state = seed >>> 0 || 1;
+  const next = () => {
+    state ^= state << 13;
+    state ^= state >>> 17;
+    state ^= state << 5;
+    return state >>> 0;
+  };
+  const letters = "abcdefghijklmnopqrstuvwxyz0123456789";
+  let out = "";
+  while (out.length < length) {
+    const size = 2 + (next() % 7);
+    for (let i = 0; i < size; i += 1) out += letters[next() % letters.length];
+    out += " ";
+  }
+  return out.slice(0, length);
+}
+
+test("copy guard: memory is bounded by the letter, not the released text (3,500 records of 5,800 characters)", () => {
+  // The old index held every 40-character window of every record: past ~2,900 records of
+  // this size it threw RangeError (Map maximum size exceeded), and the letter failed closed.
+  const records = Array.from({ length: 3_500 }, (_, index) =>
+    released(salad(index + 1, 5_800), String(index)),
+  );
+  const sentence = "rune lane drained cleanly after the restart at 03:06Z";
+  records[3_499] = released(
+    `${salad(9_999, 2_000)} ${sentence} ${salad(7_777, 2_000)}`,
+    "3499",
+  );
+  const body = `${salad(123_456, 7_000)} the radio said ${sentence}.`;
+  const started = performance.now();
+  const found = copiedRecords(
+    { body, reason: "r", assumed: ["a", "b"] },
+    records,
+  );
+  const ms = performance.now() - started;
+  assert.deepEqual(
+    found.map(({ field, records: hits }) => [
+      field,
+      hits.map((record) => record.seq),
+    ]),
+    [["body", ["3499"]]],
+  );
+  assert.ok(ms < 10_000, `took ${Math.round(ms)} ms`);
+});
+
+test("copy guard: an internal failure fails open and says so; a refusal still refuses", () => {
+  const broken = {
+    station: "ops",
+    stream: "ops.fleet",
+    epoch: 7,
+    seq: "1",
+    get text(): string {
+      throw new RangeError("boom");
+    },
+  } as ReleasedRecord;
+  const errors: unknown[] = [];
+  assert.equal(
+    refuseCopies(letterOf(RECORD), [broken], (error) => errors.push(error)),
+    COPY_UNCHECKED.failed,
+  );
+  assert.equal(errors.length, 1);
+  assert.equal(
+    refuseCopies(letterOf("plain words"), [released(RECORD)]),
+    undefined,
+  );
+  assert.throws(
+    () => refuseCopies(letterOf(RECORD), [released(RECORD)]),
+    /letter not stored/u,
+  );
+});
+
+/**
+ * Canticle on, with a live view the test can break: `unreadable` makes it throw, `poisoned`
+ * hands out items whose text throws when read (a fault inside the guard, past the view).
+ */
+function breakable() {
+  const faults = { unreadable: false, poisoned: false };
+  let host: Host | undefined;
+  const h = harness(canticleConfig(undefined), {
+    canticleHear: () => {
+      if (faults.unreadable) throw new Error("host daemon gone");
+      const view = host!.view();
+      if (!faults.poisoned) return view;
+      return {
+        ...view,
+        items: view.items.map((item) =>
+          Object.defineProperty({ ...item }, "text", {
+            get() {
+              throw new TypeError("poisoned text");
+            },
+          }),
+        ),
+      };
+    },
+    canticleGuide: () => host!.guideView(),
+  });
+  host = new Host(h.clock);
+  host.start();
+  return { h, host, faults };
+}
+
+/** The daemon-written header line of a rendered letter (the line after `[letter`). */
+const headerOf = (text: string) =>
+  text.split("\n").find((line) => line.startsWith("[letter ")) ?? "";
+
+test("copy guard: a letter left while the guard couldn't run says so when left, read and released; its body is unchanged", async () => {
+  const { h, host, faults } = breakable();
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    host.sing(2, { text: RECORD });
+    h.timers.advance(1_000);
+    await h.call(shim, "hear", {});
+    const body = `rune's lane: ${RECORD}`;
+
+    // The live set can't be read: the letter is stored (fail open), and told so.
+    faults.unreadable = true;
+    const unreadable = await h.call(shim, "leave_letter", {
+      reason: "r",
+      body,
+    });
+    assert.equal(unreadable.ok, true, unreadable.text);
+    assert.match(
+      unreadable.text,
+      /copy check: not run \(live set unreadable\)/u,
+    );
+    faults.unreadable = false;
+
+    // The guard itself fails past the view: open too, with its own reason.
+    faults.poisoned = true;
+    const failed = await h.call(shim, "leave_letter", { reason: "r", body });
+    assert.equal(failed.ok, true, failed.text);
+    assert.match(failed.text, /copy check: not run \(the check failed\)/u);
+    faults.poisoned = false;
+
+    // With the guard back, the same text is refused, and a clean letter shows nothing extra.
+    const copied = await h.call(shim, "leave_letter", { reason: "r", body });
+    assert.equal(copied.ok, false);
+    const clean = await h.call(shim, "leave_letter", {
+      reason: "r",
+      body: "my own words",
+    });
+    assert.equal(clean.ok, true, clean.text);
+    assert.doesNotMatch(clean.text, /copy check/u);
+
+    // `letters read` shows it in the header, beside left and expires.
+    const read1 = (await h.call(shim, "letters", { read: 1 })).text;
+    assert.match(
+      headerOf(read1),
+      / · expires \S+ · copy check: not run \(live set unreadable\) · /u,
+    );
+    const read2 = (await h.call(shim, "letters", { read: 2 })).text;
+    assert.match(headerOf(read2), /copy check: not run \(the check failed\)/u);
+    const read3 = (await h.call(shim, "letters", { read: 3 })).text;
+    assert.doesNotMatch(read3, /copy check/u);
+
+    // Released after the compaction: the header carries it, the body is as written.
+    await release(h);
+    const events = letterEvents(shim);
+    assert.equal(events.length, 3);
+    const [first, second, third] = events;
+    assert.match(
+      headerOf(first!.content),
+      /copy check: not run \(live set unreadable\)/u,
+    );
+    assert.match(
+      headerOf(second!.content),
+      /copy check: not run \(the check failed\)/u,
+    );
+    assert.doesNotMatch(third!.content, /copy check/u);
+    for (const event of [first!, second!]) {
+      const quoted = event.content.split("\nletter:\n")[1]!;
+      assert.equal(quoted, `> ${body}`, "the body is exactly as left");
+      assert.doesNotMatch(quoted, /copy check/u);
+    }
+  } finally {
+    h.dispose();
+  }
+});
+
+test("copy guard: records shown before frond-ear knew the session's id aren't compared, and the letter says so", async () => {
+  const { h, host } = setup(undefined);
+  try {
+    const shim = h.attach("scribe", {});
+    host.sing(2, { text: RECORD });
+    h.timers.advance(1_000);
+    assert.match((await h.call(shim, "hear", {})).text, /lane=main/u);
+    // No id: nothing can be stored at all, so nothing is unchecked yet.
+    const anonymous = await h.call(shim, "leave_letter", {
+      reason: "r",
+      body: "b",
+    });
+    assert.equal(anonymous.ok, false);
+    assert.match(anonymous.text, /nothing was stored/u);
+    // The session is named later; what this shim was shown before can't be tied to it.
+    await shim.send({ type: "session", sessionId: SESSION });
+    const left = await h.call(shim, "leave_letter", {
+      reason: "r",
+      body: `copied: ${RECORD}`,
+    });
+    assert.equal(left.ok, true, left.text);
+    assert.match(
+      left.text,
+      /copy check: partial \(records shown before frond-ear knew this session's id were not compared\)/u,
+    );
+    const read = (await h.call(shim, "letters", { read: 1 })).text;
+    assert.match(headerOf(read), /copy check: partial/u);
+    // Heard again now, under the id: compared, refused, and nothing partial about it.
+    await h.call(shim, "hear", {});
+    const again = await h.call(shim, "leave_letter", {
+      reason: "r",
+      body: `copied: ${RECORD}`,
+    });
+    assert.equal(again.ok, false);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("letter copy check: a store from before copy checks opens, and its letters say the check is unknown", () => {
+  const directory = mkdtempSync(join(tmpdir(), "frond-ear-letter-copy-"));
+  try {
+    const path = join(directory, "ear.db");
+    const old = new DatabaseSync(path);
+    old.exec(`CREATE TABLE letters (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, ear TEXT NOT NULL, session_id TEXT,
+        reason TEXT NOT NULL, body TEXT NOT NULL, bytes INTEGER NOT NULL,
+        assumed TEXT NOT NULL DEFAULT '[]', heard TEXT NOT NULL DEFAULT '[]',
+        left_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, delivered_at INTEGER,
+        deliveries INTEGER NOT NULL DEFAULT 0, nonce TEXT, acked_at INTEGER,
+        releases_at_leave INTEGER NOT NULL DEFAULT 0)`);
+    old
+      .prepare(
+        "INSERT INTO letters (ear, session_id, reason, body, bytes, left_at, expires_at) VALUES ('scribe', ?, 'r', 'b', 1, 0, 1)",
+      )
+      .run(SESSION);
+    old.close();
+    for (let open = 0; open < 2; open += 1) {
+      const store = new EventStore(path);
+      try {
+        const [letter] = store.letters("scribe");
+        assert.equal(letter?.copyUnchecked, COPY_UNCHECKED.legacy);
+        // A letter left by this build after the migration records its own check.
+        if (open === 0) {
+          store.leaveLetter({
+            ear: "scribe",
+            sessionId: SESSION,
+            reason: "r",
+            body: "b",
+            bytes: 1,
+            assumed: [],
+            heard: [],
+            leftAt: 0,
+            expiresAt: 1,
+            releasesAtLeave: 0,
+            copyUnchecked: null,
+          });
+        }
+        assert.equal(store.letters("scribe")[1]?.copyUnchecked, null);
+      } finally {
+        store.close();
+      }
     }
   } finally {
     rmSync(directory, { recursive: true, force: true });

@@ -88,11 +88,13 @@ import { guideView } from "./canticle/guide.ts";
 import { hearResult, iso, type HeardItem } from "./canticle/hear.ts";
 import { CLASS_BY_NAME } from "./canticle/ids.ts";
 import {
+  COPY_UNCHECKED,
   LETTER_LIMITS,
   leaveLetter,
   listLetters,
   parseLeave,
   refuseCopies,
+  type LeaveRequest,
   type ReleasedRecord,
   releaseCount,
   releaseLetters,
@@ -3977,13 +3979,21 @@ export class Daemon {
           );
         }
         const request = parseLeave(args);
-        refuseCopies(request, this.releasedCanticle(ear, client.sessionId));
+        // Throws only to refuse a copy; anything else the guard meets lets the letter
+        // through, marked with why it wasn't compared.
+        const unchecked = this.copyCheck(
+          ear,
+          client,
+          client.sessionId,
+          request,
+        );
         return leaveLetter(
           this.store,
           ear,
           client.sessionId,
           this.clock.now(),
           request,
+          unchecked,
         );
       }
       case "letters": {
@@ -4173,56 +4183,96 @@ export class Daemon {
   }
 
   /**
+   * The letters' copy guard (#142): refuses a letter that copies canticle text already
+   * released to `sessionId` (by throwing), or returns why it didn't compare all of it
+   * (`COPY_UNCHECKED`), null when it did. It is a check on copies, not a gate letters
+   * depend on: a live set it can't read, or any fault of its own, lets the letter through
+   * and says so in the letter, so a later turn can tell "checked" from "never checked".
+   */
+  private copyCheck(
+    ear: string,
+    client: Client,
+    sessionId: string,
+    request: LeaveRequest,
+  ): string | null {
+    const failed = (error: unknown): void => {
+      this.logger.log("warn", "letters.copy_guard_failed", {
+        ear,
+        error: error instanceof Error ? error.name : typeof error,
+      });
+    };
+    let released: { records: ReleasedRecord[]; unchecked: string | null };
+    try {
+      released = this.releasedCanticle(ear, client, sessionId);
+    } catch (error) {
+      failed(error);
+      return COPY_UNCHECKED.failed;
+    }
+    return (
+      refuseCopies(request, released.records, failed) ?? released.unchecked
+    );
+  }
+
+  /**
    * The canticle records already released to `sessionId` on this ear, with the text it was
    * shown, for the letters' copy guard: custody's whole exposures to that session (a push
    * the host confirmed, its own `hear`), joined to the live set by identity and payload
    * digest. Never the held buffer or the rest of the live set: comparing a letter against
    * text the session hasn't elected to receive would make the write an oracle for it. A
-   * record gone from the live set has no text here, so it can't be compared.
+   * record gone from the live set has no text here, so it can't be compared. `unchecked`
+   * says when what it returns isn't all there was to compare: the live set couldn't be
+   * read, or a record still live was shown to this shim before frond-ear knew the
+   * session's id.
    */
-  private releasedCanticle(ear: string, sessionId: string): ReleasedRecord[] {
+  private releasedCanticle(
+    ear: string,
+    client: Client,
+    sessionId: string,
+  ): { records: ReleasedRecord[]; unchecked: string | null } {
     const view = this.options.canticleHear;
     if (!view) {
-      return [];
+      return { records: [], unchecked: null };
     }
     const shown = this.store.canticleReleasedTo(ear, sessionId);
-    if (shown.size === 0) {
-      return [];
+    const unnamed = this.store.canticleReleasedUnnamed(
+      ear,
+      client.attachGeneration,
+    );
+    if (shown.size === 0 && unnamed.size === 0) {
+      return { records: [], unchecked: null };
     }
     let items: HearView["items"];
     try {
       items = view(ear).items;
     } catch (error) {
-      // The guard is a check on copies, not a gate letters depend on.
       this.logger.log("warn", "letters.copy_guard_unavailable", {
         ear,
         error: error instanceof Error ? error.message : String(error),
       });
-      return [];
+      return { records: [], unchecked: COPY_UNCHECKED.unreadable };
     }
-    const released: ReleasedRecord[] = [];
+    const records: ReleasedRecord[] = [];
+    let unchecked: string | null = null;
     for (const item of items) {
-      if (item.text === undefined || item.text === "") {
+      const text = item.text;
+      if (text === undefined || text === "") {
         continue;
       }
-      const digests = shown.get(canticleIdentity(item));
-      if (
-        digests === undefined ||
-        !digests.has(
-          createHash("sha256").update(item.text, "utf8").digest("hex"),
-        )
-      ) {
-        continue;
+      const identity = canticleIdentity(item);
+      const digest = createHash("sha256").update(text, "utf8").digest("hex");
+      if (shown.get(identity)?.has(digest)) {
+        records.push({
+          station: item.station,
+          stream: item.stream,
+          epoch: item.epoch,
+          seq: item.seq,
+          text,
+        });
+      } else if (unnamed.get(identity)?.has(digest)) {
+        unchecked = COPY_UNCHECKED.unnamed;
       }
-      released.push({
-        station: item.station,
-        stream: item.stream,
-        epoch: item.epoch,
-        seq: item.seq,
-        text: item.text,
-      });
     }
-    return released;
+    return { records, unchecked };
   }
 
   /** `hear` showed these payloads to the ear's own session: custody, echoed at the return. */

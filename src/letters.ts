@@ -16,7 +16,12 @@ import { shownText, token } from "./canticle/hear.ts";
 import { checkStreamName } from "./canticle/ids.ts";
 import { CANTICLE_STATION } from "./config.ts";
 import { cleanName, cleanText, type Notification } from "./render.ts";
-import type { EventStore, HeardRef, Letter } from "./store.ts";
+import {
+  LEGACY_COPY_CHECK,
+  type EventStore,
+  type HeardRef,
+  type Letter,
+} from "./store.ts";
 
 export const LETTER_LIMITS = {
   maxBodyBytes: 8192,
@@ -212,13 +217,53 @@ export function parseLeave(args: Record<string, unknown>): LeaveRequest {
 
 /**
  * The copy guard's floor: a letter copies a record when they share a run of at least this
- * many characters (UTF-16 units) after normalization. 40 is about seven words: longer than
- * the short stock phrases that recur in independent writing ("There is a room.", "deploy
- * finished", a status word), so those never trip it, and short enough to catch a copied
- * sentence or clause, and to stay meaningful against `reason` and `assumed` items, which
- * are capped at 200. A record shorter than the floor can't be caught at all.
+ * many characters (UTF-16 units) after normalization, with natural-language shape (see
+ * `COPY_MIN_SPACES`). 40 is about seven words: longer than the short stock phrases that
+ * recur in independent writing ("There is a room.", "deploy finished", a status word), so
+ * those never trip it, and short enough to catch a copied sentence or clause, and to stay
+ * meaningful against `reason` and `assumed` items, which are capped at 200. A record
+ * shorter than the floor can't be caught at all.
  */
 export const COPY_FLOOR = 40;
+
+/**
+ * A shared run is a copy only if it holds at least this many spaces (after whitespace
+ * collapses to one space): words, not an identifier. A full commit SHA, a hash, a path or
+ * a URL has none, so a letter citing the same SHA or the same repository prefix as a
+ * record is never refused (🌿's review, #142 S2: "say it in your own words" can't apply
+ * to an identifier). Four spaces in 40 characters is three whole words plus the run's
+ * edges, about five. Measured on this frond's own writing (11-27): prose clears it easily
+ * (90% of the runbook's 40-character windows do; 831 of its 835 sentences of 40+
+ * characters hold such a window, and 4,151 of 4,262 in a seat's work log); the two
+ * halves of that work log, the same author weeks apart, share 4 windows with a space or
+ * more, 2 with three or more (both a stock phrase around an issue ref, "Ledger:
+ * silas-likes-to-watch#1041 comment") and none with four. Five would miss nearly twice as many copied sentences (8
+ * and 198). What four still catches: three identical words beside a shared identifier
+ * (" to silas at <sha>"), a run with real words in it.
+ */
+export const COPY_MIN_SPACES = 4;
+
+/**
+ * What a letter's header says when the copy guard didn't compare all of it: stored with
+ * the letter, shown beside `left` and `expires` at release and in `letters read`, and
+ * told to the session in `leave_letter`'s result. A letter the guard checked shows nothing:
+ * every path that skips the check names itself here (an old store's letters included), so
+ * no mark means checked, and the header every release prints stays short.
+ */
+export const COPY_UNCHECKED = {
+  unreadable: "not run (live set unreadable)",
+  failed: "not run (the check failed)",
+  unnamed:
+    "partial (records shown before frond-ear knew this session's id were not compared)",
+  legacy: LEGACY_COPY_CHECK,
+} as const;
+
+/** A stored reason as the header shows it: only frond-ear's own wording, never free text. */
+function copyCheckLine(stored: string): string {
+  return (Object.values(COPY_UNCHECKED) as string[]).includes(stored)
+    ? stored
+    : COPY_UNCHECKED.legacy;
+}
 
 /** A canticle record frond-ear released to the session, with the text it was shown. */
 export interface ReleasedRecord extends HeardRef {
@@ -239,33 +284,70 @@ function copyForm(text: string): string {
     .trim();
 }
 
+/** The rolling hash's base (odd, so multiplying is invertible mod 2^32). */
+const HASH_BASE = 0x01000193;
+const SPACE = 0x20;
+
+/**
+ * Calls `each(hash, at, spaces)` for every `floor`-long window of `text`: a polynomial
+ * hash rolled mod 2^32 (kept as an int32, which a Map looks up fastest), the window's
+ * start, and its space count. Collisions are possible; a caller compares the text before
+ * it believes one.
+ */
+function rollWindows(
+  text: string,
+  floor: number,
+  each: (hash: number, at: number, spaces: number) => void,
+): void {
+  if (text.length < floor) {
+    return;
+  }
+  let top = 1; // HASH_BASE^(floor-1): the weight of the window's first character
+  for (let index = 1; index < floor; index += 1) {
+    top = Math.imul(top, HASH_BASE);
+  }
+  let hash = 0;
+  let spaces = 0;
+  for (let index = 0; index < floor; index += 1) {
+    const code = text.charCodeAt(index);
+    hash = (Math.imul(hash, HASH_BASE) + code) | 0;
+    if (code === SPACE) spaces += 1;
+  }
+  for (let at = 0; ; at += 1) {
+    each(hash, at, spaces);
+    if (at + floor >= text.length) {
+      return;
+    }
+    const out = text.charCodeAt(at);
+    const next = text.charCodeAt(at + floor);
+    hash = (Math.imul((hash - Math.imul(out, top)) | 0, HASH_BASE) + next) | 0;
+    if (out === SPACE) spaces -= 1;
+    if (next === SPACE) spaces += 1;
+  }
+}
+
 /**
  * Literal-copy detection, not provenance enforcement. Which `released` records each of
  * the letter's fields (body, reason, each assumed item) shares a run of at least
- * `COPY_FLOOR` characters with, after `copyForm`. `released` must be only what was
- * released to the leaving session (custody: pushes the host confirmed to it, its own
- * `hear` returns), never the held buffer or the live set at large: otherwise a refusal
- * would tell the session text it hasn't chosen to receive. A paraphrase, a fragment under
- * the floor, a record cut to fit, and a record frond-ear no longer holds all pass.
+ * `COPY_FLOOR` characters with, after `copyForm`, holding at least `COPY_MIN_SPACES`
+ * spaces. `released` must be only what was released to the leaving session (custody:
+ * pushes the host confirmed to it, its own `hear` returns), never the held buffer or the
+ * live set at large: otherwise a refusal would tell the session text it hasn't chosen to
+ * receive. A paraphrase, a fragment under the floor, an identifier, a record cut to fit,
+ * and a record frond-ear no longer holds all pass.
+ *
+ * Memory is bounded by the letter, never by the released text (#142 S3): the index holds
+ * the letter's windows (its fields are capped by `parseLeave`, ~10k windows at most), and
+ * each record is read once, one at a time, with a rolling hash against it. The old index
+ * held every window of every record and threw RangeError past ~2,900 records of 5,800
+ * characters. Time is linear in the released text.
  */
 export function copiedRecords(
   request: Pick<LeaveRequest, "body" | "reason" | "assumed">,
   released: readonly ReleasedRecord[],
   floor = COPY_FLOOR,
+  minSpaces = COPY_MIN_SPACES,
 ): Array<{ field: string; records: HeardRef[] }> {
-  const owner = new Map<string, number>();
-  released.forEach((record, index) => {
-    const text = copyForm(record.text);
-    for (let at = 0; at + floor <= text.length; at += 1) {
-      const run = text.slice(at, at + floor);
-      if (!owner.has(run)) {
-        owner.set(run, index);
-      }
-    }
-  });
-  if (owner.size === 0) {
-    return [];
-  }
   const fields: Array<[string, string]> = [
     ["body", request.body],
     ["reason", request.reason],
@@ -274,42 +356,83 @@ export function copiedRecords(
       item,
     ]),
   ];
-  const found: Array<{ field: string; records: HeardRef[] }> = [];
-  for (const [field, value] of fields) {
+  // hash → the distinct windows with that hash, each with the fields it appears in.
+  const index = new Map<number, Array<{ run: string; fields: Set<number> }>>();
+  fields.forEach(([, value], field) => {
     const text = copyForm(value);
-    const hits = new Set<number>();
-    for (let at = 0; at + floor <= text.length; at += 1) {
-      const index = owner.get(text.slice(at, at + floor));
-      if (index !== undefined) {
-        hits.add(index);
+    rollWindows(text, floor, (hash, at, spaces) => {
+      if (spaces < minSpaces) {
+        return;
       }
-    }
-    if (hits.size > 0) {
+      const run = text.slice(at, at + floor);
+      const bucket = index.get(hash) ?? [];
+      const known = bucket.find((entry) => entry.run === run);
+      if (known) {
+        known.fields.add(field);
+      } else {
+        bucket.push({ run, fields: new Set([field]) });
+        index.set(hash, bucket);
+      }
+    });
+  });
+  if (index.size === 0) {
+    return [];
+  }
+  const hits = fields.map(() => new Set<number>());
+  released.forEach((record, which) => {
+    const text = copyForm(record.text);
+    rollWindows(text, floor, (hash, at) => {
+      const bucket = index.get(hash);
+      if (bucket === undefined) {
+        return;
+      }
+      for (const entry of bucket) {
+        if (text.startsWith(entry.run, at)) {
+          for (const field of entry.fields) hits[field]!.add(which);
+        }
+      }
+    });
+  });
+  const found: Array<{ field: string; records: HeardRef[] }> = [];
+  fields.forEach(([field], position) => {
+    const records = hits[position]!;
+    if (records.size > 0) {
       found.push({
         field,
-        records: [...hits]
+        records: [...records]
           .sort((a, b) => a - b)
-          .map((index) => {
-            const { station, stream, epoch, seq } = released[index]!;
+          .map((which) => {
+            const { station, stream, epoch, seq } = released[which]!;
             return { station, stream, epoch, seq };
           }),
       });
     }
-  }
+  });
   return found;
 }
 
 /**
  * Refuses a letter that copies a released record, naming a matching record for each copied run
  * by `station:stream epoch/seq` (when two records share a run, only the first is named) and offering the `heard` reference instead. Never echoes the matched text.
+ *
+ * The guard is a check on copies, not a gate letters depend on: if the comparison itself
+ * fails, it fails open, hands the error to `onFailure` (for the log) and returns
+ * `COPY_UNCHECKED.failed` for the letter to carry. Returns undefined when it checked.
  */
 export function refuseCopies(
   request: Pick<LeaveRequest, "body" | "reason" | "assumed">,
   released: readonly ReleasedRecord[],
-): void {
-  const found = copiedRecords(request, released);
+  onFailure?: (error: unknown) => void,
+): string | undefined {
+  let found: ReturnType<typeof copiedRecords>;
+  try {
+    found = copiedRecords(request, released);
+  } catch (error) {
+    onFailure?.(error);
+    return COPY_UNCHECKED.failed;
+  }
   if (found.length === 0) {
-    return;
+    return undefined;
   }
   const refs = new Map<string, HeardRef>();
   for (const { records } of found) {
@@ -342,7 +465,7 @@ export function refuseCopies(
       )
       .join(
         "; ",
-      )} (a run of ${COPY_FLOOR}+ characters, whitespace normalized). Name the record instead, heard: [${suggestion}], and say in your own words what it meant to you; hear shows it again while it is live. This is literal-copy detection, not provenance enforcement: it compares only canticle text frond-ear released to this session and still holds, so a paraphrase, a short fragment or a record gone from the live set passes.`,
+      )} (a run of ${COPY_FLOOR}+ characters with ${COPY_MIN_SPACES}+ spaces, whitespace normalized). Name the record instead, heard: [${suggestion}], and say in your own words what it meant to you; hear shows it again while it is live. This is literal-copy detection, not provenance enforcement: it compares only canticle text frond-ear released to this session and still holds, so a paraphrase, a short fragment, an identifier or a record gone from the live set passes.`,
   );
 }
 
@@ -432,6 +555,7 @@ export function leaveLetter(
   sessionId: string | null,
   now: number,
   request: LeaveRequest,
+  copyUnchecked: string | null = null,
 ): string {
   pruneLetters(store, ear, now);
   const pending = store
@@ -460,12 +584,14 @@ export function leaveLetter(
     leftAt: now,
     expiresAt,
     releasesAtLeave: releaseCount(store, ear),
+    copyUnchecked,
   });
   const refs =
     request.heard.length === 0
       ? ""
       : `, ${request.heard.length} heard reference${request.heard.length === 1 ? "" : "s"}`;
-  return `letter ${id} left (${request.bytes} bytes${refs}; expires ${iso(expiresAt)}). It comes back to this session as a kind="letter" event after its next compaction, when the seat's SessionStart hook runs frond-ear release. Ack that event's nonce to settle it; an unsettled letter comes back after the following compaction too.`;
+  const check = copyUnchecked === null ? "" : `; copy check: ${copyUnchecked}`;
+  return `letter ${id} left (${request.bytes} bytes${refs}; expires ${iso(expiresAt)}${check}). It comes back to this session as a kind="letter" event after its next compaction, when the seat's SessionStart hook runs frond-ear release. Ack that event's nonce to settle it; an unsettled letter comes back after the following compaction too.`;
 }
 
 export interface Release {
@@ -603,6 +729,9 @@ export function renderLetter(
     `left ${iso(letter.leftAt)} (${age(now - letter.leftAt)} ago, ${since} compaction${since === 1 ? "" : "s"} or start${since === 1 ? "" : "s"} ago)`,
     by,
     `expires ${iso(letter.expiresAt)}`,
+    ...(letter.copyUnchecked === null
+      ? []
+      : [`copy check: ${copyCheckLine(letter.copyUnchecked)}`]),
     letter.deliveries === 0
       ? "first delivery"
       : `delivered ${letter.deliveries} time${letter.deliveries === 1 ? "" : "s"} before`,
