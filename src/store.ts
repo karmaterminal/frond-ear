@@ -2135,7 +2135,12 @@ export class EventStore {
   /**
    * A pushed record was withdrawn while its tombstone holds (#67): its note is owed, on
    * the tombstone, which now lasts at least until `until` so the note can wait out a hold.
-   * Only a pushed record's first withdrawal owes one. Returns whether this one did.
+   * Only a pushed record's first withdrawal owes one. In the same transaction the record
+   * stops seeding §7.9's refresh collapse, as does every tombstone sharing its seed (the
+   * refreshes collapsed into it): the session was told it is gone, so a same-body refresh
+   * is news, and the note's longer retention never holds one back (🌿 B1 on #134).
+   * Returns the seed it ended (each null for an unkeyed record), or undefined when no note
+   * is owed.
    */
   public oweCanticleWithdrawn(
     ear: string,
@@ -2143,17 +2148,36 @@ export class EventStore {
     reason: string,
     at: number,
     until: number,
-  ): boolean {
-    return (
+  ): { refreshKey: string | null; digest: string | null } | undefined {
+    return this.transaction(() => {
+      const row = this.database
+        .prepare(
+          `SELECT refresh_key AS refreshKey, digest FROM canticle_settled
+           WHERE ear = ? AND identity = ? AND outcome = 'pushed'
+             AND withdrawn IS NULL AND expires_at > ?`,
+        )
+        .get(ear, identity, this.clock.now()) as
+        | { refreshKey: string | null; digest: string | null }
+        | undefined;
+      if (row === undefined) return undefined;
       this.database
         .prepare(
           `UPDATE canticle_settled SET withdrawn = ?, withdrawn_at = ?,
              expires_at = MAX(expires_at, ?)
-           WHERE ear = ? AND identity = ? AND outcome = 'pushed'
-             AND withdrawn IS NULL AND expires_at > ?`,
+           WHERE ear = ? AND identity = ?`,
         )
-        .run(reason, at, until, ear, identity, this.clock.now()).changes > 0
-    );
+        .run(reason, at, until, ear, identity);
+      // Its own seed and those of the refreshes that collapsed into it: one statement.
+      if (row.refreshKey !== null && row.digest !== null) {
+        this.database
+          .prepare(
+            `UPDATE canticle_settled SET refresh_key = NULL, digest = NULL
+             WHERE ear = ? AND refresh_key = ? AND digest = ?`,
+          )
+          .run(ear, row.refreshKey, row.digest);
+      }
+      return { refreshKey: row.refreshKey, digest: row.digest };
+    });
   }
 
   /**
@@ -3531,7 +3555,8 @@ export class EventStore {
            )`,
         )
         .run(MAX_ANCHORS);
-      // A canticle tombstone outlives its record only by skew, whatever the retention.
+      // A canticle tombstone outlives its record by skew, or, while a withdrawn note is
+      // owed, by up to an hour after the withdrawal (#67), whatever the retention.
       this.database
         .prepare("DELETE FROM canticle_settled WHERE expires_at <= ?")
         .run(this.clock.now());

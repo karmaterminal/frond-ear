@@ -934,11 +934,17 @@ plucked, or the link went and no snapshot brought it back) gets none, however th
 delivery never infers an expiry from a record missing between polls (🪨 on #134). A frond-ear restart forgets what
 the source saw, so an alarm that runs out while frond-ear is down gets no note: a missed note, never a false one. A note goes only to a session the
 record was pushed to: custody must show a push of it (never a `hear`) offered to the session holding the ear now, by
-its session id, or with no id on either side, under the same attach. A record that was only read with `hear`, or
-pushed in a push the host never confirmed, gets none; a revert of that push ends it. Notes coalesce over `debounceMs`
-into one, which names up to `maxItems` records and counts the rest (`(and 2 more plucked on 1 stream; …)`). They
-keep every hold a push keeps (paused, no session, a breaker not closed), wait while the station is muted or off, and
-spend `maxWithdrawnPerHour` instead of the push budget. A note is **at most once**, settled with its record's
+its session id, or with no id on either side, under the same attach. That is stricter than custody's echo rule on
+purpose: with no session id, an attach is the only proof of the same session, so a note owed to a session without an
+id is stranded by any re-attach (a frond-ear restart included) and lapses as `withdrawn_lapsed`. A record that was
+only read with `hear`, or pushed in a push the host never confirmed, gets none; a revert of that push ends it. Notes
+go on their station's cadence, as its pushes do (🌿 on #134): after `debounceMs` for an `immediate` station, after
+`windowMs` for a `digest` one, each coalescing what comes due meanwhile into one note, which names up to `maxItems`
+records and counts the rest (`(and 2 more plucked on 1 stream; …)`). They keep every hold a push keeps (paused, no
+session, a breaker not closed), wait while the station is muted or off, and spend `maxWithdrawnPerHour` instead of the
+push budget. An owed note ends its record's §7.9 refresh seed, and that of every refresh that collapsed into it: the
+session was told the record is gone, so a same-body refresh after the note is pushed as news, before or after a
+frond-ear restart, and the note's longer retention never holds one back (🌿 B1 on #134). A note is **at most once**, settled with its record's
 tombstone in the store: owed when the withdrawal is seen (the tombstone then lasts at least an hour, so a note can
 wait out a hold or its session's return), and marked sent before the send, in one transaction with its budget. The
 mark is given back only when the session's connection certainly didn't take the note. A tap that fails never counts
@@ -965,7 +971,8 @@ for its age (`routed_late`), passed over (`not_allowlisted`, `relayed`, `wake_de
 pushes that didn't fit at all (`too_big`), pushes the host never confirmed before they were reverted (`reverted`;
 their records waited again), and pushes no session's connection took (`unsent`; their records waited
 for the next push). Withdrawn notes (#67) show as `withdrawn`: `owed`, `nextAt`, `held` (a push's holds,
-`withdrawn_budget`, `muted`, or `not_offered` when no owed record was offered to the session holding the ear),
+`withdrawn_budget`, `muted` or `off` for a station that holds them, or `not_offered` when no owed record due was
+offered to the session holding the ear),
 `notesLastHour` and `maxWithdrawnPerHour`; `counts` adds `withdrawn_<reason>` (owed), `withdrawn_notes` and
 `withdrawn_noted` (notes sent, and the records they told), `withdrawn_lapsed`, `withdrawn_unsent` (given back, owed
 again) and `withdrawn_unknown` (a send that failed part way: marked sent, at most once). Pushed means

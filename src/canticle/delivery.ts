@@ -712,7 +712,11 @@ interface EarState {
    * held, and when each note of the last hour went out (`maxWithdrawnPerHour`; saved with
    * each note's settlement).
    */
-  notes: { due?: number; held?: string; sent: number[] };
+  notes: {
+    due: Partial<Record<Cadence, number>>;
+    held?: string;
+    sent: number[];
+  };
   counts: Record<string, number>;
   cursor: Cursor;
   /** `missed` (or what an unconfirmed push carried) changed since it was last saved. */
@@ -1240,6 +1244,9 @@ export class CanticleDelivery {
       this.#grants(ear, state, now),
       view.capability,
     );
+    // Before anything heard this pass is judged: a refresh of a record withdrawn in the
+    // same pass is then news, not a collapse.
+    this.#oweWithdrawals(ear, view, state, now);
 
     for (const [id, seen] of state.seen) {
       if (seen.until <= now) state.seen.delete(id);
@@ -1429,10 +1436,12 @@ export class CanticleDelivery {
    * whose process dies between the mark and the send, is lost, never sent twice. Only a
    * session connection that certainly didn't take it gives the mark back. It goes only to a session the record was pushed to: custody must show
    * a push of it offered to the session holding the ear now (a `hear` is a read, not a
-   * push). Notes coalesce over `debounceMs` into one, naming up to `maxItems` and counting
-   * the rest, under every hold a push keeps but the push budget: they spend
-   * `maxWithdrawnPerHour` instead, so neither can starve the other. A mute holds them
-   * while it lasts. A note is no record and grants no new record or election authority:
+   * push). Notes coalesce on their station's cadence (`debounceMs` immediate, `windowMs`
+   * digest) into one, naming up to `maxItems` and counting the rest, under every hold a
+   * push keeps but the push budget: they spend `maxWithdrawnPerHour` instead, so neither
+   * can starve the other. A mute, or a station now off, holds them while it lasts. An
+   * owed note ends its record's refresh seed (§7.9): a same-body refresh after it is
+   * news, so the note's longer retention never holds one back. A note is no record and grants no new record or election authority:
    * no payload, no batch_id, nothing to ack, no custody, no push counted. It is a channel
    * event, so it may start a turn of the session the record was pushed to, and only that.
    */
@@ -1447,20 +1456,6 @@ export class CanticleDelivery {
   ): void {
     const settled = this.#settled.get(ear);
     const holds = (id: string) => (settled?.get(id) ?? 0) > now;
-    for (const [id, until] of state.told) {
-      if (until <= now) state.told.delete(id);
-    }
-    for (const w of view.withdrawn ?? []) {
-      const id = identity(w);
-      if (state.told.has(id)) continue;
-      // Not held here: never pushed, passed over or settled.
-      if (holds(id)) this.#owe(ear, state, id, w, w.reason, w.at, now);
-      // Looked at once; after a store write that failed, again on the next pass.
-      if (state.told.size >= MAX_SEEN) {
-        state.told.delete(state.told.keys().next().value!);
-      }
-      state.told.set(id, w.until + SETTLE_SKEW_MS);
-    }
     const owed = this.#owed.get(ear);
     for (const id of owed?.keys() ?? []) {
       if (holds(id)) continue;
@@ -1468,12 +1463,40 @@ export class CanticleDelivery {
       this.#count(state, "withdrawn_lapsed");
     }
     if (owed === undefined || owed.size === 0) {
-      delete state.notes.due;
+      state.notes.due = {};
       delete state.notes.held;
       return;
     }
-    const due = (state.notes.due ??= now + delivery.debounceMs);
-    if (now < due) return;
+    // Each note goes on its station's cadence now, as a push would (🌿 S1 on #134): an
+    // immediate station's after `debounceMs`, a digest station's after `windowMs`, each
+    // coalescing what comes due meanwhile. A station muted or off holds its notes.
+    const interval = (cadence: Cadence) =>
+      cadence === "immediate" ? delivery.debounceMs : delivery.windowMs;
+    const cadenceOf = (note: Owed): Cadence | undefined => {
+      const mode = modes.of({ key: note.key, station: note.station });
+      return mode === "immediate" || mode === "digest" ? mode : undefined;
+    };
+    const silent = new Set<string>();
+    for (const cadence of CADENCES) {
+      const any = [...owed.values()].some(
+        (note) => cadenceOf(note) === cadence,
+      );
+      if (any) state.notes.due[cadence] ??= now + interval(cadence);
+      else delete state.notes.due[cadence];
+    }
+    for (const note of owed.values()) {
+      if (cadenceOf(note) === undefined) {
+        silent.add(modes.of({ key: note.key, station: note.station }));
+      }
+    }
+    if (Object.keys(state.notes.due).length === 0) {
+      state.notes.held = silent.has("mute") ? "muted" : "off";
+      return;
+    }
+    const dueNow = CADENCES.filter(
+      (cadence) => (state.notes.due[cadence] ?? Infinity) <= now,
+    );
+    if (dueNow.length === 0) return;
     const held = this.#noteHold(ear, view, delivery, state, now);
     if (held !== undefined) {
       state.notes.held = held;
@@ -1495,16 +1518,20 @@ export class CanticleDelivery {
         .map((c) => c.identity),
     );
     const ready: Array<[string, Owed]> = [];
-    let muted = false;
     for (const [id, note] of owed) {
-      if (!offered.has(id)) continue;
-      const mode = modes.of({ key: note.key, station: note.station });
-      if (mode === "digest" || mode === "immediate") ready.push([id, note]);
-      else muted = true;
+      const cadence = cadenceOf(note);
+      if (
+        offered.has(id) &&
+        cadence !== undefined &&
+        dueNow.includes(cadence)
+      ) {
+        ready.push([id, note]);
+      }
     }
-    state.notes.due = now + delivery.debounceMs;
+    for (const cadence of dueNow)
+      state.notes.due[cadence] = now + interval(cadence);
     if (ready.length === 0) {
-      state.notes.held = muted ? "muted" : "not_offered";
+      state.notes.held = "not_offered";
       return;
     }
     delete state.notes.held;
@@ -1530,7 +1557,7 @@ export class CanticleDelivery {
       // as one is when frond-ear dies between the mark and the send.
       state.notes.sent = sent;
       for (const id of ids) owed.delete(id);
-      if (owed.size === 0) delete state.notes.due;
+      this.#settleDue(state, owed, cadenceOf);
       this.#count(state, "withdrawn_unknown");
       this.#deps.logger.log("warn", "canticle.withdrawn_unknown", {
         ear,
@@ -1554,13 +1581,47 @@ export class CanticleDelivery {
     }
     state.notes.sent = sent;
     for (const id of ids) owed.delete(id);
-    if (owed.size === 0) delete state.notes.due;
+    this.#settleDue(state, owed, cadenceOf);
     this.#count(state, "withdrawn_notes");
     this.#count(state, "withdrawn_noted", ids.length);
     this.#deps.logger.log("info", "canticle.withdrawn_noted", {
       ear,
       records: ids.length,
     });
+  }
+
+  /** What the source withdrew since the last pass, looked at once each (#67). */
+  #oweWithdrawals(ear: string, view: HearView, state: EarState, now: number) {
+    const settled = this.#settled.get(ear);
+    for (const [id, until] of state.told) {
+      if (until <= now) state.told.delete(id);
+    }
+    for (const w of view.withdrawn ?? []) {
+      const id = identity(w);
+      if (state.told.has(id)) continue;
+      // Not held here: never pushed, passed over or settled.
+      if ((settled?.get(id) ?? 0) > now) {
+        this.#owe(ear, state, id, w, w.reason, w.at, now);
+      }
+      // Looked at once; after a store write that failed, again on the next pass.
+      if (state.told.size >= MAX_SEEN) {
+        state.told.delete(state.told.keys().next().value!);
+      }
+      state.told.set(id, w.until + SETTLE_SKEW_MS);
+    }
+  }
+
+  /** A cadence with no note left on it has nothing due. */
+  #settleDue(
+    state: EarState,
+    owed: ReadonlyMap<string, Owed>,
+    cadenceOf: (note: Owed) => Cadence | undefined,
+  ): void {
+    for (const cadence of CADENCES) {
+      if (![...owed.values()].some((note) => cadenceOf(note) === cadence)) {
+        delete state.notes.due[cadence];
+      }
+    }
   }
 
   /**
@@ -1579,10 +1640,19 @@ export class CanticleDelivery {
   ): void {
     const settled = this.#settled.get(ear);
     const until = Math.max(settled?.get(id) ?? 0, now + NOTE_LIFE_MS);
-    if (!this.#deps.store.oweCanticleWithdrawn(ear, id, reason, at, until)) {
-      return;
-    }
+    const seed = this.#deps.store.oweCanticleWithdrawn(
+      ear,
+      id,
+      reason,
+      at,
+      until,
+    );
+    if (seed === undefined) return;
     settled?.set(id, until);
+    // No longer a refresh seed: a same-body refresh after the note is news (🌿 B1).
+    if (seed.refreshKey !== null && seed.digest !== null) {
+      this.#refreshes.get(ear)?.delete(`${seed.refreshKey}\n${seed.digest}`);
+    }
     const { station, key, stream, epoch, seq } = about;
     this.#owedOf(ear).set(id, { station, key, stream, epoch, seq, reason, at });
     this.#count(state, `withdrawn_${token(reason)}`);
@@ -2211,7 +2281,7 @@ export class CanticleDelivery {
         overflow: new Map(),
         reported: new Map(),
         told: new Map(),
-        notes: { sent: this.#loadNotes(ear) },
+        notes: { due: {}, sent: this.#loadNotes(ear) },
         counts: {},
         cursor,
         dirty: false,
@@ -2923,7 +2993,10 @@ export class CanticleDelivery {
       counts: { ...state.counts },
       withdrawn: {
         owed: this.#owed.get(ear)?.size ?? 0,
-        nextAt: state.notes.due ?? null,
+        nextAt:
+          Object.keys(state.notes.due).length > 0
+            ? Math.min(...Object.values(state.notes.due))
+            : null,
         held: state.notes.held ?? null,
         notesLastHour: state.notes.sent.filter((at) => at > now - HOUR_MS)
           .length,

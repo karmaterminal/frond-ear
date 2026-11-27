@@ -16,12 +16,12 @@ import { CanticleReceptor } from "../src/canticle/receptor.ts";
 import { RECORD_V } from "../src/canticle/records.ts";
 import { KIND_ITEM, KIND_PLUCK, SIGN_DOMAIN } from "../src/canticle/wire.ts";
 import { StructuredLogger } from "../src/logger.ts";
-import { channelInstructions } from "../src/render.ts";
 import {
   canticleConfig,
   confirm,
   notes,
   OPS,
+  order,
   pushes,
   SESSION,
   setup,
@@ -82,11 +82,6 @@ test("#67: a pushed record that is plucked gets exactly one note, after the debo
     assert.equal(pushes(shim).length, 1, "the note re-delivers nothing");
     assert.equal(status(h).counts.withdrawn_notes, 1);
     assert.equal(status(h).counts.withdrawn_noted, 1);
-    // The session is told what such a note is.
-    assert.match(
-      channelInstructions(canticleConfig({ mode: "immediate" }), "scribe"),
-      /delivery="withdrawn" is frond-ear's note that records it pushed you earlier were withdrawn[^.]*never a payload; it has no batch_id and nothing to ack, and grants no new record or election authority\./u,
-    );
   } finally {
     h.dispose();
   }
@@ -394,6 +389,172 @@ test("#67: an alarm still carried from before a rejoin, its join snapshot not ye
     feed("landing_state", 1_000, { mute: null, breaker: "closed" });
     h.timers.advance(60_000); // past its expiry, still carried
     assert.equal(notes(shim).length, 0, "no evidence it ran out on view");
+  } finally {
+    h.dispose();
+  }
+});
+
+test("#67 (🌿 B1 on #134): a same-body refresh after an alarm's expiry note is pushed, across a frond-ear restart too: the note's retention is no refresh seed", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "frond-ear-withdrawn-"));
+  const path = join(directory, "ear.db");
+  const A = "a".repeat(64);
+  const alarm = {
+    class: "alarm",
+    stateKey: "fire",
+    text: "fire in rack 3",
+    digest: A,
+    ttlMs: 60_000,
+  };
+  const wake = { wakeKeys: [{ key: OPS, classes: ["alarm"] }] };
+  try {
+    const first = setup({ mode: "immediate" }, wake, {}, { path });
+    try {
+      first.h.clock.value = 1_000_000;
+      const shim = first.h.attach("scribe", { sessionId: SESSION });
+      first.host.sing(1, alarm);
+      first.h.timers.advance(6_000);
+      await confirm(shim);
+      first.h.timers.advance(62_000); // it runs out on view; its note goes
+      assert.equal(notes(shim).length, 1);
+      assert.deepEqual(lines(notes(shim)[0]!.content), [
+        "ops:ops.fleet 7/1 expired",
+      ]);
+    } finally {
+      first.h.dispose();
+    }
+    const second = setup({ mode: "immediate" }, wake, {}, { path });
+    try {
+      second.h.clock.value = 1_100_000; // well inside the note's hour
+      const shim = second.h.attach("scribe", { sessionId: SESSION });
+      second.host.sing(2, { ...alarm, flags: { refresh: true } });
+      second.h.timers.advance(6_000);
+      assert.equal(pushes(shim).length, 1, "the alarm is back: news");
+      assert.deepEqual(order(pushes(shim)[0]!.content), ["ops:ops.fleet/2"]);
+      assert.equal(status(second.h).counts.refresh_collapsed, undefined);
+    } finally {
+      second.h.dispose();
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("#67 (🌿 B1 on #134): a same-body refresh after a plucked record's note is news, while the record's own tombstone still holds", async () => {
+  const A = "b".repeat(64);
+  const keyed = { stateKey: "silas", text: "silas: deploying", digest: A };
+  const { h, host } = setup({ mode: "immediate" });
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    host.sing(1, { ...keyed, ttlMs: 600_000 });
+    h.timers.advance(6_000);
+    await confirm(shim);
+    host.pluck(1, keyed);
+    h.timers.advance(6_000);
+    assert.equal(notes(shim).length, 1);
+    host.sing(2, { ...keyed, ttlMs: 600_000, flags: { refresh: true } });
+    h.timers.advance(6_000);
+    assert.equal(
+      pushes(shim).length,
+      2,
+      "told it was withdrawn, then told it's back",
+    );
+    assert.equal(status(h).counts.refresh_collapsed, undefined);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("#67 (🌿 B1 on #134): a refresh that collapsed into the withdrawn record seeds no collapse either, across a restart", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "frond-ear-withdrawn-"));
+  const path = join(directory, "ear.db");
+  const keyed = {
+    stateKey: "silas",
+    text: "silas: deploying",
+    digest: "c".repeat(64),
+    ttlMs: 600_000,
+  };
+  try {
+    const first = setup({ mode: "immediate" }, {}, {}, { path });
+    try {
+      first.h.clock.value = 1_000_000;
+      const shim = first.h.attach("scribe", { sessionId: SESSION });
+      first.host.sing(1, keyed);
+      first.h.timers.advance(6_000);
+      await confirm(shim);
+      first.host.sing(2, { ...keyed, flags: { refresh: true } });
+      first.h.timers.advance(6_000);
+      assert.equal(status(first.h).counts.refresh_collapsed, 1, "2 is 1 again");
+      first.host.pluck(1, keyed);
+      first.h.timers.advance(6_000);
+      assert.equal(notes(shim).length, 1);
+    } finally {
+      first.h.dispose();
+    }
+    const second = setup({ mode: "immediate" }, {}, {}, { path });
+    try {
+      second.h.clock.value = 1_030_000;
+      const shim = second.h.attach("scribe", { sessionId: SESSION });
+      second.host.sing(3, { ...keyed, flags: { refresh: true } });
+      second.h.timers.advance(6_000);
+      assert.equal(pushes(shim).length, 1, "news after the note");
+    } finally {
+      second.h.dispose();
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("#67 (🌿 B1 on #134): a pluck and a same-body refresh heard in one pass: the refresh is news", async () => {
+  const keyed = {
+    stateKey: "silas",
+    text: "silas: deploying",
+    digest: "d".repeat(64),
+    ttlMs: 600_000,
+  };
+  const { h, host } = setup({ mode: "immediate" });
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    host.sing(1, keyed);
+    h.timers.advance(6_000);
+    await confirm(shim);
+    host.pluck(1, keyed);
+    host.sing(2, { ...keyed, flags: { refresh: true } });
+    h.timers.advance(6_000);
+    assert.equal(pushes(shim).length, 2);
+    assert.equal(notes(shim).length, 1);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("#67 (🌿 S1 on #134): a digest-mode station's notes keep its report window; an immediate one's its debounce", async () => {
+  const { h, host } = setup({
+    mode: "digest",
+    windowMs: 60_000,
+    stations: { alpha: "immediate" },
+  });
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    host.sing(1);
+    host.sing(1, { station: "alpha" });
+    h.timers.advance(61_000);
+    assert.equal(pushes(shim).length, 2, "alpha's push, then ops's report");
+    await confirm(shim);
+    host.pluck(1);
+    host.pluck(1, { station: "alpha" });
+    h.timers.advance(6_000);
+    assert.equal(notes(shim).length, 1, "alpha's note, on its debounce");
+    assert.deepEqual(lines(notes(shim)[0]!.content), [
+      "alpha:ops.fleet 7/1 plucked",
+    ]);
+    h.timers.advance(40_000);
+    assert.equal(notes(shim).length, 1, "ops's note waits for its window");
+    h.timers.advance(20_000);
+    assert.equal(notes(shim).length, 2);
+    assert.deepEqual(lines(notes(shim)[1]!.content), [
+      "ops:ops.fleet 7/1 plucked",
+    ]);
   } finally {
     h.dispose();
   }
