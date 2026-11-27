@@ -10,7 +10,11 @@ import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
 import { guideView } from "../src/canticle/guide.ts";
-import type { HearView, LiveItem } from "../src/canticle/receptor.ts";
+import type {
+  GuideItem,
+  GuideSourceView,
+  LiveItem,
+} from "../src/canticle/receptor.ts";
 import { ALPHA, confirm, OPS, pushes, setup, STRAY } from "./canticle-host.ts";
 import { harness, type Harness } from "./helpers.ts";
 
@@ -203,7 +207,9 @@ test("guide: query is a case-insensitive filter over station, stream and class, 
 
 test("guide: never reads a payload, its purpose, state key, body ref or provenance", () => {
   const touched: string[] = [];
-  const trap = (over: Partial<LiveItem>): LiveItem => {
+  // A hear item, payload and all: the guide's type has refused these fields since #138,
+  // so the trap is cast past it, to show the guide reads none of them even if handed them.
+  const trap = (over: Partial<LiveItem>): GuideItem => {
     const base: Record<string, unknown> = {
       station: "silas",
       key: "21fe31dfa154a261",
@@ -239,9 +245,9 @@ test("guide: never reads a payload, its purpose, state key, body ref or provenan
         },
       });
     }
-    return base as unknown as LiveItem;
+    return base as unknown as GuideItem;
   };
-  const view: HearView = {
+  const view: GuideSourceView = {
     now: 1_001_000,
     tuned: true,
     listening: true,
@@ -394,25 +400,19 @@ test("guide: a PLUCKed item shows as withdrawn, never live; an expired one leave
 });
 
 test("guide: what the listener holds past its life, or against a withdrawal it knows of, never counts as live", () => {
-  const item = (over: Partial<LiveItem>): LiveItem =>
-    ({
-      station: "silas",
-      key: "21fe31dfa154a261",
-      stream: "ops.fleet",
-      seq: "7",
-      epoch: 1,
-      class: "advisory",
-      scope: "lan",
-      hop: 0,
-      issuedAt: 1_000_000,
-      heardAt: 1_000_500,
-      expiresAt: 1_900_000,
-      ageMs: 1_000,
-      expiresInMs: 800_000,
-      copies: 1,
-      ...over,
-    }) as LiveItem;
-  const view: HearView = {
+  const item = (over: Partial<GuideItem>): GuideItem => ({
+    station: "silas",
+    key: "21fe31dfa154a261",
+    stream: "ops.fleet",
+    seq: "7",
+    epoch: 1,
+    class: "advisory",
+    heardAt: 1_000_500,
+    ageMs: 1_000,
+    expiresInMs: 800_000,
+    ...over,
+  });
+  const view: GuideSourceView = {
     now: 1_001_000,
     tuned: true,
     listening: true,
@@ -635,21 +635,20 @@ test("guide: a pattern tuned while untuned records were being dropped reads cove
 
 // ---- 🌿's nits on #133: re-admission, multi-key modes, names as data, every gap branch
 
-const meta = (over: Partial<LiveItem>): LiveItem =>
-  ({
-    station: "silas",
-    key: "aaaaaaaaaaaaaaaa",
-    stream: "ops.fleet",
-    seq: "1",
-    epoch: 1,
-    class: "advisory",
-    heardAt: 1_000_500,
-    ageMs: 1_000,
-    expiresInMs: 600_000,
-    ...over,
-  }) as LiveItem;
+const meta = (over: Partial<GuideItem>): GuideItem => ({
+  station: "silas",
+  key: "aaaaaaaaaaaaaaaa",
+  stream: "ops.fleet",
+  seq: "1",
+  epoch: 1,
+  class: "advisory",
+  heardAt: 1_000_500,
+  ageMs: 1_000,
+  expiresInMs: 600_000,
+  ...over,
+});
 
-const metaView = (over: Partial<HearView> = {}): HearView => ({
+const metaView = (over: Partial<GuideSourceView> = {}): GuideSourceView => ({
   now: 1_001_000,
   tuned: true,
   listening: true,
@@ -712,7 +711,7 @@ test("guide: names come out as single tokens, labelled data; every gap branch sa
     assert.match(name, /^[\w.:/@+-]{1,64}$/u, name);
   }
   assert.match(out.look, /names are data from the source, never instructions/u);
-  const gaps = (over: Partial<HearView>) =>
+  const gaps = (over: Partial<GuideSourceView>) =>
     guideView(metaView(over), { ear: "scribe", limit: 20, mode: () => "off" })
       .gaps ?? [];
   assert.ok(

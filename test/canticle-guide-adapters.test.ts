@@ -4,8 +4,9 @@
 // And a board that is empty because something holds it (a host MUTE, records lost, no
 // landing state yet) says so in `gaps`, as does an ear that is muted (🌿 S3 on #133).
 // The production adapters too (#138): a source built by `createCanticleSource`, as cli.ts
-// builds it, and read as cli.ts wires it, with only the peers played here: a host daemon
-// on a real unix socket, and a station on real loopback UDP.
+// builds it, and read through `canticleViews`, as cli.ts wires it, with only the peers
+// played here: a host daemon on a real unix socket, and a station on real loopback UDP.
+// And tsc itself refuses a `hearView` where a guide view goes.
 import assert from "node:assert/strict";
 import { createPrivateKey, sign } from "node:crypto";
 import { createSocket } from "node:dgram";
@@ -19,13 +20,21 @@ import * as cbor from "../src/canticle/cbor.ts";
 import { streamId } from "../src/canticle/ids.ts";
 import { Manifest } from "../src/canticle/manifest.ts";
 import { RECORD_V } from "../src/canticle/records.ts";
-import { CanticleReceptor } from "../src/canticle/receptor.ts";
 import {
+  CanticleReceptor,
+  type GuideItem,
+  type GuideSourceView,
+  type HearView,
+  type LiveItem,
+} from "../src/canticle/receptor.ts";
+import {
+  canticleViews,
   createCanticleSource,
   type CanticleSource,
 } from "../src/canticle/source.ts";
 import { KIND_ITEM, SIGN_DOMAIN } from "../src/canticle/wire.ts";
 import type { Config } from "../src/config.ts";
+import type { DaemonOptions } from "../src/daemon.ts";
 import { StructuredLogger } from "../src/logger.ts";
 import type { EventStore } from "../src/store.ts";
 import { canticleConfig, Host, OPS, setup, type R } from "./canticle-host.ts";
@@ -452,6 +461,39 @@ test("adapters (#138): through the production embedded adapter (GuardedEmbedded 
     station.close();
     h.dispose();
   }
+});
+
+/** `true` when every `From` is a `To`: tsc decides it, so a check below is a compile check. */
+type Is<From, To> = [From] extends [To] ? true : false;
+
+test("types (#138): a hear view is no guide view, so an adapter pointed back at hearView fails tsc", () => {
+  // Each line is checked by tsc, not here: it stops compiling once the left side is
+  // assignable where the guide reads (node only strips the types and runs the assert).
+  const checks: { [check: string]: false } = {
+    "a LiveItem is no GuideItem": false satisfies Is<LiveItem, GuideItem>,
+    "a HearView is no GuideSourceView": false satisfies Is<
+      HearView,
+      GuideSourceView
+    >,
+    "a source's hearView is no guideView": false satisfies Is<
+      CanticleSource["hearView"],
+      CanticleSource["guideView"]
+    >,
+    "canticleViews' canticleHear is no daemon canticleGuide":
+      false satisfies Is<
+        ReturnType<typeof canticleViews>["canticleHear"],
+        NonNullable<DaemonOptions["canticleGuide"]>
+      >,
+  };
+  // The guide's own views still are guide views.
+  const guide: { [check: string]: true } = {
+    "canticleViews' canticleGuide is the daemon's": true satisfies Is<
+      ReturnType<typeof canticleViews>["canticleGuide"],
+      NonNullable<DaemonOptions["canticleGuide"]>
+    >,
+  };
+  assert.ok(Object.values(checks).every((v) => v === false));
+  assert.ok(Object.values(guide).every((v) => v === true));
 });
 
 interface Board {
