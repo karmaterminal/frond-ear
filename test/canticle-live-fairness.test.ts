@@ -2638,6 +2638,8 @@ test("#119 second review, re-review 5: a given-back FOLDED with every station it
                   stream: "s:ops.fleet",
                   key: s,
                   owed: true,
+                  // #140: owed to the session that attaches below.
+                  owedTo: { sessionId: SESSION, generation: 0 },
                   withheld: true,
                   missed: false,
                 },
@@ -2742,6 +2744,8 @@ test("#119 second review, re-review 6: a given-back FOLDED owed for a stream wit
                   stream: "s:ops.fleet",
                   key: s,
                   owed: true,
+                  // #140: owed to the session that attaches below.
+                  owedTo: { sessionId: SESSION, generation: 0 },
                   withheld: true,
                   missed: false,
                 },
