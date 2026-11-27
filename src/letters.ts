@@ -13,6 +13,7 @@
  * inside a letter's body with no label. Literal copies only; see `copiedRecords`.
  */
 import { shownText, token } from "./canticle/hear.ts";
+import { checkStreamName } from "./canticle/ids.ts";
 import { CANTICLE_STATION } from "./config.ts";
 import { cleanName, cleanText, type Notification } from "./render.ts";
 import type { EventStore, HeardRef, Letter } from "./store.ts";
@@ -46,9 +47,19 @@ export interface LeaveRequest {
   ttlMs: number;
 }
 
-/** A stream name (RFC-0001 §5.4): up to four dot-separated segments. */
-const STREAM = /^[a-z][a-z0-9-]{0,30}(\.[a-z][a-z0-9-]{0,30}){0,3}$/u;
+/** An epoch is a u32 on the wire (RFC-0001; `wire.ts`). */
+const U32_MAX = 0xffffffff;
 const U64_MAX = 18_446_744_073_709_551_615n;
+
+/** The canonical stream validator's answer (grammar and the 64-byte bound), as a boolean. */
+function validStream(name: string): boolean {
+  try {
+    checkStreamName(name);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /** `station:stream epoch/seq`, the way a canticle banner and custody name a record. */
 export function heardName(ref: HeardRef): string {
@@ -97,7 +108,7 @@ function parseHeard(raw: unknown): HeardRef[] {
         `${which}: station must be a station's name as hear shows it (lowercase letters, digits and -)`,
       );
     }
-    if (typeof stream !== "string" || !STREAM.test(stream)) {
+    if (typeof stream !== "string" || !validStream(stream)) {
       throw new Error(
         `${which}: stream must be a stream name as hear shows it (e.g. ops.fleet)`,
       );
@@ -105,9 +116,12 @@ function parseHeard(raw: unknown): HeardRef[] {
     if (
       typeof epoch !== "number" ||
       !Number.isSafeInteger(epoch) ||
-      epoch < 0
+      epoch < 0 ||
+      epoch > U32_MAX
     ) {
-      throw new Error(`${which}: epoch must be a non-negative integer`);
+      throw new Error(
+        `${which}: epoch must be an integer from 0 to 4294967295 (a u32)`,
+      );
     }
     let digits: string | undefined;
     if (typeof seq === "number" && Number.isSafeInteger(seq) && seq >= 0) {
@@ -286,8 +300,8 @@ export function copiedRecords(
 }
 
 /**
- * Refuses a letter that copies a released record, naming each record by `station:stream
- * epoch/seq` and offering the `heard` reference instead. Never echoes the matched text.
+ * Refuses a letter that copies a released record, naming a matching record for each copied run
+ * by `station:stream epoch/seq` (when two records share a run, only the first is named) and offering the `heard` reference instead. Never echoes the matched text.
  */
 export function refuseCopies(
   request: Pick<LeaveRequest, "body" | "reason" | "assumed">,

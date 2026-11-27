@@ -260,12 +260,15 @@ after it. Use it for threads in flight, what it chose and why, and what to check
   payload cleaned as a banner shows it, NFC, `> ` quote markers at line starts dropped, every
   whitespace run one space). 40 is about seven words: longer than short stock phrases ("There is
   a room."), short enough to catch a copied sentence and to mean something against the 200-
-  character `reason` and `assumed` caps. The refusal names each record as `station:stream
-epoch/seq` and offers the `heard` reference instead. It never echoes the matched text.
+  character `reason` and `assumed` caps. The refusal names a matching record for each copied run
+  as `station:stream epoch/seq` (two records with the same text: only the first is named), and offers the `heard` reference instead. It never echoes the matched text.
 - **The guard's limit, plainly: it is literal-copy detection, not provenance enforcement.** A
   paraphrase passes. So does a fragment under 40 characters, a record shorter than that, a record
   that was only shown cut, and a record gone from the live set (custody keeps digests, never
-  text, so once the record expires there's nothing to compare). Passing the guard doesn't show
+  text, so once the record expires there's nothing to compare). And **if the live set can't be
+  read at all, the guard lets the letter through** (it logs `letters.copy_guard_unavailable`):
+  letters don't depend on canticle being up, so a canticle fault means no comparison, not a
+  refusal. Passing the guard doesn't show
   that a letter carries no heard text. Keeping heard words out of letters is still the
   session's own practice; the guard only catches the plain copy.
 - **`letters`** lists ids, states, sizes and reasons, never bodies. It can also show one

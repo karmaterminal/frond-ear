@@ -139,7 +139,27 @@ test("letter heard refs: the count is bounded and each field is validated", asyn
       heard: Array.from({ length: 16 }, (_, index) => ref(index)),
     });
     assert.equal(full.ok, true, full.text);
+    // the wire's own bounds (🌫, #142 review): epoch is a u32; a stream name is 64 bytes at most
+    const STREAM_64 =
+      "abbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.abbbbbbbbbbbbbbbbbbbbbbbbbbbbb"; // 31 + 1 + 30 = 62 bytes: ".c" makes 64 (allowed), ".cd" 65 (refused)
+    for (const edge of [
+      { station: "ops", stream: "ops.fleet", epoch: 4294967295, seq: 2 },
+      { station: "ops", stream: `${STREAM_64}.c`, epoch: 7, seq: 2 },
+    ]) {
+      const result = await h.call(shim, "leave_letter", {
+        reason: "r",
+        body: "b",
+        heard: [edge],
+      });
+      assert.equal(
+        result.ok,
+        true,
+        `accepted ${JSON.stringify(edge)}: ${result.text}`,
+      );
+    }
     for (const bad of [
+      [{ station: "ops", stream: "ops.fleet", epoch: 4294967296, seq: 2 }],
+      [{ station: "ops", stream: `${STREAM_64}.cd`, epoch: 7, seq: 2 }],
       "ops:ops.fleet 7/2",
       [{ station: "OPS", stream: "ops.fleet", epoch: 7, seq: 2 }],
       [{ station: "ops", stream: "Ops Fleet", epoch: 7, seq: 2 }],
