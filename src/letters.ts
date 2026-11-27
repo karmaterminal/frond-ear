@@ -93,57 +93,7 @@ function parseHeard(raw: unknown): HeardRef[] {
   const refs: HeardRef[] = [];
   const seen = new Set<string>();
   raw.forEach((item: unknown, index) => {
-    const which = `heard item ${index + 1}`;
-    if (typeof item !== "object" || item === null || Array.isArray(item)) {
-      throw new Error(`${which} must be {station, stream, epoch, seq}`);
-    }
-    const fields = item as Record<string, unknown>;
-    if (
-      Object.keys(fields).some(
-        (key) => !["station", "stream", "epoch", "seq"].includes(key),
-      )
-    ) {
-      throw new Error(
-        `${which}: a heard reference carries station, stream, epoch and seq only, never a record's text`,
-      );
-    }
-    const { station, stream, epoch, seq } = fields;
-    if (typeof station !== "string" || !CANTICLE_STATION.test(station)) {
-      throw new Error(
-        `${which}: station must be a station's name as hear shows it (lowercase letters, digits and -)`,
-      );
-    }
-    if (typeof stream !== "string" || !validStream(stream)) {
-      throw new Error(
-        `${which}: stream must be a stream name as hear shows it (e.g. ops.fleet)`,
-      );
-    }
-    if (
-      typeof epoch !== "number" ||
-      !Number.isSafeInteger(epoch) ||
-      epoch < 0 ||
-      epoch > U32_MAX
-    ) {
-      throw new Error(
-        `${which}: epoch must be an integer from 0 to 4294967295 (a u32)`,
-      );
-    }
-    let digits: string | undefined;
-    if (typeof seq === "number" && Number.isSafeInteger(seq) && seq >= 0) {
-      digits = String(seq);
-    } else if (
-      typeof seq === "string" &&
-      /^\d{1,20}$/u.test(seq) &&
-      BigInt(seq) <= U64_MAX
-    ) {
-      digits = BigInt(seq).toString();
-    }
-    if (digits === undefined) {
-      throw new Error(
-        `${which}: seq must be a non-negative integer (as a string of digits past 2^53)`,
-      );
-    }
-    const ref = { station, stream, epoch, seq: digits };
+    const ref = heardItem(item, `heard item ${index + 1}`);
     const name = heardName(ref);
     if (!seen.has(name)) {
       seen.add(name);
@@ -151,6 +101,70 @@ function parseHeard(raw: unknown): HeardRef[] {
     }
   });
   return refs;
+}
+
+/** One `heard` reference, validated and with seq in canonical digits; throws naming `which`. */
+function heardItem(item: unknown, which: string): HeardRef {
+  if (typeof item !== "object" || item === null || Array.isArray(item)) {
+    throw new Error(`${which} must be {station, stream, epoch, seq}`);
+  }
+  const fields = item as Record<string, unknown>;
+  if (
+    Object.keys(fields).some(
+      (key) => !["station", "stream", "epoch", "seq"].includes(key),
+    )
+  ) {
+    throw new Error(
+      `${which}: a heard reference carries station, stream, epoch and seq only, never a record's text`,
+    );
+  }
+  const { station, stream, epoch, seq } = fields;
+  if (typeof station !== "string" || !CANTICLE_STATION.test(station)) {
+    throw new Error(
+      `${which}: station must be a station's name as hear shows it (lowercase letters, digits and -)`,
+    );
+  }
+  if (typeof stream !== "string" || !validStream(stream)) {
+    throw new Error(
+      `${which}: stream must be a stream name as hear shows it (e.g. ops.fleet)`,
+    );
+  }
+  if (
+    typeof epoch !== "number" ||
+    !Number.isSafeInteger(epoch) ||
+    epoch < 0 ||
+    epoch > U32_MAX
+  ) {
+    throw new Error(
+      `${which}: epoch must be an integer from 0 to 4294967295 (a u32)`,
+    );
+  }
+  let digits: string | undefined;
+  if (typeof seq === "number" && Number.isSafeInteger(seq) && seq >= 0) {
+    digits = String(seq);
+  } else if (
+    typeof seq === "string" &&
+    /^\d{1,20}$/u.test(seq) &&
+    BigInt(seq) <= U64_MAX
+  ) {
+    digits = BigInt(seq).toString();
+  }
+  if (digits === undefined) {
+    throw new Error(
+      `${which}: seq must be a non-negative integer (as a string of digits past 2^53)`,
+    );
+  }
+  return { station, stream, epoch, seq: digits };
+}
+
+/** A released record's own reference, if `heard` can carry it as it is; else undefined. */
+function referenceOf(record: HeardRef): HeardRef | undefined {
+  const { station, stream, epoch, seq } = record;
+  try {
+    return heardItem({ station, stream, epoch, seq }, "");
+  } catch {
+    return undefined;
+  }
 }
 
 /** Validates the leave_letter tool's arguments. Refuses rather than truncates. */
@@ -412,8 +426,12 @@ export function copiedRecords(
 }
 
 /**
- * Refuses a letter that copies a released record, naming a matching record for each copied run
- * by `station:stream epoch/seq` (when two records share a run, only the first is named) and offering the `heard` reference instead. Never echoes the matched text.
+ * Refuses a letter that copies a released record, naming every released record each copied
+ * field shares a run with, by `station:stream epoch/seq`, and offering their `heard` references
+ * instead. Never echoes the matched text. A suggested reference is one `parseHeard` takes back
+ * as it is; a record whose names or numbers a reference can't carry (its names come from the
+ * station's frame, which the reference grammar doesn't bind) is named but not suggested, and
+ * the refusal says so (#142 P4d).
  *
  * The guard is a check on copies, not a gate letters depend on: if the comparison itself
  * fails, it fails open, hands the error to `onFailure` (for the log) and returns
@@ -435,9 +453,15 @@ export function refuseCopies(
     return undefined;
   }
   const refs = new Map<string, HeardRef>();
+  const unreferenced = new Set<string>();
   for (const { records } of found) {
     for (const record of records) {
-      refs.set(heardName(record), record);
+      const ref = referenceOf(record);
+      if (ref === undefined) {
+        unreferenced.add(heardName(record));
+      } else {
+        refs.set(heardName(ref), ref);
+      }
     }
   }
   // A released record's names come from its verified frame; banner tokens all the same.
@@ -450,13 +474,22 @@ export function refuseCopies(
           `${token(record.station)}:${token(record.stream)} ${record.epoch}/${seqOf(record.seq)}`,
       )
       .join(", ");
+  // Each ref passed parseHeard: its names are already token-safe, its seq canonical digits.
   const suggestion = [...refs.values()]
     .slice(0, LETTER_LIMITS.maxHeard)
     .map(
-      (record) =>
-        `{station: "${token(record.station)}", stream: "${token(record.stream)}", epoch: ${record.epoch}, seq: ${/^\d{1,15}$/u.test(record.seq) ? record.seq : `"${seqOf(record.seq)}"`}}`,
+      (ref) =>
+        `{station: "${ref.station}", stream: "${ref.stream}", epoch: ${ref.epoch}, seq: ${/^\d{1,15}$/u.test(ref.seq) ? ref.seq : `"${ref.seq}"`}}`,
     )
     .join(", ");
+  const uncarried =
+    unreferenced.size === 0
+      ? ""
+      : ` (heard can't carry ${unreferenced.size === 1 ? "one record named here" : `${unreferenced.size} records named here`}: a station or stream name, epoch or seq outside a reference's grammar)`;
+  const instead =
+    suggestion === ""
+      ? `Say in your own words what it meant to you instead${uncarried}`
+      : `Name the record instead, heard: [${suggestion}], and say in your own words what it meant to you${uncarried}`;
   throw new Error(
     `letter not stored: ${found
       .map(
@@ -465,8 +498,20 @@ export function refuseCopies(
       )
       .join(
         "; ",
-      )} (a run of ${COPY_FLOOR}+ characters with ${COPY_MIN_SPACES}+ spaces, whitespace normalized). Name the record instead, heard: [${suggestion}], and say in your own words what it meant to you; hear shows it again while it is live. This is literal-copy detection, not provenance enforcement: it compares only canticle text frond-ear released to this session and still holds, so a paraphrase, a short fragment, an identifier or a record gone from the live set passes.`,
+      )} (a run of ${COPY_FLOOR}+ characters with ${COPY_MIN_SPACES}+ spaces, whitespace normalized). ${instead}; hear shows it again while it is live. This is literal-copy detection, not provenance enforcement: it compares only canticle text frond-ear released to this session and still holds, so a paraphrase, a short fragment, an identifier or a record gone from the live set passes.`,
   );
+}
+
+/**
+ * An error's constructor name for the log (`RangeError`), never its message: a bare name of
+ * 1 to 40 letters, `Error` for any other name, and the type for a thrown non-Error. The
+ * logger redacts any field whose key holds `error`, so this goes in a field of its own.
+ */
+export function faultName(error: unknown): string {
+  if (!(error instanceof Error)) {
+    return typeof error;
+  }
+  return /^[A-Za-z]{1,40}$/u.test(error.name) ? error.name : "Error";
 }
 
 /**

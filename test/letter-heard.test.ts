@@ -16,6 +16,8 @@ import {
   COPY_MIN_SPACES,
   COPY_UNCHECKED,
   copiedRecords,
+  faultName,
+  parseLeave,
   refuseCopies,
   type ReleasedRecord,
 } from "../src/letters.ts";
@@ -586,6 +588,188 @@ test("copy guard: an internal failure fails open and says so; a refusal still re
     () => refuseCopies(letterOf(RECORD), [released(RECORD)]),
     /letter not stored/u,
   );
+});
+
+/** A refusal's message, or a failure if `refuseCopies` stored the letter. */
+function refusal(
+  request: Parameters<typeof refuseCopies>[0],
+  records: ReleasedRecord[],
+): string {
+  try {
+    refuseCopies(request, records);
+  } catch (error) {
+    return (error as Error).message;
+  }
+  assert.fail("the letter was stored, not refused");
+}
+
+/** The `heard: [...]` a refusal suggests, read back as `leave_letter` arguments would be. */
+function suggested(message: string): unknown[] | undefined {
+  const list = /heard: \[(.*?)\], and say/u.exec(message)?.[1];
+  if (list === undefined) return undefined;
+  return JSON.parse(
+    `[${list.replace(/(\{|, )(station|stream|epoch|seq):/gu, '$1"$2":')}]`,
+  ) as unknown[];
+}
+
+test("copy guard: every record sharing a copied run is named and suggested, not only the first", () => {
+  const records = [
+    released(RECORD, "1"),
+    { ...released(SECOND, "2"), station: "elliott" },
+    { ...released(`rune log: ${RECORD}`, "3"), stream: "ops.rune" },
+  ];
+  const found = copiedRecords(letterOf(`it said ${RECORD}`), records);
+  assert.deepEqual(
+    found.map(({ field, records: hits }) => [
+      field,
+      hits.map((record) => `${record.stream} ${record.seq}`),
+    ]),
+    [["body", ["ops.fleet 1", "ops.rune 3"]]],
+    "both records holding the run, the unrelated one not",
+  );
+  const message = refusal(letterOf(`it said ${RECORD}`), records);
+  assert.match(
+    message,
+    /its body copies heard canticle records ops:ops\.fleet 7\/1, ops:ops\.rune 7\/3 \(/u,
+  );
+  assert.deepEqual(suggested(message), [
+    { station: "ops", stream: "ops.fleet", epoch: 7, seq: 1 },
+    { station: "ops", stream: "ops.rune", epoch: 7, seq: 3 },
+  ]);
+});
+
+test("copy guard: every refusal's suggested heard reference parses back through leave_letter", () => {
+  // A released record's names come from its station's frame: nothing holds them to the
+  // reference grammar (🌿 P4d: `Ops_Fleet` came back as a suggestion parseHeard refused).
+  const odd: Array<Partial<ReleasedRecord>> = [
+    { station: "Ops_Fleet" },
+    { station: "ops fleet" },
+    { station: "0123456789abcdef" },
+    { station: "a".repeat(40) },
+    { station: 'o"p:s' },
+    { station: "" },
+    { stream: "Ops.Fleet" },
+    { stream: `ops.${"x".repeat(70)}` },
+    { epoch: 2 ** 32 },
+    { epoch: -1 },
+    { seq: "x" },
+    { seq: "18446744073709551616" },
+    { seq: "007" },
+    { seq: "18446744073709551615" },
+  ];
+  // Deterministic station names over a hostile alphabet.
+  let state = 7;
+  const next = () => {
+    state = (Math.imul(state, 1_103_515_245) + 12_345) >>> 0;
+    return state;
+  };
+  const alphabet = "abzAZ09-_. :\"'/@+é\u0000";
+  for (let i = 0; i < 200; i += 1) {
+    let station = "";
+    for (let n = 1 + (next() % 40); n > 0; n -= 1) {
+      station += alphabet[next() % alphabet.length];
+    }
+    odd.push({ station });
+  }
+  const leave = (heard: unknown[]) =>
+    parseLeave({ reason: "r", body: "b", heard }).heard;
+  const records = odd.map((change, index) => ({
+    ...released(RECORD, String(index + 1)),
+    ...change,
+  }));
+  let suggestedRefs = 0;
+  for (const record of [released(RECORD), ...records]) {
+    const message = refusal(letterOf(RECORD), [record]);
+    const refs = suggested(message);
+    if (refs === undefined) {
+      assert.match(message, /can't carry/u, message);
+      continue;
+    }
+    suggestedRefs += refs.length;
+    // It names this record, not a sanitized look-alike of it.
+    const [ref] = refs as Array<{
+      station: string;
+      stream: string;
+      epoch: number;
+      seq: number | string;
+    }>;
+    assert.deepEqual(
+      [ref!.station, ref!.stream, ref!.epoch, BigInt(ref!.seq)],
+      [record.station, record.stream, record.epoch, BigInt(record.seq)],
+      message,
+    );
+    assert.deepEqual(
+      leave(refs).map((ref) => ({ ...ref })),
+      refs.map((ref) => {
+        const { seq } = ref as { seq: number | string };
+        return { ...(ref as object), seq: String(seq) };
+      }),
+      `${JSON.stringify(record.station)}: ${message}`,
+    );
+  }
+  // ops, seq 007 (as 7) and the u64 maximum are references as they are.
+  assert.ok(suggestedRefs >= 3, "the valid names are still suggested");
+  // All of them in one refusal: the suggestion is capped, and still parses.
+  const all = refusal(letterOf(RECORD), [released(RECORD), ...records]);
+  const refs = suggested(all);
+  assert.ok(refs !== undefined && refs.length > 0);
+  assert.doesNotThrow(() => leave(refs), all);
+});
+
+test("copy guard: a guard failure is logged with the error's name, never its message", async () => {
+  const { h, host, faults } = breakable();
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    host.sing(2, { text: RECORD });
+    h.timers.advance(1_000);
+    await h.call(shim, "hear", {});
+    faults.poisoned = true;
+    const left = await h.call(shim, "leave_letter", {
+      reason: "r",
+      body: "my own words",
+    });
+    assert.equal(left.ok, true, left.text);
+    const lines = h.logs
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+      .filter((line) => line.event === "letters.copy_guard_failed");
+    assert.equal(lines.length, 1, h.logs.join("\n"));
+    assert.equal(lines[0]!.fault, "TypeError");
+    const line = JSON.stringify(lines[0]);
+    assert.doesNotMatch(line, /poisoned/u, "never the message");
+  } finally {
+    h.dispose();
+  }
+});
+
+test("copy guard: faultName is a bare constructor name, never message text", () => {
+  assert.equal(
+    faultName(new RangeError("Map maximum size exceeded")),
+    "RangeError",
+  );
+  assert.equal(faultName(new TypeError("x")), "TypeError");
+  class SqliteError extends Error {
+    override name = "SqliteError";
+  }
+  assert.equal(
+    faultName(new SqliteError("disk I/O error at /home")),
+    "SqliteError",
+  );
+  const named = (name: string) => Object.assign(new Error("m"), { name });
+  assert.equal(
+    faultName(named("rune gateway restarted")),
+    "Error",
+    "spaces: not a name",
+  );
+  assert.equal(faultName(named("A".repeat(41))), "Error", "too long");
+  assert.equal(faultName(named("A".repeat(40))), "A".repeat(40));
+  assert.equal(faultName(named("")), "Error");
+  assert.equal(
+    faultName("secret words"),
+    "string",
+    "a thrown string: its type only",
+  );
+  assert.equal(faultName({ name: "Fake", message: "m" }), "object");
+  assert.equal(faultName(undefined), "undefined");
 });
 
 /**

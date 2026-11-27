@@ -93,6 +93,7 @@ import {
   leaveLetter,
   listLetters,
   parseLeave,
+  faultName,
   refuseCopies,
   type LeaveRequest,
   type ReleasedRecord,
@@ -4196,9 +4197,10 @@ export class Daemon {
     request: LeaveRequest,
   ): string | null {
     const failed = (error: unknown): void => {
+      // Not `error`: the logger redacts that key, and the name is all this logs.
       this.logger.log("warn", "letters.copy_guard_failed", {
         ear,
-        error: error instanceof Error ? error.name : typeof error,
+        fault: faultName(error),
       });
     };
     let released: { records: ReleasedRecord[]; unchecked: string | null };
