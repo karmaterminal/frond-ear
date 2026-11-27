@@ -189,6 +189,7 @@ test("dry-run daemon + channel shim + MCP client: inject → <channel> notificat
   assert.deepEqual(tools.tools.map((tool) => tool.name).sort(), [
     "ack",
     "canticle_custody",
+    "canticle_guide",
     "ear_status",
     "edit_message",
     "fetch_attachment",

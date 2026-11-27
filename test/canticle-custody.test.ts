@@ -1865,7 +1865,9 @@ test("revert: a refresh that superseded the record of a reverted push goes out t
     h.timers.advance(6_000);
     assert.equal(pushes(first).length, 1, "record 1, never confirmed");
     host.sing(2, { ...x, ttlMs: 600_000, flags: { refresh: true } });
-    host.pluck(1, x); // superseded by the refresh
+    // Superseded by the refresh, as a host daemon retracts it (a pluck would end the
+    // seed: the session is told it is gone, so the refresh is news, #67).
+    host.retract(1, "superseded", x);
     h.timers.advance(2_000);
     assert.equal(status(h).counts.refresh_collapsed, 1);
     first.close();

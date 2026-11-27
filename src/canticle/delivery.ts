@@ -55,6 +55,12 @@
 // 256 its place can go to a stream owed a push as they merge; if it gets one back, it has
 // that key again).
 //
+// A record already pushed and offered to the session that its station withdraws while its
+// tombstone holds (plucked, revoked, quarantined; an alarm, also when it runs out on view)
+// gets a withdrawn note of its own, once (#67, RFC-0001 §14.14): one line, no payload, no
+// batch_id, its own hourly budget, and no new record or election authority; see
+// `#withdrawals`.
+//
 // A tombstone is a dedupe claim, not delivery (binary-canticle#161). Each push is a batch:
 // its claim (batch, tombstones, cursor, a custody row per record) is written in one
 // transaction before the push. A push no session's connection takes gives its claim
@@ -120,6 +126,48 @@ const MAX_MISSED_LINES = 5;
  * they are reverted; past it, the oldest one's records are read from the view again.
  */
 const MAX_UNCONFIRMED = 256;
+
+/**
+ * How long a withdrawn note (#67) may wait for a hold, its budget or its session: its
+ * record's tombstone lasts at least this long after the withdrawal.
+ */
+const NOTE_LIFE_MS = HOUR_MS;
+
+/** Where a pushed record was, as its withdrawn note names it (#67). */
+interface About {
+  station: string;
+  key: string;
+  stream: string;
+  epoch: number;
+  seq: string;
+}
+
+/** A withdrawn note owed to the session the record was pushed to. */
+interface Owed extends About {
+  reason: string;
+  at: number;
+}
+
+/** `key:epoch:stream:seq` back into its parts; the station by name, or its key. */
+function aboutOf(
+  id: string,
+  station: string | null | undefined,
+): About | undefined {
+  const first = id.indexOf(":");
+  const second = id.indexOf(":", first + 1);
+  const last = id.lastIndexOf(":");
+  if (first < 0 || second < 0 || last <= second) return undefined;
+  const epoch = Number(id.slice(first + 1, second));
+  if (!Number.isSafeInteger(epoch)) return undefined;
+  const key = id.slice(0, first);
+  return {
+    station: station ?? key,
+    key,
+    stream: id.slice(second + 1, last),
+    epoch,
+    seq: id.slice(last + 1),
+  };
+}
 
 /** The longest a `wake_grant` may last (binary-canticle#176 decision 1): a visit, not a habit. */
 export const MAX_WAKE_GRANT_MS = 86_400_000;
@@ -657,6 +705,18 @@ interface EarState {
    * expiry, so a later drop of one is not told again.
    */
   reported: Map<string, number>;
+  /** Identity → when to forget it: withdrawals (#67) already looked at, so each is once. */
+  told: Map<string, number>;
+  /**
+   * Withdrawn notes (#67): when the next is due (coalesced over `debounceMs`), why it is
+   * held, and when each note of the last hour went out (`maxWithdrawnPerHour`; saved with
+   * each note's settlement).
+   */
+  notes: {
+    due: Partial<Record<Cadence, number>>;
+    held?: string;
+    sent: number[];
+  };
   counts: Record<string, number>;
   cursor: Cursor;
   /** `missed` (or what an unconfirmed push carried) changed since it was last saved. */
@@ -1003,6 +1063,12 @@ export interface DeliveryDeps {
    * which only the host's `offered` for the batch confirms.
    */
   push: (ear: string, batchId: number, notification: Notification) => boolean;
+  /**
+   * Sends a notice outside every ledger to the ear's session (and its taps): no batch_id,
+   * nothing to confirm or ack. A withdrawn note (#67) goes this way. Returns whether a
+   * session's connection took it.
+   */
+  notice: (ear: string, notification: Notification) => boolean;
   /** Whether the ear's session silenced every chat (`set_attention` silent, no chat_id). */
   silenced: (ear: string) => boolean;
 }
@@ -1022,6 +1088,8 @@ export class CanticleDelivery {
     string,
     Map<number, { records: Waiting[]; missed: Map<string, Missed> }>
   >();
+  /** Per ear, identity → a withdrawn note owed (#67), mirroring `canticle_settled`. */
+  readonly #owed = new Map<string, Map<string, Owed>>();
   #timer: unknown;
   #stopped = false;
   #sweptAt: number;
@@ -1038,6 +1106,7 @@ export class CanticleDelivery {
     if (ear !== undefined) {
       this.#settled.delete(ear);
       this.#refreshes.delete(ear);
+      this.#owed.delete(ear);
     }
     for (const row of this.#deps.store.canticleSettled(now)) {
       if (ear !== undefined && row.ear !== ear) continue;
@@ -1048,7 +1117,28 @@ export class CanticleDelivery {
         row.digest,
         row.expiresAt,
       );
+      // A pushed record's withdrawn note still owed (#67), as its tombstone says.
+      if (
+        row.outcome !== "pushed" ||
+        row.withdrawn == null ||
+        row.notedAt != null
+      ) {
+        continue;
+      }
+      const about = aboutOf(row.identity, row.station);
+      if (about === undefined) continue;
+      this.#owedOf(row.ear).set(row.identity, {
+        ...about,
+        reason: row.withdrawn,
+        at: row.withdrawnAt ?? now,
+      });
     }
+  }
+
+  #owedOf(ear: string): Map<string, Owed> {
+    let owed = this.#owed.get(ear);
+    if (owed === undefined) this.#owed.set(ear, (owed = new Map()));
+    return owed;
   }
 
   start(): void {
@@ -1154,6 +1244,9 @@ export class CanticleDelivery {
       this.#grants(ear, state, now),
       view.capability,
     );
+    // Before anything heard this pass is judged: a refresh of a record withdrawn in the
+    // same pass is then news, not a collapse.
+    this.#oweWithdrawals(ear, view, state, now);
 
     for (const [id, seen] of state.seen) {
       if (seen.until <= now) state.seen.delete(id);
@@ -1321,7 +1414,265 @@ export class CanticleDelivery {
     if (state.held === undefined && state.waiting.size > 0) {
       state.held = this.#hold(ear, view, delivery, state, now);
     }
+    this.#withdrawals(ear, view, delivery, config, modes, state, now);
     if (state.dirty) this.#saveWithheld(ear, state);
+  }
+
+  /**
+   * Withdrawn notes (#67, RFC-0001 §14.14): a record already pushed to the session that
+   * is withdrawn while its tombstone holds gets one short line, behind the daemon's own
+   * header, with no payload: where it was (`station:stream`, `epoch/seq`) and why. A
+   * withdrawal is what the source saw happen to a record it held (`HearView.withdrawals`):
+   * a `retract` for plucked, revoked or quarantined (the embedded receptor: a PLUCK), or,
+   * for a class whose expiry is news (alarm), a `retract` for its expiry or its running
+   * out while still in the source's live set. Nothing here infers an expiry from a record
+   * missing between polls, which can't tell a supersession or a lost link from one (🪨 on
+   * #134). A superseded record's successor speaks for it, and chatter running out is no
+   * news.
+   *
+   * The note is owed on the record's tombstone, which then lasts at least
+   * `NOTE_LIFE_MS`, and marked sent there before it goes out: at most once. A restart
+   * never repeats a sent note and keeps an owed one; a note whose send fails part way, or
+   * whose process dies between the mark and the send, is lost, never sent twice. Only a
+   * session connection that certainly didn't take it gives the mark back. It goes only to a session the record was pushed to: custody must show
+   * a push of it offered to the session holding the ear now (a `hear` is a read, not a
+   * push). Notes coalesce on their station's cadence (`debounceMs` immediate, `windowMs`
+   * digest) into one, naming up to `maxItems` and counting the rest, under every hold a
+   * push keeps but the push budget: they spend `maxWithdrawnPerHour` instead, so neither
+   * can starve the other. A mute, or a station now off, holds them while it lasts. An
+   * owed note ends its record's refresh seed (§7.9): a same-body refresh after it is
+   * news, so the note's longer retention never holds one back. A note is no record and grants no new record or election authority:
+   * no payload, no batch_id, nothing to ack, no custody, no push counted. It is a channel
+   * event, so it may start a turn of the session the record was pushed to, and only that.
+   */
+  #withdrawals(
+    ear: string,
+    view: HearView,
+    delivery: CanticleEarDelivery,
+    config: Config,
+    modes: Modes,
+    state: EarState,
+    now: number,
+  ): void {
+    const settled = this.#settled.get(ear);
+    const holds = (id: string) => (settled?.get(id) ?? 0) > now;
+    const owed = this.#owed.get(ear);
+    for (const id of owed?.keys() ?? []) {
+      if (holds(id)) continue;
+      owed!.delete(id);
+      this.#count(state, "withdrawn_lapsed");
+    }
+    if (owed === undefined || owed.size === 0) {
+      state.notes.due = {};
+      delete state.notes.held;
+      return;
+    }
+    // Each note goes on its station's cadence now, as a push would (🌿 S1 on #134): an
+    // immediate station's after `debounceMs`, a digest station's after `windowMs`, each
+    // coalescing what comes due meanwhile. A station muted or off holds its notes.
+    const interval = (cadence: Cadence) =>
+      cadence === "immediate" ? delivery.debounceMs : delivery.windowMs;
+    const cadenceOf = (note: Owed): Cadence | undefined => {
+      const mode = modes.of({ key: note.key, station: note.station });
+      return mode === "immediate" || mode === "digest" ? mode : undefined;
+    };
+    const silent = new Set<string>();
+    for (const cadence of CADENCES) {
+      const any = [...owed.values()].some(
+        (note) => cadenceOf(note) === cadence,
+      );
+      if (any) state.notes.due[cadence] ??= now + interval(cadence);
+      else delete state.notes.due[cadence];
+    }
+    for (const note of owed.values()) {
+      if (cadenceOf(note) === undefined) {
+        silent.add(modes.of({ key: note.key, station: note.station }));
+      }
+    }
+    if (Object.keys(state.notes.due).length === 0) {
+      state.notes.held = silent.has("mute") ? "muted" : "off";
+      return;
+    }
+    const dueNow = CADENCES.filter(
+      (cadence) => (state.notes.due[cadence] ?? Infinity) <= now,
+    );
+    if (dueNow.length === 0) return;
+    const held = this.#noteHold(ear, view, delivery, state, now);
+    if (held !== undefined) {
+      state.notes.held = held;
+      return;
+    }
+    const session = this.#deps.session(ear)!;
+    // Offered to this session: a push's (never a hear's), handed to the session holding
+    // the ear now, by its id, or with no id on either side, under this same attach.
+    const offered = new Set(
+      this.#deps.store
+        .canticleCustodyOf(ear, [...owed.keys()])
+        .filter(
+          (c) =>
+            c.path !== "hear" &&
+            c.offeredAt !== null &&
+            c.offerSession === session.sessionId &&
+            (c.offerSession !== null || c.generation === session.generation),
+        )
+        .map((c) => c.identity),
+    );
+    const ready: Array<[string, Owed]> = [];
+    for (const [id, note] of owed) {
+      const cadence = cadenceOf(note);
+      if (
+        offered.has(id) &&
+        cadence !== undefined &&
+        dueNow.includes(cadence)
+      ) {
+        ready.push([id, note]);
+      }
+    }
+    for (const cadence of dueNow)
+      state.notes.due[cadence] = now + interval(cadence);
+    if (ready.length === 0) {
+      state.notes.held = "not_offered";
+      return;
+    }
+    delete state.notes.held;
+    const notification = renderWithdrawn(
+      ready.map(([, note]) => note),
+      delivery.maxItems,
+      config.limits.maxNotificationChars,
+    );
+    const ids = ready.map(([id]) => id);
+    const name = `canticle.notes.${ear}`;
+    const sent = [...state.notes.sent, now];
+    // Settled before it goes, with the budget it spends: at most once, as a push's claim.
+    this.#deps.store.noteCanticleWithdrawn(ear, ids, now, {
+      name,
+      value: JSON.stringify(sent),
+    });
+    let taken: boolean;
+    try {
+      taken = this.#deps.notice(ear, notification);
+    } catch (error) {
+      // The send failed part way: whether the session got it is unknown. At most once
+      // (🪨 on #134): the mark stands, so the note is never sent twice, and may be lost,
+      // as one is when frond-ear dies between the mark and the send.
+      state.notes.sent = sent;
+      for (const id of ids) owed.delete(id);
+      this.#settleDue(state, owed, cadenceOf);
+      this.#count(state, "withdrawn_unknown");
+      this.#deps.logger.log("warn", "canticle.withdrawn_unknown", {
+        ear,
+        records: ids.length,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+      return;
+    }
+    if (!taken) {
+      // No session's connection took it, for certain: owed again, its budget unspent.
+      this.#deps.store.noteCanticleWithdrawn(ear, ids, null, {
+        name,
+        value: JSON.stringify(state.notes.sent),
+      });
+      this.#count(state, "withdrawn_unsent");
+      this.#deps.logger.log("warn", "canticle.withdrawn_unsent", {
+        ear,
+        records: ids.length,
+      });
+      return;
+    }
+    state.notes.sent = sent;
+    for (const id of ids) owed.delete(id);
+    this.#settleDue(state, owed, cadenceOf);
+    this.#count(state, "withdrawn_notes");
+    this.#count(state, "withdrawn_noted", ids.length);
+    this.#deps.logger.log("info", "canticle.withdrawn_noted", {
+      ear,
+      records: ids.length,
+    });
+  }
+
+  /** What the source withdrew since the last pass, looked at once each (#67). */
+  #oweWithdrawals(ear: string, view: HearView, state: EarState, now: number) {
+    const settled = this.#settled.get(ear);
+    for (const [id, until] of state.told) {
+      if (until <= now) state.told.delete(id);
+    }
+    for (const w of view.withdrawals ?? []) {
+      const id = identity(w);
+      if (state.told.has(id)) continue;
+      // Not held here: never pushed, passed over or settled.
+      if ((settled?.get(id) ?? 0) > now) {
+        this.#owe(ear, state, id, w, w.reason, w.at, now);
+      }
+      // Looked at once; after a store write that failed, again on the next pass.
+      if (state.told.size >= MAX_SEEN) {
+        state.told.delete(state.told.keys().next().value!);
+      }
+      state.told.set(id, w.until + SETTLE_SKEW_MS);
+    }
+  }
+
+  /** A cadence with no note left on it has nothing due. */
+  #settleDue(
+    state: EarState,
+    owed: ReadonlyMap<string, Owed>,
+    cadenceOf: (note: Owed) => Cadence | undefined,
+  ): void {
+    for (const cadence of CADENCES) {
+      if (![...owed.values()].some((note) => cadenceOf(note) === cadence)) {
+        delete state.notes.due[cadence];
+      }
+    }
+  }
+
+  /**
+   * A pushed record was withdrawn (#67): its note is owed on its tombstone, if this is
+   * its first withdrawal and the tombstone is a push's. The tombstone then lasts at least
+   * `NOTE_LIFE_MS`, so the note can wait out a hold, its budget or its session's return.
+   */
+  #owe(
+    ear: string,
+    state: EarState,
+    id: string,
+    about: About,
+    reason: string,
+    at: number,
+    now: number,
+  ): void {
+    const settled = this.#settled.get(ear);
+    const until = Math.max(settled?.get(id) ?? 0, now + NOTE_LIFE_MS);
+    const seed = this.#deps.store.oweCanticleWithdrawn(
+      ear,
+      id,
+      reason,
+      at,
+      until,
+    );
+    if (seed === undefined) return;
+    settled?.set(id, until);
+    // No longer a refresh seed: a same-body refresh after the note is news (🌿 B1).
+    if (seed.refreshKey !== null && seed.digest !== null) {
+      this.#refreshes.get(ear)?.delete(`${seed.refreshKey}\n${seed.digest}`);
+    }
+    const { station, key, stream, epoch, seq } = about;
+    this.#owedOf(ear).set(id, { station, key, stream, epoch, seq, reason, at });
+    this.#count(state, `withdrawn_${token(reason)}`);
+  }
+
+  /** Why no withdrawn note can go now (#67): a push's holds, and the notes' own budget. */
+  #noteHold(
+    ear: string,
+    view: HearView,
+    delivery: CanticleEarDelivery,
+    state: EarState,
+    now: number,
+  ): string | undefined {
+    const gate = this.#gate(ear, view);
+    if (gate !== undefined) return gate;
+    state.notes.sent = state.notes.sent.filter((at) => at > now - HOUR_MS);
+    if (state.notes.sent.length >= delivery.maxWithdrawnPerHour) {
+      return "withdrawn_budget";
+    }
+    return undefined;
   }
 
   /**
@@ -1539,6 +1890,16 @@ export class CanticleDelivery {
     return cadence;
   }
 
+  /** What holds every push and note: a pause, no session, or a breaker not closed. */
+  #gate(ear: string, view: HearView): string | undefined {
+    if (this.#deps.config().paused) return "paused";
+    if (this.#deps.session(ear) === undefined) return "no_session";
+    if (view.breaker !== undefined && view.breaker !== "closed") {
+      return `breaker_${view.breaker}`;
+    }
+    return undefined;
+  }
+
   /** Why nothing can be pushed right now, or undefined. Records wait meanwhile. */
   #hold(
     ear: string,
@@ -1547,11 +1908,8 @@ export class CanticleDelivery {
     state: EarState,
     now: number,
   ): string | undefined {
-    if (this.#deps.config().paused) return "paused";
-    if (this.#deps.session(ear) === undefined) return "no_session";
-    if (view.breaker !== undefined && view.breaker !== "closed") {
-      return `breaker_${view.breaker}`;
-    }
+    const gate = this.#gate(ear, view);
+    if (gate !== undefined) return gate;
     const { cursor } = state;
     cursor.pushes = cursor.pushes.filter((at) => at > now - HOUR_MS);
     if (cursor.pushes.length >= delivery.maxPushesPerHour) return "push_budget";
@@ -1922,6 +2280,8 @@ export class CanticleDelivery {
         missed: new Map(),
         overflow: new Map(),
         reported: new Map(),
+        told: new Map(),
+        notes: { due: {}, sent: this.#loadNotes(ear) },
         counts: {},
         cursor,
         dirty: false,
@@ -1997,6 +2357,22 @@ export class CanticleDelivery {
         reason: error instanceof Error ? error.message : String(error),
       });
     }
+  }
+
+  /** When each withdrawn note of the last hour went out (#67), as its settlement saved it. */
+  #loadNotes(ear: string): number[] {
+    const saved = this.#deps.store.runtimeState(`canticle.notes.${ear}`);
+    if (saved === undefined) return [];
+    try {
+      const sent = JSON.parse(saved) as unknown;
+      if (Array.isArray(sent)) {
+        return sent.filter((at): at is number => Number.isSafeInteger(at));
+      }
+    } catch {
+      // fall through: the hour starts empty, at worst one hour's notes twice the cap
+    }
+    this.#deps.logger.log("warn", "canticle.notes_unreadable", { ear });
+    return [];
   }
 
   #loadCursor(ear: string): Cursor {
@@ -2288,6 +2664,8 @@ export class CanticleDelivery {
       refreshKey: seeds(outcome) ? (refreshKey(item) ?? null) : null,
       digest: seeds(outcome) ? (item.bodyDigest ?? null) : null,
       expiresAt: expiresAt + SETTLE_SKEW_MS,
+      // What a pushed record's withdrawn note names it by (#67).
+      ...(outcome === "pushed" ? { station: item.station } : {}),
     }));
   }
 
@@ -2447,12 +2825,15 @@ export class CanticleDelivery {
 
   /**
    * The ear's effective mode for this record's station now, for custody of a `hear`
-   * (binary-canticle#161): `off` where the ear has no delivery.
+   * (binary-canticle#161) and the guide's rows; for the ear as a whole with no station.
+   * `off` where the ear has no delivery.
    */
-  modeOf(ear: string, item: LiveItem): DeliveryMode {
+  modeOf(ear: string, item?: Pick<LiveItem, "key" | "station">): DeliveryMode {
     const config = this.#deps.config();
     if (config.canticle?.delivery[ear] === undefined) return "off";
-    return this.#modes(ear, config, this.#deps.clock.now()).of(item);
+    return this.#modes(ear, config, this.#deps.clock.now()).of(
+      item === undefined ? undefined : { key: item.key, station: item.station },
+    );
   }
 
   /** The ear's modes: config ceilings, the session's choices, and the effective result. */
@@ -2613,8 +2994,75 @@ export class CanticleDelivery {
       maxPushesPerHour: delivery.maxPushesPerHour,
       reports: state.cursor.report,
       counts: { ...state.counts },
+      withdrawn: {
+        owed: this.#owed.get(ear)?.size ?? 0,
+        nextAt:
+          Object.keys(state.notes.due).length > 0
+            ? Math.min(...Object.values(state.notes.due))
+            : null,
+        held: state.notes.held ?? null,
+        notesLastHour: state.notes.sent.filter((at) => at > now - HOUR_MS)
+          .length,
+        maxWithdrawnPerHour: delivery.maxWithdrawnPerHour,
+      },
     };
   }
+}
+
+/**
+ * A withdrawn note's text (#67): the daemon's header, then one line per record, naming
+ * up to `maxItems` (as few as fit `maxChars`) and counting the rest. Never a payload.
+ */
+function renderWithdrawn(
+  notes: readonly Owed[],
+  maxItems: number,
+  maxChars: number,
+): Notification {
+  const sorted = [...notes].sort((a, b) => {
+    const [x, y] = [`${a.station}:${a.stream}`, `${b.station}:${b.stream}`];
+    if (x !== y) return x < y ? -1 : 1;
+    if (a.epoch !== b.epoch) return a.epoch - b.epoch;
+    const [p, q] = [
+      BigInt(/^\d+$/u.test(a.seq) ? a.seq : 0),
+      BigInt(/^\d+$/u.test(b.seq) ? b.seq : 0),
+    ];
+    return p < q ? -1 : p > q ? 1 : 0;
+  });
+  const n = sorted.length;
+  const head = `canticle: ${plural(n, "record")} pushed to you earlier ${n === 1 ? "was" : "were"} withdrawn (a note frond-ear writes: no payload, nothing to ack; hear reads what is live now).`;
+  const line = (note: Owed) =>
+    `[canticle:withdrawn] ${token(note.station)}:${token(note.stream)} item=${note.epoch}/${token(note.seq)} reason=${token(note.reason)} at=${iso(note.at)}`;
+  const text = (named: number) => {
+    const rest = sorted.slice(named);
+    const reasons = new Map<string, number>();
+    for (const note of rest) {
+      reasons.set(note.reason, (reasons.get(note.reason) ?? 0) + 1);
+    }
+    const why =
+      reasons.size === 1
+        ? `${rest.length} more ${token(rest[0]!.reason)}`
+        : `${rest.length} more: ${[...reasons]
+            .map(([reason, count]) => `${count} ${token(reason)}`)
+            .join(", ")}`;
+    const streams = new Set(
+      rest.map((note) => `${note.station}:${note.stream}`),
+    );
+    return [
+      head,
+      ...sorted.slice(0, named).map(line),
+      ...(rest.length > 0
+        ? [
+            `(and ${why} on ${plural(streams.size, "stream")}; ear_status counts them.)`,
+          ]
+        : []),
+    ].join("\n");
+  };
+  let named = Math.min(n, maxItems);
+  while (named > 0 && text(named).length > maxChars) named -= 1;
+  return {
+    content: text(named),
+    meta: { kind: "canticle", delivery: "withdrawn", count: String(n) },
+  };
 }
 
 /** The cursor after a push: per-stream positions, and where a capped push stopped. */
