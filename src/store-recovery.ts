@@ -6,6 +6,7 @@ import {
   readdirSync,
   readFileSync,
   renameSync,
+  statSync,
   writeSync,
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
@@ -188,7 +189,7 @@ export function setStoreAside(
   // records the reset still leaves this for the next start to find.
   const marker = markerPath(path, keptAt);
   try {
-    writeMarker(marker, {
+    writeMarker(path, marker, {
       frondEar: "store-reset-marker",
       version: 1,
       at: now,
@@ -254,7 +255,7 @@ const DIRECTORY_SYNC_UNSUPPORTED = new Set(["EINVAL", "ENOTSUP", "EOPNOTSUPP"]);
  * (writeSync returns fewer bytes than asked, as under a file-size limit) is written on
  * from where it stopped, and one that makes no progress or reads back different throws.
  */
-function writeMarker(marker: string, content: ResetMarker): void {
+function writeMarker(path: string, marker: string, content: ResetMarker): void {
   const bytes = Buffer.from(`${JSON.stringify(content, null, 2)}\n`, "utf8");
   const fd = openSync(marker, "wx", 0o600);
   try {
@@ -278,7 +279,7 @@ function writeMarker(marker: string, content: ResetMarker): void {
     closeSync(fd);
   }
   const back = readFileSync(marker);
-  if (!back.equals(bytes) || readMarker(marker) === undefined) {
+  if (!back.equals(bytes) || readMarker(path, marker) === undefined) {
     throw new Error(
       `the reset marker reads back ${back.length} bytes, not the ${bytes.length} written`,
     );
@@ -304,10 +305,13 @@ function writeMarker(marker: string, content: ResetMarker): void {
 
 /**
  * Every reset marker beside the store at `path` that no store has recorded yet, oldest
- * first. A marker that doesn't parse whole was cut off as it was written, before
- * anything moved, so the store it names was found again where it was: it is skipped.
- * So is one whose quarantine holds no file at all (its set-aside moved nothing). Where
- * the store went is read from the marker's own name, beside the store as it is now.
+ * first. A marker is believed only when it agrees with itself and with the disk (🕯's
+ * review of 4723d24): it names this store, its keptAt is the quarantine its own name
+ * says, its moving list is that quarantine's database last with only the store's
+ * sidecars before it, and the quarantined database itself is there. Anything else is
+ * skipped: a marker cut off as it was written (before anything moved), or a set-aside
+ * cut off after its sidecars moved but before the database did, whose store was then
+ * found again where it was and set aside by that start.
  */
 export function pendingResets(path: string): PendingReset[] {
   const directory = dirname(path);
@@ -322,43 +326,66 @@ export function pendingResets(path: string): PendingReset[] {
       continue;
     }
     const marker = join(directory, name);
-    const content = readMarker(marker);
+    const content = readMarker(path, marker);
     if (content === undefined) {
       continue;
     }
-    const keptAt = `${path}.corrupt-${name.slice(prefix.length, -MARKER_SUFFIX.length)}`;
-    const moved = [...SIDECARS, ""]
-      .map((suffix) => `${keptAt}${suffix}`)
-      .filter((file) => existsSync(file));
-    if (moved.length === 0) {
+    const { keptAt } = content;
+    if (statSync(keptAt, { throwIfNoEntry: false })?.isFile() !== true) {
       continue;
     }
     pending.push({
       marker,
-      reset: { at: content.at, keptAt, moved, error: content.error },
+      reset: {
+        at: content.at,
+        keptAt,
+        moved: content.moving.filter((file) => existsSync(file)),
+        error: content.error,
+      },
     });
   }
   return pending.sort((a, b) => a.reset.at - b.reset.at);
 }
 
-function readMarker(marker: string): ResetMarker | undefined {
+/** The marker at `marker` for the store at `path`, if it is whole and agrees with itself. */
+function readMarker(path: string, marker: string): ResetMarker | undefined {
+  let content: Partial<Record<keyof ResetMarker, unknown>>;
   try {
-    const content = JSON.parse(readFileSync(marker, "utf8")) as Partial<
-      Record<keyof ResetMarker, unknown>
-    >;
-    if (
-      content.frondEar !== "store-reset-marker" ||
-      content.version !== 1 ||
-      typeof content.at !== "number" ||
-      !Number.isFinite(content.at) ||
-      typeof content.error !== "string"
-    ) {
-      return undefined;
-    }
-    return content as ResetMarker;
+    content = JSON.parse(readFileSync(marker, "utf8")) as typeof content;
   } catch {
     return undefined;
   }
+  const name = basename(marker);
+  const prefix = `${basename(path)}.reset-`;
+  if (!name.startsWith(prefix) || !name.endsWith(MARKER_SUFFIX)) {
+    return undefined;
+  }
+  const keptAt = `${path}.corrupt-${name.slice(prefix.length, -MARKER_SUFFIX.length)}`;
+  const moving = content.moving;
+  const allowed = [...SIDECARS, ""].map((suffix) => `${keptAt}${suffix}`);
+  if (
+    content.frondEar !== "store-reset-marker" ||
+    content.version !== 1 ||
+    typeof content.at !== "number" ||
+    !Number.isFinite(content.at) ||
+    typeof content.error !== "string" ||
+    content.store !== path ||
+    content.keptAt !== keptAt ||
+    !Array.isArray(moving) ||
+    moving.length === 0 ||
+    moving.at(-1) !== keptAt ||
+    !moving.every(
+      (file, index) =>
+        typeof file === "string" &&
+        allowed.includes(file) &&
+        // In the order they move: each later in the list than the one before.
+        (index === 0 ||
+          allowed.indexOf(file) > allowed.indexOf(moving[index - 1])),
+    )
+  ) {
+    return undefined;
+  }
+  return content as ResetMarker;
 }
 
 /**

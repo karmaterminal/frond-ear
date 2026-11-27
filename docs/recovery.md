@@ -69,14 +69,21 @@ database"), or a quick_check finding. Then it starts a fresh store and keeps goi
   place to be found again, never a fresh database beside an old WAL. An earlier quarantine with
   the same stamp is never overwritten (`-1`, `-2` are added). **Nothing is ever deleted**, and
   nothing deletes these files later: they are yours to keep or remove.
-- Before anything moves, a small marker is written and synced beside it:
+- Before anything moves, a small marker is written beside it, whole (a short write is written on
+  from where it stopped), read back byte for byte, and synced with its directory:
   `frond-ear.db.reset-<UTC stamp>.json` (when, SQLite's words for why, the store's path and where
-  each file is going; paths and a time only, never ledger content). If the fresh store then fails
-  (a full disk, a crash), the next start finds the marker with no record in the live store and
-  records the reset from it, so `storeReset` still says it, adding that the fresh store did not
-  complete and which marker it was read back from (journal: `"event":"store.reset_recovered"`).
-  Once the live store holds the record, the marker is renamed `….reset-<stamp>.recorded.json` and
-  never read again; like the quarantine, it is never deleted.
+  each file is going; paths and a time only, never ledger content). If any of that fails (a full
+  disk, a file-size limit, an I/O error syncing the directory), the daemon refuses with nothing
+  moved, as for a failed rename. If the fresh store then fails (a full disk, a crash), the next
+  start finds the marker with no record in the live store and records the reset from it, so
+  `storeReset` still says it, adding that the fresh store did not complete and which marker it was
+  read back from (journal: `"event":"store.reset_recovered"`). A marker is believed only when it
+  names this store, its own quarantine, and a move list ending on the database, and the
+  quarantined database itself is there. A set-aside cut off after the sidecars moved but before
+  the database did is not a reset: the database was still in place, so that start found it again
+  and set it aside itself (the sidecars moved first stay under the earlier stamp; copy both stamps'
+  files when you read the old store). Once the live store holds the record, the marker is renamed
+  `….reset-<stamp>.recorded.json` and never read again; like the quarantine, it is never deleted.
 - `frond-ear.db.lock` (one daemon per database, #130) is not the store's and stays where it is.
 - The journal says it once (`"event":"store.set_aside"`, with `keptAt` and what SQLite found).
   `ear_status` (and `node src/cli.ts status`) leads with `storeReset`, whose `said` line says when,

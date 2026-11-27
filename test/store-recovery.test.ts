@@ -6,6 +6,7 @@ import fs, {
   existsSync,
   fstatSync,
   mkdirSync,
+  renameSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
@@ -809,6 +810,89 @@ test(
     }
   },
 );
+
+test("a set-aside cut off after its sidecars moved but before the database did is not a reset: the next start sets the store aside itself, and reports one reset", () => {
+  const directory = scratch();
+  const path = join(directory, "ear.db");
+  const garbage = Buffer.from("garbage ".repeat(600));
+  try {
+    writeFileSync(path, garbage);
+    writeFileSync(`${path}-wal`, "old wal ".repeat(60));
+    const cut = setStoreAside(path, new Error("file is not a database"), AT);
+    // The crash shape: the WAL is aside, the database (last) never moved.
+    renameSync(cut.keptAt, path);
+    assert.ok(existsSync(`${cut.keptAt}-wal`) && !existsSync(cut.keptAt));
+    const later = AT + 60_000;
+    const next = new EventStore(path, new FakeClock(later));
+    try {
+      const resets = next.storeResets();
+      assert.deepEqual(
+        resets.map((reset) => reset.keptAt),
+        [`${path}.corrupt-20261126T143105.123Z`],
+        "only the set-aside that moved the database",
+      );
+      assert.equal(resets[0]?.recoveredFrom, undefined);
+      assert.deepEqual(next.recovered, []);
+      assert.deepEqual(
+        readFileSync(`${path}.corrupt-20261126T143105.123Z`),
+        garbage,
+      );
+    } finally {
+      next.close();
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a marker whose store, keptAt or moving don't match what is on disk is not a reset", () => {
+  const directory = scratch();
+  const path = join(directory, "ear.db");
+  try {
+    const cases: Array<[string, (m: Record<string, unknown>) => void]> = [
+      ["another store", (m) => (m.store = join(directory, "other.db"))],
+      [
+        // A real file, but not the quarantine this marker's own name says.
+        "keptAt not its own name",
+        (m) => {
+          const elsewhere = `${path}.corrupt-elsewhere`;
+          writeFileSync(elsewhere, "x");
+          m.keptAt = elsewhere;
+        },
+      ],
+      ["moving ends on a sidecar", (m) => (m.moving = [`${m.keptAt}-wal`])],
+      [
+        "moving outside the quarantine",
+        (m) => (m.moving = ["/etc/passwd", m.keptAt]),
+      ],
+    ];
+    cases.forEach(([, edit], index) => {
+      const at = AT + index * 1_000;
+      writeFileSync(path, "garbage ".repeat(600));
+      const reset = setStoreAside(
+        path,
+        new Error("file is not a database"),
+        at,
+      );
+      const stamp = reset.keptAt.slice(`${path}.corrupt-`.length);
+      const file = marker(path, stamp).pending;
+      const content = JSON.parse(readFileSync(file, "utf8")) as Record<
+        string,
+        unknown
+      >;
+      edit(content);
+      writeFileSync(file, JSON.stringify(content));
+    });
+    const store = new EventStore(path, new FakeClock(AT + 10_000));
+    try {
+      assert.deepEqual(store.storeResets(), [], "no marker was believed");
+    } finally {
+      store.close();
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
 
 for (const [label, fake] of [
   ["a write that makes no progress", () => 0],
