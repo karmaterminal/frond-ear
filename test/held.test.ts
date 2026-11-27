@@ -5,6 +5,7 @@
 // one message that tells nothing apart and echoes nothing. Letters are unchanged: a letter's
 // `heard` ref never resolves to a held item. The export is p57#187's heard-item.v0 shape.
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -777,4 +778,149 @@ test("hold and held: the tools are registered with the ref schema, and their des
   };
   assert.deepEqual(schema.required, ["ref"]);
   assert.ok(schema.properties.keep_for);
+});
+
+/**
+ * 🌿's sequence on #144: session H hears a record whole and holds it, the record leaves the
+ * live set, and after a /clear another session reads the hold. Returns the harness at that
+ * point, the record off air and held.
+ */
+async function heldOffAir() {
+  const { h, host } = setup(undefined);
+  const first = h.attach("scribe", { sessionId: HEARER });
+  host.sing(2, { text: RECORD });
+  h.timers.advance(1_000);
+  await h.call(first, "hear", {});
+  const held = await h.call(first, "hold", { ref: REF, keep_for: 7_200 });
+  assert.equal(held.ok, true, held.text);
+  h.clock.advance(600_000); // past the record's local and source expiry
+  assert.equal(host.view().items.length, 0, "the record is off air");
+  return { h, host };
+}
+
+const HEARER = "33333333-cccc-4ccc-8ccc-000000000003";
+
+test("copy guard: a hold this session read is compared after its record leaves the live set; the refusal names the ref and echoes nothing", async () => {
+  const { h } = await heldOffAir();
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    const read = await h.call(shim, "held", { read: REF });
+    assert.equal(read.ok, true, read.text);
+    // The read is custody: a whole release to the reading session, marked as a held read.
+    const db = new DatabaseSync(join(h.directory, "ear.db"));
+    const rows = db
+      .prepare(
+        "SELECT path, mode, shown, offer_session, echo_session, digest FROM canticle_custody WHERE offer_session = ?",
+      )
+      .all(SESSION) as Array<Record<string, unknown>>;
+    db.close();
+    assert.equal(rows.length, 1, "one custody row for the read");
+    assert.deepEqual(
+      { ...rows[0] },
+      {
+        path: "hear",
+        mode: "held",
+        shown: "whole",
+        offer_session: SESSION,
+        echo_session: SESSION,
+        digest: createHash("sha256").update(RECORD, "utf8").digest("hex"),
+      },
+    );
+
+    const copied = await h.call(shim, "leave_letter", {
+      reason: "the thread",
+      body: `from the held record: ${RECORD.slice(0, 70)}. check it`,
+    });
+    assert.equal(copied.ok, false, "refused");
+    assert.match(
+      copied.text,
+      /body copies heard canticle record ops:ops\.fleet 7\/2/u,
+    );
+    assert.match(
+      copied.text,
+      /heard: \[\{station: "ops", stream: "ops\.fleet", epoch: 7, seq: 2\}\]/u,
+    );
+    assert.ok(echoesNone(copied.text, RECORD), "never echoes the text");
+    // Its own words pass.
+    const own = await h.call(shim, "leave_letter", {
+      reason: "the thread",
+      body: "rune came back after the burst and lost some room events; the record is held",
+      heard: [REF],
+    });
+    assert.equal(own.ok, true, own.text);
+
+    // The guard still fails open, and says so, when the held store can't be read.
+    const side = new DatabaseSync(join(h.directory, "ear.db"));
+    side.exec("DROP TABLE held_items");
+    side.close();
+    const blind = await h.call(shim, "leave_letter", {
+      reason: "r",
+      body: RECORD,
+    });
+    assert.equal(blind.ok, true, blind.text);
+    assert.match(blind.text, /copy check: not run \(the check failed\)/u);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("copy guard: a hold this session never read is not compared, so a letter is no oracle for held text", async () => {
+  const { h } = await heldOffAir();
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    const listed = (await h.call(shim, "held", {})).text;
+    assert.match(listed, /ops:ops\.fleet 7\/2/u, "it knows a hold exists");
+    const letter = await h.call(shim, "leave_letter", {
+      reason: "r",
+      body: RECORD,
+    });
+    assert.equal(letter.ok, true, letter.text);
+    assert.doesNotMatch(letter.text, /canticle|ops:ops|copy check/u);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("copy guard: a held read by one session doesn't count for another", async () => {
+  const { h } = await heldOffAir();
+  try {
+    const reader = h.attach("scribe", { sessionId: OTHER });
+    assert.equal((await h.call(reader, "held", { read: REF })).ok, true);
+    const other = h.attach("scribe", { sessionId: SESSION });
+    const unread = await h.call(other, "leave_letter", {
+      reason: "r",
+      body: RECORD,
+    });
+    assert.equal(unread.ok, true, unread.text);
+    assert.doesNotMatch(unread.text, /canticle|ops:ops/u);
+    const back = h.attach("scribe", { sessionId: OTHER });
+    const copied = await h.call(back, "leave_letter", {
+      reason: "r",
+      body: RECORD,
+    });
+    assert.equal(copied.ok, false, "the reader's own letter is compared");
+    assert.match(copied.text, /ops:ops\.fleet 7\/2/u);
+    assert.ok(echoesNone(copied.text, RECORD));
+  } finally {
+    h.dispose();
+  }
+});
+
+test("copy guard: the hearer who held a record is compared against the hold after it leaves the live set, without reading it again", async () => {
+  const { h } = await heldOffAir();
+  try {
+    const hearer = h.attach("scribe", { sessionId: HEARER });
+    const copied = await h.call(hearer, "leave_letter", {
+      reason: "r",
+      body: RECORD,
+    });
+    assert.equal(
+      copied.ok,
+      false,
+      "released by its own hear, text from the hold",
+    );
+    assert.match(copied.text, /ops:ops\.fleet 7\/2/u);
+  } finally {
+    h.dispose();
+  }
 });
