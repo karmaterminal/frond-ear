@@ -5306,13 +5306,19 @@ export class Daemon {
       return {};
     }
     const at = new Date(latest.at).toISOString();
+    // Deep Dive No. 2 §08: the start that set it aside never recorded it; a later one
+    // did, from the marker left beside it before anything moved.
+    const started =
+      latest.recoveredFrom === undefined
+        ? "frond-ear started a fresh store then."
+        : `the fresh store that start began did not complete, and this record was read back from ${latest.recoveredFrom} at ${new Date(latest.recoveredAt ?? latest.at).toISOString()}.`;
     const earlier =
       resets.length > 1
         ? ` It has been set aside ${resets.length} times; resets lists each.`
         : "";
     return {
       storeReset: {
-        said: `the ledger store was corrupt at start and was set aside at ${at}; frond-ear started a fresh store then. Owed letters and wakes from before ${at} (and everything else the store held: queued events, schedules, canticle custody) are not in the live store. The old file is kept, never deleted, at ${latest.keptAt}; an owner can read it by hand (sqlite3 .recover, docs/recovery.md).${earlier}`,
+        said: `the ledger store was corrupt at start and was set aside at ${at}; ${started} Owed letters and wakes from before ${at} (and everything else the store held: queued events, schedules, canticle custody) are not in the live store. The old file is kept, never deleted, at ${latest.keptAt}; an owner can read it by hand (sqlite3 .recover, docs/recovery.md).${earlier}`,
         resets: resets.map((reset) => ({
           ...reset,
           atIso: new Date(reset.at).toISOString(),

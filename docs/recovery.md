@@ -69,6 +69,14 @@ database"), or a quick_check finding. Then it starts a fresh store and keeps goi
   place to be found again, never a fresh database beside an old WAL. An earlier quarantine with
   the same stamp is never overwritten (`-1`, `-2` are added). **Nothing is ever deleted**, and
   nothing deletes these files later: they are yours to keep or remove.
+- Before anything moves, a small marker is written and synced beside it:
+  `frond-ear.db.reset-<UTC stamp>.json` (when, SQLite's words for why, the store's path and where
+  each file is going; paths and a time only, never ledger content). If the fresh store then fails
+  (a full disk, a crash), the next start finds the marker with no record in the live store and
+  records the reset from it, so `storeReset` still says it, adding that the fresh store did not
+  complete and which marker it was read back from (journal: `"event":"store.reset_recovered"`).
+  Once the live store holds the record, the marker is renamed `….reset-<stamp>.recorded.json` and
+  never read again; like the quarantine, it is never deleted.
 - `frond-ear.db.lock` (one daemon per database, #130) is not the store's and stays where it is.
 - The journal says it once (`"event":"store.set_aside"`, with `keptAt` and what SQLite found).
   `ear_status` (and `node src/cli.ts status`) leads with `storeReset`, whose `said` line says when,
@@ -84,7 +92,7 @@ holds (`database is locked`), one it can't open (permissions, a directory it can
 errors, a full disk. A healthy store is never moved. If the rename itself fails (a read-only
 directory, say) the daemon refuses with `the ledger store <path> is corrupt (…) and could not be
 moved aside to <target>: …; refusing to start, nothing was deleted`, naming what it had already
-moved. Move the database and its sidecars aside together by hand, then start again.
+moved (if the target is the reset marker, nothing moved). Move the database and its sidecars aside together by hand, then start again.
 
 To read what the old store held, work on a copy, so nothing writes to the kept file:
 

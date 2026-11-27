@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import {
   chmodSync,
   copyFileSync,
@@ -17,6 +18,7 @@ import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
 import { EventStore } from "../src/store.ts";
+import { probeStore, setStoreAside } from "../src/store-recovery.ts";
 import { FakeClock, harness, testConfig } from "./helpers.ts";
 
 // #115: a corrupt ledger store is set aside whole (never deleted) and a fresh one starts,
@@ -392,7 +394,11 @@ test(
           (error: Error) =>
             error.message.includes(path) &&
             error.message.includes("refusing to start") &&
-            error.message.includes("nothing was deleted"),
+            error.message.includes("nothing was deleted") &&
+            // The marker is the first write, before any rename (Deep Dive No. 2 §08).
+            error.message.includes(
+              `could not be moved aside to ${path}.reset-${STAMP}.json (the reset marker`,
+            ),
         );
       } finally {
         chmodSync(directory, 0o700);
@@ -475,3 +481,210 @@ test("ear_status on a store that was never reset carries no storeReset", () => {
     h.dispose();
   }
 });
+
+// Deep Dive No. 2 §08: a reset whose fresh store fails right after the rename must not
+// vanish. A small marker is written beside the quarantine before anything moves; a later
+// start that finds it with no record in the live store records it, so ear_status says it.
+
+const STORE_URL = new URL("../src/store.ts", import.meta.url).href;
+const LINUX = process.platform === "linux";
+
+/** The reset marker a quarantine at `stamp` leaves beside `path`, before and after it is recorded. */
+function marker(path: string, stamp = STAMP) {
+  return {
+    pending: `${path}.reset-${stamp}.json`,
+    recorded: `${path}.reset-${stamp}.recorded.json`,
+  };
+}
+
+test(
+  "the fresh store fails just after the corrupt one is set aside (the real constructor, a file-size limit): the next start still says the reset in ear_status",
+  { skip: LINUX ? false : "ulimit -f is the Linux shape of a full disk here" },
+  () => {
+    const directory = scratch();
+    const path = join(directory, "ear.db");
+    const garbage = Buffer.from("not a database at all ".repeat(400));
+    try {
+      writeFileSync(path, garbage);
+      // 2 KiB per file: the marker and the renames fit, the fresh store's first page does not.
+      const child = spawnSync(
+        "bash",
+        [
+          "-c",
+          'ulimit -f 2; exec "$0" --input-type=module -e "$1"',
+          process.execPath,
+          `import { EventStore } from ${JSON.stringify(STORE_URL)}; new EventStore(process.env.FROND_EAR_TEST_DB);`,
+        ],
+        {
+          env: { ...process.env, FROND_EAR_TEST_DB: path },
+          encoding: "utf8",
+        },
+      );
+      assert.notEqual(child.status, 0, "the fresh store failed in the child");
+      assert.match(
+        `${child.stderr}${child.signal ?? ""}`,
+        /disk I\/O error|SIGXFSZ|EFBIG|File too large/,
+      );
+      const kept = quarantined(directory).filter((name) =>
+        /^ear\.db\.corrupt-[0-9T.Z]+$/u.test(name),
+      );
+      assert.equal(kept.length, 1, "the corrupt store was set aside");
+      const keptAt = join(directory, kept[0]!);
+      assert.deepEqual(readFileSync(keptAt), garbage);
+      // What a start then finds where the store was: no store, or an empty one that reads ok.
+      assert.ok(!existsSync(path) || statSync(path).size === 0);
+
+      const h = harness(testConfig(), { path });
+      try {
+        const status = h.daemon.status() as {
+          storeReset?: {
+            said: string;
+            resets: Array<{ keptAt: string; error: string }>;
+          };
+        };
+        assert.ok(status.storeReset, "ear_status carries the reset");
+        assert.deepEqual(
+          status.storeReset.resets.map((reset) => [reset.keptAt, reset.error]),
+          [[keptAt, "file is not a database"]],
+        );
+        assert.match(status.storeReset.said, /did not complete/);
+        assert.ok(status.storeReset.said.includes(keptAt));
+      } finally {
+        h.dispose();
+      }
+      // Recorded once: the marker is kept as recorded, and a later start adds nothing.
+      const stamp = kept[0]!.slice("ear.db.corrupt-".length);
+      assert.ok(existsSync(marker(path, stamp).recorded));
+      assert.ok(!existsSync(marker(path, stamp).pending));
+      const again = new EventStore(path, new FakeClock(AT));
+      try {
+        assert.equal(again.storeResets().length, 1);
+      } finally {
+        again.close();
+      }
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  },
+);
+
+test("a start that dies right after the set-aside (no fresh store at all) is reported by the next start, once, and clearing the record clears it", () => {
+  const directory = scratch();
+  const path = join(directory, "ear.db");
+  try {
+    writeFileSync(path, "garbage ".repeat(600));
+    writeFileSync(`${path}-wal`, "old wal ".repeat(60));
+    // The constructor's first two steps, then the process is gone.
+    const damage = probeStore(path);
+    assert.ok(damage !== undefined);
+    const reset = setStoreAside(path, damage, AT);
+    assert.ok(!existsSync(path));
+    assert.ok(existsSync(marker(path).pending), "the marker came first");
+
+    const next = new EventStore(path, new FakeClock(AT + 5_000));
+    try {
+      const resets = next.storeResets();
+      assert.equal(resets.length, 1);
+      assert.equal(resets[0]?.keptAt, `${path}.corrupt-${STAMP}`);
+      assert.equal(resets[0]?.at, AT);
+      assert.deepEqual(resets[0]?.moved, reset.moved);
+      assert.equal(resets[0]?.error, "file is not a database");
+      assert.equal(resets[0]?.recoveredFrom, marker(path).pending);
+      assert.equal(resets[0]?.recoveredAt, AT + 5_000);
+      assert.deepEqual(next.recovered, resets, "said in the journal too");
+      assert.equal(next.reset, undefined, "this start set nothing aside");
+      // Custody before the reset is unknown, as on the ordinary path.
+      assert.equal(next.canticleCustodySince(), AT);
+    } finally {
+      next.close();
+    }
+    assert.ok(existsSync(marker(path).recorded));
+    // The runbook's clear is a real clear: the recorded marker is never read again.
+    const owner = new DatabaseSync(path);
+    owner.exec("DELETE FROM store_resets");
+    owner.close();
+    const cleared = new EventStore(path, new FakeClock(AT + 10_000));
+    try {
+      assert.deepEqual(cleared.storeResets(), []);
+    } finally {
+      cleared.close();
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+for (const [label, damage] of [
+  [
+    "a truncated store",
+    (path: string) => truncateSync(path, statSync(path).size >> 1),
+  ],
+  [
+    "damage only in the letters table (quick_check's findings)",
+    (path: string) => {
+      const probe = new DatabaseSync(path, { readOnly: true });
+      const { rootpage } = probe
+        .prepare(
+          "SELECT rootpage FROM sqlite_master WHERE type = 'table' AND name = 'letters'",
+        )
+        .get() as { rootpage: number };
+      probe.close();
+      const bytes = readFileSync(path);
+      const pageSize = bytes.readUInt16BE(16);
+      for (let i = (rootpage - 1) * pageSize; i < rootpage * pageSize; i++) {
+        if (i % 7 !== 0) bytes[i] = 0x2a;
+      }
+      writeFileSync(path, bytes);
+    },
+  ],
+] as const) {
+  test(`the reset marker never holds ledger content: ${label}`, () => {
+    const directory = scratch();
+    const path = join(directory, "ear.db");
+    const secret = "LEDGER-SECRET-owed-letter-9f4c2e71";
+    try {
+      const store = new EventStore(path, new FakeClock(AT - 120_000));
+      letter(store, `${secret} ${secret}`);
+      store.close();
+      damage(path);
+      const found = probeStore(path);
+      assert.ok(found !== undefined, "the damage is seen");
+      const kept = `${path}.corrupt-${STAMP}`;
+      const moving = ["-wal", "-shm", "-journal", ""]
+        .filter((suffix) => existsSync(`${path}${suffix}`))
+        .map((suffix) => `${kept}${suffix}`);
+      setStoreAside(path, found, AT);
+      const bytes = readFileSync(marker(path).pending);
+      assert.ok(bytes.length < 2048, "small");
+      const text = bytes.toString("utf8");
+      assert.ok(!text.includes("LEDGER-SECRET"), "no letter text");
+      assert.ok(!text.includes("owed-letter"), "no letter text");
+      assert.ok(!text.includes("SQLite format"), "no store bytes");
+      const parsed = JSON.parse(text) as Record<string, unknown>;
+      assert.deepEqual(Object.keys(parsed).sort(), [
+        "at",
+        "atIso",
+        "error",
+        "frondEar",
+        "keptAt",
+        "moving",
+        "store",
+        "version",
+      ]);
+      assert.equal(parsed.frondEar, "store-reset-marker");
+      assert.equal(parsed.store, path);
+      assert.equal(parsed.keptAt, `${path}.corrupt-${STAMP}`);
+      assert.equal(parsed.at, AT);
+      assert.equal(parsed.atIso, new Date(AT).toISOString());
+      assert.deepEqual(parsed.moving, moving, "paths only");
+      assert.equal(moving.at(-1), kept, "the database last");
+      // Why: SQLite's own words or quick_check's page findings, the same the record keeps.
+      assert.equal(
+        parsed.error,
+        found instanceof Error ? found.message : String(found),
+      );
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+}

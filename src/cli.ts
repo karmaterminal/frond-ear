@@ -134,6 +134,15 @@ async function runDaemon(argv: string[]): Promise<void> {
       found: store.reset.error,
     });
   }
+  for (const reset of store.recovered) {
+    // A reset an earlier start set aside but never recorded, read back from its marker.
+    logger.log("warn", "store.reset_recovered", {
+      keptAt: reset.keptAt,
+      marker: reset.recoveredFrom,
+      setAsideAt: new Date(reset.at).toISOString(),
+      found: reset.error,
+    });
+  }
   const pruned = store.prune(config.limits.retentionMs);
 
   let gateway: DiscordGateway | undefined;

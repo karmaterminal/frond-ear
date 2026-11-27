@@ -1,4 +1,14 @@
-import { existsSync, renameSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  writeSync,
+} from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 /**
@@ -14,6 +24,36 @@ export interface StoreReset {
   moved: string[];
   /** What SQLite said: its error text, or quick_check's first findings. */
   error: string;
+  /**
+   * Set when the start that set the store aside never recorded it (its fresh store
+   * failed, or the process died) and a later start recorded it from the reset marker:
+   * that marker's path, and when.
+   */
+  recoveredFrom?: string;
+  recoveredAt?: number;
+}
+
+/**
+ * What a reset marker holds: when, why, and where the store went. Written beside the
+ * store before anything moves, so a start whose fresh store fails still leaves a trace
+ * the next start records (Deep Dive No. 2 §08). Paths, a time and SQLite's own words:
+ * never ledger content.
+ */
+interface ResetMarker {
+  frondEar: "store-reset-marker";
+  version: 1;
+  at: number;
+  atIso: string;
+  store: string;
+  keptAt: string;
+  moving: string[];
+  error: string;
+}
+
+/** A reset marker no live store has recorded yet, and the reset it describes. */
+export interface PendingReset {
+  marker: string;
+  reset: StoreReset;
 }
 
 /**
@@ -137,16 +177,39 @@ export function setStoreAside(
 ): StoreReset {
   const base = `${path}.corrupt-${stamp(now)}`;
   let keptAt = base;
-  for (let n = 1; taken(keptAt); n++) {
+  for (let n = 1; taken(path, keptAt); n++) {
     keptAt = `${base}-${n}`;
   }
   const error = errorText(corruption);
+  const suffixes = [...SIDECARS, ""].filter(
+    (suffix) => suffix === "" || existsSync(`${path}${suffix}`),
+  );
+  // The marker first: once anything moves, a start that fails before its fresh store
+  // records the reset still leaves this for the next start to find.
+  const marker = markerPath(path, keptAt);
+  try {
+    writeMarker(marker, {
+      frondEar: "store-reset-marker",
+      version: 1,
+      at: now,
+      atIso: new Date(now).toISOString(),
+      store: path,
+      keptAt,
+      moving: suffixes.map((suffix) => `${keptAt}${suffix}`),
+      error,
+    });
+  } catch (cause) {
+    throw new StoreSetAsideError(
+      path,
+      `${marker} (the reset marker, written before anything moves)`,
+      error,
+      cause,
+      [],
+    );
+  }
   const moved: string[] = [];
-  for (const suffix of [...SIDECARS, ""]) {
+  for (const suffix of suffixes) {
     const from = `${path}${suffix}`;
-    if (suffix !== "" && !existsSync(from)) {
-      continue;
-    }
     const to = `${keptAt}${suffix}`;
     try {
       renameSync(from, to);
@@ -158,6 +221,116 @@ export function setStoreAside(
   return { at: now, keptAt, moved, error };
 }
 
-function taken(keptAt: string): boolean {
-  return [...SIDECARS, ""].some((suffix) => existsSync(`${keptAt}${suffix}`));
+function taken(path: string, keptAt: string): boolean {
+  const marker = markerPath(path, keptAt);
+  return (
+    [...SIDECARS, ""].some((suffix) => existsSync(`${keptAt}${suffix}`)) ||
+    existsSync(marker) ||
+    existsSync(recordedPath(marker))
+  );
+}
+
+const MARKER_SUFFIX = ".json";
+const RECORDED_SUFFIX = ".recorded.json";
+
+/** `<db>.corrupt-<stamp>` → `<db>.reset-<stamp>.json`, beside it. */
+function markerPath(path: string, keptAt: string): string {
+  return `${path}.reset-${keptAt.slice(`${path}.corrupt-`.length)}${MARKER_SUFFIX}`;
+}
+
+function recordedPath(marker: string): string {
+  return `${marker.slice(0, -MARKER_SUFFIX.length)}${RECORDED_SUFFIX}`;
+}
+
+/** Written whole and synced, file and directory, before the first rename. Never overwrites. */
+function writeMarker(marker: string, content: ResetMarker): void {
+  const fd = openSync(marker, "wx", 0o600);
+  try {
+    writeSync(fd, `${JSON.stringify(content, null, 2)}\n`);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  try {
+    const directory = openSync(dirname(marker), "r");
+    try {
+      fsyncSync(directory);
+    } finally {
+      closeSync(directory);
+    }
+  } catch {
+    // A directory that can't be opened to sync (not Linux): the file itself is synced.
+  }
+}
+
+/**
+ * Every reset marker beside the store at `path` that no store has recorded yet, oldest
+ * first. A marker that doesn't parse whole was cut off as it was written, before
+ * anything moved, so the store it names was found again where it was: it is skipped.
+ * So is one whose quarantine holds no file at all (its set-aside moved nothing). Where
+ * the store went is read from the marker's own name, beside the store as it is now.
+ */
+export function pendingResets(path: string): PendingReset[] {
+  const directory = dirname(path);
+  const prefix = `${basename(path)}.reset-`;
+  const pending: PendingReset[] = [];
+  for (const name of readdirSync(directory)) {
+    if (
+      !name.startsWith(prefix) ||
+      !name.endsWith(MARKER_SUFFIX) ||
+      name.endsWith(RECORDED_SUFFIX)
+    ) {
+      continue;
+    }
+    const marker = join(directory, name);
+    const content = readMarker(marker);
+    if (content === undefined) {
+      continue;
+    }
+    const keptAt = `${path}.corrupt-${name.slice(prefix.length, -MARKER_SUFFIX.length)}`;
+    const moved = [...SIDECARS, ""]
+      .map((suffix) => `${keptAt}${suffix}`)
+      .filter((file) => existsSync(file));
+    if (moved.length === 0) {
+      continue;
+    }
+    pending.push({
+      marker,
+      reset: { at: content.at, keptAt, moved, error: content.error },
+    });
+  }
+  return pending.sort((a, b) => a.reset.at - b.reset.at);
+}
+
+function readMarker(marker: string): ResetMarker | undefined {
+  try {
+    const content = JSON.parse(readFileSync(marker, "utf8")) as Partial<
+      Record<keyof ResetMarker, unknown>
+    >;
+    if (
+      content.frondEar !== "store-reset-marker" ||
+      content.version !== 1 ||
+      typeof content.at !== "number" ||
+      !Number.isFinite(content.at) ||
+      typeof content.error !== "string"
+    ) {
+      return undefined;
+    }
+    return content as ResetMarker;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The live store holds the reset now: the marker is kept, renamed, so it is never read
+ * again (clearing the record clears the report) and nothing is deleted. Best effort: a
+ * marker left pending is found again and matched to the record by where the store went.
+ */
+export function markRecorded(marker: string): void {
+  try {
+    renameSync(marker, recordedPath(marker));
+  } catch {
+    // Matched to its record on the next start instead.
+  }
 }

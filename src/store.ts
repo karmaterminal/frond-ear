@@ -13,6 +13,8 @@ import {
   pendingIdOf,
 } from "./canticle/exposure.ts";
 import {
+  markRecorded,
+  pendingResets,
   probeStore,
   setStoreAside,
   type StoreReset,
@@ -734,6 +736,11 @@ export class EventStore {
   public readonly wakes: WakeStore;
   /** Set when this open found the store corrupt and set it aside (#115). */
   public readonly reset: StoreReset | undefined;
+  /**
+   * Resets an earlier start set aside but never recorded (its fresh store failed, or it
+   * died), recorded by this open from their markers (Deep Dive No. 2 §08).
+   */
+  public readonly recovered: StoreReset[];
 
   public constructor(path: string, clock: Clock = systemClock) {
     if (path !== ":memory:") {
@@ -753,16 +760,57 @@ export class EventStore {
     }
     this.database = new DatabaseSync(path);
     this.wakes = this.migrate();
-    if (reset !== undefined) {
-      this.database
-        .prepare(
-          "INSERT INTO store_resets (reset_at, kept_at, moved, error) VALUES (?, ?, ?, ?)",
-        )
-        .run(reset.at, reset.keptAt, JSON.stringify(reset.moved), reset.error);
-      // A fresh store reads as "nothing was ever exposed"; after a reset that is unknown.
-      this.setRuntimeState(CUSTODY_SINCE, String(reset.at));
-    }
     this.reset = reset;
+    this.recovered =
+      path === ":memory:" ? [] : this.recordResets(path, reset?.keptAt);
+  }
+
+  /**
+   * Records every reset whose marker sits beside the store and that this store doesn't
+   * hold yet: this start's own, and any an earlier start set aside but never recorded.
+   * Each is recorded with custody made unknown before it, then its marker is renamed
+   * recorded. Returns the earlier ones.
+   */
+  private recordResets(
+    path: string,
+    ownKeptAt: string | undefined,
+  ): StoreReset[] {
+    const recovered: StoreReset[] = [];
+    const known = new Set(this.storeResets().map((reset) => reset.keptAt));
+    for (const { marker, reset } of pendingResets(path)) {
+      if (!known.has(reset.keptAt)) {
+        const own = reset.keptAt === ownKeptAt;
+        const row: StoreReset = own
+          ? reset
+          : { ...reset, recoveredFrom: marker, recoveredAt: this.clock.now() };
+        this.transaction(() => {
+          this.database
+            .prepare(
+              `INSERT INTO store_resets (reset_at, kept_at, moved, error, recovered_from, recovered_at)
+                 VALUES (?, ?, ?, ?, ?, ?)`,
+            )
+            .run(
+              row.at,
+              row.keptAt,
+              JSON.stringify(row.moved),
+              row.error,
+              row.recoveredFrom ?? null,
+              row.recoveredAt ?? null,
+            );
+          // A fresh store reads as "nothing was ever exposed"; after a reset that is
+          // unknown before it.
+          if (this.canticleCustodySince() < row.at) {
+            this.setRuntimeState(CUSTODY_SINCE, String(row.at));
+          }
+        });
+        known.add(row.keptAt);
+        if (!own) {
+          recovered.push(row);
+        }
+      }
+      markRecorded(marker);
+    }
+    return recovered;
   }
 
   /** Opens the schema on `this.database`: every table and migration, then the wake store. */
@@ -774,7 +822,9 @@ export class EventStore {
         reset_at INTEGER NOT NULL,
         kept_at TEXT NOT NULL,
         moved TEXT NOT NULL,
-        error TEXT NOT NULL
+        error TEXT NOT NULL,
+        recovered_from TEXT,
+        recovered_at INTEGER
       );
       CREATE TABLE IF NOT EXISTS events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1022,6 +1072,25 @@ export class EventStore {
         CUSTODY_SINCE,
         String(exposedBefore.used === 1 ? this.clock.now() : 0),
       );
+    // A reset recorded from a marker says so (Deep Dive No. 2 §08); a store made before
+    // that has none of those.
+    const resetColumns = new Set(
+      (
+        this.database
+          .prepare("PRAGMA table_info(store_resets)")
+          .all() as Array<{ name: string }>
+      ).map((column) => column.name),
+    );
+    for (const [column, type] of [
+      ["recovered_from", "TEXT"],
+      ["recovered_at", "INTEGER"],
+    ] as const) {
+      if (!resetColumns.has(column)) {
+        this.database.exec(
+          `ALTER TABLE store_resets ADD COLUMN ${column} ${type}`,
+        );
+      }
+    }
     // A push's tombstones name its batch (#161), so a push no session took can give its
     // claim back. Older tombstones name none and keep the claim they made.
     const settledColumns = new Set(
@@ -1180,19 +1249,29 @@ export class EventStore {
     return (
       this.database
         .prepare(
-          "SELECT reset_at AS at, kept_at AS keptAt, moved, error FROM store_resets ORDER BY id",
+          `SELECT reset_at AS at, kept_at AS keptAt, moved, error,
+                  recovered_from AS recoveredFrom, recovered_at AS recoveredAt
+             FROM store_resets ORDER BY id`,
         )
         .all() as Array<{
         at: number;
         keptAt: string;
         moved: string;
         error: string;
+        recoveredFrom: string | null;
+        recoveredAt: number | null;
       }>
     ).map((row) => ({
       at: row.at,
       keptAt: row.keptAt,
       moved: JSON.parse(row.moved) as string[],
       error: row.error,
+      ...(row.recoveredFrom === null
+        ? {}
+        : {
+            recoveredFrom: row.recoveredFrom,
+            recoveredAt: row.recoveredAt ?? row.at,
+          }),
     }));
   }
 
