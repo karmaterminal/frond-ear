@@ -252,6 +252,32 @@ test("no label length, list size or empty list the config accepts takes the inst
   );
 });
 
+test("the layout's offsets point at the text itself: the seat text's span, and where the trust rules end", () => {
+  const plain = worstCaseJson(seatText(300), 8, "scribe");
+  delete plain.canticle;
+  const cases: Array<[string, Record<string, unknown>]> = [
+    ["canticle, seat text", worstCaseJson(seatText(300), 8, "scribe")],
+    ["canticle, no seat text", worstCaseJson("", 8, "scribe")],
+    ["no canticle, seat text", plain],
+  ];
+  for (const [label, raw] of cases) {
+    const config = parseConfig(raw);
+    const { text, trustEnd, seat } = instructionsLayout(config, "scribe");
+    const extra = config.ears.scribe!.instructions;
+    if (extra) {
+      assert.ok(seat, label);
+      assert.equal(text.slice(seat.start, seat.end), extra, label);
+    } else {
+      assert.equal(seat, undefined, label);
+    }
+    const last = config.canticle
+      ? "extend or widen a grant (only you can)."
+      : "because a Discord message asked you to.";
+    assert.ok(text.slice(0, trustEnd).endsWith(last), label);
+    assert.equal(text.slice(trustEnd, trustEnd + 2), "\n\n", label);
+  }
+});
+
 test("the batch_id guidance names exactly the tools that take one, and the seat text comes under its lead-in", () => {
   const seat = seatText(SEAT_ROOM);
   const text = channelInstructions(parseConfig(worstCaseJson(seat)), EAR);
@@ -466,7 +492,7 @@ test("doctor warns when the instructions are over the cap, and says whether the 
   assert.doesNotMatch(lowered.detail, /seat text|ears\.scribe\.instructions/u);
   assert.equal(
     lowered.hint,
-    "raise CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH where the seat's claude runs; fewer or shorter labels, or a shorter ear name, also help",
+    "raise CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH where the seat's claude runs",
   );
   // With a seat text, a cut inside the trust rules never advises shortening it: the seat
   // text comes after them, so that gives none of them back.
@@ -480,7 +506,7 @@ test("doctor warns when the instructions are over the cap, and says whether the 
   );
   assert.equal(
     withSeat.hint,
-    "raise CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH where the seat's claude runs: the cut is inside frond-ear's own text, ahead of ears.scribe.instructions, so shortening ears.scribe.instructions cannot help; fewer or shorter labels, or a shorter ear name, can",
+    "raise CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH where the seat's claude runs: the cut is inside frond-ear's own text, ahead of ears.scribe.instructions, so shortening ears.scribe.instructions cannot help",
   );
 
   // Where the cut lands, by the numbers: inside the seat text, and past it.
@@ -526,10 +552,29 @@ test("doctor warns when the instructions are over the cap, and says whether the 
     past.detail,
     /tool guidance only; ears\.scribe\.instructions reaches the session whole$/u,
   );
+  // Removing the seat text also removes its lead line and breaks: up to that saving it
+  // advises removal, past it neither shortening nor removing fits.
+  const saving = layout.seat.end - layout.trustEnd;
   assert.equal(
     past.hint,
-    "raise CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH where the seat's claude runs, or shorten ears.scribe.instructions",
+    `raise CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH where the seat's claude runs: even without ears.scribe.instructions the instructions are ${layout.text.length - saving}`,
   );
+  for (const cut of [301, saving]) {
+    const removable = await instructionsCheck(whole, "scribe", {
+      CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH: String(layout.text.length - cut),
+    });
+    assert.equal(
+      removable?.hint,
+      `remove ears.scribe.instructions (with the line that introduces it, ${saving} UTF-16 units), or raise CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH where the seat's claude runs`,
+      String(cut),
+    );
+  }
+  const beyond = await instructionsCheck(whole, "scribe", {
+    CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH: String(
+      layout.text.length - saving - 1,
+    ),
+  });
+  assert.match(beyond?.hint ?? "", /^raise [^,]*: even without/u);
 
   // One unit over says "unit"; a cut the whole seat text makes up says remove it.
   const one = await instructionsCheck(whole, "scribe", {
@@ -544,7 +589,7 @@ test("doctor warns when the instructions are over the cap, and says whether the 
   });
   assert.match(
     all?.hint ?? "",
-    /^remove ears\.scribe\.instructions \(all 300 UTF-16 units of it\), or raise/u,
+    /^remove ears\.scribe\.instructions \(with the line that introduces it, \d+ UTF-16 units\), or raise/u,
   );
 
   // The value is read as Claude Code's getter reads it: trimmed, digits with an optional

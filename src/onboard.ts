@@ -795,19 +795,23 @@ function instructionsChecks(config: Config, env: NodeJS.ProcessEnv): Check[] {
       // The seat text comes after the trust rules: shortening it gives none of them back.
       lost = `from inside frond-ear's trust rules: the session misses some of them${seat ? `, ${field}` : ""} and all the tool guidance`;
       hint = seat
-        ? `${raise}: the cut is inside frond-ear's own text, ahead of ${field}, so shortening ${field} cannot help; fewer or shorter labels, or a shorter ear name, can`
-        : `${raise}; fewer or shorter labels, or a shorter ear name, also help`;
+        ? `${raise}: the cut is inside frond-ear's own text, ahead of ${field}, so shortening ${field} cannot help`
+        : raise;
     } else {
       lost =
         seat && cap < seat.end
           ? `${seat.end - Math.max(cap, seat.start)} of the ${seatLength} in ${field} and all the tool guidance after it`
           : `tool guidance only; ${seat ? `${field} reaches the session whole` : `there is no ${field}`}`;
+      // Without the seat text its lead line and breaks go too.
+      const saving = seat ? seat.end - trustEnd : 0;
       hint =
         seatLength > cut
           ? `shorten ${field} by ${units(cut)} (to ${seatLength - cut} or fewer; most emoji count 2), or ${raise}`
-          : seatLength === cut
-            ? `remove ${field} (all ${units(cut)} of it), or ${raise}`
-            : `${raise}${seat ? `, or shorten ${field}` : ""}`;
+          : seat && cut <= saving
+            ? `remove ${field} (with the line that introduces it, ${units(saving)}), or ${raise}`
+            : seat
+              ? `${raise}: even without ${field} the instructions are ${length - saving}`
+              : raise;
     }
     checks.push({
       name: `ear ${name}: instructions`,

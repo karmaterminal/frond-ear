@@ -349,7 +349,7 @@ export function instructionsLayout(
     const rest = ids.length - named.length;
     const text =
       named.length === 0
-        ? `${rest} unnamed`
+        ? `${rest} not listed here`
         : `${named.join(", ")}${rest > 0 ? ` and ${rest} more` : ""}`;
     room = Math.max(0, room - text.length);
     return text;
