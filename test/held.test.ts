@@ -266,6 +266,14 @@ test("hold: refused with one identical message, never echoing text, for a record
         ...REF,
         station: "nobody",
       });
+      // The epoch is part of the record's name: a station that restarted sings seq 6
+      // again under a new epoch, and the one this session heard doesn't vouch for it.
+      host.sing(6, { text: `${RECORD} (epoch 7)`, epoch: 7 });
+      h.timers.advance(1_000);
+      await h.call(shim, "hear", { stream: "ops:ops.fleet", limit: 1 });
+      host.sing(6, { text: `${RECORD} (epoch 8)`, epoch: 8 });
+      h.timers.advance(1_000);
+      await attempt(h, shim, "another epoch", { ...ref(6), epoch: 8 });
       for (const [, text] of refusals) {
         assert.ok(echoesNone(text, RECORD));
         assert.ok(echoesNone(text, SECOND));
@@ -276,7 +284,7 @@ test("hold: refused with one identical message, never echoing text, for a record
     }
   }
 
-  assert.equal(refusals.length, 7);
+  assert.equal(refusals.length, 8);
   for (const [label, text] of refusals) {
     assert.equal(text, HOLD_REFUSED, `${label}: the one refusal`);
   }
