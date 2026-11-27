@@ -35,3 +35,13 @@ three `snapshot` records at W = 7 whose `entry` is wrapped one level (`{"presenc
 `{"frame": …}` for a surfaced `alarms` item and a surfaced `chatter` item), `snapshot_end` (W 7, count 3, not
 truncated), then a live `frame` at rec_seq 8. This settles the entry form as the wrapped `{frame|presence}`.
 `test/canticle-join-snapshot.test.ts` feeds every line through `RecordConsumer`. Don't edit it here; recapture it upstream.
+
+# Heard-item specimen (project-57)
+
+`heard-item.v0.json` is copied byte for byte from `karmaterminal/project-57` PR #187 at head
+`099e2e00dd9c5fcfbfe0c5b80801e75af743eb20`, `spikes/heard-item-specimen/heard-item.v0.json`, sha256
+`a1d058c6cf2156e1cfe3cb93502d321e2dc281c9c5523740ab227b039c9d1883`. It is one synthetic heard-item record: the
+source's claims (`source_record`), the listener's (`listener_envelope`, `provenance`, `beside_hold_request`) and an
+empty `receipt_observations`. 🌫 ruled (2026-11-27 16:37Z) that frond-ear's held-item v0 keeps these fields as they
+stand. `test/held.test.ts` checks that frond-ear's export (`heldItemRecord`) has exactly its keys, section by section.
+Don't edit it here; copy it again from project-57.

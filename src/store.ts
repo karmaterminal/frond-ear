@@ -338,6 +338,42 @@ export const LEGACY_COPY_CHECK =
   "unknown (left before frond-ear recorded copy checks)";
 
 /**
+ * A canticle record a session chose to hold across a compaction (the held state, held-item
+ * v0 in p57#187's shape): the source's claims as it was heard (station, stream, epoch, seq,
+ * its identity, signer key, text and expiry), what the listener adds (when it heard it, the
+ * host's verdict) and the hold's own facts (who held it, when, until when, an opaque local
+ * evidence ref). `text` is null once the hold has expired: the words are dropped and only
+ * the reference stays, to be reported.
+ */
+export interface HeldItem {
+  id: number;
+  ear: string;
+  /** The session that held it. */
+  sessionId: string;
+  station: string;
+  stream: string;
+  epoch: number;
+  /** Decimal digits: a seq is a u64. */
+  seq: string;
+  /** The record's identity, `key:epoch:stream:seq`, as custody names it. */
+  itemId: string;
+  signerKeyId: string;
+  text: string | null;
+  /** UTF-8 bytes of the text when held; counted against the byte cap while it is live. */
+  bytes: number;
+  /** The source's own `expires_at` claim (ms). */
+  sourceExpiresAt: number;
+  /** When this listener first heard it (ms). */
+  receivedAt: number;
+  verificationResult: string;
+  heldAt: number;
+  /** When the hold ends (ms): the source's expiry, or keep_for, within the cap. */
+  expiresAt: number;
+  /** Opaque, local, unique: what a `retained_item` observation points at. */
+  evidenceRef: string;
+}
+
+/**
  * Something an ear's own session left for a later turn of itself (#88),
  * released to it as a channel event when its seat's SessionStart hook says
  * it compacted.
@@ -730,6 +766,25 @@ export function readExposures(
   ).map(exposureEntry);
 }
 
+/**
+ * An ear's held records, oldest first, from any open database: the daemon's store, or the
+ * export CLI's read-only handle.
+ */
+export function readHeld(database: DatabaseSync, ear: string): HeldItem[] {
+  return (
+    database
+      .prepare(
+        `SELECT id, ear, session_id AS sessionId, station, stream, epoch, seq,
+                item_id AS itemId, signer_key_id AS signerKeyId, content AS text, bytes,
+                source_expires_at AS sourceExpiresAt, received_at AS receivedAt,
+                verification_result AS verificationResult, held_at AS heldAt,
+                expires_at AS expiresAt, evidence_ref AS evidenceRef
+           FROM held_items WHERE ear = ? ORDER BY id`,
+      )
+      .all(ear) as Array<Record<string, unknown>>
+  ).map((row) => ({ ...(row as unknown as HeldItem), seq: String(row.seq) }));
+}
+
 const PENDING_STATES = "('context', 'queued', 'stored')";
 const UNSEEN_STATES = "('context', 'queued', 'stored', 'offered')";
 /**
@@ -920,6 +975,26 @@ export class EventStore {
         copy_unchecked TEXT
       );
       CREATE INDEX IF NOT EXISTS letters_ear ON letters (ear, id);
+      CREATE TABLE IF NOT EXISTS held_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ear TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        station TEXT NOT NULL,
+        stream TEXT NOT NULL,
+        epoch INTEGER NOT NULL,
+        seq TEXT NOT NULL,
+        item_id TEXT NOT NULL,
+        signer_key_id TEXT NOT NULL,
+        content TEXT,
+        bytes INTEGER NOT NULL,
+        source_expires_at INTEGER NOT NULL,
+        received_at INTEGER NOT NULL,
+        verification_result TEXT NOT NULL,
+        held_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        evidence_ref TEXT NOT NULL UNIQUE,
+        UNIQUE (ear, station, stream, epoch, seq)
+      );
       CREATE TABLE IF NOT EXISTS canticle_custody (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         ear TEXT NOT NULL,
@@ -2906,6 +2981,74 @@ export class EventStore {
     );
     let changes = 0;
     this.atomically(() => {
+      for (const id of ids) {
+        changes += Number(statement.run(ear, id).changes);
+      }
+    });
+    return changes;
+  }
+
+  // ---- held canticle records (the held state) ----------------------------------------
+
+  /** Stores one held record; returns its id. The ref (ear, station, stream, epoch, seq) is unique. */
+  public holdItem(item: HeldItem): number {
+    const result = this.database
+      .prepare(
+        `INSERT INTO held_items (ear, session_id, station, stream, epoch, seq, item_id,
+           signer_key_id, content, bytes, source_expires_at, received_at, verification_result,
+           held_at, expires_at, evidence_ref)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        item.ear,
+        item.sessionId,
+        item.station,
+        item.stream,
+        item.epoch,
+        item.seq,
+        item.itemId,
+        item.signerKeyId,
+        item.text,
+        item.bytes,
+        item.sourceExpiresAt,
+        item.receivedAt,
+        item.verificationResult,
+        item.heldAt,
+        item.expiresAt,
+        item.evidenceRef,
+      );
+    return Number(result.lastInsertRowid);
+  }
+
+  /** Every record the ear holds, expired tombstones included, oldest first. */
+  public heldItems(ear: string): HeldItem[] {
+    return readHeld(this.database, ear);
+  }
+
+  /**
+   * Ends every hold of the ear past its expiry: its text is dropped (set null), its
+   * reference kept to be reported, and tombstones expired before `forgetBefore` are deleted.
+   */
+  public expireHeld(ear: string, now: number, forgetBefore: number): void {
+    this.whole(() => {
+      this.database
+        .prepare(
+          "UPDATE held_items SET content = NULL WHERE ear = ? AND expires_at <= ? AND content IS NOT NULL",
+        )
+        .run(ear, now);
+      this.database
+        .prepare("DELETE FROM held_items WHERE ear = ? AND expires_at <= ?")
+        .run(ear, forgetBefore);
+    });
+  }
+
+  /** Deletes held records by id. */
+  public dropHeld(ear: string, ids: readonly number[]): number {
+    const statement = this.database.prepare(
+      "DELETE FROM held_items WHERE ear = ? AND id = ?",
+    );
+    let changes = 0;
+    this.whole(() => {
       for (const id of ids) {
         changes += Number(statement.run(ear, id).changes);
       }

@@ -103,8 +103,11 @@ function parseHeard(raw: unknown): HeardRef[] {
   return refs;
 }
 
-/** One `heard` reference, validated and with seq in canonical digits; throws naming `which`. */
-function heardItem(item: unknown, which: string): HeardRef {
+/**
+ * One `heard` reference, validated and with seq in canonical digits; throws naming `which`.
+ * A hold (held.ts) names its record the same way.
+ */
+export function heardItem(item: unknown, which: string): HeardRef {
   if (typeof item !== "object" || item === null || Array.isArray(item)) {
     throw new Error(`${which} must be {station, stream, epoch, seq}`);
   }
@@ -266,6 +269,8 @@ export const COPY_MIN_SPACES = 4;
  */
 export const COPY_UNCHECKED = {
   unreadable: "not run (live set unreadable)",
+  unavailable:
+    "partial (no live set on this daemon: only held records were compared)",
   failed: "not run (the check failed)",
   unnamed:
     "partial (records shown before frond-ear knew this session's id were not compared)",
@@ -345,10 +350,11 @@ function rollWindows(
  * the letter's fields (body, reason, each assumed item) shares a run of at least
  * `COPY_FLOOR` characters with, after `copyForm`, holding at least `COPY_MIN_SPACES`
  * spaces. `released` must be only what was released to the leaving session (custody:
- * pushes the host confirmed to it, its own `hear` returns), never the held buffer or the
- * live set at large: otherwise a refusal would tell the session text it hasn't chosen to
+ * pushes the host confirmed to it, its own `hear` returns and `held` reads), with the text
+ * from the live set or the ear's held records, never the delivery buffer, the live set at
+ * large or a hold the session wasn't released: otherwise a refusal would tell the session text it hasn't chosen to
  * receive. A paraphrase, a fragment under the floor, an identifier, a record cut to fit,
- * and a record frond-ear no longer holds all pass.
+ * and a record frond-ear has neither live nor held all pass.
  *
  * Memory is bounded by the letter, never by the released text (#142 S3): the index holds
  * the letter's windows (its fields are capped by `parseLeave`, ~10k windows at most), and
@@ -498,7 +504,7 @@ export function refuseCopies(
       )
       .join(
         "; ",
-      )} (a run of ${COPY_FLOOR}+ characters with ${COPY_MIN_SPACES}+ spaces, whitespace normalized). ${instead}; hear shows it again while it is live. This is literal-copy detection, not provenance enforcement: it compares only canticle text frond-ear released to this session and still holds, so a paraphrase, a short fragment, an identifier or a record gone from the live set passes.`,
+      )} (a run of ${COPY_FLOOR}+ characters with ${COPY_MIN_SPACES}+ spaces, whitespace normalized). ${instead}; hear shows it again while it is live. This is literal-copy detection, not provenance enforcement: it compares only canticle text frond-ear released to this session and still has (live, or a hold), so a paraphrase, a short fragment, an identifier or a record gone from the live set and not held passes.`,
   );
 }
 

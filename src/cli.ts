@@ -25,6 +25,7 @@ import {
   type CanticleSource,
 } from "./canticle/source.ts";
 import { runExposure } from "./canticle/exposure-cli.ts";
+import { runHeldExport } from "./canticle/held-cli.ts";
 import { Manifest } from "./canticle/manifest.ts";
 import { runConnectorEcho } from "./connector/echo.ts";
 import { Daemon } from "./daemon.ts";
@@ -96,6 +97,10 @@ usage:
                                       off by default): one record per canticle push, fenced before it went out,
                                       then offered, echoed or unknown. Reads the database read-only; hashes
                                       and provenance only, never payload text; no network side
+  frond-ear held-export --ear <name> --station <s> --stream <s> --epoch <n> --seq <n> [--before-hold]
+                                      print one held canticle record (hold/held tools) as p57#187's
+                                      heard-item.v0 JSON; --before-hold (before p57's hold, not the ear's) leaves receipt_observations empty.
+                                      Reads the database read-only; prints the record's text; no network side
   frond-ear inject --chat <id> --author <id> [--guild <id>] [--name <n>] [--bot] [--mention] <text…>
                                       push a synthetic MESSAGE_CREATE (dry-run or FROND_EAR_ALLOW_INJECT=1)
   frond-ear connector-echo [--public-url https://<host>] [--auth none|bearer|oauth] …
@@ -954,6 +959,13 @@ async function main(): Promise<void> {
       return;
     case "exposure":
       process.exitCode = await runExposure(rest, {
+        stdout: process.stdout,
+        stderr: process.stderr,
+        env: process.env,
+      });
+      return;
+    case "held-export":
+      process.exitCode = await runHeldExport(rest, {
         stdout: process.stdout,
         stderr: process.stderr,
         env: process.env,

@@ -60,6 +60,8 @@ const NOT_ROOM_OUTPUT = [
   "fetch_attachment",
   "fetch_messages",
   "hear",
+  "held",
+  "hold",
   "hold_compaction",
   "inbox",
   "leave_letter",
@@ -96,6 +98,8 @@ function argsFor(tool: string, message: string): Record<string, unknown> {
       return { reason: "test", body: "a note to a later turn" };
     case "hold_compaction":
       return { action: "status" };
+    case "hold":
+      return { ref: { station: "ops", stream: "ops.fleet", epoch: 7, seq: 1 } };
     default:
       return {};
   }

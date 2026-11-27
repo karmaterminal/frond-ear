@@ -86,6 +86,16 @@ import {
 import { chunkMessage, definitive, RestError } from "./rest.ts";
 import { guideView } from "./canticle/guide.ts";
 import { hearResult, iso, type HeardItem } from "./canticle/hear.ts";
+import {
+  HOLD_REFUSED,
+  heldCount,
+  heldExposure,
+  heldReleaseNote,
+  heldTool,
+  holdRecord,
+  parseHold,
+  releasedLive,
+} from "./canticle/held.ts";
 import { CLASS_BY_NAME } from "./canticle/ids.ts";
 import {
   COPY_UNCHECKED,
@@ -133,7 +143,12 @@ import {
   type PollOutcome,
 } from "./github.ts";
 import type { Schedule, Wake } from "./wake-store.ts";
-import type { CompactionBoundary, EventStore, ReplyPart } from "./store.ts";
+import type {
+  CompactionBoundary,
+  EventStore,
+  HeardRef,
+  ReplyPart,
+} from "./store.ts";
 import type {
   BatchKind,
   Clock,
@@ -2594,8 +2609,11 @@ export class Daemon {
       held: release.held,
       expired: release.expired,
     });
+    // Counts only, never text: a held record comes back by the session's own held read.
+    const held = heldReleaseNote(heldCount(this.store, ear, this.clock.now()));
+    const also = held === "" ? "" : `; ${held}`;
     if (release.notifications.length === 0) {
-      return `no letters for ear ${ear}`;
+      return `no letters for ear ${ear}${also}`;
     }
     const parts = [`${release.delivered} delivered`];
     if (release.held > 0) {
@@ -2605,7 +2623,7 @@ export class Daemon {
       parts.push(`${release.expired} expired`);
     }
     const events = release.notifications.length;
-    return `letters for ear ${ear}: ${parts.join(", ")}; sent as ${events} channel event${events === 1 ? "" : "s"}`;
+    return `letters for ear ${ear}: ${parts.join(", ")}; sent as ${events} channel event${events === 1 ? "" : "s"}${also}`;
   }
 
   // ---- schedules and wakes (#111) ---------------------------------------------------
@@ -4029,6 +4047,39 @@ export class Daemon {
         }
         return listLetters(this.store, ear, now, client.sessionId ?? null);
       }
+      case "hold": {
+        const ear = this.requireHolder(client, "hold a canticle record");
+        if (!client.sessionId) {
+          throw new Error(
+            "frond-ear does not know this session's id (its shim had no CLAUDE_CODE_SESSION_ID), so it cannot tell what was shown to this session; nothing was held",
+          );
+        }
+        return this.holdCanticle(ear, client.sessionId, args);
+      }
+      case "held": {
+        const ear = this.requireHolder(client, "read its held records");
+        const now = this.clock.now();
+        // A read shows the session heard text: custody, a whole release to the reader,
+        // so the letters' copy guard compares its letters against the hold (🌿 on #144).
+        return heldTool(
+          this.store,
+          ear,
+          client.sessionId ?? null,
+          now,
+          args,
+          (item) =>
+            this.store.recordCanticleHear(
+              ear,
+              {
+                generation: client.attachGeneration,
+                sessionId: client.sessionId ?? null,
+              },
+              [heldExposure(item)],
+              now,
+              this.boundary(ear),
+            ),
+        );
+      }
       case "schedule":
         return this.scheduleTool(client, args);
       case "schedules":
@@ -4218,23 +4269,21 @@ export class Daemon {
   /**
    * The canticle records already released to `sessionId` on this ear, with the text it was
    * shown, for the letters' copy guard: custody's whole exposures to that session (a push
-   * the host confirmed, its own `hear`), joined to the live set by identity and payload
-   * digest. Never the held buffer or the rest of the live set: comparing a letter against
-   * text the session hasn't elected to receive would make the write an oracle for it. A
-   * record gone from the live set has no text here, so it can't be compared. `unchecked`
-   * says when what it returns isn't all there was to compare: the live set couldn't be
-   * read, or a record still live was shown to this shim before frond-ear knew the
-   * session's id.
+   * the host confirmed, its own `hear`, its own `held` read), joined by identity and payload
+   * digest to the text frond-ear still has: the live set, and the ear's held records (🌿 on
+   * #144: a hold outlives its record, so the live set alone would let held words past the
+   * guard). Never the delivery buffer, the rest of the live set, or a hold not released to
+   * this session: comparing a letter against text the session hasn't elected to receive
+   * would make the write an oracle for it. A record neither live nor held has no text here,
+   * so it can't be compared. `unchecked` says when what it returns isn't all there was to
+   * compare: the live set couldn't be read, or a record was shown to this shim before
+   * frond-ear knew the session's id.
    */
   private releasedCanticle(
     ear: string,
     client: Client,
     sessionId: string,
   ): { records: ReleasedRecord[]; unchecked: string | null } {
-    const view = this.options.canticleHear;
-    if (!view) {
-      return { records: [], unchecked: null };
-    }
     const shown = this.store.canticleReleasedTo(ear, sessionId);
     const unnamed = this.store.canticleReleasedUnnamed(
       ear,
@@ -4243,38 +4292,110 @@ export class Daemon {
     if (shown.size === 0 && unnamed.size === 0) {
       return { records: [], unchecked: null };
     }
-    let items: HearView["items"];
-    try {
-      items = view(ear).items;
-    } catch (error) {
-      this.logger.log("warn", "letters.copy_guard_unavailable", {
-        ear,
-        error: error instanceof Error ? error.message : String(error),
-      });
-      return { records: [], unchecked: COPY_UNCHECKED.unreadable };
+    // Holds are compared whatever the live view is (🌫 on #144): with canticle off there is
+    // no live set, but a store reopened under it still has holds a session can read.
+    const view = this.options.canticleHear;
+    let items: HearView["items"] = [];
+    let live: string | null = view ? null : COPY_UNCHECKED.unavailable;
+    if (view) {
+      try {
+        items = view(ear).items;
+      } catch (error) {
+        // The held records are still compared; the letter says the live set wasn't.
+        live = COPY_UNCHECKED.unreadable;
+        this.logger.log("warn", "letters.copy_guard_unavailable", {
+          ear,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
     }
     const records: ReleasedRecord[] = [];
     let unchecked: string | null = null;
-    for (const item of items) {
-      const text = item.text;
-      if (text === undefined || text === "") {
-        continue;
-      }
-      const identity = canticleIdentity(item);
+    // Every released (identity, digest) pair is compared on its own: the identity holds the
+    // station's key, so two records named alike under different keys never stand in for
+    // each other (🌫 on #144), and only an exact pair already taken is skipped.
+    const compared = new Set<string>();
+    const consider = (identity: string, ref: HeardRef, text: string): void => {
       const digest = createHash("sha256").update(text, "utf8").digest("hex");
       if (shown.get(identity)?.has(digest)) {
-        records.push({
-          station: item.station,
-          stream: item.stream,
-          epoch: item.epoch,
-          seq: item.seq,
-          text,
-        });
+        const pair = `${identity}\u0000${digest}`;
+        if (!compared.has(pair)) {
+          compared.add(pair);
+          records.push({ ...ref, text });
+        }
       } else if (unnamed.get(identity)?.has(digest)) {
         unchecked = COPY_UNCHECKED.unnamed;
       }
+    };
+    for (const item of items) {
+      if (item.text === undefined || item.text === "") {
+        continue;
+      }
+      const { station, stream, epoch, seq } = item;
+      consider(
+        canticleIdentity(item),
+        { station, stream, epoch, seq },
+        item.text,
+      );
     }
-    return { records, unchecked };
+    // Held text released to this session: a hold outlives its record. A fault reading the
+    // store reaches copyCheck, which fails open.
+    for (const item of this.store.heldItems(ear)) {
+      if (item.text === null || item.text === "") {
+        continue;
+      }
+      const { station, stream, epoch, seq } = item;
+      consider(item.itemId, { station, stream, epoch, seq }, item.text);
+    }
+    return { records, unchecked: live ?? unchecked };
+  }
+
+  /**
+   * The hold tool (the held state): keeps the live record `ref` names only if custody says it
+   * was released whole to `sessionId`, by the copy guard's own predicate (`canticleReleasedTo`:
+   * a push the host confirmed to that session, or its own `hear`, shown whole), with the live
+   * item's identity and digest matching. Every other case, an unknown record included, gets
+   * `HOLD_REFUSED` and nothing else, so a hold is no oracle for text the session never
+   * received. Caps are checked only after that, so they tell nothing either.
+   */
+  private holdCanticle(
+    ear: string,
+    sessionId: string,
+    args: Record<string, unknown>,
+  ): string {
+    const request = parseHold(args);
+    const view = this.options.canticleHear;
+    if (!view) {
+      throw new Error(
+        "canticle is not enabled on this daemon (config canticle.enabled); nothing was held",
+      );
+    }
+    let items: HearView["items"];
+    try {
+      items = view(ear).items;
+    } catch {
+      throw new Error(
+        "not held: canticle's live set can't be read right now (see ear_status); nothing was stored",
+      );
+    }
+    const item = releasedLive(
+      request.ref,
+      items,
+      this.store.canticleReleasedTo(ear, sessionId),
+    );
+    if (item === undefined) {
+      throw new Error(HOLD_REFUSED);
+    }
+    const text = holdRecord(
+      this.store,
+      ear,
+      sessionId,
+      this.clock.now(),
+      request,
+      item,
+    );
+    this.logger.log("info", "canticle.held", { ear });
+    return text;
   }
 
   /** `hear` showed these payloads to the ear's own session: custody, echoed at the return. */

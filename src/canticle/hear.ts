@@ -45,9 +45,9 @@ export function token(value: unknown): string {
 /** A quoted banner value: single-line and quote-free. */
 const quotedName = (value: string) => cleanName(value).replace(/"/gu, "'");
 
-const digits = (value: unknown) =>
+export const digits = (value: unknown) =>
   /^\d{1,20}$/u.test(String(value)) ? String(value) : "unavailable";
-const hex = (value: unknown, length: number) =>
+export const hex = (value: unknown, length: number) =>
   /^[0-9a-f]+$/iu.test(String(value))
     ? String(value).slice(0, length)
     : "unavailable";
@@ -71,7 +71,8 @@ export function shownText(text: string): string {
   return stripLookalikes(cleanText(text));
 }
 
-function quoted(text: string): string {
+/** A payload as every banner shows it: cleaned, look-alikes defused, each line quoted "> ". */
+export function quoted(text: string): string {
   return shownText(text)
     .split("\n")
     .map((line) => `> ${line}`)
@@ -85,8 +86,14 @@ function prefix(text: string, n: number): string {
   return text.slice(0, code >= 0xd800 && code <= 0xdbff ? end - 1 : end);
 }
 
-/** §14.13: only the payload goes inside the untrusted wrapper; the banner stays out. */
-function wrapped(item: LiveItem, payload: string): string[] {
+/**
+ * §14.13: only the payload goes inside the untrusted wrapper; the banner stays out. A held
+ * record (held.ts) is read back inside the same wrapper.
+ */
+export function wrapped(
+  item: Pick<LiveItem, "station" | "key">,
+  payload: string,
+): string[] {
   const id = randomBytes(6).toString("hex");
   return [
     `<<<EXTERNAL_UNTRUSTED_CONTENT id="${id}">>>`,
