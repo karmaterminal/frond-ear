@@ -233,9 +233,9 @@ type GuideField =
  * One record as the guide sees it (binary-canticle RFC-0002 §3.3): metadata only. A source
  * builds it without reading, decoding, copying or hashing the record's body, text,
  * purpose, state key, body ref or provenance, so a guide call touches no payload at all.
- * Every other `LiveItem` field is `never` here, a field added later included (#138), so no
- * `LiveItem`, and no `HearView`, passes for a guide's: an adapter pointed at `hearView`
- * where `guideView` belongs, or a projection spreading the item, fails tsc.
+ * Every other `LiveItem` field is `never` here, a field added later included (#138): no
+ * `LiveItem` is a `GuideItem`, and no `HearView` a `GuideSourceView`, so an adapter pointed
+ * at `hearView` where `guideView` belongs, or a projection spreading the item, fails tsc.
  */
 export type GuideItem = Pick<LiveItem, GuideField> & {
   [K in Exclude<keyof LiveItem, GuideField>]?: never;
