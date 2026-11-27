@@ -320,6 +320,24 @@ export interface CanticleWakeGrant {
 }
 
 /**
+ * A canticle record a letter names instead of copying it: `station:stream epoch/seq`.
+ * The seq is kept as decimal digits, since a record's seq is a u64.
+ */
+export interface HeardRef {
+  station: string;
+  stream: string;
+  epoch: number;
+  seq: string;
+}
+
+/**
+ * What an old store's letters say of the copy guard (`COPY_UNCHECKED.legacy`): they were
+ * left before frond-ear recorded whether it compared them.
+ */
+export const LEGACY_COPY_CHECK =
+  "unknown (left before frond-ear recorded copy checks)";
+
+/**
  * Something an ear's own session left for a later turn of itself (#88),
  * released to it as a channel event when its seat's SessionStart hook says
  * it compacted.
@@ -333,6 +351,8 @@ export interface Letter {
   bytes: number;
   /** What the letter rested on; the receiving turn re-reads each. */
   assumed: string[];
+  /** Canticle records the letter points at, by reference: never their text. */
+  heard: HeardRef[];
   leftAt: number;
   expiresAt: number;
   deliveredAt: number | null;
@@ -341,6 +361,11 @@ export interface Letter {
   ackedAt: number | null;
   /** The ear's release count when it was left: releases since = compactions or starts since. */
   releasesAtLeave: number;
+  /**
+   * Why the copy guard didn't compare all of the letter (`COPY_UNCHECKED`), shown in its
+   * header; null when it did.
+   */
+  copyUnchecked: string | null;
 }
 
 /**
@@ -884,13 +909,15 @@ export class EventStore {
         body TEXT NOT NULL,
         bytes INTEGER NOT NULL,
         assumed TEXT NOT NULL DEFAULT '[]',
+        heard TEXT NOT NULL DEFAULT '[]',
         left_at INTEGER NOT NULL,
         expires_at INTEGER NOT NULL,
         delivered_at INTEGER,
         deliveries INTEGER NOT NULL DEFAULT 0,
         nonce TEXT,
         acked_at INTEGER,
-        releases_at_leave INTEGER NOT NULL DEFAULT 0
+        releases_at_leave INTEGER NOT NULL DEFAULT 0,
+        copy_unchecked TEXT
       );
       CREATE INDEX IF NOT EXISTS letters_ear ON letters (ear, id);
       CREATE TABLE IF NOT EXISTS canticle_custody (
@@ -1023,6 +1050,32 @@ export class EventStore {
       this.database.exec(
         "ALTER TABLE canticle_custody ADD COLUMN lineage TEXT",
       );
+    }
+    // Letters name heard canticle records by reference; older letters name none.
+    const letterColumns = new Set(
+      (
+        this.database.prepare("PRAGMA table_info(letters)").all() as Array<{
+          name: string;
+        }>
+      ).map((column) => column.name),
+    );
+    if (!letterColumns.has("heard")) {
+      this.database.exec(
+        "ALTER TABLE letters ADD COLUMN heard TEXT NOT NULL DEFAULT '[]'",
+      );
+    }
+    // A letter records whether the copy guard compared it (#142). One already stored when
+    // the column arrives can't say: it was left by a build that recorded nothing, so it
+    // reads as unknown, never as checked.
+    if (!letterColumns.has("copy_unchecked")) {
+      this.transaction(() => {
+        this.database.exec(
+          "ALTER TABLE letters ADD COLUMN copy_unchecked TEXT",
+        );
+        this.database
+          .prepare("UPDATE letters SET copy_unchecked = ?")
+          .run(LEGACY_COPY_CHECK);
+      });
     }
     // An earlier build of the egress gate had no `unconfirmed` outcome, nonce or resent:
     // rebuild its table into this shape, keeping every row and id. A row its process left
@@ -2110,6 +2163,58 @@ export class EventStore {
       .map(mapCustody);
   }
 
+  /**
+   * What custody says this session was shown whole of a canticle record, by identity: the
+   * payload digests of records the host confirmed it handed to that session (a push it
+   * offered) or that its own `hear` returned. A push only claimed, a record cut to fit or
+   * shown as counts, and anything shown to another session are not among them.
+   */
+  public canticleReleasedTo(
+    ear: string,
+    sessionId: string,
+  ): Map<string, Set<string>> {
+    const rows = this.database
+      .prepare(
+        `SELECT identity, digest FROM canticle_custody
+          WHERE ear = ? AND offered_at IS NOT NULL AND offer_session = ?
+            AND shown = 'whole' AND digest IS NOT NULL`,
+      )
+      .all(ear, sessionId) as Array<{ identity: string; digest: string }>;
+    const released = new Map<string, Set<string>>();
+    for (const row of rows) {
+      const digests = released.get(row.identity) ?? new Set<string>();
+      digests.add(row.digest);
+      released.set(row.identity, digests);
+    }
+    return released;
+  }
+
+  /**
+   * The records shown whole to this ear's attach `generation` before frond-ear knew the
+   * session's id (custody's `offer_session` null): identity → digests. They went to this
+   * shim, but can't be tied to the session now holding it, so the letters' copy guard
+   * doesn't compare them and says so instead.
+   */
+  public canticleReleasedUnnamed(
+    ear: string,
+    generation: number,
+  ): Map<string, Set<string>> {
+    const rows = this.database
+      .prepare(
+        `SELECT identity, digest FROM canticle_custody
+          WHERE ear = ? AND offered_at IS NOT NULL AND offer_session IS NULL
+            AND generation = ? AND shown = 'whole' AND digest IS NOT NULL`,
+      )
+      .all(ear, generation) as Array<{ identity: string; digest: string }>;
+    const released = new Map<string, Set<string>>();
+    for (const row of rows) {
+      const digests = released.get(row.identity) ?? new Set<string>();
+      digests.add(row.digest);
+      released.set(row.identity, digests);
+    }
+    return released;
+  }
+
   /** Custody is whole for exposures claimed at or after this time. */
   public canticleCustodySince(): number {
     return Number(this.runtimeState(CUSTODY_SINCE) ?? 0);
@@ -2724,15 +2829,17 @@ export class EventStore {
     body: string;
     bytes: number;
     assumed: string[];
+    heard: HeardRef[];
     leftAt: number;
     expiresAt: number;
     releasesAtLeave: number;
+    copyUnchecked: string | null;
   }): number {
     const result = this.database
       .prepare(
-        `INSERT INTO letters (ear, session_id, reason, body, bytes, assumed, left_at, expires_at,
-           releases_at_leave)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO letters (ear, session_id, reason, body, bytes, assumed, heard, left_at,
+           expires_at, releases_at_leave, copy_unchecked)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         letter.ear,
@@ -2741,9 +2848,11 @@ export class EventStore {
         letter.body,
         letter.bytes,
         JSON.stringify(letter.assumed),
+        JSON.stringify(letter.heard),
         letter.leftAt,
         letter.expiresAt,
         letter.releasesAtLeave,
+        letter.copyUnchecked,
       );
     return Number(result.lastInsertRowid);
   }
@@ -2753,15 +2862,18 @@ export class EventStore {
     return (
       this.database
         .prepare(
-          `SELECT id, session_id AS sessionId, reason, body, bytes, assumed, left_at AS leftAt,
+          `SELECT id, session_id AS sessionId, reason, body, bytes, assumed, heard,
+                  left_at AS leftAt,
                   expires_at AS expiresAt, delivered_at AS deliveredAt, deliveries, nonce,
-                  acked_at AS ackedAt, releases_at_leave AS releasesAtLeave
+                  acked_at AS ackedAt, releases_at_leave AS releasesAtLeave,
+                  copy_unchecked AS copyUnchecked
              FROM letters WHERE ear = ? ORDER BY id`,
         )
         .all(ear) as Array<Record<string, unknown>>
     ).map((row) => ({
       ...(row as unknown as Letter),
       assumed: JSON.parse(String(row.assumed)) as string[],
+      heard: JSON.parse(String(row.heard)) as HeardRef[],
     }));
   }
 

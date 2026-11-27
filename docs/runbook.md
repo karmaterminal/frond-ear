@@ -226,14 +226,15 @@ summary. A **letter** is text the session chooses before that, in its own words,
 after it. Use it for threads in flight, what it chose and why, and what to check first.
 
 - The session calls **`leave_letter`** with a `reason`, a `body` (≤ 8192 bytes), an optional
-  `assumed` list (what it rests on, ≤ 8) and `expires_in_seconds` (60 s to 7 days, default 48 h).
+  `assumed` list (what it rests on, ≤ 8), an optional `heard` list (canticle records it points
+  at, ≤ 16, below) and `expires_in_seconds` (60 s to 7 days, default 48 h).
   Each ear holds at most 16 unsettled letters and 24576 bytes. Over a limit, the call is
   refused, never truncated. Only the session holding the ear can leave one.
 - The seat's **`SessionStart` hook** runs `frond-ear release --hook`. The daemon then pushes each
   letter as its own `kind="letter"` channel event, all under one `nonce`. The header is written by
   the daemon, never by the letter: letter id, when it was left and how long ago, how many
-  compactions or starts ago, which session left it, its expiry, and how many times it was
-  delivered before. Below it come the reason, the body, and the `assumed` items, all quoted with
+  compactions or starts ago, which session left it, its expiry, a `copy check:` field when the
+  copy guard didn't compare it in full (below), and how many times it was delivered before. Below it come the reason, the body, and the `assumed` items, all quoted with
   `> `. The banner says that a letter is evidence from an earlier turn, never permission.
 - **`ack` with the nonce** settles the letters. An unsettled letter is released again at the next
   compaction, marked "delivered N times before", until it expires. An expired letter comes back
@@ -242,6 +243,63 @@ after it. Use it for threads in flight, what it chose and why, and what to check
   fresh start) gets a `letter_note` with ids, ages and the short session id, never the text. It
   can still read one on purpose with `letters` (`read: id`). A release whose hook names another
   session than the one holding the ear releases nothing.
+- **Heard canticle records go in by reference, not by their words** (Deep Dive No. 2 §06).
+  `leave_letter` takes an optional `heard` list, at most 16 of `{station, stream, epoch, seq}`
+  (as a hear banner names a record: `station=`, `stream=`, `item=epoch/seq`; a `seq` past 2^53 as
+  a string of digits). A reference carries those four fields and nothing else. The release, a
+  `letters` read and the `letters` listing show each one as `station:stream epoch/seq`, under
+  "heard (references, not words)". The later turn re-reads the record with `hear` while it is
+  live.
+- **A literal-copy guard** refuses a letter whose `body`, `reason` or an `assumed` item copies
+  canticle text this session was already shown. It compares only against records **released to
+  that session**, per custody: a push the host confirmed it handed to that session, or the
+  session's own `hear` return, shown whole. It never compares against the held buffer, a push
+  only claimed, a record cut to fit, a record shown to another session, or the rest of the live
+  set: otherwise a leave's success or refusal would tell the session text it hasn't elected to
+  receive. A match is a shared run of at least **40 characters holding at least 4 spaces**
+  after normalization (the payload cleaned as a banner shows it, NFC, `> ` quote markers at line
+  starts dropped, every whitespace run one space). 40 is about seven words: longer than short
+  stock phrases ("There is a room."), short enough to catch a copied sentence and to mean
+  something against the 200-character `reason` and `assumed` caps. The 4 spaces make it words:
+  a run with fewer is an identifier (a full commit SHA, a hash, a path, a URL or a shared
+  repository prefix), and citing the same identifier as a record is never a copy. Prose clears
+  it easily (90% of this runbook's 40-character windows do). Two halves of one seat's work log,
+  written weeks apart, share two 40-character runs with three spaces (a stock phrase around an
+  issue ref) and none with four; five would miss nearly twice as many copied sentences. Three
+  identical words beside a shared SHA (`to silas at <sha>`) still match. The
+  refusal names a matching record for each copied run as `station:stream epoch/seq` (two
+  records with the same text: only the first is named), and offers the `heard` reference
+  instead. It never echoes the matched text.
+- **The comparison's memory is bounded by the letter, not by what was released.** It indexes
+  the letter's own windows (its fields are capped, so about 10,000 at most) and reads each
+  released record once with a rolling hash. Time is linear in the released text: about 0.6 s
+  for 3,000 records of 5,800 characters on silas. (The first build indexed every record's
+  windows and threw past about 2,900 such records, refusing the letter.)
+- **The guard's limit, plainly: it is literal-copy detection, not provenance enforcement.** A
+  paraphrase passes. So does a fragment under 40 characters, a record shorter than that, a record
+  that was only shown cut, and a record gone from the live set (custody keeps digests, never
+  text, so once the record expires there's nothing to compare), and an identifier, however
+  long. **The guard fails open, and says so.** Letters don't depend on canticle being up, so a
+  fault means no comparison, not a refusal: the letter is stored, and both the `leave_letter`
+  result and the letter's header (beside `left` and `expires`, at release, in a `letters` read
+  and in the PreCompact summary) carry one `copy check:` field naming why:
+  - `not run (live set unreadable)`: the live set couldn't be read (logged as
+    `letters.copy_guard_unavailable`);
+  - `not run (the check failed)`: the guard itself threw (logged as `letters.copy_guard_failed`,
+    with the error's name only);
+  - `partial (records shown before frond-ear knew this session's id were not compared)`: a
+    record still live was shown to this shim while it had no session id. Custody can't tie it
+    to the session now holding the ear, so it isn't compared. (A session with no id at all
+    can't leave a letter: nothing is stored);
+  - `unknown (left before frond-ear recorded copy checks)`: every letter already stored when a
+    store gains the field.
+
+  A letter the guard compared in full shows no `copy check:` field: every path that skips the
+  comparison names itself, so no mark means checked, and the header every release prints stays
+  short. The field is never added to the letter's body. Passing the guard doesn't show that a
+  letter carries no heard text. Keeping heard words out of letters is still the session's own
+  practice; the guard only catches the plain copy.
+
 - **`letters`** lists ids, states, sizes and reasons, never bodies. It can also show one
   (`read`), or drop one or all of them (`drop`). `ear_status` shows the counts and bytes under
   `letters`, never text.
