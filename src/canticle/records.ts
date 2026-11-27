@@ -48,7 +48,12 @@
 import { createHash } from "node:crypto";
 
 import type { HeardProvenance, SourceTuple } from "./exposure.ts";
-import type { HearView, LiveItem } from "./receptor.ts";
+import type {
+  GuideItem,
+  GuideSourceView,
+  HearView,
+  LiveItem,
+} from "./receptor.ts";
 import { MAX_CLAMP_TTL_S } from "./wire.ts";
 
 export const RECORD_V = "canticle-receptor-record/1";
@@ -1029,6 +1034,9 @@ export class RecordConsumer {
         return;
     }
     this.#live.set(r, share);
+    // The host vouches for it again (a revoke undone, a restart that resurfaced it): a
+    // withdrawal mark from before must not hide a record that is live (🌿 N2 on #133).
+    this.#withdrawn.delete(r.idem);
   }
 
   /** A tuned record's share is its own `station:stream`; every untuned one shares one. */
@@ -1564,6 +1572,56 @@ export class RecordConsumer {
     nowMs: number,
     listening: boolean,
   ): HearView {
+    return this.#view(patterns, nowMs, listening, (r) => ({
+      ...r.item,
+      expiresInMs: r.localExpiryAt - nowMs,
+      ageMs: Math.max(r.item.ageMs, nowMs - r.item.issuedAt),
+    }));
+  }
+
+  /**
+   * `hearView` for the guide (binary-canticle RFC-0002 §3.3): the same records, metadata
+   * only, read field by field so no payload, purpose, state key, body ref or provenance is
+   * touched; and what holds the board empty (a host MUTE, records lost, no landing state).
+   */
+  guideView(
+    patterns: readonly string[],
+    nowMs: number,
+    listening: boolean,
+  ): GuideSourceView {
+    const view = this.#view(patterns, nowMs, listening, (r): GuideItem => {
+      const it = r.item;
+      return {
+        station: it.station,
+        key: it.key,
+        stream: it.stream,
+        seq: it.seq,
+        epoch: it.epoch,
+        class: it.class,
+        heardAt: it.heardAt,
+        ageMs: Math.max(it.ageMs, nowMs - it.issuedAt),
+        expiresInMs: r.localExpiryAt - nowMs,
+      };
+    });
+    const live = this.health !== "failed" && this.health !== "stopped";
+    return {
+      ...view,
+      ...(this.mute !== null ? { hostMute: { ...this.mute } } : {}),
+      ...(this.healthReasons.includes("records_lost")
+        ? { recordsLost: true }
+        : {}),
+      ...(listening && live && !this.#landingSeen
+        ? { awaitingLanding: true }
+        : {}),
+    };
+  }
+
+  #view<T>(
+    patterns: readonly string[],
+    nowMs: number,
+    listening: boolean,
+    project: (r: LiveRecord) => T,
+  ): Omit<HearView, "items" | "capability"> & { items: T[] } {
     const tuned = (station: string, stream: string) =>
       tunes(patterns, station, stream);
     this.#syncOverflow(nowMs);
@@ -1591,7 +1649,7 @@ export class RecordConsumer {
     const live = this.health !== "failed" && this.health !== "stopped";
     const deliverable =
       listening && live && this.#landingSeen && this.mute === null;
-    const items: LiveItem[] = [];
+    const items: T[] = [];
     for (const [idem, r] of this.#live.entries()) {
       if (r.localExpiryAt <= nowMs) {
         this.#live.delete(idem);
@@ -1599,11 +1657,7 @@ export class RecordConsumer {
       }
       if (r.carried || !deliverable || !tuned(r.item.station, r.item.stream))
         continue;
-      items.push({
-        ...r.item,
-        expiresInMs: r.localExpiryAt - nowMs,
-        ageMs: Math.max(r.item.ageMs, nowMs - r.item.issuedAt),
-      });
+      items.push(project(r));
     }
     const withdrawn: WithdrawnMark[] = [];
     for (const [idem, mark] of this.#withdrawn) {

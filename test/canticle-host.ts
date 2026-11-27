@@ -287,6 +287,11 @@ export class Host {
   view() {
     return this.consumer.hearView(this.tune, this.now, this.listening);
   }
+
+  /** The metadata-only view the guide reads (RFC-0002 §3.3). */
+  guideView() {
+    return this.consumer.guideView(this.tune, this.now, this.listening);
+  }
 }
 
 /** The test config with canticle on, from the host daemon, delivering to `scribe`. */
@@ -320,6 +325,7 @@ export function setup(
   let host: Host | undefined;
   const h = harness(canticleConfig(delivery, canticle, top), {
     canticleHear: () => host!.view(),
+    canticleGuide: () => host!.guideView(),
     ...options,
   });
   host = new Host(h.clock);

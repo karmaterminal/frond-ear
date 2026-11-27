@@ -1,5 +1,5 @@
 import type { DerivedRoute } from "../src/canticle/derived.ts";
-import type { HearView } from "../src/canticle/receptor.ts";
+import type { GuideSourceView, HearView } from "../src/canticle/receptor.ts";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -198,6 +198,8 @@ export function harness(
     nonce?: string;
     path?: string;
     canticleHear?: (ear: string) => HearView;
+    /** The metadata-only view `canticle_guide` reads (RFC-0002 §3.3). */
+    canticleGuide?: (ear: string) => GuideSourceView;
     gatewayStatus?: () => { state: string; closeCode?: number };
     env?: NodeJS.ProcessEnv;
     /** The TCP shared token, for a test that serves this daemon over listenTcp. */
@@ -232,6 +234,7 @@ export function harness(
     allowInject: true,
     nonce: () => options.nonce ?? "nonce-1",
     ...(options.canticleHear ? { canticleHear: options.canticleHear } : {}),
+    ...(options.canticleGuide ? { canticleGuide: options.canticleGuide } : {}),
     ...(options.gatewayStatus ? { gatewayStatus: options.gatewayStatus } : {}),
     attachmentsDir: join(directory, "attachments"),
     ...(options.env ? { env: options.env } : {}),
