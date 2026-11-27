@@ -48,7 +48,12 @@
 import { createHash } from "node:crypto";
 
 import type { HeardProvenance, SourceTuple } from "./exposure.ts";
-import type { HearView, LiveItem } from "./receptor.ts";
+import {
+  type HearView,
+  type LiveItem,
+  MAX_WITHDRAWN,
+  type Withdrawn,
+} from "./receptor.ts";
 import { MAX_CLAMP_TTL_S } from "./wire.ts";
 
 export const RECORD_V = "canticle-receptor-record/1";
@@ -93,6 +98,16 @@ const ADMISSIONS = new Set([
   "equivocation",
 ]);
 const BREAKER = new Set(["closed", "open", "half_open"]);
+/**
+ * The `retract` reasons that withdraw a surfaced record (#67): a supersession's successor
+ * speaks for it, and a held item was never surfaced.
+ */
+const WITHDRAWN_REASONS = new Set([
+  "plucked",
+  "revoked",
+  "quarantined",
+  "expired",
+]);
 
 type Json = null | boolean | number | string | Json[] | { [k: string]: Json };
 type Obj = { [k: string]: Json };
@@ -139,6 +154,10 @@ class LiveSet {
 
   has(idem: string): boolean {
     return this.#all.has(idem);
+  }
+
+  get(idem: string): LiveRecord | undefined {
+    return this.#all.get(idem)?.record;
   }
 
   /** In admission order; a record put again keeps its place. */
@@ -546,6 +565,8 @@ export class RecordConsumer {
   noDatagrams = false;
   readonly presence = new Map<string, string>();
   readonly #live = new LiveSet();
+  /** Idem → a `retract` that withdrew a record on view (#67), until its local expiry. */
+  readonly #withdrawn = new Map<string, Withdrawn>();
   /** Every ear's `station:stream` patterns together: what admission counts as tuned. */
   #tune: readonly string[];
   /** Per share, what the live set dropped (tuned streams, at most `MAX_OMITTED_STREAMS`). */
@@ -702,6 +723,7 @@ export class RecordConsumer {
           this.#count("malformed_record");
           return;
         }
+        this.#keepWithdrawn(rec.idem, rec.reason, nowMs);
         this.#live.delete(rec.idem);
         return;
       case "presence":
@@ -1424,6 +1446,41 @@ export class RecordConsumer {
    * after its `landing_state`. The last mute stays until that `landing_state` replaces
    * it (status only: nothing is delivered before it anyway).
    */
+  /**
+   * A `retract` of a record in the live set, for a reason that withdraws it: kept for
+   * delivery's withdrawn notes (#67) until the record's local expiry (one already past
+   * it is never shown), the newest `MAX_WITHDRAWN` of them.
+   */
+  #keepWithdrawn(idem: string, reason: Json | undefined, nowMs: number): void {
+    const r = this.#live.get(idem);
+    if (
+      r === undefined ||
+      typeof reason !== "string" ||
+      !WITHDRAWN_REASONS.has(reason)
+    ) {
+      return;
+    }
+    for (const [id, w] of this.#withdrawn) {
+      if (w.until <= nowMs) this.#withdrawn.delete(id);
+    }
+    this.#withdrawn.delete(idem);
+    if (this.#withdrawn.size >= MAX_WITHDRAWN) {
+      this.#withdrawn.delete(this.#withdrawn.keys().next().value!);
+    }
+    const { station, key, stream, epoch, seq, class: cls } = r.item;
+    this.#withdrawn.set(idem, {
+      station,
+      key,
+      stream,
+      epoch,
+      seq,
+      class: cls,
+      reason,
+      at: nowMs,
+      until: r.localExpiryAt,
+    });
+  }
+
   #endRun(): void {
     this.#dropLive();
     this.#landingSeen = false;
@@ -1545,6 +1602,9 @@ export class RecordConsumer {
     const retuned = [...this.#retuned]
       .filter(([pattern]) => patterns.includes(pattern))
       .map(([pattern, r]) => ({ pattern, ...r }));
+    const withdrawn = [...this.#withdrawn.values()].filter(
+      (w) => w.until > nowMs && tuned(w.station, w.stream),
+    );
     const live = this.health !== "failed" && this.health !== "stopped";
     const deliverable =
       listening && live && this.#landingSeen && this.mute === null;
@@ -1587,6 +1647,7 @@ export class RecordConsumer {
         presence: blind ? "unknown" : state,
       })),
       items,
+      ...(withdrawn.length > 0 ? { withdrawn } : {}),
       ...(omitted.length > 0 ? { omitted } : {}),
       ...(otherHeard ? { otherOmitted: view(OTHER_TUNED, other) } : {}),
       ...(untuned !== undefined && untuned.until > nowMs

@@ -755,6 +755,7 @@ export class Daemon {
           },
           push: (ear, batchId, notification) =>
             this.pushCanticle(ear, batchId, notification),
+          notice: (ear, notification) => this.pushNotice(ear, notification),
           silenced: (ear) =>
             this.store
               .attentionOverrides(ear, this.clock.now())
@@ -769,16 +770,18 @@ export class Daemon {
   /**
    * A notice outside the Discord ledger (no batch_id, nothing to confirm or mark seen):
    * to the ear's attached session, and to its taps, which see what the session is sent.
+   * Returns whether the session's connection took it.
    */
   private pushNotice(
     ear: string,
     notification: { content: string; meta: Record<string, string> },
-  ): void {
+  ): boolean {
     const event = { type: "event", batchId: null, ...notification } as const;
-    this.attached.get(ear)?.connection.send(event);
+    const taken = this.attached.get(ear)?.connection.send(event) ?? false;
     for (const tap of this.taps.get(ear) ?? []) {
       tap.connection.send(event);
     }
+    return taken;
   }
 
   /**

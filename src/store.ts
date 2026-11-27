@@ -117,6 +117,17 @@ export interface CanticleSettled {
   /** The body's SHA-256, for a keyed record. */
   digest: string | null;
   expiresAt: number;
+  /** A pushed record's station and class (#67), for its withdrawn note; else null. */
+  station?: string | null;
+  cls?: string | null;
+  /**
+   * A pushed record withdrawn while its tombstone held (#67): why (`plucked`, `revoked`,
+   * `quarantined`, or for an alarm `expired`) and when. Null when it wasn't.
+   */
+  withdrawn?: string | null;
+  withdrawnAt?: number | null;
+  /** When its withdrawn note went out: null while the note is owed (or none is). */
+  notedAt?: number | null;
 }
 
 /**
@@ -986,6 +997,22 @@ export class EventStore {
         "ALTER TABLE canticle_settled ADD COLUMN batch_id INTEGER",
       );
     }
+    // A pushed record's withdrawn note (#67) is owed and settled on its tombstone. Older
+    // tombstones name no station or class, so a withdrawal of one is told by its station's
+    // key; one never pushed owes none.
+    for (const [column, type] of [
+      ["station", "TEXT"],
+      ["class", "TEXT"],
+      ["withdrawn", "TEXT"],
+      ["withdrawn_at", "INTEGER"],
+      ["withdrawn_noted_at", "INTEGER"],
+    ] as const) {
+      if (!settledColumns.has(column)) {
+        this.database.exec(
+          `ALTER TABLE canticle_settled ADD COLUMN ${column} ${type}`,
+        );
+      }
+    }
     // Custody keeps each exposure's lineage (#161 item 4); older rows read as none.
     const custodyColumns = new Set(
       (
@@ -1460,7 +1487,9 @@ export class EventStore {
     return this.database
       .prepare(
         `SELECT ear, identity, outcome, refresh_key AS refreshKey, digest,
-           expires_at AS expiresAt FROM canticle_settled`,
+           expires_at AS expiresAt, station, class AS cls, withdrawn,
+           withdrawn_at AS withdrawnAt, withdrawn_noted_at AS notedAt
+         FROM canticle_settled`,
       )
       .all() as unknown as CanticleSettled[];
   }
@@ -1537,8 +1566,9 @@ export class EventStore {
     }
     const insert = this.database.prepare(
       `INSERT INTO canticle_settled
-         (ear, identity, outcome, refresh_key, digest, settled_at, expires_at, batch_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         (ear, identity, outcome, refresh_key, digest, settled_at, expires_at, batch_id,
+          station, class)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(ear, identity) DO UPDATE SET
          expires_at = MAX(canticle_settled.expires_at, excluded.expires_at)`,
     );
@@ -1552,6 +1582,8 @@ export class EventStore {
         this.clock.now(),
         row.expiresAt,
         batchId,
+        row.station ?? null,
+        row.cls ?? null,
       );
     }
   }
@@ -2101,6 +2133,51 @@ export class EventStore {
          WHERE ear = ? AND identity = ?`,
       )
       .run(expiresAt, ear, identity);
+  }
+
+  /**
+   * A pushed record was withdrawn while its tombstone holds (#67): its note is owed, on
+   * the tombstone, which now lasts at least until `until` so the note can wait out a hold.
+   * Only a pushed record's first withdrawal owes one. Returns whether this one did.
+   */
+  public oweCanticleWithdrawn(
+    ear: string,
+    identity: string,
+    reason: string,
+    at: number,
+    until: number,
+  ): boolean {
+    return (
+      this.database
+        .prepare(
+          `UPDATE canticle_settled SET withdrawn = ?, withdrawn_at = ?,
+             expires_at = MAX(expires_at, ?)
+           WHERE ear = ? AND identity = ? AND outcome = 'pushed'
+             AND withdrawn IS NULL AND expires_at > ?`,
+        )
+        .run(reason, at, until, ear, identity, this.clock.now()).changes > 0
+    );
+  }
+
+  /**
+   * Settles withdrawn notes before they go out, in one transaction with the ear's note
+   * budget (`notes`): a crash between the two loses a note, never repeats one. With
+   * `at` null, gives them back (the note no connection took): owed again.
+   */
+  public noteCanticleWithdrawn(
+    ear: string,
+    identities: readonly string[],
+    at: number | null,
+    notes: { name: string; value: string },
+  ): void {
+    this.transaction(() => {
+      const update = this.database.prepare(
+        `UPDATE canticle_settled SET withdrawn_noted_at = ?
+         WHERE ear = ? AND identity = ? AND withdrawn IS NOT NULL`,
+      );
+      for (const identity of identities) update.run(at, ear, identity);
+      this.setRuntimeState(notes.name, notes.value);
+    });
   }
 
   /** `scope` is a station name or key id (lowercase), or "*" for every station the ear hears. */
