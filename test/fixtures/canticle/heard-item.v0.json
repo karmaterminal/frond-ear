@@ -1,0 +1,25 @@
+{
+  "specimen": {
+    "name": "heard-item.v0",
+    "synthetic": true,
+    "scope": "one scratch fixture; not a production schema, not an adoption path; 🌫 decides p57's fields"
+  },
+  "source_record": {
+    "station": "fixture-station-a",
+    "stream": "tide-notes",
+    "epoch": 1795651200,
+    "seq": 41,
+    "item_id": "fixture-item-tide-third-buoy",
+    "content": {"text": "Synthetic fixture: the tide turns at the third buoy."},
+    "signer_key_id": "fixture-key-1",
+    "expires_at": "2099-01-01T00:00:00Z"
+  },
+  "listener_envelope": {
+    "received_at": "2026-11-27T14:30:00Z"
+  },
+  "provenance": "heard",
+  "beside_hold_request": {
+    "verification_result": "verified"
+  },
+  "receipt_observations": []
+}
