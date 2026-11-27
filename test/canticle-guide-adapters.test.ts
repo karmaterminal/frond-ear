@@ -475,6 +475,11 @@ test("types (#138): a hear view is no guide view, so an adapter pointed back at 
       HearView,
       GuideSourceView
     >,
+    // `{ ...source.hearView(ear), items }`: the hear view is still built, payload and all
+    "a HearView with guide items is no GuideSourceView": false satisfies Is<
+      Omit<HearView, "items"> & { items: GuideItem[] },
+      GuideSourceView
+    >,
     "a source's hearView is no guideView": false satisfies Is<
       CanticleSource["hearView"],
       CanticleSource["guideView"]

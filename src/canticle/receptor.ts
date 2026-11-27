@@ -248,6 +248,11 @@ export type GuideItem = Pick<LiveItem, GuideField> & {
 export interface GuideSourceView
   extends Omit<HearView, "items" | "capability"> {
   items: GuideItem[];
+  /**
+   * Never here: every `HearView` declares it, so one spread into a guide view (built
+   * payload and all, then its items swapped) fails tsc too (#138).
+   */
+  capability?: never;
   /** Record v1: the host daemon's receptor-wide MUTE (§14.8), while it holds. */
   hostMute?: { until: number | null; by: string | null };
   /** Record v1: records were lost on the host socket, and the live set was cleared. */
