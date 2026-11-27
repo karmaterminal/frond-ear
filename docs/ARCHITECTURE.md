@@ -62,8 +62,10 @@ the one before (`src/daemon.ts:1786-1790`), gives back every batch the host neve
 
 ## After a gap
 
-**A session away.** The ledger is SQLite, so what waits outlives the session and the daemon, for
-`limits.retentionMs` (14 days; `prune`, `src/store.ts:3427-3437`). When a session attaches
+**A session away.** The ledger is SQLite, so what waits outlives the session and the daemon.
+Queued, context and stored rows have no time limit, only the pending cap below. Offered events
+nobody acted on are deleted `limits.retentionMs` (14 days) after they were offered (`prune`,
+`src/store.ts:3427-3437`). When a session attaches
 (`hello`, `src/daemon.ts:1707-1870`):
 
 - every batch the host never confirmed goes back to waiting: wake-worthy events as `queued`,
@@ -77,7 +79,7 @@ the one before (`src/daemon.ts:1786-1790`), gives back every batch the host neve
 nothing sent in between is replayed. On READY, before the new session's first dispatch, every chat
 with an anchor owes a read-back from it, the anchor being the newest message heard there
 (`gatewayReady`, `src/daemon.ts:1109-1124`). The prune keeps the 1,000 most recently active anchors
-(`src/store.ts:708`), and `limits.catchUpMessages: 0` turns read-back off. The read-back takes one
+(`src/store.ts:3449-3459`), and `limits.catchUpMessages: 0` turns read-back off. The read-back takes one
 page of `limits.catchUpMessages` (50) for each of the `limits.catchUpChats` (25) most recently
 active chats, counted across all ears, and admits what is newer than the anchor as if it were heard
 live (`catchUp`, `src/daemon.ts:1161-1274`). A chat is settled once a read-back that began after
@@ -105,7 +107,8 @@ the ear it is saved until one attaches, keeping the last 100 chats (`reportCatch
   (`src/daemon.ts:3787-3792`).
 - Only the daemon uses the bot token, read from `DISCORD_BOT_TOKEN_FILE` or `DISCORD_BOT_TOKEN`
   (`readBotToken`, `src/config.ts:1027-1036`), and its logger redacts it (`src/cli.ts:122-125`).
-  `doctor` only checks that the file isn't empty (`src/onboard.ts:770`). The shim never has it.
+  `init` writes a pasted token to its 0600 file, and `init` and `doctor` check the file isn't
+  empty; neither connects with it (`src/onboard.ts:505-518`, `770`). The shim never has it.
 
 ## Letters
 
@@ -220,8 +223,8 @@ Not promised:
   ones (`capPending`, `src/store.ts:3050-3082`). The drop is counted (`overflow_dropped` in
   `status`) and logged as `ear.overflow`, but the session gets no event about it
   (`src/daemon.ts:1096-1103`). A chat keeps `historyLimit` (20) context rows, and older ones expire
-  (`src/daemon.ts:1086-1094`). Offered events nobody acted on are deleted after `retentionMs`
-  (`src/store.ts:3427-3437`). A message's text is cut at `limits.maxMessageChars` (4000)
+  (`src/daemon.ts:1086-1094`). Offered events nobody acted on are deleted `retentionMs` (14 days)
+  after they were offered (`src/store.ts:3427-3437`). A message's text is cut at `limits.maxMessageChars` (4000)
   (`messageText`, `src/components.ts:178-187`).
 - **That seen means shown.** A call that settles a batch also settles what the batch didn't show
   for length, and what an earlier attach was offered in that chat; after that `inbox` no longer
