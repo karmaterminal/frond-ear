@@ -986,7 +986,20 @@ carries them or says they went off air, and a push that spends the hour's last s
 them. If they go off air with nothing else left waiting, or what the budget held goes off air, a push of the
 coverage note alone goes out (a canticle push with no records; naming its `batch_id` echoes nothing), on the
 stations' cadence and inside every hold and the budget, never as an extra push or another wake (binary-canticle#171
-findings 3 and 5). While records wait under a hold, `hear` says why and until when.
+findings 3 and 5). It goes only to the session it is owed to, at most once (#140, RFC-0002 §7.5): a note is owed to the
+session a push promised its records to, or the one the budget held them from (for a `live_overflow` drop, the one
+holding the ear then, or with none, the one that held it last; with no session since frond-ear started, it is owed to
+none and only rides with a push). That session is named as the withdrawn note's is: by its session id, or with no id on
+either side, by the same attach. A re-attach of the same session gets it, a frond-ear restart included. When another
+session holds the ear (a `/clear`, a new attach with a new id), the note is dropped before anything is pushed, neither
+pushed on its own nor carried by that session's pushes, and counted (`coverage_note_dropped`, the records it would have
+told) and logged (`canticle.coverage_note_dropped`, `reason=session_changed`). A note given back from an unconfirmed
+push is dropped the same way as it comes back, so it never merges into one owed to the session after. Dropped, not
+held: the session it was owed to may never come back (a `/clear`'d session doesn't), and a note held for it would
+wait for good. A stream counted together past the 256 can't be taken out of the shared count: it stops being owed
+(`coverage_note_unowed`), so it never asks for a push of its own, and rides counted with a push that goes anyway. A
+note saved owed by a build before #140 names no session, so the first session to hold the ear drops it, counted.
+While records wait under a hold, `hear` says why and until when.
 
 **Withdrawn notes (#67, RFC-0001 §14.14).** A channel event can't be recalled, so a record already pushed to the
 session that is withdrawn while its tombstone holds gets a small note of its own: a `kind="canticle"` event with
@@ -1031,7 +1044,8 @@ gate. It is a channel event, so it may start a turn of that session, as #67 asks
 `windowMs`, `debounceMs`, `maxAgeMs`, `waiting`, `nextPushAt`, `held` (`paused`, `no_session`, `breaker_open`,
 `breaker_half_open` or `push_budget`), `heldUntil` (for `push_budget`, when the hour next has room), `lastPushAt`,
 `pushesLastHour`, `reports`, and `counts`: what was pushed (`pushes`, `reports`, `records_pushed`, and of those
-`records_pushed_late`; `coverage_notes`, pushes of the coverage note alone), what the live set dropped that the ear
+`records_pushed_late`; `coverage_notes`, pushes of the coverage note alone), coverage notes owed to another
+session (`coverage_note_dropped`, records; `coverage_note_unowed`, streams counted together), what the live set dropped that the ear
 would have pushed (`live_overflow`) or past the streams it counts one by one (`live_overflow_other`), sent from
 `immediate` to a report
 for its age (`routed_late`), passed over (`not_allowlisted`, `relayed`, `wake_derived`, `off`, `muted`,
