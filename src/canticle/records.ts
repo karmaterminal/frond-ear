@@ -54,6 +54,7 @@ import {
   MAX_WITHDRAWN,
   type Withdrawn,
 } from "./receptor.ts";
+import { EXPIRED_SHOWN_MS, expiryIsNews } from "./ids.ts";
 import { MAX_CLAMP_TTL_S } from "./wire.ts";
 
 export const RECORD_V = "canticle-receptor-record/1";
@@ -195,13 +196,18 @@ class LiveSet {
     this.#soonest = Infinity;
   }
 
-  /** Drops every record past its local expiry; a full set under a flood calls it often. */
-  expire(nowMs: number): void {
+  /**
+   * Drops every record past its local expiry, each told to `ranOut`; a full set under a
+   * flood calls it often.
+   */
+  expire(nowMs: number, ranOut: (record: LiveRecord) => void): void {
     if (nowMs < this.#soonest) return;
     let soonest = Infinity;
     for (const [idem, { record }] of this.#all) {
-      if (record.localExpiryAt <= nowMs) this.delete(idem);
-      else soonest = Math.min(soonest, record.localExpiryAt);
+      if (record.localExpiryAt <= nowMs) {
+        this.delete(idem);
+        ranOut(record);
+      } else soonest = Math.min(soonest, record.localExpiryAt);
     }
     this.#soonest = soonest;
   }
@@ -723,7 +729,7 @@ export class RecordConsumer {
           this.#count("malformed_record");
           return;
         }
-        this.#keepWithdrawn(rec.idem, rec.reason, nowMs);
+        this.#retracted(rec.idem, rec.reason, nowMs);
         this.#live.delete(rec.idem);
         return;
       case "presence":
@@ -1440,35 +1446,62 @@ export class RecordConsumer {
   }
 
   /**
-   * Drop everything the previous run vouched for. A new run can't retract what the
-   * last one heard, so its items, presence and datagram clock end with it; anything
-   * still live comes back only through the new run's own frames (`dedup: resurfaced`),
-   * after its `landing_state`. The last mute stays until that `landing_state` replaces
-   * it (status only: nothing is delivered before it anyway).
+   * A `retract` of a record in the live set, for a reason that withdraws it (#67): kept
+   * for delivery's withdrawn notes until the record's local expiry (one already past it
+   * is never shown). The host's `expired` counts only for a class whose expiry is news.
    */
-  /**
-   * A `retract` of a record in the live set, for a reason that withdraws it: kept for
-   * delivery's withdrawn notes (#67) until the record's local expiry (one already past
-   * it is never shown), the newest `MAX_WITHDRAWN` of them.
-   */
-  #keepWithdrawn(idem: string, reason: Json | undefined, nowMs: number): void {
+  #retracted(idem: string, reason: Json | undefined, nowMs: number): void {
     const r = this.#live.get(idem);
     if (
       r === undefined ||
       typeof reason !== "string" ||
-      !WITHDRAWN_REASONS.has(reason)
+      !WITHDRAWN_REASONS.has(reason) ||
+      (reason === "expired" && !expiryIsNews(r.item.class))
     ) {
       return;
     }
+    this.#keepWithdrawn(r, reason, nowMs, r.localExpiryAt, nowMs);
+  }
+
+  /**
+   * A record still in the live set reached its local expiry (#67): the positive evidence
+   * that it ran out on view, kept as an `expired` withdrawal for `EXPIRED_SHOWN_MS`, for a
+   * class whose expiry is news. One a `retract` or a dropped link took out of the set
+   * first never gets here, and neither does one that runs out while the link is down or
+   * carried from an earlier connection that no snapshot confirmed: its `retract` may
+   * have been missed.
+   */
+  #ranOut(r: LiveRecord, nowMs: number): void {
+    if (r.carried === true || !expiryIsNews(r.item.class)) return;
+    // Heard to its end only over a connection that is open, of a run that hasn't failed:
+    // with the link down, a `retract` may be on its way unread.
+    if (!this.#receiving || this.health === "failed") return;
+    this.#keepWithdrawn(
+      r,
+      "expired",
+      r.localExpiryAt,
+      r.localExpiryAt + EXPIRED_SHOWN_MS,
+      nowMs,
+    );
+  }
+
+  /** One withdrawal for delivery to read until `until`, the newest `MAX_WITHDRAWN` kept. */
+  #keepWithdrawn(
+    r: LiveRecord,
+    reason: string,
+    at: number,
+    until: number,
+    nowMs: number,
+  ): void {
     for (const [id, w] of this.#withdrawn) {
       if (w.until <= nowMs) this.#withdrawn.delete(id);
     }
-    this.#withdrawn.delete(idem);
+    this.#withdrawn.delete(r.idem);
     if (this.#withdrawn.size >= MAX_WITHDRAWN) {
       this.#withdrawn.delete(this.#withdrawn.keys().next().value!);
     }
     const { station, key, stream, epoch, seq, class: cls } = r.item;
-    this.#withdrawn.set(idem, {
+    this.#withdrawn.set(r.idem, {
       station,
       key,
       stream,
@@ -1476,11 +1509,18 @@ export class RecordConsumer {
       seq,
       class: cls,
       reason,
-      at: nowMs,
-      until: r.localExpiryAt,
+      at,
+      until,
     });
   }
 
+  /**
+   * Drop everything the previous run vouched for. A new run can't retract what the
+   * last one heard, so its items, presence and datagram clock end with it; anything
+   * still live comes back only through the new run's own frames (`dedup: resurfaced`),
+   * after its `landing_state`. The last mute stays until that `landing_state` replaces
+   * it (status only: nothing is delivered before it anyway).
+   */
   #endRun(): void {
     this.#dropLive();
     this.#landingSeen = false;
@@ -1490,7 +1530,7 @@ export class RecordConsumer {
   }
 
   #prune(nowMs: number): void {
-    this.#live.expire(nowMs);
+    this.#live.expire(nowMs, (r) => this.#ranOut(r, nowMs));
   }
 
   #degrade(reason: string): void {
@@ -1612,6 +1652,7 @@ export class RecordConsumer {
     for (const [idem, r] of this.#live.entries()) {
       if (r.localExpiryAt <= nowMs) {
         this.#live.delete(idem);
+        this.#ranOut(r, nowMs);
         continue;
       }
       if (r.carried || !deliverable || !tuned(r.item.station, r.item.stream))

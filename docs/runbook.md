@@ -928,20 +928,27 @@ a record still on view, for `plucked`, `revoked` or `quarantined` (record v1), o
 `superseded` record gets none: its successor speaks for it, and a held item was never pushed. Plain expiry gets a note
 only for a class that may wake a session, `alarm` in v1: a session that acted on an alarm has to hear it ran out, while
 chatter, ambient or advisory records running out is what they do, and a note each would be noise. An alarm's expiry
-counts when the host retracts it for `expired`, or when it reaches its local expiry while still on view; one that left
-the view first (superseded, or the link went and it didn't come back) gets none. A note goes only to a session the
+counts only on the source's own evidence: the host retracts it for `expired`, or it reaches its local expiry while
+still in the source's live set (record v1) or current in the listener (embedded). One that left first (superseded,
+plucked, or the link went and no snapshot brought it back) gets none, however the polls or a frond-ear restart fall:
+delivery never infers an expiry from a record missing between polls (🪨 on #134). A frond-ear restart forgets what
+the source saw, so an alarm that runs out while frond-ear is down gets no note: a missed note, never a false one. A note goes only to a session the
 record was pushed to: custody must show a push of it (never a `hear`) offered to the session holding the ear now, by
 its session id, or with no id on either side, under the same attach. A record that was only read with `hear`, or
 pushed in a push the host never confirmed, gets none; a revert of that push ends it. Notes coalesce over `debounceMs`
 into one, which names up to `maxItems` records and counts the rest (`(and 2 more plucked on 1 stream; …)`). They
 keep every hold a push keeps (paused, no session, a breaker not closed), wait while the station is muted or off, and
-spend `maxWithdrawnPerHour` instead of the push budget. Each note is settled once with its record's tombstone, in the
-store, before it goes out: owed when the withdrawal is seen (the tombstone then lasts at least an hour, so a note can
-wait out a hold or its session's return), marked sent before the send and given back only if no session's connection
-took it. A restart neither repeats a sent note nor loses an owed one, and one no hold lets go before its tombstone
-lapses is counted (`withdrawn_lapsed`). A note is not a record and never a wake by itself: it goes only where the
-record already woke the session, carries no batch_id (nothing to ack, no custody row, outside the Discord ledger as
-canticle events are), spends no push, and nothing in it is pushed or can open a gate.
+spend `maxWithdrawnPerHour` instead of the push budget. A note is **at most once**, settled with its record's
+tombstone in the store: owed when the withdrawal is seen (the tombstone then lasts at least an hour, so a note can
+wait out a hold or its session's return), and marked sent before the send, in one transaction with its budget. The
+mark is given back only when the session's connection certainly didn't take the note. A tap that fails never counts
+as the session's failure (🪨 on #134). A restart never repeats a note marked sent and keeps one still owed. The price
+is a window with no acknowledgement to close it: a note whose send fails part way (`withdrawn_unknown`), or whose
+frond-ear dies between the mark and the send, is lost, never sent twice. One no hold lets go before its tombstone
+lapses is counted (`withdrawn_lapsed`). A note is not a record and grants no new record or election authority: it
+goes only to the session the record was pushed to, carries no payload and no batch_id (nothing to ack, no custody
+row, outside the Discord ledger as canticle events are), spends no push, and nothing in it is pushed or can open a
+gate. It is a channel event, so it may start a turn of that session, as #67 asks of a new small event.
 
 **Check it.** `ear_status` shows `ears[].canticleDelivery`: the `ceiling` and effective `mode`, `style`, any
 `muted` reason, per-station modes (each scope as config or the session names it), the session's `choices`,
@@ -960,7 +967,8 @@ their records waited again), and pushes no session's connection took (`unsent`; 
 for the next push). Withdrawn notes (#67) show as `withdrawn`: `owed`, `nextAt`, `held` (a push's holds,
 `withdrawn_budget`, `muted`, or `not_offered` when no owed record was offered to the session holding the ear),
 `notesLastHour` and `maxWithdrawnPerHour`; `counts` adds `withdrawn_<reason>` (owed), `withdrawn_notes` and
-`withdrawn_noted` (notes sent, and the records they told), `withdrawn_lapsed` and `withdrawn_unsent`. Pushed means
+`withdrawn_noted` (notes sent, and the records they told), `withdrawn_lapsed`, `withdrawn_unsent` (given back, owed
+again) and `withdrawn_unknown` (a send that failed part way: marked sent, at most once). Pushed means
 handed to the session's connection, not heard: `ears[].canticleCustody` says what
 the session confirmed ([Custody](#custody-and-confirmation-binary-canticle161)).
 

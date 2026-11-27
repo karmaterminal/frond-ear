@@ -1248,7 +1248,12 @@ export class Listener {
           keyId: h.kid,
           stream: this.#streamName(h.kid, h.item.stream),
           seq: h.item.seq,
-          data: {},
+          // It ran out while current (#67): what a binding tells a session it woke.
+          data: {
+            epoch: h.item.epoch,
+            cls: CLASSES.get(h.item.cls)?.name ?? String(h.item.cls),
+            localExpiry: h.localExpiry,
+          },
         });
       }
     }

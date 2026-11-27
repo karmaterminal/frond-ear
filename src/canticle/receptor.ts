@@ -15,7 +15,7 @@ import type { StructuredLogger } from "../logger.ts";
 import type { Clock, Timers } from "../types.ts";
 import type { HeardProvenance, SourceTuple } from "./exposure.ts";
 import { systemClock, systemTimers } from "../types.ts";
-import { CLASSES, SCOPE_NAMES } from "./ids.ts";
+import { CLASSES, EXPIRED_SHOWN_MS, expiryIsNews, SCOPE_NAMES } from "./ids.ts";
 import { Listener, type ListenerEvent, type SafetyState } from "./listener.ts";
 import type { Manifest } from "./manifest.ts";
 import {
@@ -548,10 +548,12 @@ export class CanticleReceptor {
       if (e.event === "item") this.#counts.items += 1;
       else if (e.event === "withdrawn") {
         this.#counts.withdrawn += 1;
-        this.#keepWithdrawn(e);
+        this.#keepWithdrawn(e, "plucked");
       } else if (e.event === "superseded") this.#counts.superseded += 1;
-      else if (e.event === "expired") this.#counts.expired += 1;
-      else if (e.event === "evidence") {
+      else if (e.event === "expired") {
+        this.#counts.expired += 1;
+        this.#keepWithdrawn(e, "expired");
+      } else if (e.event === "evidence") {
         this.#counts.evidence += 1;
         this.#options.logger.log("debug", "canticle.evidence", {
           station: e.station,
@@ -561,8 +563,12 @@ export class CanticleReceptor {
     }
   }
 
-  /** A pluck of a record that was on view, kept for delivery's withdrawn notes (#67). */
-  #keepWithdrawn(e: ListenerEvent): void {
+  /**
+   * A record that was current, plucked or run out (the listener's own expiry: the
+   * positive evidence it ran out on view), kept for delivery's withdrawn notes (#67).
+   * An expiry only for a class whose expiry is news, shown for `EXPIRED_SHOWN_MS`.
+   */
+  #keepWithdrawn(e: ListenerEvent, reason: "plucked" | "expired"): void {
     const { epoch, cls, localExpiry } = e.data as {
       epoch?: number;
       cls?: string;
@@ -573,7 +579,8 @@ export class CanticleReceptor {
       e.seq === undefined ||
       epoch === undefined ||
       cls === undefined ||
-      localExpiry === undefined
+      localExpiry === undefined ||
+      (reason === "expired" && !expiryIsNews(cls))
     ) {
       return;
     }
@@ -595,9 +602,10 @@ export class CanticleReceptor {
       epoch,
       seq,
       class: cls,
-      reason: "plucked",
-      at: now,
-      until: localExpiry,
+      reason,
+      at: reason === "expired" ? localExpiry : now,
+      until:
+        reason === "expired" ? localExpiry + EXPIRED_SHOWN_MS : localExpiry,
     });
   }
 

@@ -117,9 +117,8 @@ export interface CanticleSettled {
   /** The body's SHA-256, for a keyed record. */
   digest: string | null;
   expiresAt: number;
-  /** A pushed record's station and class (#67), for its withdrawn note; else null. */
+  /** A pushed record's station (#67), for its withdrawn note; else null. */
   station?: string | null;
-  cls?: string | null;
   /**
    * A pushed record withdrawn while its tombstone held (#67): why (`plucked`, `revoked`,
    * `quarantined`, or for an alarm `expired`) and when. Null when it wasn't.
@@ -998,11 +997,10 @@ export class EventStore {
       );
     }
     // A pushed record's withdrawn note (#67) is owed and settled on its tombstone. Older
-    // tombstones name no station or class, so a withdrawal of one is told by its station's
-    // key; one never pushed owes none.
+    // tombstones name no station, so a withdrawal of one is told by its station's key;
+    // one never pushed owes none.
     for (const [column, type] of [
       ["station", "TEXT"],
-      ["class", "TEXT"],
       ["withdrawn", "TEXT"],
       ["withdrawn_at", "INTEGER"],
       ["withdrawn_noted_at", "INTEGER"],
@@ -1487,7 +1485,7 @@ export class EventStore {
     return this.database
       .prepare(
         `SELECT ear, identity, outcome, refresh_key AS refreshKey, digest,
-           expires_at AS expiresAt, station, class AS cls, withdrawn,
+           expires_at AS expiresAt, station, withdrawn,
            withdrawn_at AS withdrawnAt, withdrawn_noted_at AS notedAt
          FROM canticle_settled`,
       )
@@ -1567,8 +1565,8 @@ export class EventStore {
     const insert = this.database.prepare(
       `INSERT INTO canticle_settled
          (ear, identity, outcome, refresh_key, digest, settled_at, expires_at, batch_id,
-          station, class)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          station)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(ear, identity) DO UPDATE SET
          expires_at = MAX(canticle_settled.expires_at, excluded.expires_at)`,
     );
@@ -1583,7 +1581,6 @@ export class EventStore {
         row.expiresAt,
         batchId,
         row.station ?? null,
-        row.cls ?? null,
       );
     }
   }

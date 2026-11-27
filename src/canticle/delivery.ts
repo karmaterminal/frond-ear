@@ -58,7 +58,8 @@
 // A record already pushed and offered to the session that its station withdraws while its
 // tombstone holds (plucked, revoked, quarantined; an alarm, also when it runs out on view)
 // gets a withdrawn note of its own, once (#67, RFC-0001 §14.14): one line, no payload, no
-// batch_id, its own hourly budget; see `#withdrawals`.
+// batch_id, its own hourly budget, and no new record or election authority; see
+// `#withdrawals`.
 //
 // A tombstone is a dedupe claim, not delivery (binary-canticle#161). Each push is a batch:
 // its claim (batch, tombstones, cursor, a custody row per record) is written in one
@@ -131,14 +132,6 @@ const MAX_UNCONFIRMED = 256;
  * record's tombstone lasts at least this long after the withdrawal.
  */
 const NOTE_LIFE_MS = HOUR_MS;
-
-/**
- * Whether plain expiry of a pushed record of this class gets a withdrawn note (#67): a
- * class that may wake a session (v1: alarm, §14.10). A session that acted on an alarm has
- * to hear it ran out; chatter running out is what chatter does, and a note would be noise.
- */
-const expiryNoted = (cls: string) =>
-  CLASS_BY_NAME.get(cls)?.wakeEligible === true;
 
 /** Where a pushed record was, as its withdrawn note names it (#67). */
 interface About {
@@ -1093,12 +1086,6 @@ export class CanticleDelivery {
   >();
   /** Per ear, identity → a withdrawn note owed (#67), mirroring `canticle_settled`. */
   readonly #owed = new Map<string, Map<string, Owed>>();
-  /**
-   * Per ear, identity → a pushed record of a class whose expiry is noted (#67), not yet
-   * withdrawn. `gone`: it left the view before its expiry (superseded, or the link went),
-   * so unless it comes back, its expiry is not news.
-   */
-  readonly #expiring = new Map<string, Map<string, About & { gone?: true }>>();
   #timer: unknown;
   #stopped = false;
   #sweptAt: number;
@@ -1116,7 +1103,6 @@ export class CanticleDelivery {
       this.#settled.delete(ear);
       this.#refreshes.delete(ear);
       this.#owed.delete(ear);
-      this.#expiring.delete(ear);
     }
     for (const row of this.#deps.store.canticleSettled(now)) {
       if (ear !== undefined && row.ear !== ear) continue;
@@ -1127,21 +1113,21 @@ export class CanticleDelivery {
         row.digest,
         row.expiresAt,
       );
-      // A pushed record's withdrawn note, owed or not yet (#67), as its tombstone says.
-      if (row.outcome !== "pushed") continue;
+      // A pushed record's withdrawn note still owed (#67), as its tombstone says.
+      if (
+        row.outcome !== "pushed" ||
+        row.withdrawn == null ||
+        row.notedAt != null
+      ) {
+        continue;
+      }
       const about = aboutOf(row.identity, row.station);
       if (about === undefined) continue;
-      if (row.withdrawn != null) {
-        if (row.notedAt == null) {
-          this.#owedOf(row.ear).set(row.identity, {
-            ...about,
-            reason: row.withdrawn,
-            at: row.withdrawnAt ?? now,
-          });
-        }
-      } else if (row.cls != null && expiryNoted(row.cls)) {
-        this.#expiringOf(row.ear).set(row.identity, about);
-      }
+      this.#owedOf(row.ear).set(row.identity, {
+        ...about,
+        reason: row.withdrawn,
+        at: row.withdrawnAt ?? now,
+      });
     }
   }
 
@@ -1149,12 +1135,6 @@ export class CanticleDelivery {
     let owed = this.#owed.get(ear);
     if (owed === undefined) this.#owed.set(ear, (owed = new Map()));
     return owed;
-  }
-
-  #expiringOf(ear: string): Map<string, About & { gone?: true }> {
-    let expiring = this.#expiring.get(ear);
-    if (expiring === undefined) this.#expiring.set(ear, (expiring = new Map()));
-    return expiring;
   }
 
   start(): void {
@@ -1427,7 +1407,7 @@ export class CanticleDelivery {
     if (state.held === undefined && state.waiting.size > 0) {
       state.held = this.#hold(ear, view, delivery, state, now);
     }
-    this.#withdrawals(ear, view, live, delivery, config, modes, state, now);
+    this.#withdrawals(ear, view, delivery, config, modes, state, now);
     if (state.dirty) this.#saveWithheld(ear, state);
   }
 
@@ -1435,25 +1415,30 @@ export class CanticleDelivery {
    * Withdrawn notes (#67, RFC-0001 §14.14): a record already pushed to the session that
    * is withdrawn while its tombstone holds gets one short line, behind the daemon's own
    * header, with no payload: where it was (`station:stream`, `epoch/seq`) and why. A
-   * withdrawal is a source's `retract` of a record on view, plucked, revoked or
-   * quarantined (the embedded receptor: plucked), or for a class that may wake (alarm)
-   * its expiry, from the source or this ear's own clock, while it was still on view. A
-   * superseded record's successor speaks for it, and chatter running out is no news.
+   * withdrawal is what the source saw happen to a record it held (`HearView.withdrawn`):
+   * a `retract` for plucked, revoked or quarantined (the embedded receptor: a PLUCK), or,
+   * for a class whose expiry is news (alarm), a `retract` for its expiry or its running
+   * out while still in the source's live set. Nothing here infers an expiry from a record
+   * missing between polls, which can't tell a supersession or a lost link from one (🪨 on
+   * #134). A superseded record's successor speaks for it, and chatter running out is no
+   * news.
    *
    * The note is owed on the record's tombstone, which then lasts at least
-   * `NOTE_LIFE_MS`, and settled there before it goes out, so a restart neither repeats it
-   * nor loses it. It goes only to a session the record was pushed to: custody must show
+   * `NOTE_LIFE_MS`, and marked sent there before it goes out: at most once. A restart
+   * never repeats a sent note and keeps an owed one; a note whose send fails part way, or
+   * whose process dies between the mark and the send, is lost, never sent twice. Only a
+   * session connection that certainly didn't take it gives the mark back. It goes only to a session the record was pushed to: custody must show
    * a push of it offered to the session holding the ear now (a `hear` is a read, not a
    * push). Notes coalesce over `debounceMs` into one, naming up to `maxItems` and counting
    * the rest, under every hold a push keeps but the push budget: they spend
    * `maxWithdrawnPerHour` instead, so neither can starve the other. A mute holds them
-   * while it lasts. A note is no record: no batch_id, nothing to ack, no custody, no
-   * push counted, and nothing it carries can be pushed or woken by.
+   * while it lasts. A note is no record and grants no new record or election authority:
+   * no payload, no batch_id, nothing to ack, no custody, no push counted. It is a channel
+   * event, so it may start a turn of the session the record was pushed to, and only that.
    */
   #withdrawals(
     ear: string,
     view: HearView,
-    live: ReadonlySet<string>,
     delivery: CanticleEarDelivery,
     config: Config,
     modes: Modes,
@@ -1468,36 +1453,13 @@ export class CanticleDelivery {
     for (const w of view.withdrawn ?? []) {
       const id = identity(w);
       if (state.told.has(id)) continue;
-      // Not held here (never pushed, passed over or settled), or chatter running out.
-      if (holds(id) && (w.reason !== "expired" || expiryNoted(w.class))) {
-        this.#owe(ear, state, id, w, w.reason, w.at, now);
-      }
+      // Not held here: never pushed, passed over or settled.
+      if (holds(id)) this.#owe(ear, state, id, w, w.reason, w.at, now);
       // Looked at once; after a store write that failed, again on the next pass.
       if (state.told.size >= MAX_SEEN) {
         state.told.delete(state.told.keys().next().value!);
       }
       state.told.set(id, w.until + SETTLE_SKEW_MS);
-    }
-    const expiring = this.#expiring.get(ear);
-    for (const [id, about] of expiring ?? []) {
-      const until = settled?.get(id) ?? 0;
-      if (until <= now) {
-        expiring!.delete(id);
-        continue;
-      }
-      if (live.has(id)) {
-        delete about.gone;
-        continue;
-      }
-      const expiry = until - SETTLE_SKEW_MS;
-      if (expiry > now) {
-        about.gone = true;
-        continue;
-      }
-      expiring!.delete(id);
-      if (about.gone !== true) {
-        this.#owe(ear, state, id, about, "expired", expiry, now);
-      }
     }
     const owed = this.#owed.get(ear);
     for (const id of owed?.keys() ?? []) {
@@ -1559,15 +1521,26 @@ export class CanticleDelivery {
       name,
       value: JSON.stringify(sent),
     });
-    let taken = false;
-    let failure: string | undefined;
+    let taken: boolean;
     try {
       taken = this.#deps.notice(ear, notification);
     } catch (error) {
-      failure = error instanceof Error ? error.message : String(error);
+      // The send failed part way: whether the session got it is unknown. At most once
+      // (🪨 on #134): the mark stands, so the note is never sent twice, and may be lost,
+      // as one is when frond-ear dies between the mark and the send.
+      state.notes.sent = sent;
+      for (const id of ids) owed.delete(id);
+      if (owed.size === 0) delete state.notes.due;
+      this.#count(state, "withdrawn_unknown");
+      this.#deps.logger.log("warn", "canticle.withdrawn_unknown", {
+        ear,
+        records: ids.length,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+      return;
     }
     if (!taken) {
-      // No session's connection took it: owed again, its budget unspent.
+      // No session's connection took it, for certain: owed again, its budget unspent.
       this.#deps.store.noteCanticleWithdrawn(ear, ids, null, {
         name,
         value: JSON.stringify(state.notes.sent),
@@ -1576,7 +1549,6 @@ export class CanticleDelivery {
       this.#deps.logger.log("warn", "canticle.withdrawn_unsent", {
         ear,
         records: ids.length,
-        ...(failure !== undefined ? { reason: failure } : {}),
       });
       return;
     }
@@ -1611,7 +1583,6 @@ export class CanticleDelivery {
       return;
     }
     settled?.set(id, until);
-    this.#expiring.get(ear)?.delete(id);
     const { station, key, stream, epoch, seq } = about;
     this.#owedOf(ear).set(id, { station, key, stream, epoch, seq, reason, at });
     this.#count(state, `withdrawn_${token(reason)}`);
@@ -2026,20 +1997,7 @@ export class CanticleDelivery {
       return group.length;
     }
     state.cursor = cursor;
-    for (const waiting of rendered.pushed) {
-      this.#unwait(state, waiting);
-      // Its expiry is news to the session it woke (#67), if it runs out on view.
-      if (expiryNoted(waiting.item.class)) {
-        const { station, key, stream, epoch, seq } = waiting.item;
-        this.#expiringOf(ear).set(waiting.id, {
-          station,
-          key: key.toLowerCase(),
-          stream,
-          epoch,
-          seq,
-        });
-      }
-    }
+    for (const waiting of rendered.pushed) this.#unwait(state, waiting);
     // What the footer said waits for the next push: this cadence's records on view it
     // didn't carry, and everything the other cadence holds. One gone from the view waits
     // for its return unannounced, as before.
@@ -2636,10 +2594,8 @@ export class CanticleDelivery {
       refreshKey: seeds(outcome) ? (refreshKey(item) ?? null) : null,
       digest: seeds(outcome) ? (item.bodyDigest ?? null) : null,
       expiresAt: expiresAt + SETTLE_SKEW_MS,
-      // What a pushed record's withdrawn note names it by, and whether its expiry is one.
-      ...(outcome === "pushed"
-        ? { station: item.station, cls: item.class }
-        : {}),
+      // What a pushed record's withdrawn note names it by (#67).
+      ...(outcome === "pushed" ? { station: item.station } : {}),
     }));
   }
 

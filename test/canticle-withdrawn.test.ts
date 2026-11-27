@@ -13,6 +13,7 @@ import * as cbor from "../src/canticle/cbor.ts";
 import { streamId } from "../src/canticle/ids.ts";
 import { Manifest } from "../src/canticle/manifest.ts";
 import { CanticleReceptor } from "../src/canticle/receptor.ts";
+import { RECORD_V } from "../src/canticle/records.ts";
 import { KIND_ITEM, KIND_PLUCK, SIGN_DOMAIN } from "../src/canticle/wire.ts";
 import { StructuredLogger } from "../src/logger.ts";
 import { channelInstructions } from "../src/render.ts";
@@ -84,7 +85,7 @@ test("#67: a pushed record that is plucked gets exactly one note, after the debo
     // The session is told what such a note is.
     assert.match(
       channelInstructions(canticleConfig({ mode: "immediate" }), "scribe"),
-      /delivery="withdrawn" is frond-ear's note that records it pushed you earlier were withdrawn[^.]*never a payload; it has no batch_id and nothing to ack\./u,
+      /delivery="withdrawn" is frond-ear's note that records it pushed you earlier were withdrawn[^.]*never a payload; it has no batch_id and nothing to ack, and grants no new record or election authority\./u,
     );
   } finally {
     h.dispose();
@@ -218,6 +219,186 @@ test("#67: an alarm the host retracts for expiry gets its note too; one supersed
   }
 });
 
+test("#67 (🪨 P2 on #134): an alarm that left the view before its expiry gets no expiry note, when frond-ear restarts and first polls inside the tombstone's 5 s skew", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "frond-ear-withdrawn-"));
+  const path = join(directory, "ear.db");
+  const alarm = { class: "alarm", stateKey: "fire", ttlMs: 30_000 };
+  const wake = { wakeKeys: [{ key: OPS, classes: ["alarm"] }] };
+  try {
+    const first = setup({ mode: "immediate" }, wake, {}, { path });
+    let expiry: number;
+    try {
+      first.h.clock.value = 1_000_000;
+      expiry = first.h.clock.value + 30_000; // the alarm's local expiry
+      const shim = first.h.attach("scribe", { sessionId: SESSION });
+      first.host.sing(1, alarm);
+      first.h.timers.advance(6_000);
+      assert.equal(pushes(shim).length, 1);
+      await confirm(shim);
+      // Its successor replaces it on view, well before its expiry.
+      first.host.retract(1, "superseded");
+      first.h.timers.advance(10_000);
+      assert.equal(notes(shim).length, 0);
+    } finally {
+      first.h.dispose(); // down before the alarm's expiry
+    }
+    const second = setup({ mode: "immediate" }, wake, {}, { path });
+    try {
+      // Back up after the expiry, while the tombstone's 5 s skew still holds it.
+      second.h.clock.value = expiry + 2_000;
+      const shim = second.h.attach("scribe", { sessionId: SESSION });
+      second.h.timers.advance(60_000);
+      assert.equal(notes(shim).length, 0, "it never expired on view");
+      assert.equal(status(second.h).counts.withdrawn_expired, undefined);
+    } finally {
+      second.h.dispose();
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("#67 (🪨 P2 on #134): an alarm superseded and past its expiry between two polls gets no expiry note", async () => {
+  const { h, host } = setup(
+    { mode: "immediate" },
+    { wakeKeys: [{ key: OPS, classes: ["alarm"] }] },
+  );
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    const expiry = h.clock.value + 30_000;
+    host.sing(1, { class: "alarm", stateKey: "fire", ttlMs: 30_000 });
+    h.timers.advance(6_000);
+    await confirm(shim);
+    h.timers.advance(expiry - 700 - h.clock.value); // the last poll saw it on view
+    h.clock.value = expiry - 300; // between polls: its successor replaces it,
+    host.retract(1, "superseded");
+    h.clock.value = expiry + 200; // and its expiry passes, before the next poll
+    h.timers.advance(60_000);
+    assert.equal(notes(shim).length, 0, "it left the view before its expiry");
+  } finally {
+    h.dispose();
+  }
+});
+
+test("#67: an alarm whose link is down when it reaches its expiry gets no expiry note: a retract may have been missed meanwhile", async () => {
+  const { h, host } = setup(
+    { mode: "immediate" },
+    { wakeKeys: [{ key: OPS, classes: ["alarm"] }] },
+  );
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    host.sing(1, { class: "alarm", stateKey: "fire", ttlMs: 30_000 });
+    h.timers.advance(6_000);
+    await confirm(shim);
+    host.drop(); // what it held is carried, unconfirmed, until a snapshot
+    h.timers.advance(60_000);
+    assert.equal(notes(shim).length, 0, "no evidence it ran out on view");
+  } finally {
+    h.dispose();
+  }
+});
+
+test("#67 (🪨 #134 review, item 1): a tap that throws after the session took a note never makes the session get it twice", async () => {
+  const { h, host } = setup({ mode: "immediate" });
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    const tap = h.attach("scribe", { role: "tap" });
+    tap.connection.send = () => {
+      throw new Error("tap socket gone");
+    };
+    host.sing(1);
+    h.timers.advance(6_000);
+    await confirm(shim);
+    host.pluck(1);
+    h.timers.advance(6_000);
+    assert.equal(notes(shim).length, 1, "the session took it");
+    h.timers.advance(600_000);
+    assert.equal(notes(shim).length, 1, "and never again");
+    assert.equal(status(h).withdrawn.owed, 0);
+    // Counted as the session's delivery: a tap's failure is not the session's.
+    assert.equal(status(h).counts.withdrawn_notes, 1);
+    assert.equal(status(h).counts.withdrawn_unknown, undefined);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("#67 (🪨 #134 review, item 3): at most once: a send that fails after the note was marked sent loses that note, through a restart, and never sends it twice", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "frond-ear-withdrawn-"));
+  const path = join(directory, "ear.db");
+  try {
+    const first = setup({ mode: "immediate" }, {}, {}, { path });
+    let send: typeof shim.connection.send;
+    let shim!: ReturnType<typeof first.h.attach>;
+    try {
+      first.h.clock.value = 1_000_000;
+      shim = first.h.attach("scribe", { sessionId: SESSION });
+      first.host.sing(1);
+      first.host.sing(2);
+      first.h.timers.advance(6_000);
+      await confirm(shim);
+      first.host.pluck(1);
+      // The crash window: the mark is committed, then the send's I/O dies.
+      send = shim.connection.send.bind(shim.connection);
+      shim.connection.send = (message) => {
+        if (message.type === "event" && message.meta.delivery === "withdrawn") {
+          throw new Error("killed mid-send");
+        }
+        return send(message);
+      };
+      first.h.timers.advance(6_000);
+      assert.equal(notes(shim).length, 0, "it never went out");
+      first.h.timers.advance(60_000);
+      assert.equal(notes(shim).length, 0, "and is not tried again");
+      assert.equal(status(first.h).counts.withdrawn_unknown, 1);
+    } finally {
+      first.h.dispose();
+    }
+    const second = setup({ mode: "immediate" }, {}, {}, { path });
+    try {
+      second.h.clock.value = 1_100_000;
+      const back = second.h.attach("scribe", { sessionId: SESSION });
+      second.h.timers.advance(60_000);
+      assert.equal(
+        notes(back).length,
+        0,
+        "lost, at most once: never sent twice",
+      );
+    } finally {
+      second.h.dispose();
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("#67: an alarm still carried from before a rejoin, its join snapshot not yet in, gets no expiry note: its retract may have been missed", async () => {
+  const { h, host } = setup(
+    { mode: "immediate" },
+    { wakeKeys: [{ key: OPS, classes: ["alarm"] }] },
+  );
+  try {
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    host.sing(1, { class: "alarm", stateKey: "fire", ttlMs: 30_000 });
+    h.timers.advance(6_000);
+    await confirm(shim);
+    host.drop();
+    // A new connection to the same run asks for a join snapshot that never comes in time.
+    host.consumer.reconnected({ joinSnapshot: true });
+    const feed = (type: string, recSeq: number, extra = {}) =>
+      host.consumer.feed(
+        { v: RECORD_V, type, rec_seq: recSeq, run: host.run, ...extra },
+        h.clock.now(),
+      );
+    feed("hello", 1, { join_snapshot: true });
+    feed("landing_state", 1_000, { mute: null, breaker: "closed" });
+    h.timers.advance(60_000); // past its expiry, still carried
+    assert.equal(notes(shim).length, 0, "no evidence it ran out on view");
+  } finally {
+    h.dispose();
+  }
+});
+
 test("#67: a burst of plucks is coalesced into one note and capped on its own budget; notes and pushes never starve each other", async () => {
   const { h, host } = setup({
     mode: "immediate",
@@ -298,7 +479,7 @@ test("#67: a spent push budget never holds a note back", async () => {
   }
 });
 
-test("#67: a note is settled once with the record's tombstone: a frond-ear restart neither repeats a sent note nor loses an owed one", async () => {
+test("#67: a note is settled with the record's tombstone: a frond-ear restart never repeats a sent note and keeps one still owed", async () => {
   const directory = mkdtempSync(join(tmpdir(), "frond-ear-withdrawn-"));
   const path = join(directory, "ear.db");
   try {
@@ -347,7 +528,7 @@ test("#67: a note is settled once with the record's tombstone: a frond-ear resta
   }
 });
 
-test("#67: a note is never a wake: no batch, nothing to ack, no push spent, and it never goes to an ear no session holds", async () => {
+test("#67: a note grants no new record or election authority: no payload, no batch, nothing to ack, no push spent, and it never goes to an ear no session holds", async () => {
   const { h, host } = setup({ mode: "immediate" });
   try {
     let shim = h.attach("scribe", { sessionId: SESSION });
@@ -487,7 +668,7 @@ const secret = createPrivateKey({
   type: "pkcs8",
 });
 
-function signed(kind: number, fields: Record<number, number | Uint8Array>) {
+function signed(kind: number, fields: Record<number, cbor.CborValue | number>) {
   const m: cbor.CborMap = new Map();
   for (const [k, v] of Object.entries(fields))
     m.set(BigInt(k), typeof v === "number" ? BigInt(v) : v);
@@ -500,8 +681,11 @@ function signed(kind: number, fields: Record<number, number | Uint8Array>) {
   return new Uint8Array(Buffer.concat([unsigned, signature]));
 }
 
-/** A chatter ITEM from test1, issued at T0, for 60 s. */
-const item = (seq: number) =>
+/** A chatter ITEM from test1, issued at T0, for 60 s; `extra` overrides its fields. */
+const item = (
+  seq: number,
+  extra: Record<number, cbor.CborValue | number> = {},
+) =>
   signed(KIND_ITEM, {
     1: 1, // epoch
     2: streamId("chatter"),
@@ -513,6 +697,7 @@ const item = (seq: number) =>
     8: new TextEncoder().encode(`deploy.started ${seq}`),
     11: 0, // hop
     13: 1, // text
+    ...extra,
   });
 
 /** test1's PLUCK of `target`, carrying the target's expires_at and scope (§9.7). */
@@ -573,6 +758,68 @@ test("#67, embedded receptor: a pushed item its station plucks gets one note", a
     // chatter 2 runs out on its own: no note.
     h.timers.advance(120_000);
     assert.equal(notes(shim).length, 1);
+    receptor.stop();
+  } finally {
+    h.dispose();
+  }
+});
+
+test("#67, embedded receptor: an alarm that runs out while current gets an expiry note; one superseded first gets none", async () => {
+  // test1's manifest entry, granted alarm (as #176's proof 3 does), its key bare: alarm only.
+  const manifest = structuredClone(vectors.manifest) as {
+    stations: Array<{ name: string; classes: string[] }>;
+  };
+  manifest.stations.find((s) => s.name === "test1")!.classes.push("alarm");
+  const config = canticleConfig(
+    { mode: "immediate" },
+    {
+      source: "embedded",
+      manifestPath: "unused",
+      tune: { scribe: ["*:chatter"] },
+      wakeKeys: [test1.key_id],
+    },
+  );
+  let receptor: CanticleReceptor | undefined;
+  const h = harness(config, { canticleHear: (ear) => receptor!.hearView(ear) });
+  try {
+    h.clock.value = T0 + 1_000;
+    receptor = new CanticleReceptor({
+      config: config.canticle!,
+      manifest: Manifest.fromJson(manifest),
+      store: h.store,
+      logger: new StructuredLogger(() => {}),
+      clock: h.clock,
+      timers: h.timers,
+      socket: () =>
+        ({
+          on: () => {},
+          bind: (_port: number, _host: string, bound: () => void) => bound(),
+          close: () => {},
+        }) as never,
+    });
+    receptor.start();
+    const shim = h.attach("scribe", { sessionId: SESSION });
+    receptor.receive(item(1, { 6: 7, 10: "fire" }));
+    receptor.receive(item(2, { 6: 7, 10: "flood" }));
+    h.timers.advance(6_000);
+    assert.equal(pushes(shim).length, 1);
+    assert.equal(pushes(shim)[0]!.meta.count, "2");
+    await confirm(shim);
+    // 3 replaces 2 (same state_key): 2 leaves before its expiry.
+    receptor.receive(item(3, { 4: T0 + 2_000, 6: 7, 10: "flood" }));
+    h.timers.advance(6_000);
+    assert.equal(pushes(shim).length, 2);
+    await confirm(shim);
+
+    h.timers.advance(60_000); // past T0 + 60 s, when 1 and 3 run out while current
+    assert.equal(notes(shim).length, 1);
+    payloadFree(notes(shim)[0]!);
+    assert.deepEqual(lines(notes(shim)[0]!.content), [
+      "test1:chatter 1/1 expired",
+      "test1:chatter 1/3 expired",
+    ]);
+    h.timers.advance(120_000);
+    assert.equal(notes(shim).length, 1, "2 was superseded, never expired");
     receptor.stop();
   } finally {
     h.dispose();

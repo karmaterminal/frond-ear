@@ -770,7 +770,8 @@ export class Daemon {
   /**
    * A notice outside the Discord ledger (no batch_id, nothing to confirm or mark seen):
    * to the ear's attached session, and to its taps, which see what the session is sent.
-   * Returns whether the session's connection took it.
+   * Returns whether the session's connection took it; a tap's failure is not the
+   * session's.
    */
   private pushNotice(
     ear: string,
@@ -779,7 +780,11 @@ export class Daemon {
     const event = { type: "event", batchId: null, ...notification } as const;
     const taken = this.attached.get(ear)?.connection.send(event) ?? false;
     for (const tap of this.taps.get(ear) ?? []) {
-      tap.connection.send(event);
+      try {
+        tap.connection.send(event);
+      } catch {
+        // A tap's failure never changes what the session was sent (🪨 on #134).
+      }
     }
     return taken;
   }
