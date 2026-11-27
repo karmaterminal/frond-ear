@@ -31,6 +31,7 @@ interface Row {
   withdrawn?: { count: number; lastAt: string; reasons: string[] };
   expired?: number;
   localOmissions?: { reason: string; count: number };
+  coverageUnknown?: { tunedAt: string; dropped: number; until: string };
 }
 
 interface Guide {
@@ -525,6 +526,108 @@ test("guide tool: canticle off, or an ear that tunes nothing, says so", async ()
     const result = await h.call(shim, "canticle_guide", {});
     assert.equal(result.ok, true);
     assert.match(result.text, /tunes no station:stream/u);
+  } finally {
+    h.dispose();
+  }
+});
+
+// ---- known gaps stay known (🌫 on #133): a stream frond-ear itself dropped is never absent
+
+/** The record v1 live set's bound (records.ts MAX_LIVE). */
+const FULL = 4_096;
+
+/** Fills the live set with one tuned record each on FULL stations' ops.fleet. */
+function fill(host: { sing(seq: number, o: Record<string, unknown>): void }) {
+  for (let i = 0; i < FULL; i += 1) host.sing(i + 1, { station: `s${i}` });
+}
+
+test("guide: a stream known only by its local omission gets a row (live 0) and matches query; hear and the guide agree", async () => {
+  const { h, host } = setup(undefined);
+  try {
+    const shim = h.attach("scribe");
+    fill(host);
+    host.sing(9_000, { station: "quiet" }); // refused: 4,096 tuned streams hold one each
+    const heard = await h.call(shim, "hear", { stream: "quiet:ops.fleet" });
+    assert.match(
+      heard.text,
+      /^local omission \(live_overflow\): quiet:ops\.fleet: 1 record dropped/mu,
+      "hear names the known local omission",
+    );
+    const { view } = await guide(h, shim, { query: "quiet" });
+    assert.equal(view.streams, 1, "the dropped stream is not absent");
+    const quiet = row(view, "quiet", "ops.fleet");
+    assert.equal(quiet.live, 0);
+    assert.deepEqual(quiet.localOmissions, {
+      reason: "live_overflow",
+      count: 1,
+    });
+    assert.deepEqual(quiet.keys, [OPS]);
+    assert.equal(quiet.freshness, "none live");
+    assert.equal((await guide(h, shim)).view.streams, FULL + 1);
+  } finally {
+    h.dispose();
+  }
+});
+
+test("guide: drops past the streams counted one by one (the shared count) are a gap, whatever the query", async () => {
+  const { h, host } = setup(undefined);
+  try {
+    const shim = h.attach("scribe");
+    fill(host);
+    for (let i = 0; i < 300; i += 1) {
+      host.sing(10_000 + i, { station: `late${i}` }); // each refused, a stream of its own
+    }
+    const heard = await h.call(shim, "hear", {});
+    assert.match(heard.text, /other tuned streams: \d+ records? dropped/u);
+    for (const query of [undefined, "late299", "nothing-matches-this"]) {
+      const { view } = await guide(h, shim, query ? { query } : {});
+      assert.ok(
+        view.gaps?.some((gap) =>
+          /^local omission \(live_overflow\): other tuned streams: \d+ records? dropped .*which streams is unknown/u.test(
+            gap,
+          ),
+        ),
+        `query ${query}: ${JSON.stringify(view.gaps)}`,
+      );
+    }
+  } finally {
+    h.dispose();
+  }
+});
+
+test("guide: a pattern tuned while untuned records were being dropped reads coverage unknown, on its rows and as a gap", async () => {
+  const { h, host } = setup(undefined);
+  try {
+    const shim = h.attach("scribe");
+    for (let i = 0; i < FULL + 1; i += 1) {
+      host.sing(i + 1, { stream: "town.square" }); // untuned: the last is refused
+    }
+    host.tune = [...host.tune, "ops:town.square"];
+    const heard = await h.call(shim, "hear", { limit: 1 });
+    assert.match(
+      heard.text,
+      /^coverage unknown: ops:town\.square was tuned at /mu,
+    );
+    const { view } = await guide(h, shim, { query: "square" });
+    const square = row(view, "ops", "town.square");
+    assert.equal(square.live, FULL);
+    assert.equal(square.coverageUnknown?.dropped, 1);
+    assert.ok(
+      view.gaps?.some((gap) =>
+        /^coverage unknown: ops:town\.square was tuned at .*how many unknown/u.test(
+          gap,
+        ),
+      ),
+      JSON.stringify(view.gaps),
+    );
+    assert.ok(
+      view.gaps?.some((gap) =>
+        /^local omission \(live_overflow\): untuned streams: 1 record dropped/u.test(
+          gap,
+        ),
+      ),
+      JSON.stringify(view.gaps),
+    );
   } finally {
     h.dispose();
   }

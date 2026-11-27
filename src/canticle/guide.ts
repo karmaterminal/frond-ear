@@ -12,6 +12,12 @@
 // - The index obeys §2.2: an item past its local expiry is not live, and an item the
 //   listener knows was withdrawn (a PLUCK, a revocation or a quarantine) is never live; a
 //   stream it withdrew shows the withdrawal while the item would still be on air.
+// - Known gaps stay known (RFC-0002 §3.1, 🌫 on #133): a tuned stream frond-ear's own live
+//   set dropped records from gets a row (live 0 if nothing of it is held) with its local
+//   omission, never an absence; a pattern tuned while untuned records were being dropped
+//   marks its rows coverage unknown; and the shares no row can name (the shared count past
+//   the streams counted one by one, the untuned share, a `*` pattern) are `gaps` entries,
+//   shown whatever the query.
 // - Paginated by an opaque keyset cursor over (station, stream), so a row that leaves
 //   between pages moves nothing past the cursor.
 
@@ -61,6 +67,11 @@ export interface GuideRow {
   expired?: number;
   /** frond-ear's own live set dropped records here (RFC-0002 §3.1, local omission). */
   localOmissions?: { reason: "live_overflow"; count: number };
+  /**
+   * Tuned while frond-ear's live set was dropping untuned records that would still be on
+   * air: records from before `tunedAt` may be missing here, how many unknown.
+   */
+  coverageUnknown?: { tunedAt: string; dropped: number; until: string };
 }
 
 export interface GuideView {
@@ -133,6 +144,8 @@ interface Building {
   liveUntil: number | undefined;
   expired: number;
   withdrawn: { count: number; lastAt: number; reasons: Set<string> };
+  dropped: number;
+  coverage: { at: number; dropped: number; until: number } | undefined;
 }
 
 /**
@@ -164,6 +177,8 @@ export function guideView(view: HearView, options: GuideOptions): GuideView {
         liveUntil: undefined,
         expired: 0,
         withdrawn: { count: 0, lastAt: 0, reasons: new Set() },
+        dropped: 0,
+        coverage: undefined,
       };
       rows.set(key, row);
     }
@@ -200,12 +215,31 @@ export function guideView(view: HearView, options: GuideOptions): GuideView {
     row.withdrawn.lastAt = Math.max(row.withdrawn.lastAt, mark.at);
     row.withdrawn.reasons.add(mark.reason);
   }
+  // A stream known only by what frond-ear dropped of it still gets its row (🌫 on #133).
+  for (const o of view.omitted ?? []) {
+    if (!(o.count > 0 && o.until > now)) continue;
+    const row = building(o.station, o.stream);
+    row.keys.add(o.key.toLowerCase());
+    row.dropped += o.count;
+  }
+  // A pattern naming its station marks (or makes) that row; a `*` one marks every row of
+  // its stream, and its gap line covers the stations nothing names.
+  for (const r of view.retuned ?? []) {
+    if (!(r.until > now)) continue;
+    const at = r.pattern.indexOf(":");
+    const station = r.pattern.slice(0, at);
+    const stream = r.pattern.slice(at + 1);
+    if (station !== "*") building(station, stream);
+    for (const row of rows.values()) {
+      if (
+        (station === "*" || row.station === station) &&
+        row.stream === stream
+      ) {
+        row.coverage = { at: r.at, dropped: r.dropped, until: r.until };
+      }
+    }
+  }
   const presence = new Map(view.stations.map((s) => [s.name, s.presence]));
-  const omitted = new Map(
-    (view.omitted ?? [])
-      .filter((o) => o.count > 0 && o.until > now)
-      .map((o) => [rowKey(o.station, o.stream), o.count]),
-  );
   // Metadata only: the shown station, stream and classes, never anything of a payload.
   const matches = (row: Building) =>
     query === undefined ||
@@ -242,7 +276,7 @@ export function guideView(view: HearView, options: GuideOptions): GuideView {
     delivery: options.mode(),
     ...(options.query !== undefined ? { query: options.query } : {}),
     streams: sorted.length,
-    rows: page.map((row) => render(row, presence, omitted, options)),
+    rows: page.map((row) => render(row, presence, options)),
     ...(more && last !== undefined
       ? { nextCursor: encodeCursor(last.station, last.stream) }
       : {}),
@@ -255,7 +289,6 @@ export function guideView(view: HearView, options: GuideOptions): GuideView {
 function render(
   row: Building,
   presence: ReadonlyMap<string, string>,
-  omitted: ReadonlyMap<string, number>,
   options: GuideOptions,
 ): GuideRow {
   const keys = [...row.keys].sort();
@@ -263,7 +296,6 @@ function render(
   const stale =
     row.newest === undefined ? undefined : STALE_AFTER_MS[row.newest.cls];
   const mode = options.mode({ key: keys[0] ?? "", station: row.station });
-  const dropped = omitted.get(rowKey(row.station, row.stream));
   return {
     station: token(row.station),
     stream: token(row.stream),
@@ -296,8 +328,22 @@ function render(
         }
       : {}),
     ...(row.expired > 0 ? { expired: row.expired } : {}),
-    ...(dropped !== undefined
-      ? { localOmissions: { reason: "live_overflow" as const, count: dropped } }
+    ...(row.dropped > 0
+      ? {
+          localOmissions: {
+            reason: "live_overflow" as const,
+            count: row.dropped,
+          },
+        }
+      : {}),
+    ...(row.coverage !== undefined
+      ? {
+          coverageUnknown: {
+            tunedAt: iso(row.coverage.at),
+            dropped: row.coverage.dropped,
+            until: iso(row.coverage.until),
+          },
+        }
       : {}),
   };
 }
@@ -321,6 +367,29 @@ function gapLines(view: HearView): string[] {
   if (view.joinedLate && !view.ended) {
     gaps.push(
       `joined the host daemon's run late (joined_late, join snapshot ${token(view.joinedLate.snapshot)}): items and presence from before the join may be missing, how many unknown`,
+    );
+  }
+  // The shares no row can name, in hear's words (hear.ts omissionLines).
+  const now = view.now;
+  const other = view.otherOmitted;
+  if (other !== undefined && other.count > 0 && other.until > now) {
+    gaps.push(
+      `local omission (live_overflow): other tuned streams: ${other.count} record${other.count === 1 ? "" : "s"} dropped by frond-ear's full live set between ${iso(other.from)} and ${iso(other.to)}, past the 256 streams it names one by one, so which streams is unknown; they would be on air until ${iso(other.until)}.`,
+    );
+  }
+  const untuned = view.untunedOmitted;
+  if (untuned !== undefined && untuned.count > 0 && untuned.until > now) {
+    gaps.push(
+      `local omission (live_overflow): untuned streams: ${untuned.count} record${untuned.count === 1 ? "" : "s"} dropped by frond-ear's full live set between ${iso(untuned.from)} and ${iso(untuned.to)}, on air until ${iso(untuned.until)}; tuned streams keep shares of their own.`,
+    );
+  }
+  for (const r of view.retuned ?? []) {
+    if (!(r.until > now)) continue;
+    const at = r.pattern.indexOf(":");
+    const station = r.pattern.slice(0, at);
+    const pattern = `${station === "*" ? "*" : token(station)}:${token(r.pattern.slice(at + 1))}`;
+    gaps.push(
+      `coverage unknown: ${pattern} was tuned at ${iso(r.at)}, while frond-ear's live set was dropping untuned records (${r.dropped} that would be on air until ${iso(r.until)}); its records from before then may be missing, how many unknown (local omission, live_overflow).`,
     );
   }
   return gaps;
