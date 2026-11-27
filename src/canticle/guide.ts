@@ -24,7 +24,7 @@
 import type { DeliveryMode } from "./delivery.ts";
 import { identity } from "./delivery.ts";
 import { iso, STALE_AFTER_MS, token } from "./hear.ts";
-import type { GuideSourceView } from "./receptor.ts";
+import type { GuideMetadata, GuideSourceView } from "./receptor.ts";
 
 /** The longest `query` the guide takes. */
 export const MAX_QUERY_CHARS = 200;
@@ -187,7 +187,8 @@ export function guideView(
     }
     return row;
   };
-  for (const item of view.items) {
+  const items: readonly GuideMetadata[] = view.items; // so no other field compiles
+  for (const item of items) {
     const station: string = item.station;
     const stream: string = item.stream;
     const key: string = item.key;

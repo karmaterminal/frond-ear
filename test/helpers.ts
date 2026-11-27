@@ -293,7 +293,7 @@ export function harness(
       return result;
     },
     dispose() {
-      canticle?.stop(); // before the store it saves to closes, as cli.ts does
+      canticle?.stop(); // before the store closes (a receptor saves to it), as cli.ts does
       daemon.shutdown();
       store.close();
       rmSync(directory, { recursive: true, force: true });

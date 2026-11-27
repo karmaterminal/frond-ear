@@ -237,9 +237,15 @@ type GuideField =
  * `LiveItem` is a `GuideItem`, and no `HearView` a `GuideSourceView`, so an adapter pointed
  * at `hearView` where `guideView` belongs, or a projection spreading the item, fails tsc.
  */
-export type GuideItem = Pick<LiveItem, GuideField> & {
+export type GuideItem = GuideMetadata & {
   [K in Exclude<keyof LiveItem, GuideField>]?: never;
 };
+
+/**
+ * What the guide reads of a `GuideItem`: its metadata fields and no other. A `never` field
+ * still reads as `undefined`, so the guide reads items as this, where any other is TS2339.
+ */
+export type GuideMetadata = Pick<LiveItem, GuideField>;
 
 /**
  * What `canticle_guide` reads from a source: the `hear` view's metadata, its items as
@@ -249,8 +255,9 @@ export interface GuideSourceView
   extends Omit<HearView, "items" | "capability"> {
   items: GuideItem[];
   /**
-   * Never here: every `HearView` declares it, so one spread into a guide view (built
-   * payload and all, then its items swapped) fails tsc too (#138).
+   * Never here: every `HearView` declares it, so a whole `HearView` spread into a guide
+   * view fails tsc too (#138). One taken apart first, or cast, still compiles; the
+   * adapters' tests, counting payload reads through the real sources, catch those.
    */
   capability?: never;
   /** Record v1: the host daemon's receptor-wide MUTE (§14.8), while it holds. */

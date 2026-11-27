@@ -45,11 +45,11 @@ type Client = ReturnType<Harness["attach"]>;
 /**
  * Runs `admit` while catching every value put into a Map, and keeps those `pick` names:
  * the objects a source holds its records in, which are not reachable otherwise. `admit`
- * may wait for records to come in over a socket; it sees what is held so far.
+ * may wait for records to come in over a socket.
  */
 async function captured(
   pick: (value: unknown) => object | undefined,
-  admit: (held: readonly object[]) => void | Promise<void>,
+  admit: () => void | Promise<void>,
 ): Promise<object[]> {
   const held: object[] = [];
   const set = Map.prototype.set;
@@ -59,7 +59,7 @@ async function captured(
     return set.call(this, key, value);
   };
   try {
-    await admit(held);
+    await admit();
   } finally {
     Map.prototype.set = set;
   }
@@ -75,12 +75,15 @@ async function until(done: () => boolean, what: string, ms = 5_000) {
   }
 }
 
-/** Turns each named field of each held object into a getter that counts its reads. */
+/**
+ * Turns each named field of each held object into a getter that counts its reads. Each must
+ * be the object's own: one held anywhere else would go unwatched, so it fails instead.
+ */
 function poison(held: object[], fields: readonly string[]) {
   const reads: string[] = [];
   for (const object of held) {
     for (const field of fields) {
-      if (!Object.hasOwn(object, field)) continue;
+      assert.ok(Object.hasOwn(object, field), `a held record's own ${field}`);
       const value = (object as Record<string, unknown>)[field];
       Object.defineProperty(object, field, {
         enumerable: true,
