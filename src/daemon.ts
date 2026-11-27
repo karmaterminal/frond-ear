@@ -25,6 +25,7 @@ import {
 import {
   CanticleDelivery,
   exposure,
+  identity as canticleIdentity,
   MAX_WAKE_GRANT_MS,
 } from "./canticle/delivery.ts";
 import {
@@ -91,6 +92,8 @@ import {
   leaveLetter,
   listLetters,
   parseLeave,
+  refuseCopies,
+  type ReleasedRecord,
   releaseCount,
   releaseLetters,
   renderLetter,
@@ -3973,12 +3976,14 @@ export class Daemon {
             "frond-ear does not know this session's id (its shim had no CLAUDE_CODE_SESSION_ID), so it cannot record who left the letter; nothing was stored",
           );
         }
+        const request = parseLeave(args);
+        refuseCopies(request, this.releasedCanticle(ear, client.sessionId));
         return leaveLetter(
           this.store,
           ear,
           client.sessionId,
           this.clock.now(),
-          parseLeave(args),
+          request,
         );
       }
       case "letters": {
@@ -4165,6 +4170,59 @@ export class Daemon {
       null,
       2,
     );
+  }
+
+  /**
+   * The canticle records already released to `sessionId` on this ear, with the text it was
+   * shown, for the letters' copy guard: custody's whole exposures to that session (a push
+   * the host confirmed, its own `hear`), joined to the live set by identity and payload
+   * digest. Never the held buffer or the rest of the live set: comparing a letter against
+   * text the session hasn't elected to receive would make the write an oracle for it. A
+   * record gone from the live set has no text here, so it can't be compared.
+   */
+  private releasedCanticle(ear: string, sessionId: string): ReleasedRecord[] {
+    const view = this.options.canticleHear;
+    if (!view) {
+      return [];
+    }
+    const shown = this.store.canticleReleasedTo(ear, sessionId);
+    if (shown.size === 0) {
+      return [];
+    }
+    let items: HearView["items"];
+    try {
+      items = view(ear).items;
+    } catch (error) {
+      // The guard is a check on copies, not a gate letters depend on.
+      this.logger.log("warn", "letters.copy_guard_unavailable", {
+        ear,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return [];
+    }
+    const released: ReleasedRecord[] = [];
+    for (const item of items) {
+      if (item.text === undefined || item.text === "") {
+        continue;
+      }
+      const digests = shown.get(canticleIdentity(item));
+      if (
+        digests === undefined ||
+        !digests.has(
+          createHash("sha256").update(item.text, "utf8").digest("hex"),
+        )
+      ) {
+        continue;
+      }
+      released.push({
+        station: item.station,
+        stream: item.stream,
+        epoch: item.epoch,
+        seq: item.seq,
+        text: item.text,
+      });
+    }
+    return released;
   }
 
   /** `hear` showed these payloads to the ear's own session: custody, echoed at the return. */

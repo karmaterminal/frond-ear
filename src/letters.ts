@@ -6,15 +6,24 @@
  * the session that left it (a fresh session is told letters exist, never shown
  * their text), it expires, and it is evidence from an earlier turn, never
  * permission: its banner says so, and what it rested on is listed unchecked.
+ *
+ * A letter names heard canticle records by reference (`heard`), never by their words, and
+ * a literal-copy guard refuses one whose text copies a record already released to the
+ * session that leaves it (Deep Dive No. 2 §06): heard broadcast must not cross a compaction
+ * inside a letter's body with no label. Literal copies only; see `copiedRecords`.
  */
+import { shownText, token } from "./canticle/hear.ts";
+import { CANTICLE_STATION } from "./config.ts";
 import { cleanName, cleanText, type Notification } from "./render.ts";
-import type { EventStore, Letter } from "./store.ts";
+import type { EventStore, HeardRef, Letter } from "./store.ts";
 
 export const LETTER_LIMITS = {
   maxBodyBytes: 8192,
   maxReasonChars: 200,
   maxAssumed: 8,
   maxAssumedChars: 200,
+  /** Heard canticle references per letter. */
+  maxHeard: 16,
   /** Unsettled, unexpired letters per ear. */
   maxPending: 16,
   maxPendingBytes: 24576,
@@ -33,7 +42,96 @@ export interface LeaveRequest {
   body: string;
   bytes: number;
   assumed: string[];
+  heard: HeardRef[];
   ttlMs: number;
+}
+
+/** A stream name (RFC-0001 §5.4): up to four dot-separated segments. */
+const STREAM = /^[a-z][a-z0-9-]{0,30}(\.[a-z][a-z0-9-]{0,30}){0,3}$/u;
+const U64_MAX = 18_446_744_073_709_551_615n;
+
+/** `station:stream epoch/seq`, the way a canticle banner and custody name a record. */
+export function heardName(ref: HeardRef): string {
+  return `${ref.station}:${ref.stream} ${ref.epoch}/${ref.seq}`;
+}
+
+/**
+ * The `heard` argument: references to canticle records, each `{station, stream, epoch,
+ * seq}` and nothing else, so a reference can never carry a record's words. seq is an
+ * integer, or its decimal digits as a string for one past 2^53 (a seq is a u64).
+ */
+function parseHeard(raw: unknown): HeardRef[] {
+  if (raw === undefined || raw === null) {
+    return [];
+  }
+  if (!Array.isArray(raw)) {
+    throw new Error(
+      "heard must be a list of {station, stream, epoch, seq} references",
+    );
+  }
+  if (raw.length > LETTER_LIMITS.maxHeard) {
+    throw new Error(
+      `heard has ${raw.length} references; the limit is ${LETTER_LIMITS.maxHeard}`,
+    );
+  }
+  const refs: HeardRef[] = [];
+  const seen = new Set<string>();
+  raw.forEach((item: unknown, index) => {
+    const which = `heard item ${index + 1}`;
+    if (typeof item !== "object" || item === null || Array.isArray(item)) {
+      throw new Error(`${which} must be {station, stream, epoch, seq}`);
+    }
+    const fields = item as Record<string, unknown>;
+    if (
+      Object.keys(fields).some(
+        (key) => !["station", "stream", "epoch", "seq"].includes(key),
+      )
+    ) {
+      throw new Error(
+        `${which}: a heard reference carries station, stream, epoch and seq only, never a record's text`,
+      );
+    }
+    const { station, stream, epoch, seq } = fields;
+    if (typeof station !== "string" || !CANTICLE_STATION.test(station)) {
+      throw new Error(
+        `${which}: station must be a station's name as hear shows it (lowercase letters, digits and -)`,
+      );
+    }
+    if (typeof stream !== "string" || !STREAM.test(stream)) {
+      throw new Error(
+        `${which}: stream must be a stream name as hear shows it (e.g. ops.fleet)`,
+      );
+    }
+    if (
+      typeof epoch !== "number" ||
+      !Number.isSafeInteger(epoch) ||
+      epoch < 0
+    ) {
+      throw new Error(`${which}: epoch must be a non-negative integer`);
+    }
+    let digits: string | undefined;
+    if (typeof seq === "number" && Number.isSafeInteger(seq) && seq >= 0) {
+      digits = String(seq);
+    } else if (
+      typeof seq === "string" &&
+      /^\d{1,20}$/u.test(seq) &&
+      BigInt(seq) <= U64_MAX
+    ) {
+      digits = BigInt(seq).toString();
+    }
+    if (digits === undefined) {
+      throw new Error(
+        `${which}: seq must be a non-negative integer (as a string of digits past 2^53)`,
+      );
+    }
+    const ref = { station, stream, epoch, seq: digits };
+    const name = heardName(ref);
+    if (!seen.has(name)) {
+      seen.add(name);
+      refs.push(ref);
+    }
+  });
+  return refs;
 }
 
 /** Validates the leave_letter tool's arguments. Refuses rather than truncates. */
@@ -94,7 +192,144 @@ export function parseLeave(args: Record<string, unknown>): LeaveRequest {
     }
     ttlSeconds = value;
   }
-  return { reason, body, bytes, assumed, ttlMs: ttlSeconds * 1000 };
+  const heard = parseHeard(args.heard);
+  return { reason, body, bytes, assumed, heard, ttlMs: ttlSeconds * 1000 };
+}
+
+/**
+ * The copy guard's floor: a letter copies a record when they share a run of at least this
+ * many characters (UTF-16 units) after normalization. 40 is about seven words: longer than
+ * the short stock phrases that recur in independent writing ("There is a room.", "deploy
+ * finished", a status word), so those never trip it, and short enough to catch a copied
+ * sentence or clause, and to stay meaningful against `reason` and `assumed` items, which
+ * are capped at 200. A record shorter than the floor can't be caught at all.
+ */
+export const COPY_FLOOR = 40;
+
+/** A canticle record frond-ear released to the session, with the text it was shown. */
+export interface ReleasedRecord extends HeardRef {
+  text: string;
+}
+
+/**
+ * The form both sides are compared in: the text as a banner shows a payload (cleaned,
+ * look-alikes defused), NFC, a `> ` quote marker at a line's start dropped (so a block
+ * copied out of a banner, markers and all, still reads as the record), and every run of
+ * whitespace one space.
+ */
+function copyForm(text: string): string {
+  return shownText(text)
+    .normalize("NFC")
+    .replace(/^[ \t]*>[ \t]?/gmu, "")
+    .replace(/\s+/gu, " ")
+    .trim();
+}
+
+/**
+ * Literal-copy detection, not provenance enforcement. Which `released` records each of
+ * the letter's fields (body, reason, each assumed item) shares a run of at least
+ * `COPY_FLOOR` characters with, after `copyForm`. `released` must be only what was
+ * released to the leaving session (custody: pushes the host confirmed to it, its own
+ * `hear` returns), never the held buffer or the live set at large: otherwise a refusal
+ * would tell the session text it hasn't chosen to receive. A paraphrase, a fragment under
+ * the floor, a record cut to fit, and a record frond-ear no longer holds all pass.
+ */
+export function copiedRecords(
+  request: Pick<LeaveRequest, "body" | "reason" | "assumed">,
+  released: readonly ReleasedRecord[],
+  floor = COPY_FLOOR,
+): Array<{ field: string; records: HeardRef[] }> {
+  const owner = new Map<string, number>();
+  released.forEach((record, index) => {
+    const text = copyForm(record.text);
+    for (let at = 0; at + floor <= text.length; at += 1) {
+      const run = text.slice(at, at + floor);
+      if (!owner.has(run)) {
+        owner.set(run, index);
+      }
+    }
+  });
+  if (owner.size === 0) {
+    return [];
+  }
+  const fields: Array<[string, string]> = [
+    ["body", request.body],
+    ["reason", request.reason],
+    ...request.assumed.map((item, index): [string, string] => [
+      `assumed item ${index + 1}`,
+      item,
+    ]),
+  ];
+  const found: Array<{ field: string; records: HeardRef[] }> = [];
+  for (const [field, value] of fields) {
+    const text = copyForm(value);
+    const hits = new Set<number>();
+    for (let at = 0; at + floor <= text.length; at += 1) {
+      const index = owner.get(text.slice(at, at + floor));
+      if (index !== undefined) {
+        hits.add(index);
+      }
+    }
+    if (hits.size > 0) {
+      found.push({
+        field,
+        records: [...hits]
+          .sort((a, b) => a - b)
+          .map((index) => {
+            const { station, stream, epoch, seq } = released[index]!;
+            return { station, stream, epoch, seq };
+          }),
+      });
+    }
+  }
+  return found;
+}
+
+/**
+ * Refuses a letter that copies a released record, naming each record by `station:stream
+ * epoch/seq` and offering the `heard` reference instead. Never echoes the matched text.
+ */
+export function refuseCopies(
+  request: Pick<LeaveRequest, "body" | "reason" | "assumed">,
+  released: readonly ReleasedRecord[],
+): void {
+  const found = copiedRecords(request, released);
+  if (found.length === 0) {
+    return;
+  }
+  const refs = new Map<string, HeardRef>();
+  for (const { records } of found) {
+    for (const record of records) {
+      refs.set(heardName(record), record);
+    }
+  }
+  // A released record's names come from its verified frame; banner tokens all the same.
+  const seqOf = (seq: string) =>
+    /^\d{1,20}$/u.test(seq) ? seq : "unavailable";
+  const named = (records: HeardRef[]) =>
+    records
+      .map(
+        (record) =>
+          `${token(record.station)}:${token(record.stream)} ${record.epoch}/${seqOf(record.seq)}`,
+      )
+      .join(", ");
+  const suggestion = [...refs.values()]
+    .slice(0, LETTER_LIMITS.maxHeard)
+    .map(
+      (record) =>
+        `{station: "${token(record.station)}", stream: "${token(record.stream)}", epoch: ${record.epoch}, seq: ${/^\d{1,15}$/u.test(record.seq) ? record.seq : `"${seqOf(record.seq)}"`}}`,
+    )
+    .join(", ");
+  throw new Error(
+    `letter not stored: ${found
+      .map(
+        ({ field, records }) =>
+          `its ${field} copies heard canticle record${records.length === 1 ? "" : "s"} ${named(records)}`,
+      )
+      .join(
+        "; ",
+      )} (a run of ${COPY_FLOOR}+ characters, whitespace normalized). Name the record instead, heard: [${suggestion}], and say in your own words what it meant to you; hear shows it again while it is live. This is literal-copy detection, not provenance enforcement: it compares only canticle text frond-ear released to this session and still holds, so a paraphrase, a short fragment or a record gone from the live set passes.`,
+  );
 }
 
 /**
@@ -207,11 +442,16 @@ export function leaveLetter(
     body: request.body,
     bytes: request.bytes,
     assumed: request.assumed,
+    heard: request.heard,
     leftAt: now,
     expiresAt,
     releasesAtLeave: releaseCount(store, ear),
   });
-  return `letter ${id} left (${request.bytes} bytes; expires ${iso(expiresAt)}). It comes back to this session as a kind="letter" event after its next compaction, when the seat's SessionStart hook runs frond-ear release. Ack that event's nonce to settle it; an unsettled letter comes back after the following compaction too.`;
+  const refs =
+    request.heard.length === 0
+      ? ""
+      : `, ${request.heard.length} heard reference${request.heard.length === 1 ? "" : "s"}`;
+  return `letter ${id} left (${request.bytes} bytes${refs}; expires ${iso(expiresAt)}). It comes back to this session as a kind="letter" event after its next compaction, when the seat's SessionStart hook runs frond-ear release. Ack that event's nonce to settle it; an unsettled letter comes back after the following compaction too.`;
 }
 
 export interface Release {
@@ -366,6 +606,12 @@ export function renderLetter(
       ...letter.assumed.map((item) => quote(`- ${item}`)),
     );
   }
+  if (letter.heard.length > 0) {
+    lines.push(
+      "heard (references, not words: re-read each with hear while it is live):",
+      ...letter.heard.map((ref) => quote(`- ${heardName(ref)}`)),
+    );
+  }
   return lines.join("\n");
 }
 
@@ -457,7 +703,11 @@ export function listLetters(
           : letter.sessionId === attachedSessionId
             ? "this session"
             : `session ${shortSession(letter.sessionId)}`;
-      return `letter ${letter.id} · ${state} · ${letter.bytes} bytes · left ${age(now - letter.leftAt)} ago by ${by} · expires ${iso(letter.expiresAt)} · reason: ${cleanName(letter.reason)}`;
+      const heard =
+        letter.heard.length === 0
+          ? ""
+          : ` · heard: ${letter.heard.map(heardName).join(", ")}`;
+      return `letter ${letter.id} · ${state} · ${letter.bytes} bytes · left ${age(now - letter.leftAt)} ago by ${by} · expires ${iso(letter.expiresAt)}${heard} · reason: ${cleanName(letter.reason)}`;
     })
     .join("\n");
 }

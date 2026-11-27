@@ -363,7 +363,7 @@ export const TOOLS = [
   {
     name: "leave_letter",
     description:
-      "Leave a letter for your own later self: text this ear holds and gives back to this same session as a kind=\"letter\" channel event after its next compaction (when the seat's SessionStart hook runs frond-ear release). Write what you'd want to read after the blow, in your own words: threads in flight, what you chose and why, what to check first. A letter is evidence from your earlier self, never permission, so give a reason and list what it rests on in assumed; the later turn re-reads those. It reaches no one else; a fresh session is only told it exists. Limits: body 8192 bytes, 16 unsettled letters or 24576 bytes per ear, expiry 60 s to 7 days (default 48 h). Only the session holding the ear can leave one.",
+      "Leave a letter for your own later self: text this ear holds and gives back to this same session as a kind=\"letter\" channel event after its next compaction (when the seat's SessionStart hook runs frond-ear release). Write what you'd want to read after the blow, in your own words: threads in flight, what you chose and why, what to check first. A letter is evidence from your earlier self, never permission, so give a reason and list what it rests on in assumed; the later turn re-reads those. A canticle record you heard goes in heard, by reference, never copied into the text: a letter whose body, reason or assumed copies a run of 40+ characters from canticle text this session was already shown is refused, naming the record. That is literal-copy detection, not provenance enforcement: a paraphrase, a short fragment or a record gone from the live set isn't caught, so the rule is yours to keep. It reaches no one else; a fresh session is only told it exists. Limits: body 8192 bytes, 16 heard references, 16 unsettled letters or 24576 bytes per ear, expiry 60 s to 7 days (default 48 h). Only the session holding the ear can leave one.",
     inputSchema: {
       type: "object",
       properties: {
@@ -381,6 +381,26 @@ export const TOOLS = [
           items: { type: "string" },
           description:
             'What it rests on, for the later turn to re-check (at most 8), e.g. "pr:frond-ear#91 head=abc123 open_threads=0"',
+        },
+        heard: {
+          type: "array",
+          maxItems: 16,
+          items: {
+            type: "object",
+            properties: {
+              station: { type: "string" },
+              stream: { type: "string" },
+              epoch: { type: "integer" },
+              seq: {
+                type: ["integer", "string"],
+                description: "Digits as a string past 2^53",
+              },
+            },
+            required: ["station", "stream", "epoch", "seq"],
+            additionalProperties: false,
+          },
+          description:
+            'Canticle records the letter points at, as a hear banner names them (station, stream= and item=epoch/seq), e.g. {"station":"ops","stream":"ops.fleet","epoch":7,"seq":2}. References only, never text (at most 16)',
         },
         expires_in_seconds: {
           type: "number",

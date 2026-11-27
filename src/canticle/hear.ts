@@ -62,9 +62,17 @@ function stripLookalikes(text: string): string {
     );
 }
 
-function quoted(text: string): string {
+/**
+ * A payload's text as a banner shows it, before the `> ` quoting: cleaned, and with any
+ * look-alike of our own frame defused. The letters' copy guard compares against this form.
+ */
+export function shownText(text: string): string {
   // Clean first: removing invisible controls can join a look-alike back together.
-  return stripLookalikes(cleanText(text))
+  return stripLookalikes(cleanText(text));
+}
+
+function quoted(text: string): string {
+  return shownText(text)
     .split("\n")
     .map((line) => `> ${line}`)
     .join("\n");

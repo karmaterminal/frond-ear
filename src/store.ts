@@ -320,6 +320,17 @@ export interface CanticleWakeGrant {
 }
 
 /**
+ * A canticle record a letter names instead of copying it: `station:stream epoch/seq`.
+ * The seq is kept as decimal digits, since a record's seq is a u64.
+ */
+export interface HeardRef {
+  station: string;
+  stream: string;
+  epoch: number;
+  seq: string;
+}
+
+/**
  * Something an ear's own session left for a later turn of itself (#88),
  * released to it as a channel event when its seat's SessionStart hook says
  * it compacted.
@@ -333,6 +344,8 @@ export interface Letter {
   bytes: number;
   /** What the letter rested on; the receiving turn re-reads each. */
   assumed: string[];
+  /** Canticle records the letter points at, by reference: never their text. */
+  heard: HeardRef[];
   leftAt: number;
   expiresAt: number;
   deliveredAt: number | null;
@@ -884,6 +897,7 @@ export class EventStore {
         body TEXT NOT NULL,
         bytes INTEGER NOT NULL,
         assumed TEXT NOT NULL DEFAULT '[]',
+        heard TEXT NOT NULL DEFAULT '[]',
         left_at INTEGER NOT NULL,
         expires_at INTEGER NOT NULL,
         delivered_at INTEGER,
@@ -1022,6 +1036,19 @@ export class EventStore {
     if (!custodyColumns.has("lineage")) {
       this.database.exec(
         "ALTER TABLE canticle_custody ADD COLUMN lineage TEXT",
+      );
+    }
+    // Letters name heard canticle records by reference; older letters name none.
+    const letterColumns = new Set(
+      (
+        this.database.prepare("PRAGMA table_info(letters)").all() as Array<{
+          name: string;
+        }>
+      ).map((column) => column.name),
+    );
+    if (!letterColumns.has("heard")) {
+      this.database.exec(
+        "ALTER TABLE letters ADD COLUMN heard TEXT NOT NULL DEFAULT '[]'",
       );
     }
     // An earlier build of the egress gate had no `unconfirmed` outcome, nonce or resent:
@@ -2110,6 +2137,32 @@ export class EventStore {
       .map(mapCustody);
   }
 
+  /**
+   * What custody says this session was shown whole of a canticle record, by identity: the
+   * payload digests of records the host confirmed it handed to that session (a push it
+   * offered) or that its own `hear` returned. A push only claimed, a record cut to fit or
+   * shown as counts, and anything shown to another session are not among them.
+   */
+  public canticleReleasedTo(
+    ear: string,
+    sessionId: string,
+  ): Map<string, Set<string>> {
+    const rows = this.database
+      .prepare(
+        `SELECT identity, digest FROM canticle_custody
+          WHERE ear = ? AND offered_at IS NOT NULL AND offer_session = ?
+            AND shown = 'whole' AND digest IS NOT NULL`,
+      )
+      .all(ear, sessionId) as Array<{ identity: string; digest: string }>;
+    const released = new Map<string, Set<string>>();
+    for (const row of rows) {
+      const digests = released.get(row.identity) ?? new Set<string>();
+      digests.add(row.digest);
+      released.set(row.identity, digests);
+    }
+    return released;
+  }
+
   /** Custody is whole for exposures claimed at or after this time. */
   public canticleCustodySince(): number {
     return Number(this.runtimeState(CUSTODY_SINCE) ?? 0);
@@ -2724,15 +2777,16 @@ export class EventStore {
     body: string;
     bytes: number;
     assumed: string[];
+    heard: HeardRef[];
     leftAt: number;
     expiresAt: number;
     releasesAtLeave: number;
   }): number {
     const result = this.database
       .prepare(
-        `INSERT INTO letters (ear, session_id, reason, body, bytes, assumed, left_at, expires_at,
-           releases_at_leave)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO letters (ear, session_id, reason, body, bytes, assumed, heard, left_at,
+           expires_at, releases_at_leave)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         letter.ear,
@@ -2741,6 +2795,7 @@ export class EventStore {
         letter.body,
         letter.bytes,
         JSON.stringify(letter.assumed),
+        JSON.stringify(letter.heard),
         letter.leftAt,
         letter.expiresAt,
         letter.releasesAtLeave,
@@ -2753,7 +2808,8 @@ export class EventStore {
     return (
       this.database
         .prepare(
-          `SELECT id, session_id AS sessionId, reason, body, bytes, assumed, left_at AS leftAt,
+          `SELECT id, session_id AS sessionId, reason, body, bytes, assumed, heard,
+                  left_at AS leftAt,
                   expires_at AS expiresAt, delivered_at AS deliveredAt, deliveries, nonce,
                   acked_at AS ackedAt, releases_at_leave AS releasesAtLeave
              FROM letters WHERE ear = ? ORDER BY id`,
@@ -2762,6 +2818,7 @@ export class EventStore {
     ).map((row) => ({
       ...(row as unknown as Letter),
       assumed: JSON.parse(String(row.assumed)) as string[],
+      heard: JSON.parse(String(row.heard)) as HeardRef[],
     }));
   }
 
