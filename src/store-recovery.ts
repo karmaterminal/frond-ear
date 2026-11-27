@@ -243,6 +243,12 @@ function recordedPath(marker: string): string {
 }
 
 /**
+ * fsync errors that mean the file system can't sync a directory at all, as opposed to a
+ * sync that failed (EIO and the rest), which refuses (🌫's review of 4723d24).
+ */
+const DIRECTORY_SYNC_UNSUPPORTED = new Set(["EINVAL", "ENOTSUP", "EOPNOTSUPP"]);
+
+/**
  * Written whole, read back whole and synced, file and directory, before the first
  * rename; never overwrites. Throws if any of that fails, so nothing moves: a short write
  * (writeSync returns fewer bytes than asked, as under a file-size limit) is written on
@@ -277,15 +283,22 @@ function writeMarker(marker: string, content: ResetMarker): void {
       `the reset marker reads back ${back.length} bytes, not the ${bytes.length} written`,
     );
   }
+  if (process.platform === "win32") {
+    return; // A directory can't be opened to sync there; the file itself is synced.
+  }
+  const directory = openSync(dirname(marker), "r");
   try {
-    const directory = openSync(dirname(marker), "r");
-    try {
-      fsyncSync(directory);
-    } finally {
-      closeSync(directory);
+    fsyncSync(directory);
+  } catch (error) {
+    if (
+      !DIRECTORY_SYNC_UNSUPPORTED.has(
+        String((error as { code?: unknown }).code),
+      )
+    ) {
+      throw error;
     }
-  } catch {
-    // A directory that can't be opened to sync (not Linux): the file itself is synced.
+  } finally {
+    closeSync(directory);
   }
 }
 

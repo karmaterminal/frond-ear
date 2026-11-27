@@ -4,6 +4,7 @@ import fs, {
   chmodSync,
   copyFileSync,
   existsSync,
+  fstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -764,6 +765,47 @@ test(
       }
     } finally {
       rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "a directory fsync that fails (EIO) refuses before any rename",
+  { skip: process.platform === "win32" ? "no directory fsync" : false },
+  () => {
+    const directory = scratch();
+    const path = join(directory, "ear.db");
+    const garbage = Buffer.from("garbage ".repeat(600));
+    const real = fs.fsyncSync;
+    try {
+      writeFileSync(path, garbage);
+      writeFileSync(`${path}-wal`, "old wal ".repeat(60));
+      fs.fsyncSync = (fd: number) => {
+        if (fstatSync(fd).isDirectory()) {
+          throw Object.assign(new Error("EIO: i/o error, fsync"), {
+            code: "EIO",
+          });
+        }
+        real(fd);
+      };
+      syncBuiltinESMExports();
+      assert.throws(
+        () => setStoreAside(path, new Error("file is not a database"), AT),
+        (error: Error) =>
+          error.message.includes("refusing to start") &&
+          error.message.includes("EIO") &&
+          error.message.includes("Nothing was moved"),
+      );
+    } finally {
+      fs.fsyncSync = real;
+      syncBuiltinESMExports();
+    }
+    try {
+      assert.deepEqual(readFileSync(path), garbage);
+      assert.ok(existsSync(`${path}-wal`));
+      assert.deepEqual(quarantined(directory), [], "nothing moved");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
     }
   },
 );
