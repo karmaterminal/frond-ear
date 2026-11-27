@@ -2447,12 +2447,15 @@ export class CanticleDelivery {
 
   /**
    * The ear's effective mode for this record's station now, for custody of a `hear`
-   * (binary-canticle#161): `off` where the ear has no delivery.
+   * (binary-canticle#161) and the guide's rows; for the ear as a whole with no station.
+   * `off` where the ear has no delivery.
    */
-  modeOf(ear: string, item: LiveItem): DeliveryMode {
+  modeOf(ear: string, item?: Pick<LiveItem, "key" | "station">): DeliveryMode {
     const config = this.#deps.config();
     if (config.canticle?.delivery[ear] === undefined) return "off";
-    return this.#modes(ear, config, this.#deps.clock.now()).of(item);
+    return this.#modes(ear, config, this.#deps.clock.now()).of(
+      item === undefined ? undefined : { key: item.key, station: item.station },
+    );
   }
 
   /** The ear's modes: config ceilings, the session's choices, and the effective result. */

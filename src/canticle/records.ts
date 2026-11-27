@@ -93,6 +93,14 @@ const ADMISSIONS = new Set([
   "equivocation",
 ]);
 const BREAKER = new Set(["closed", "open", "half_open"]);
+/**
+ * `retract` reasons that withdraw a record (RFC-0002 §2.2): the guide keeps a mark of each
+ * while the record would still be on air. A supersession is a newer value, and an expiry
+ * is the record's own end; neither is a withdrawal.
+ */
+const WITHDRAWN_REASONS = new Set(["plucked", "revoked", "quarantined"]);
+
+type WithdrawnMark = NonNullable<HearView["withdrawn"]>[number];
 
 type Json = null | boolean | number | string | Json[] | { [k: string]: Json };
 type Obj = { [k: string]: Json };
@@ -139,6 +147,10 @@ class LiveSet {
 
   has(idem: string): boolean {
     return this.#all.has(idem);
+  }
+
+  get(idem: string): LiveRecord | undefined {
+    return this.#all.get(idem)?.record;
   }
 
   /** In admission order; a record put again keeps its place. */
@@ -546,6 +558,12 @@ export class RecordConsumer {
   noDatagrams = false;
   readonly presence = new Map<string, string>();
   readonly #live = new LiveSet();
+  /**
+   * What the host daemon withdrew from the live set, by idem, each until the record would
+   * have left anyway; at most `MAX_LIVE`, the oldest going first. Facts, not live state:
+   * a lost connection or a new run leaves them be.
+   */
+  readonly #withdrawn = new Map<string, WithdrawnMark>();
   /** Every ear's `station:stream` patterns together: what admission counts as tuned. */
   #tune: readonly string[];
   /** Per share, what the live set dropped (tuned streams, at most `MAX_OMITTED_STREAMS`). */
@@ -701,6 +719,9 @@ export class RecordConsumer {
         if (!str(rec.idem)) {
           this.#count("malformed_record");
           return;
+        }
+        if (str(rec.reason) && WITHDRAWN_REASONS.has(rec.reason)) {
+          this.#markWithdrawn(rec.idem, rec.reason, nowMs);
         }
         this.#live.delete(rec.idem);
         return;
@@ -1172,6 +1193,28 @@ export class RecordConsumer {
     return share;
   }
 
+  /** A record of the live set was withdrawn: keep a mark of it while it would be on air. */
+  #markWithdrawn(idem: string, reason: string, nowMs: number): void {
+    const held = this.#live.get(idem);
+    if (held === undefined || held.localExpiryAt <= nowMs) return;
+    const item = held.item;
+    this.#withdrawn.delete(idem);
+    if (this.#withdrawn.size >= MAX_LIVE) {
+      const oldest = this.#withdrawn.keys().next().value;
+      if (oldest !== undefined) this.#withdrawn.delete(oldest);
+    }
+    this.#withdrawn.set(idem, {
+      station: item.station,
+      stream: item.stream,
+      key: item.key,
+      class: item.class,
+      identity: `${item.key.toLowerCase()}:${item.epoch}:${item.stream}:${item.seq}`,
+      reason,
+      at: nowMs,
+      until: held.localExpiryAt,
+    });
+  }
+
   /**
    * Everything live goes (a run ended, records were lost, delivery stopped). What the
    * live set dropped before is moot now: its windows close, and their reasons with them.
@@ -1562,6 +1605,11 @@ export class RecordConsumer {
         ageMs: Math.max(r.item.ageMs, nowMs - r.item.issuedAt),
       });
     }
+    const withdrawn: WithdrawnMark[] = [];
+    for (const [idem, mark] of this.#withdrawn) {
+      if (mark.until <= nowMs) this.#withdrawn.delete(idem);
+      else if (tuned(mark.station, mark.stream)) withdrawn.push({ ...mark });
+    }
     const blind =
       !listening || this.noDatagrams || this.lastDatagramAt === undefined;
     return {
@@ -1600,6 +1648,7 @@ export class RecordConsumer {
           }
         : {}),
       ...(retuned.length > 0 ? { retuned } : {}),
+      ...(withdrawn.length > 0 ? { withdrawn } : {}),
     };
   }
 }

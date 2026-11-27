@@ -680,6 +680,70 @@ by default.
    If nothing at all has been heard for 30 s, every station reads **unknown**, not offline: silence from
    everyone at once is more likely our own socket or network.
 
+### The guide (`canticle_guide`)
+
+`canticle_guide` is the first slice of the trainboard (binary-canticle RFC-0002 §3.3, "Searching the guide"):
+what is on air now, one row per tuned `station:stream`, read from what the listener already holds. `hear` reads
+the items; the guide only lists them.
+
+```json
+{
+  "ear": "my-ear",
+  "at": "2026-11-26T18:00:00Z",
+  "look": "metadata only (station, stream, class); no payload text is read, searched or shown. A look, not an arrival: …",
+  "listener": "listening",
+  "delivery": "immediate",
+  "streams": 2,
+  "rows": [
+    {
+      "station": "ops",
+      "stream": "ops.fleet",
+      "classes": ["advisory"],
+      "live": 1,
+      "newestHeardAt": "2026-11-26T17:59:58Z",
+      "newestAgeS": 2,
+      "freshness": "fresh",
+      "liveUntil": "2026-11-26T18:05:00Z",
+      "keys": ["0123456789abcdef"],
+      "verification": "verified",
+      "presence": "EQUIPPED_SPEAKING",
+      "delivery": "immediate",
+      "muted": false,
+      "withdrawn": {
+        "count": 1,
+        "lastAt": "2026-11-26T17:59:00Z",
+        "reasons": ["plucked"]
+      }
+    }
+  ],
+  "nextCursor": "…"
+}
+```
+
+| Field                              | What it says                                                                                                                                                                                                                                                |
+| ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `classes`, `live`                  | The row's classes, and how many items are on air now: unexpired and not withdrawn.                                                                                                                                                                          |
+| `newestHeardAt`, `newestAgeS`      | When the newest live item was first heard, and its receiver-measured age.                                                                                                                                                                                   |
+| `freshness`                        | `aged` when that item is older than its class's stale limit (RFC-0001 §6.3, as `hear` marks it), `fresh` otherwise, `none live` with nothing live.                                                                                                          |
+| `liveUntil`                        | The expiry horizon: when the last live item leaves.                                                                                                                                                                                                         |
+| `keys`, `verification`, `presence` | The station key ids, and `verified` (every listed item verified against its manifest key; nothing else is in the live set) or `ROOT_UNKNOWN` (verified, but no root item heard since tuning in, RFC-0001 §8.6). `presence` is the station's presence state. |
+| `delivery`, `muted`                | This ear's delivery mode for the station now, and whether it is muted (`set_canticle_delivery`, `canticle.muted`, or a `set_attention` silence over everything).                                                                                            |
+| `withdrawn`                        | Host daemon source: items the host withdrew here (a PLUCK, a revocation or a quarantine), each shown until it would have expired anyway. A withdrawn item never counts as `live` (RFC-0002 §2.2). A supersession is a newer value, not a withdrawal.        |
+| `expired`, `localOmissions`        | Items the listener still held past their expiry (never counted live), and records frond-ear's own full live set dropped on this stream while they would still be on air (RFC-0002 §3.1, a local omission).                                                  |
+| `gaps`                             | Where coverage is unknown, each said as itself: the listener not bound, blind (every station unknown, not offline), ended, or joined late.                                                                                                                  |
+
+- **Metadata only.** `query` is a case-insensitive substring of a station, stream or class name. It never reads,
+  searches or shows an item's payload, purpose, state key or body ref. No descriptor stream exists yet, so there
+  is no topic to search.
+- **A look, not an arrival.** The guide records no custody or exposure, marks no Discord event seen, echoes no
+  push (it takes no `batch_id`), tunes or mutes nothing and wakes no one. It reads the listener's in-memory view
+  and the ear's delivery modes, and reaches no network.
+- **Paginated.** `limit` (default 20, at most 100) and `cursor`: pass `nextCursor` back for the next page. The
+  cursor is a position in the (station, stream) order, so rows that leave between pages move nothing past it.
+- **Not yet:** payload search, a descriptor stream (station, stream axes, topic and sample, RFC-0002 §3.3), DNS-SD
+  enumeration, and withdrawal marks for the embedded source, whose listener drops a plucked item at once (it is
+  excluded, not shown withdrawn).
+
 **`ops.fleet`** is the first real stream. Fleet scripts (flush, deploy, restart) announce themselves with the
 spike's `canticle sing --control <station.sock> --stream ops.fleet --class advisory --ctype 1 --state-key <host>
 --text "…"`, so an agent going dark is explained without anyone asking. One `state_key` per host means a newer

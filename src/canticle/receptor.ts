@@ -154,6 +154,24 @@ export interface HearView {
    * manifest there, and the host admits as `verified` only a class the key is granted.
    */
   capability?: (key: string) => ReadonlySet<string> | undefined;
+  /**
+   * Record v1: tuned records the host daemon withdrew from this ear's live set (a PLUCK, a
+   * revocation or a quarantine: `retract` reasons other than supersession and expiry),
+   * each kept until the record would have left anyway, so the guide shows them withdrawn
+   * and never live (RFC-0002 §2.2). Not set by the embedded receptor, whose listener drops
+   * a plucked item from its live set at once.
+   */
+  withdrawn?: Array<{
+    station: string;
+    stream: string;
+    key: string;
+    class: string;
+    /** `key:epoch:stream:seq`, as delivery's `identity` spells it. */
+    identity: string;
+    reason: string;
+    at: number;
+    until: number;
+  }>;
   /** Record v1: the untuned share's drops, while any of them would still be on air. */
   untunedOmitted?: { count: number; from: number; to: number; until: number };
   /**
