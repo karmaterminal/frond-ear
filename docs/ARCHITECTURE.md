@@ -152,7 +152,11 @@ hook's `release --hook` hands it back afterwards as `kind="letter"` events under
 
 frond-ear can hear binary-canticle stations. `hear` reads what is on air. The push is opt-in twice:
 an ear's `canticle.delivery` (default `off`), and only records from a station key on
-`canticle.wakeKeys`, sung at hop 0 and not wake-derived (`src/canticle/delivery.ts:1-7`).
+`canticle.wakeKeys`, sung at hop 0 and not wake-derived (`src/canticle/delivery.ts:1-7`). The class
+is a third gate (#176). A key wakes only for the classes `canticle.wakeClasses` names for it, and a bare
+key wakes for `alarm` alone (`src/config.ts:445`, `src/canticle/delivery.ts:965-976`). Records of any
+other class from that key are still delivered, but without a wake, and are marked as such
+(`src/canticle/delivery.ts:381-382`).
 
 - `immediate` coalesces a burst over at least 5 s into one push. `digest` sends one report per
   window. The session can narrow either, down to mute, with `set_canticle_delivery`, and a mute
