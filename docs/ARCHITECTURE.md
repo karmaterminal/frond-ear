@@ -63,11 +63,9 @@ the one before (`src/daemon.ts:1786-1790`), gives back every batch the host neve
 ## After a gap
 
 **A session away.** The ledger is SQLite, so what waits outlives the session and the daemon.
-Queued, context and stored rows have no time limit; their bounds are under
-"Not promised". Offered events
-nobody acted on are deleted `limits.retentionMs` (14 days) after they were offered (`prune`,
-`src/store.ts:3427-3437`). When a session attaches
-(`hello`, `src/daemon.ts:1707-1870`):
+Queued, context and stored rows have no time limit; their bounds are under "Not promised". Offered
+events nobody acted on are deleted `limits.retentionMs` (14 days) after they were offered (`prune`,
+`src/store.ts:3427-3437`). When a session attaches (`hello`, `src/daemon.ts:1707-1870`):
 
 - every batch the host never confirmed goes back to waiting: wake-worthy events as `queued`,
   context as `context` (`revertUnconfirmed`, `src/store.ts:3267-3274`). It goes out again;
