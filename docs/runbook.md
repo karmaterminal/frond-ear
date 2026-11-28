@@ -892,8 +892,11 @@ why, never what. Either way it prints nothing and exits 1.
 `source: "frond-ear <short sha>[+dirty]"`): `names`, and the three sets that say which way each pushes,
 `board_empty` (the board is held, or might be: no `live` count), `walk_breaks` (the walk is `partial`) and
 `not_coverage` (not every station is made partial). It reads no config and asks the daemon nothing. The list is
-`GAP_NAMES` in `src/canticle/house-cli.ts`; every gap map there takes only those names, so a new gap is a type
-error until it is listed, and `test/house-gap-names.test.ts` holds the list to the names the code pushes. A reader
+`GAP_NAMES` in `src/canticle/house-cli.ts`. Every gap map there is typed to those names, so the type check catches a
+literal push of an unlisted name, and `test/house-gap-names.test.ts` holds the list to the names the code pushes.
+Neither sees a widened alias, a cast or a computed call, so the export also checks at run time, both the daemon's
+view as it comes in and `deck.gaps` as it is printed: any name outside the list refuses the whole export (exit 1,
+nothing on stdout, `refused: N gap name(s) outside GAP_NAMES at …`), never dropping the gap. A reader
 with its own table of gap names (ews-concept-new's house card, `scripts/check-gap-names.mjs`) checks it against
 this output whenever frond-ear moves.
 
