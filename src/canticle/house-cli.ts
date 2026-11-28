@@ -389,6 +389,24 @@ function gapName(line: unknown): string {
 type CanticleState = "on" | "off" | "unknown";
 
 /**
+ * Every canticle state word the daemon's status gives, by name (🌿 round 9): the record v1
+ * client's (connecting, connected, backoff, stopped), the embedded receptor's (starting,
+ * listening, backoff, stopped), the embedded source's refused, and the daemon's disabled
+ * when it runs no source. A running source is on, whatever its link: the guide's listener
+ * says the rest. A stopped or refused source is unknown. Any other word, or none, is unknown.
+ */
+const CANTICLE_STATES: Readonly<Record<string, CanticleState>> = {
+  connecting: "on",
+  connected: "on",
+  backoff: "on",
+  starting: "on",
+  listening: "on",
+  stopped: "unknown",
+  refused: "unknown",
+  disabled: "off",
+};
+
+/**
  * One status read's canticle facts: its state (on, off, or unknown when the read says
  * nothing or its source was refused) and the tune its source says it applies to `ear`.
  */
@@ -401,12 +419,11 @@ function canticleOf(
     Array.isArray(raw) && raw.every((p) => typeof p === "string")
       ? (raw as string[])
       : undefined;
+  const word = canticle?.state;
   const state: CanticleState =
-    canticle === undefined || canticle.state === "refused"
-      ? "unknown"
-      : canticle.state === "disabled"
-        ? "off"
-        : "on";
+    typeof word === "string" && Object.hasOwn(CANTICLE_STATES, word)
+      ? CANTICLE_STATES[word]!
+      : "unknown";
   return { state, applied };
 }
 
@@ -954,11 +971,11 @@ export function houseExport(input: {
   const state: CanticleState = live0 ? daemon.canticleState : "unknown";
   const on = live0 && state === "on";
   // payload_text is the daemon's: on, off, or (its state unclear) unknown; offline, the file's.
-  const enabled: boolean | null = live0
-    ? state === "unknown"
+  const enabled: boolean | null = !live0
+    ? null // not reached, or not asked: the file's word is intent only (🌿 round 9)
+    : state === "unknown"
       ? null
-      : state === "on"
-    : configEnabled;
+      : state === "on";
   // The scope: the daemon's applied tune when it says it; else only what its tuned rows
   // prove (a row it listed as tuned); offline, nothing (the file's tune is unverified).
   const applied = on ? daemon.appliedTune : undefined;
@@ -1101,6 +1118,8 @@ export function houseExport(input: {
   }
   const gaps = new Map(daemon.kind === "daemon" ? daemon.gaps : []);
   if (mismatch > 0) gaps.set("config_daemon_mismatch", mismatch);
+  if (daemon.kind === "config" && daemon.listener === "not reached")
+    gaps.set("daemon_unreachable", 1);
   if (applied === undefined && state !== "off")
     gaps.set("runtime_scope_unverified", 1);
   // Canticle off in the daemon: nothing is heard, so no stream is vouched for (each reads
@@ -1217,6 +1236,7 @@ export function houseExport(input: {
         canticle:
           enabled === null ? "unknown" : enabled ? "enabled" : "disabled",
         scope: scopeBasis,
+        canticle_configured: configEnabled ? "enabled" : "disabled",
         config_patterns: configPatterns.length,
         // The file's tune: configured intent, never proof of what the daemon reads (🌫).
         may_read_configured: configured,

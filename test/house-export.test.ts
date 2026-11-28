@@ -85,6 +85,7 @@ const ALLOWED_KEYS = new Set([
   "config_patterns",
   "may_read_configured",
   "may_read_observed",
+  "canticle_configured",
   "withheld",
   "field",
   "reason",
@@ -186,6 +187,7 @@ function setup(
     canticle: {
       enabled: true,
       source: "host-daemon",
+      state: "connected",
       hostSocket: "/nonexistent/canticle.sock",
       manifestPath,
       tune: { [ear]: tune },
@@ -263,6 +265,7 @@ interface Export {
       config_patterns: number;
       may_read_configured: string[];
       may_read_observed: string[];
+      canticle_configured: string;
       hear: string;
       push: {
         mode: string;
@@ -575,10 +578,12 @@ test("house-export: canticle off: no payload text, nothing tuned", async () => {
   try {
     const { code, doc } = await run(s, ["--ear", "scribe", "--offline"]);
     assert.equal(code, 0);
-    assert.equal(doc.reader.payload_text, false);
+    // Offline the daemon's own state is unknown; the file's "disabled" is intent only (🌿 round 9).
+    assert.equal(doc.reader.payload_text, null);
     assert.deepEqual(doc.reader.may_read, []);
-    assert.equal(doc.reader.basis.canticle, "disabled");
-    assert.equal(doc.reader.basis.hear, "off");
+    assert.equal(doc.reader.basis.canticle, "unknown");
+    assert.equal(doc.reader.basis.canticle_configured, "disabled");
+    assert.equal(doc.reader.basis.hear, "unknown");
     assert.equal(
       doc.deck.listener,
       "not asked",
@@ -807,6 +812,7 @@ function guideDaemon(
         text: JSON.stringify({
           canticle: o.status ?? {
             source: "host-daemon",
+            state: "connected",
             stations: { ops: "EQUIPPED_SPEAKING" },
             appliedTune: { scribe: TUNE },
           },
@@ -1249,6 +1255,7 @@ test("house-export: a presence, verification or listener word outside the closed
       request: guideDaemon(view(), {
         status: {
           source: "host-daemon",
+          state: "connected",
           stations: { ops: "Free Text Here", alpha: "EQUIPPED_QUIET" },
         },
         page: (_n, text) => {
@@ -1978,7 +1985,7 @@ test("house-export coverage: one station leaving the presence table as another j
         return {
           ok: true,
           text: JSON.stringify({
-            canticle: { source: "host-daemon", stations },
+            canticle: { source: "host-daemon", state: "connected", stations },
           }),
         };
       },
@@ -2386,6 +2393,7 @@ test("house-export coverage: a guide presence word that disagrees with a steady 
         {
           status: {
             source: "host-daemon",
+            state: "connected",
             stations: { ops: "EQUIPPED_SPEAKING", alpha: "EQUIPPED_QUIET" },
           },
         },
@@ -2471,6 +2479,7 @@ test("house-export coverage: a row's verification that contradicts the status ta
         {
           status: {
             source: "host-daemon",
+            state: "connected",
             stations: { ops: "EQUIPPED_SPEAKING", alpha: "EQUIPPED_QUIET" },
           },
         },
@@ -2499,6 +2508,7 @@ test("house-export coverage: a station the status table doesn't hold, whose row'
         {
           status: {
             source: "host-daemon",
+            state: "connected",
             stations: { ops: "EQUIPPED_SPEAKING", alpha: "EQUIPPED_QUIET" },
           },
           page: (n, text) => {
@@ -2543,6 +2553,7 @@ test("house-export coverage: a tuned row whose verification differs on the re-wa
       request: guideDaemon(view({ items: manyItems() }), {
         status: {
           source: "host-daemon",
+          state: "connected",
           stations: { alpha: "EQUIPPED_QUIET" },
         },
         page: rewalkEdit((r) =>
@@ -2576,6 +2587,7 @@ test("house-export coverage: a status word of unknown says nothing a sighting ca
         {
           status: {
             source: "host-daemon",
+            state: "connected",
             stations: { ops: "EQUIPPED_SPEAKING", alpha: "unknown" },
           },
         },
@@ -2759,6 +2771,7 @@ test("house-export scope: --offline says the scope is the config's, unverified: 
 test("house-export scope: a daemon that doesn't say its tune: only its tuned rows prove a read, and rows the file contradicts are named", async () => {
   const s = setup({}, (host) => ({
     source: "host-daemon",
+    state: "connected",
     stations: Object.fromEntries(host.consumer.presence),
   }));
   try {
@@ -2954,6 +2967,7 @@ test("house-export scope: an appliedTune that isn't a list of patterns is a daem
       request: guideDaemon(view(), {
         status: {
           source: "host-daemon",
+          state: "connected",
           stations: { ops: "EQUIPPED_SPEAKING" },
           appliedTune: { scribe: ["*:ops.fleet", 7] },
         },
@@ -3100,7 +3114,7 @@ test("house-export scope: a row the daemon lists tuned on one page and untuned o
   try {
     const { doc } = await run(s, undefined, {
       request: guideDaemon(view({ items: manyItems() }), {
-        status: { source: "host-daemon", stations: {} },
+        status: { source: "host-daemon", state: "connected", stations: {} },
         page: (n, text) => {
           if (n !== 1) return { ok: true, text };
           const v = JSON.parse(text) as Record<string, unknown>;
@@ -3157,6 +3171,7 @@ test("house-export scope: 🌫's repro: status read 1 from one daemon, the guide
     canticleGuide: () => hostB!.guideView(),
     canticleStatus: () => ({
       source: "host-daemon",
+      state: "connected",
       stations: Object.fromEntries(hostB!.consumer.presence),
       appliedTune: { scribe: hostB!.tune },
     }),
@@ -3254,7 +3269,11 @@ test("house-export coverage: a second status read with canticle on but no presen
         return {
           ok: true,
           text: JSON.stringify({
-            canticle: { source: "host-daemon", appliedTune: { scribe: TUNE } },
+            canticle: {
+              source: "host-daemon",
+              state: "connected",
+              appliedTune: { scribe: TUNE },
+            },
           }),
         };
       },
@@ -3443,6 +3462,7 @@ function phases(opts: { exposes?: boolean } = {}) {
     opts.exposes === false
       ? (host) => ({
           source: "host-daemon",
+          state: "connected",
           stations: Object.fromEntries(host.consumer.presence),
         })
       : undefined,
@@ -3559,5 +3579,93 @@ test("house-export scope: the helper's repro: a later page says canticle is not 
     );
   } finally {
     p.dispose();
+  }
+});
+
+// 🌿 round 9: the canticle state is a closed list of the daemon's own words; anything else
+// is unknown. And with no daemon read, payload text is unknown, the file's only intent.
+test("house-export scope: 🌿's repro: a canticle state word outside the daemon's own (failed, unknown, null, missing) is unknown, never on", async () => {
+  const cases: Array<[string, Record<string, unknown>]> = [
+    ["failed", { state: "failed" }],
+    ["an unknown word", { state: "humming" }],
+    ["null", { state: null }],
+    ["missing", {}],
+    ["an object property's name", { state: "constructor" }],
+  ];
+  for (const [what, extra] of cases) {
+    const s = setup();
+    try {
+      const { doc } = await run(s, undefined, {
+        request: guideDaemon(view(), {
+          status: {
+            source: "host-daemon",
+            stations: { ops: "EQUIPPED_SPEAKING" },
+            appliedTune: { scribe: TUNE },
+            ...extra,
+          },
+        }),
+      });
+      assert.equal(doc.reader.payload_text, null, what);
+      assert.ok(
+        gapNames(doc).includes("canticle_state_unknown"),
+        `${what}: ${JSON.stringify(doc.deck.gaps)}`,
+      );
+      assert.ok(!doc.reader.may_read.includes("*:ops.fleet"), what);
+      assert.equal(doc.reader.may_read_complete, false, what);
+    } finally {
+      s.dispose();
+    }
+  }
+});
+
+test("house-export scope: every canticle state word the daemon's sources emit maps to on, off or unknown by name", async () => {
+  const expect: Array<[string, boolean | null]> = [
+    ["connected", true],
+    ["connecting", true],
+    ["backoff", true],
+    ["starting", true],
+    ["listening", true],
+    ["stopped", null],
+    ["refused", null],
+  ];
+  for (const [word, payload] of expect) {
+    const s = setup();
+    try {
+      const { doc } = await run(s, undefined, {
+        request: guideDaemon(view(), {
+          status: {
+            source: "host-daemon",
+            state: word,
+            stations: { ops: "EQUIPPED_SPEAKING" },
+            appliedTune: { scribe: TUNE },
+          },
+        }),
+      });
+      assert.equal(doc.reader.payload_text, payload, word);
+    } finally {
+      s.dispose();
+    }
+  }
+});
+
+test("house-export scope: 🌿's should-fix: the daemon not reached, or not asked, leaves payload text unknown; the file's word is intent only", async () => {
+  const s = setup();
+  try {
+    const gone = await run(s, undefined, {
+      request: () =>
+        Promise.reject(Object.assign(new Error("x"), { code: "ENOENT" })),
+    });
+    assert.equal(gone.doc.reader.payload_text, null);
+    assert.equal(gone.doc.reader.basis.canticle, "unknown");
+    assert.equal(gone.doc.reader.basis.canticle_configured, "enabled");
+    assert.ok(
+      gone.doc.deck.gaps.some((g) => g.name === "daemon_unreachable"),
+      JSON.stringify(gone.doc.deck.gaps),
+    );
+    const offline = await run(s, ["--ear", "scribe", "--offline"]);
+    assert.equal(offline.doc.reader.payload_text, null);
+    assert.equal(offline.doc.reader.basis.canticle_configured, "enabled");
+  } finally {
+    s.dispose();
   }
 });
