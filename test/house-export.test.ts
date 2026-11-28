@@ -3367,6 +3367,11 @@ test("house-export scope: a daemon that says it tunes nothing, beside an empty a
     );
     assert.deepEqual(doc.reader.may_read, []);
     assert.equal(doc.reader.payload_text, true);
+    // On the walk's first page the plain reply is the whole answer, not a broken walk.
+    assert.ok(
+      !gapNames(doc).includes("page_unparsed"),
+      JSON.stringify(doc.deck.gaps),
+    );
   } finally {
     s.dispose();
   }
@@ -3412,5 +3417,147 @@ test("house-export coverage: the plain no-tune reply on a later page is a broken
     assert.equal(doc.deck.walk, "partial");
   } finally {
     s.dispose();
+  }
+});
+
+// 🌫 at ac469b9d: the plain replies can come on any request, cursor or not. A later page's
+// plain reply still breaks the walk, and its fact is kept: empty tuning disputes every
+// positive seen before; enabled and off accumulate across every request.
+
+/** A CLI client of another scratch daemon, for requests a test routes to it. */
+function clientOf(h: Harness): Setup["request"] {
+  const cli = h.attach(undefined, { role: "cli" });
+  let id = 9_000;
+  return async (message) => {
+    const at = ++id;
+    await cli.send({ ...message, id: at } as never);
+    const r = cli.connection.results().find((x) => x.id === at)!;
+    return { ok: r.ok, text: r.text };
+  };
+}
+
+/** Daemon A (setup's), with 150 tuned rows; daemon B tunes nothing; C has no canticle. */
+function phases(opts: { exposes?: boolean } = {}) {
+  const s = setup(
+    {},
+    opts.exposes === false
+      ? (host) => ({
+          source: "host-daemon",
+          stations: Object.fromEntries(host.consumer.presence),
+        })
+      : undefined,
+    { tune: ["*:ops.fleet"] },
+  );
+  for (let i = 0; i < 150; i++)
+    s.host.sing(10 + i, { station: `st${String(i).padStart(3, "0")}` });
+  const raw = JSON.parse(readFile(s.env.FROND_EAR_CONFIG!, "utf8")) as Record<
+    string,
+    unknown
+  >;
+  let hostB: Host | undefined;
+  const b = harness(parseConfig(raw), {
+    canticleGuide: () => hostB!.guideView(),
+  });
+  hostB = new Host(b.clock, []);
+  hostB.start();
+  const c = harness(parseConfig(raw)); // no canticle source: "not enabled"
+  return {
+    s,
+    toB: clientOf(b),
+    toC: clientOf(c),
+    dispose: () => (b.dispose(), c.dispose(), s.dispose()),
+  };
+}
+
+test("house-export scope: 🌫's repro: page 2 of the walk says the ear tunes nothing: walk partial, and the wildcard leaves may_read", async () => {
+  const p = phases();
+  try {
+    let calls = 0;
+    const { doc } = await run(p.s, undefined, {
+      request: async (m) =>
+        m.type === "call" && calls++ === 1 ? p.toB(m) : p.s.request(m),
+    });
+    assert.ok(
+      gapNames(doc).includes("page_unparsed"),
+      JSON.stringify(doc.deck.gaps),
+    );
+    assert.equal(doc.deck.walk, "partial");
+    assert.ok(
+      gapNames(doc).includes("applied_tune_disagrees"),
+      JSON.stringify(doc.deck.gaps),
+    );
+    assert.ok(!doc.reader.may_read.includes("*:ops.fleet"));
+    assert.equal(doc.reader.may_read_complete, false);
+  } finally {
+    p.dispose();
+  }
+});
+
+test("house-export scope: 🌫's repro: the re-walk's first request says the ear tunes nothing: the wildcard leaves may_read", async () => {
+  const p = phases();
+  try {
+    let calls = 0;
+    const { doc } = await run(p.s, undefined, {
+      request: async (m) =>
+        m.type === "call" && calls++ === 2 ? p.toB(m) : p.s.request(m),
+    });
+    assert.ok(
+      gapNames(doc).includes("applied_tune_disagrees"),
+      JSON.stringify(doc.deck.gaps),
+    );
+    assert.ok(!doc.reader.may_read.includes("*:ops.fleet"));
+  } finally {
+    p.dispose();
+  }
+});
+
+test("house-export scope: 🌫's repro, legacy daemon: a later no-tune reply disputes the exact positives seen before", async () => {
+  const p = phases({ exposes: false });
+  try {
+    let calls = 0;
+    const { doc } = await run(p.s, undefined, {
+      request: async (m) =>
+        m.type === "call" && calls++ === 1 ? p.toB(m) : p.s.request(m),
+    });
+    assert.deepEqual(
+      doc.reader.may_read,
+      [],
+      "no earlier exact positive survives",
+    );
+    assert.ok(
+      doc.reader.basis.may_read_observed.includes("st000:ops.fleet"),
+      "kept as observed",
+    );
+    assert.equal(
+      station(doc, "st000").streams.find((x) => x.stream === "ops.fleet")
+        ?.tuned,
+      null,
+    );
+  } finally {
+    p.dispose();
+  }
+});
+
+test("house-export scope: the helper's repro: a later page says canticle is not enabled: contradicts, payload text unknown", async () => {
+  const p = phases();
+  try {
+    let calls = 0;
+    const { doc } = await run(p.s, undefined, {
+      request: async (m) =>
+        m.type === "call" && calls++ === 1 ? p.toC(m) : p.s.request(m),
+    });
+    assert.ok(
+      gapNames(doc).includes("canticle_state_contradicts"),
+      JSON.stringify(doc.deck.gaps),
+    );
+    assert.equal(doc.reader.payload_text, null);
+    assert.equal(doc.deck.walk, "partial");
+    assert.notEqual(
+      doc.deck.listener,
+      "canticle off",
+      "a later word never stands alone",
+    );
+  } finally {
+    p.dispose();
   }
 });

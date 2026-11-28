@@ -288,6 +288,8 @@ type DaemonView =
       appliedTune: string[] | undefined;
       /** Every applied tune pattern either status read reported, accepted or not. */
       observedTune: string[];
+      /** A guide reply said this ear tunes nothing: every positive seen is disputed. */
+      tunesNothing: boolean;
       /** Rows the daemon listed tuned on one sighting and untuned on another. */
       tunedUnknown: Set<string>;
     }
@@ -458,7 +460,8 @@ async function readDaemon(
   // taken only when both status reads and the guide's own rows agree (🌿 R7, 🌫).
   const first = canticleOf(canticle, ear);
   let canticleState: CanticleState = first.state;
-  let guideSaid: "on" | "off" | undefined;
+  /** Every canticle state the guide's replies showed, on any request: never first or last wins. */
+  const guideSays = new Set<"on" | "off">();
   let guideTunesNothing = false;
   if (first.state === "on" && canticle?.source !== "host-daemon")
     gap("untuned_partial_source");
@@ -554,31 +557,29 @@ async function readDaemon(
         view = undefined;
       }
       if (view === undefined || !Array.isArray(view.rows)) {
-        // Two plain answers are the guide's own, and only on the walk's first page.
-        if (
-          pass === 0 &&
-          page === 0 &&
-          /^canticle is not enabled/u.test(result.text)
-        ) {
-          listener = "canticle off";
-          guideSaid = "off";
-        } else if (
-          pass === 0 &&
-          page === 0 &&
-          /^canticle: this ear tunes no station:stream/u.test(result.text)
-        ) {
-          // A plain success, and an observed fact (🌫 at 1b89902e): canticle is on and the
-          // applied tuning is empty. Empty tuning, not empty air: a tuned ear with nothing on
-          // air answers rows [] instead.
-          guideSaid = "on";
+        // Two plain answers are the guide's own, and the daemon can give either on any
+        // request, cursor or not (🌫 at ac469b9d). Each is an observed fact wherever it comes:
+        // "not enabled" is canticle off; "tunes no station:stream" is canticle on with the
+        // applied tuning empty (empty tuning, not empty air: a tuned ear with nothing on air
+        // answers rows [] instead). Past the walk's first page it also breaks the walk.
+        const opening = pass === 0 && page === 0;
+        const off = /^canticle is not enabled/u.test(result.text);
+        const none = /^canticle: this ear tunes no station:stream/u.test(
+          result.text,
+        );
+        if (off) guideSays.add("off");
+        if (none) {
+          guideSays.add("on");
           guideTunesNothing = true;
-        } else {
+        }
+        if (opening && off) listener = "canticle off";
+        if (!opening || (!off && !none)) {
           gap("page_unparsed");
           broken = passBroken = true;
         }
         break;
       }
-      guideSaid ??= "on";
+      guideSays.add("on");
       // Every page's coverage signals count, not just the first's (🌫 at f22fae03): a gap
       // line on any page is kept, by name, at the most any one page said it.
       const pageGaps = new Map<string, number>();
@@ -809,8 +810,8 @@ async function readDaemon(
     gap("canticle_state_changed");
     canticleState = "unknown";
   } else if (
-    (first.state === "off" && guideSaid === "on") ||
-    (first.state === "on" && guideSaid === "off")
+    (first.state === "off" && guideSays.has("on")) ||
+    (first.state === "on" && guideSays.has("off"))
   ) {
     gap("canticle_state_contradicts");
     canticleState = "unknown";
@@ -919,6 +920,7 @@ async function readDaemon(
     unsure,
     canticleState,
     appliedTune,
+    tunesNothing: guideTunesNothing,
     observedTune: observed,
     tunedUnknown,
     presence,
@@ -970,7 +972,7 @@ export function houseExport(input: {
           ? "the running daemon's applied tune"
           : "the running daemon's tuned rows only (it doesn't say its tune)";
   // A row the daemon listed both ways proves nothing (🌿 R7).
-  const provenRows =
+  const tunedRowNames =
     on && applied === undefined
       ? [
           ...new Set(
@@ -980,6 +982,10 @@ export function houseExport(input: {
           ),
         ].sort()
       : [];
+  // A reply that said this ear tunes nothing disputes every positive seen, exact rows as
+  // well as wildcards (🌫 at ac469b9d): they leave may_read and are kept only as observed.
+  const disputesAll = live0 && daemon.tunesNothing;
+  const provenRows = disputesAll ? [] : tunedRowNames;
   const patterns = applied ?? provenRows;
   let mismatch = 0;
   if (live0 && state !== "unknown" && on !== configEnabled) mismatch += 1;
@@ -1066,7 +1072,9 @@ export function houseExport(input: {
   const configured: string[] = [];
   const observedKept =
     daemon.kind === "daemon"
-      ? daemon.observedTune.filter((p) => patternIssue(p) === null)
+      ? [...daemon.observedTune, ...(disputesAll ? tunedRowNames : [])].filter(
+          (p) => patternIssue(p) === null,
+        )
       : [];
   for (const pattern of configPatterns) {
     const issue = patternIssue(pattern);
@@ -1104,6 +1112,10 @@ export function houseExport(input: {
     for (const row of daemon.rows) rowTuned.set(rowKey(row), true);
     for (const row of daemon.untuned) rowTuned.set(rowKey(row), false);
     for (const key of daemon.tunedUnknown) rowTuned.delete(key);
+    // Empty tuning was seen: no row's tuned listing stands, so each reads unknown.
+    if (daemon.tunesNothing) {
+      for (const [key, tuned] of rowTuned) if (tuned) rowTuned.delete(key);
+    }
   }
   if (daemon.kind === "daemon") {
     // readDaemon already held every presence word to the closed list.
