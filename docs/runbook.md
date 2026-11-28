@@ -852,6 +852,31 @@ spike's `canticle sing --control <station.sock> --stream ops.fleet --class advis
 --text "…"`, so an agent going dark is explained without anyone asking. One `state_key` per host means a newer
 status supersedes the older one.
 
+### The house export (`frond-ear house-export`)
+
+`frond-ear house-export --ear <name> [--offline]` prints one JSON document (`kind: "frond-house-export/0"`) that
+ews-concept-new's house card renders from (`render-house-card --from`, frond-house §3.C.1): one ear's own view,
+headed by `source: "frond-ear <short sha>[+dirty] ear <name>"`. It reads two files and two looks:
+
+- **the config**, with the daemon's own parser (`FROND_EAR_CONFIG`), and only `canticle.enabled`, `tune.<ear>`,
+  `delivery.<ear>` and `muted` from it;
+- **the manifest** (`canticle.manifestPath`): station names and their stream names only;
+- **the daemon**, as a CLI client over its usual socket: `status` (only its canticle presence table) and every page
+  of `canticle_guide` (rows and `untuned`). Both are the looks `ear_status` and the guide already are. `--offline`,
+  or a daemon it can't reach, leaves `deck.view: "config"` with `listener` `not asked` or `not reached`, and every
+  `live` count `null`.
+
+| Part            | What it says                                                                                                                                                                                                                                                                                                                                                        |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `reader`        | `reader` is the ear. `may_read` is its `canticle.tune` list as it stands, tune.ts's patterns. `payload_text` is whether `hear` shows this ear payload text at all: `true` whenever canticle is enabled, since delivery gates only what is pushed. `basis.push` keeps the push side apart (mode, style, mute, station-named modes; key-scoped entries only counted). |
+| `deck.stations` | Every station the manifest, the tune, the presence table or a guide row names, sorted. `presence` is the presence word, or `null` when the daemon's table doesn't hold it. `verification` is the guide's. `in_manifest` says whether the manifest has an entry.                                                                                                     |
+| `….streams`     | Each stream with `tuned` (tune.ts's answer for `may_read`), `admitted` (`true` when the station's manifest entry names the stream, otherwise `null`, never `false`), `live` (items on air now, from the guide) and `newest_age_ms`. `streams_known` is `partial` with no daemon view, past the guide's untuned cap, or past 20 pages.                               |
+| `deck.left_out` | What it counted instead of printing: stations known only by key id (`unnamed_stations`), untuned streams past the guide's 50 (`untuned_more`), a guide longer than 20 pages (`truncated`), and names that aren't identifiers (`refused_names`).                                                                                                                     |
+
+Names and state words only, built field by field. No payload, purpose or state key reaches it (the guide never
+reads them), and no key id, public key, Discord id, path or token. It has no beacon age and no window start, and
+it leaves the guide's `gaps` lines out, since they are prose. It starts, stops and writes nothing.
+
 ### Delivery modes
 
 By default nothing heard reaches a session unasked (frond-ear#65). An ear opts in with a `canticle.delivery`
