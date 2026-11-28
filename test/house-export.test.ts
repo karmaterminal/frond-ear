@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { runHouseExport } from "../src/canticle/house-cli.ts";
+import { identityIn, runHouseExport } from "../src/canticle/house-cli.ts";
 import { tunes } from "../src/canticle/tune.ts";
 import type { CliRequest } from "../src/client.ts";
 import { parseConfig } from "../src/config.ts";
@@ -49,7 +49,6 @@ const ALLOWED_KEYS = new Set([
   "muted",
   "stations",
   "station",
-  "key_scoped",
   "deck",
   "view",
   "listener",
@@ -68,10 +67,14 @@ const ALLOWED_KEYS = new Set([
   "live",
   "newest_age_ms",
   "left_out",
-  "unnamed_stations",
   "untuned_more",
   "truncated",
-  "refused_names",
+  "may_read_complete",
+  "may_read_withheld",
+  "withheld",
+  "field",
+  "reason",
+  "count",
 ]);
 
 function keysOf(value: unknown, out: Set<string> = new Set()): Set<string> {
@@ -111,7 +114,15 @@ function setup(
     lastError: `payload ${SENTINEL}`,
     stations: Object.fromEntries(host.consumer.presence),
   }),
+  opts: {
+    ear?: string;
+    tune?: string[];
+    manifestStations?: Array<{ name: string; streams: string[] }>;
+    pushStations?: Record<string, string>;
+  } = {},
 ): Setup {
+  const ear = opts.ear ?? "scribe";
+  const tune = opts.tune ?? TUNE;
   const dir = mkdtempSync(join(tmpdir(), "frond-ear-house-"));
   const publicKeys = [publicKeyHex(), publicKeyHex(), publicKeyHex()];
   const manifestPath = join(dir, "fleet.json");
@@ -137,6 +148,11 @@ function setup(
           classes: ["advisory"],
           streams: ["chatter"],
         },
+        ...(opts.manifestStations ?? []).map((st) => ({
+          ...st,
+          public_key: publicKeyHex(),
+          classes: ["advisory"],
+        })),
       ],
     }),
   );
@@ -146,7 +162,7 @@ function setup(
     peerAgents: [PEER_BOT],
     labels: { [PRINCIPAL]: "figs" },
     ears: {
-      scribe: {
+      [ear]: {
         target: "claude-channel",
         channels: { [CHANNEL]: { mode: "mentions" }, [ROOM]: { mode: "room" } },
       },
@@ -156,12 +172,12 @@ function setup(
       source: "host-daemon",
       hostSocket: "/nonexistent/canticle.sock",
       manifestPath,
-      tune: { scribe: TUNE },
+      tune: { [ear]: tune },
       wakeKeys: advisory([OPS, ALPHA]),
       delivery: {
-        scribe: {
+        [ear]: {
           mode: "digest",
-          stations: { ops: "immediate", [ALPHA]: "off" },
+          stations: opts.pushStations ?? { ops: "immediate", [ALPHA]: "off" },
         },
       },
       ...canticle,
@@ -174,7 +190,7 @@ function setup(
     canticleGuide: () => host!.guideView(),
     canticleStatus: () => status(host!),
   });
-  host = new Host(h.clock, TUNE);
+  host = new Host(h.clock, tune);
   host.start();
   const cli = h.attach(undefined, { role: "cli" });
   let id = 1_000;
@@ -223,6 +239,8 @@ interface Export {
     reader: string;
     payload_text: boolean | null;
     may_read: string[];
+    may_read_complete: boolean;
+    may_read_withheld: number;
     basis: {
       canticle: string;
       hear: string;
@@ -231,7 +249,6 @@ interface Export {
         style: string;
         muted: boolean;
         stations: Array<{ station: string; mode: string }>;
-        key_scoped: number;
       };
     };
   };
@@ -243,12 +260,11 @@ interface Export {
     manifest: string;
     stations: Station[];
     left_out: {
-      unnamed_stations: number;
       untuned_more: number;
       truncated: boolean;
-      refused_names: number;
     };
   };
+  withheld: Array<{ field: string; reason: string; count: number }>;
 }
 
 async function run(
@@ -306,7 +322,11 @@ test("house-export: the reader profile is the ear's own config: its name, its tu
     assert.deepEqual(doc.reader.basis.push.stations, [
       { station: "ops", mode: "immediate" },
     ]);
-    assert.equal(doc.reader.basis.push.key_scoped, 1);
+    assert.equal(doc.reader.may_read_complete, true);
+    assert.equal(doc.reader.may_read_withheld, 0);
+    assert.deepEqual(doc.withheld, [
+      { field: "push.stations", reason: "key-id shape", count: 1 },
+    ]);
   } finally {
     s.dispose();
   }
@@ -454,7 +474,11 @@ test("house-export: a station known only by key id is counted, never printed", a
     s.host.sing(1, { station: "0f1e2d3c4b5a6978", stream: "ops.fleet" });
     const { doc, out } = await run(s);
     assert.ok(!out.includes("0f1e2d3c4b5a6978"));
-    assert.equal(doc.deck.left_out.unnamed_stations, 1);
+    assert.deepEqual(
+      doc.withheld.filter((w) => w.field === "deck.stations"),
+      [{ field: "deck.stations", reason: "key-id shape", count: 1 }],
+      "presence and a row of one key id are one station",
+    );
   } finally {
     s.dispose();
   }
@@ -555,6 +579,111 @@ test("house-export: read-only: it writes nothing beside the config or manifest",
     await run(s);
     await run(s, ["--ear", "scribe", "--offline"]);
     assert.deepEqual(readdirSync(s.dir).sort(), before);
+  } finally {
+    s.dispose();
+  }
+});
+
+// 🌫 on #147: "no identities" held only for deck station keys. Every output string is
+// checked: each field below carries a name-shaped identity that the config, manifest or
+// host accepts as valid, and each is withheld, counted with a reason, never printed.
+const DISCORD = "1122611838010535946";
+const KEYISH = OPS; // a real fixture key id, and a valid stream name and tune station
+test("house-export: identity-shaped names in every field are withheld, counted with a reason, never printed", async () => {
+  const s = setup({}, undefined, {
+    tune: [
+      "*:ops.fleet",
+      `${KEYISH}:ops.fleet`, // key id as a tune's station
+      `ops:${KEYISH}`, // key id as a tune's stream
+      `ops:s${PRINCIPAL}`, // a Discord id inside a stream name
+    ],
+    manifestStations: [
+      { name: DISCORD, streams: ["chatter"] }, // a Discord id as a station name
+      { name: "/home/figs/station", streams: ["chatter"] }, // a path
+      { name: "beta", streams: [KEYISH, "chatter"] }, // a key id as a manifest stream
+    ],
+    pushStations: { ops: "immediate", [`s${DISCORD}`]: "off" },
+  });
+  try {
+    s.host.presence(PRINCIPAL, "EQUIPPED_QUIET"); // a Discord id in the presence table
+    s.host.sing(1, { station: "ops", stream: KEYISH }); // a tuned row on a key-id stream
+    s.host.sing(2, { station: PEER_BOT, stream: "chatter" }); // an untuned row's station
+    const { code, out, doc } = await run(s);
+    assert.equal(code, 0);
+    for (const value of [KEYISH, PRINCIPAL, PEER_BOT, DISCORD, "/home/figs"]) {
+      assert.ok(!out.includes(value), `${value.slice(0, 6)}… withheld`);
+    }
+    assert.doesNotMatch(out, /[0-9]{17,20}/u);
+    assert.doesNotMatch(out, /[0-9a-f]{16}/iu);
+    // The scope lost patterns, so it says it's incomplete: a card can't read a miss as no.
+    assert.deepEqual(doc.reader.may_read, ["*:ops.fleet"]);
+    assert.equal(doc.reader.may_read_complete, false);
+    // How many patterns the scope lost, for a reader to carry: a count, never the values.
+    assert.equal(doc.reader.may_read_withheld, 3);
+    assert.deepEqual(doc.withheld, [
+      { field: "deck.stations", reason: "discord-id shape", count: 3 },
+      { field: "deck.stations", reason: "path shape", count: 1 },
+      { field: "deck.streams", reason: "key-id shape", count: 2 },
+      { field: "push.stations", reason: "discord-id shape", count: 1 },
+      { field: "reader.may_read", reason: "discord-id shape", count: 1 },
+      { field: "reader.may_read", reason: "key-id shape", count: 2 },
+    ]);
+    // A withheld tune pattern is counted once, under the reader: it adds nothing to the deck.
+    // A station that lost a stream says its list is partial.
+    assert.equal(station(doc, "ops").streams_known, "partial");
+    assert.equal(station(doc, "beta").streams_known, "partial");
+    assert.deepEqual(
+      station(doc, "beta").streams.map((x) => x.stream),
+      ["chatter"],
+    );
+    assert.equal(station(doc, "alpha").streams_known, "complete");
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export: an identity-shaped ear name fails closed: exit 1, nothing printed, the reason without the value", async () => {
+  for (const ear of [DISCORD, KEYISH]) {
+    const s = setup({}, undefined, { ear });
+    try {
+      const { code, out, err } = await run(s, ["--ear", ear]);
+      assert.equal(code, 1, ear);
+      assert.equal(out, "");
+      assert.match(err, /identity-shaped \((discord|key)-id shape\)/u);
+      assert.ok(!err.includes(ear), "the value is not repeated");
+    } finally {
+      s.dispose();
+    }
+  }
+});
+
+test("house-export: the backstop finds any identity-shaped string or number anywhere, by place and reason, never by value", () => {
+  assert.deepEqual(identityIn({ a: "ok", b: ["fine", 3] }), []);
+  assert.deepEqual(
+    identityIn({
+      kind: "frond-house-export/0",
+      a: [{ name: `x${DISCORD}` }],
+      b: { c: KEYISH.toUpperCase() },
+      d: "/etc/hosts",
+      e: 12345678901234567890,
+      f: "a\\b",
+    }),
+    [
+      { at: "a[0].name", reason: "discord-id shape" },
+      { at: "b.c", reason: "key-id shape" },
+      { at: "d", reason: "path shape" },
+      { at: "e", reason: "discord-id shape" },
+      { at: "f", reason: "path shape" },
+    ],
+  );
+});
+
+test("house-export: a whole real export passes its own backstop", async () => {
+  const s = setup();
+  try {
+    s.host.sing(1);
+    const { doc } = await run(s);
+    assert.deepEqual(identityIn(doc), []);
   } finally {
     s.dispose();
   }

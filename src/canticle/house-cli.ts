@@ -14,8 +14,12 @@
 //   `admitted` (named in its station's manifest entry; unknown otherwise, never no) and
 //   what is `live` on air now. No beacon age and no window start exist here, so none is given.
 // - Names and state words only, built field by field: no payload, purpose or state key
-//   (the guide never reads them), no key ids, public keys, Discord ids, paths or tokens. A
-//   station known only by its key id is counted, not named; a name that isn't one is refused.
+//   (the guide never reads them), no key ids, public keys, Discord ids, paths or tokens.
+//   Every name that reaches it (station, stream, tune pattern, push station) is checked for
+//   an identity shape (`identityShape`); one that has one is withheld, and `withheld` says
+//   how many, where and why, never what. A withheld tune pattern marks `may_read` incomplete.
+//   An identity-shaped ear name refuses the export, and a last pass over every output string
+//   (`identityIn`) refuses it whole if anything slipped past, printing nothing.
 // - Read-only. It reads two files and asks the daemon `status` and `canticle_guide`, both
 //   looks (the guide's read of delivery modes purges attention rows whose TTL had already
 //   lapsed, as every such read does); it starts, stops and writes nothing itself.
@@ -53,11 +57,85 @@ export const HOUSE_EXPORT_KIND = "frond-house-export/0";
 const LOOK =
   "names and state words only: no payload text, item content, key, Discord id, path or token";
 
-/** A station or stream name the export will print: identifier-safe, never a key id. */
+/** A station or stream name the export will print: identifier-safe, and no identity shape. */
 const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u;
-const KEY_ID = /^[0-9a-f]{16}$/iu;
 /** A closed state word (presence, verification, delivery mode, listener). */
 const WORD = /^[A-Za-z][A-Za-z_: -]{0,39}$/u;
+
+/** Why a name was withheld: the shape it had, never its value. */
+export type Withheld =
+  | "discord-id shape"
+  | "key-id shape"
+  | "path shape"
+  | "not an identifier";
+
+/**
+ * The identity shapes no export string may carry, anywhere in it: a 17-20 digit run (a
+ * Discord id), 16 hex digits in a row (a station key id, or part of a public key), and a
+ * path separator or home prefix. A name that fits a parser's grammar can still hold one: a
+ * tune's `f6eecf2f43082a97:ops.fleet`, a manifest station named by a Discord id (🌫, #147).
+ */
+export function identityShape(text: string): Withheld | null {
+  if (/[0-9]{17,20}/u.test(text)) return "discord-id shape";
+  if (/[0-9a-f]{16}/iu.test(text)) return "key-id shape";
+  if (/[\\/]|^~/u.test(text)) return "path shape";
+  return null;
+}
+
+/** Why a station or stream name can't be printed, or null when it can. */
+function nameIssue(name: string): Withheld | null {
+  return identityShape(name) ?? (NAME.test(name) ? null : "not an identifier");
+}
+
+/** Why a tune pattern can't be printed, or null when it can (its station may be `*`). */
+function patternIssue(pattern: string): Withheld | null {
+  const at = pattern.indexOf(":");
+  if (at < 0) return "not an identifier";
+  const station = pattern.slice(0, at);
+  return (
+    (station === "*" ? null : nameIssue(station)) ??
+    nameIssue(pattern.slice(at + 1))
+  );
+}
+
+/** The export's own fixed strings, which carry no identity: the kind holds a `/`. */
+const CONSTANTS = new Set<string>([HOUSE_EXPORT_KIND, LOOK]);
+
+/**
+ * The backstop: every string and number in `doc` (keys too) that holds an identity shape,
+ * by place and reason, never by value. The export is refused whole if any is found, so a
+ * field a future change forgets to check fails closed instead of printing.
+ */
+export function identityIn(
+  doc: unknown,
+): Array<{ at: string; reason: Withheld }> {
+  const found: Array<{ at: string; reason: Withheld }> = [];
+  const walk = (value: unknown, at: string) => {
+    if (typeof value === "string") {
+      if (CONSTANTS.has(value)) return;
+      const reason = identityShape(value);
+      if (reason !== null) found.push({ at, reason });
+    } else if (typeof value === "number" || typeof value === "bigint") {
+      const reason = /[0-9]{17,}/u.test(
+        typeof value === "number" ? value.toFixed(0) : String(value),
+      )
+        ? "discord-id shape"
+        : null;
+      if (reason !== null) found.push({ at, reason });
+    } else if (Array.isArray(value)) {
+      value.forEach((item, i) => walk(item, `${at}[${i}]`));
+    } else if (typeof value === "object" && value !== null) {
+      for (const [key, item] of Object.entries(value)) {
+        const place = at === "" ? key : `${at}.${key}`;
+        const reason = identityShape(key);
+        if (reason !== null) found.push({ at: `${place} (key)`, reason });
+        walk(item, place);
+      }
+    }
+  };
+  walk(doc, "");
+  return found;
+}
 
 /** The most guide pages read (100 rows each); past it the deck is marked truncated. */
 const MAX_PAGES = 20;
@@ -85,6 +163,8 @@ interface Building {
   verification: string | null;
   manifestStreams: Set<string> | undefined;
   streams: Map<string, { live: number; newestAgeMs: number | null }>;
+  /** A stream of this station was withheld, so its list is partial. */
+  lost: boolean;
 }
 
 const obj = (value: unknown): Record<string, unknown> | undefined =>
@@ -113,7 +193,8 @@ function gitRevision(): string {
       ["-C", repo, "status", "--porcelain", "--untracked-files=no"],
       { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
     ).trim();
-    return /^[0-9a-f]{7,40}$/u.test(sha)
+    // At most 12 digits: a longer one would read as a key id to the backstop.
+    return /^[0-9a-f]{7,12}$/u.test(sha)
       ? `${sha}${dirty === "" ? "" : "+dirty"}`
       : "unknown";
   } catch {
@@ -216,22 +297,21 @@ export function houseExport(input: {
       : undefined;
   const pushStations = Object.entries(delivery?.stations ?? {});
 
-  // A station known only by its key id is counted once, never named; any other name that
-  // isn't identifier-safe is refused and counted.
-  const unnamed = new Set<string>();
-  let refused = 0;
+  // Every name that reaches the export is checked here first. One that can't be printed is
+  // withheld: counted once per distinct value, under its field and its shape, never kept.
+  const withheld = new Map<string, Set<string>>();
+  const withhold = (field: string, reason: Withheld, value: string) => {
+    const key = `${field}\u0000${reason}`;
+    let values = withheld.get(key);
+    if (values === undefined) withheld.set(key, (values = new Set()));
+    values.add(value.toLowerCase());
+  };
   const stations = new Map<string, Building>();
   const named = (name: unknown): name is string => {
     if (typeof name !== "string") return false;
-    if (KEY_ID.test(name)) {
-      unnamed.add(name.toLowerCase());
-      return false;
-    }
-    if (!NAME.test(name)) {
-      refused += 1;
-      return false;
-    }
-    return true;
+    const issue = nameIssue(name);
+    if (issue !== null) withhold("deck.stations", issue, name);
+    return issue === null;
   };
   const building = (name: string): Building => {
     let st = stations.get(name);
@@ -241,14 +321,18 @@ export function houseExport(input: {
         verification: null,
         manifestStreams: undefined,
         streams: new Map(),
+        lost: false,
       };
       stations.set(name, st);
     }
     return st;
   };
-  const addStream = (st: Building, stream: unknown) => {
-    if (typeof stream !== "string" || !NAME.test(stream)) {
-      refused += 1;
+  const addStream = (st: Building, name: string, stream: unknown) => {
+    if (typeof stream !== "string") return undefined;
+    const issue = nameIssue(stream);
+    if (issue !== null) {
+      withhold("deck.streams", issue, `${name}:${stream}`);
+      st.lost = true;
       return undefined;
     }
     let s = st.streams.get(stream);
@@ -264,14 +348,23 @@ export function houseExport(input: {
       if (!named(entry.name)) continue;
       const st = building(entry.name);
       st.manifestStreams = new Set(entry.streams);
-      for (const stream of entry.streams) addStream(st, stream);
+      for (const stream of entry.streams) addStream(st, entry.name, stream);
     }
   }
+  // A tune pattern that can't be printed is withheld from the reader's scope, which then
+  // says it is incomplete, so a card never reads its absence as a definite no. It adds
+  // nothing to the deck: it is counted once, under the reader.
+  const mayRead: string[] = [];
   for (const pattern of patterns) {
+    const issue = patternIssue(pattern);
+    if (issue !== null) {
+      withhold("reader.may_read", issue, pattern);
+      continue;
+    }
+    mayRead.push(pattern);
     const at = pattern.indexOf(":");
     const name = pattern.slice(0, at);
-    if (name === "*" || !named(name)) continue;
-    addStream(building(name), pattern.slice(at + 1));
+    if (name !== "*") addStream(building(name), name, pattern.slice(at + 1));
   }
   if (daemon.kind === "daemon") {
     for (const [name, state] of daemon.presence) {
@@ -286,7 +379,7 @@ export function houseExport(input: {
         if (st.verification !== "ROOT_UNKNOWN")
           st.verification = row.verification;
       }
-      const s = addStream(st, row.stream);
+      const s = addStream(st, row.station, row.stream);
       if (s === undefined) continue;
       s.live += count(row.live) ?? 0;
       const age = count(row.newestAgeS);
@@ -303,7 +396,7 @@ export function houseExport(input: {
       presence: st.presence,
       verification: st.verification,
       in_manifest: st.manifestStreams !== undefined,
-      streams_known: complete ? "complete" : "partial",
+      streams_known: complete && !st.lost ? "complete" : "partial",
       streams: [...st.streams.entries()]
         .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
         .map(([stream, s]) => ({
@@ -326,7 +419,11 @@ export function houseExport(input: {
     reader: {
       reader: ear,
       payload_text: enabled,
-      may_read: patterns,
+      may_read: mayRead,
+      may_read_complete: mayRead.length === patterns.length,
+      // How many tune patterns were withheld: a reader carries it, so a stream no kept
+      // pattern matches reads unknown there, never outside the scope.
+      may_read_withheld: patterns.length - mayRead.length,
       basis: {
         canticle: enabled ? "enabled" : "disabled",
         hear: enabled ? "payload text of tuned streams" : "off",
@@ -334,11 +431,12 @@ export function houseExport(input: {
           mode: delivery?.mode ?? "off",
           style: delivery?.style ?? "records",
           muted: canticle?.muted === true,
-          stations: pushStations
-            .filter(([scope]) => !KEY_ID.test(scope) && NAME.test(scope))
-            .map(([station, mode]) => ({ station, mode })),
-          key_scoped: pushStations.filter(([scope]) => KEY_ID.test(scope))
-            .length,
+          stations: pushStations.flatMap(([station, mode]) => {
+            const issue = nameIssue(station);
+            if (issue === null) return [{ station, mode }];
+            withhold("push.stations", issue, station);
+            return [];
+          }),
         },
       },
     },
@@ -350,12 +448,26 @@ export function houseExport(input: {
       manifest: manifest instanceof Manifest ? "read" : manifest,
       stations: out,
       left_out: {
-        unnamed_stations: unnamed.size,
         untuned_more: daemon.kind === "daemon" ? daemon.untunedMore : 0,
         truncated: daemon.kind === "daemon" && daemon.truncated,
-        refused_names: refused,
       },
     },
+    withheld: [...withheld.entries()]
+      .map(([key, values]) => {
+        const [field, reason] = key.split("\u0000") as [string, Withheld];
+        return { field, reason, count: values.size };
+      })
+      .sort((a, b) =>
+        a.field !== b.field
+          ? a.field < b.field
+            ? -1
+            : 1
+          : a.reason < b.reason
+            ? -1
+            : a.reason > b.reason
+              ? 1
+              : 0,
+      ),
   };
 }
 
@@ -393,6 +505,15 @@ export async function runHouseExport(
   }
   if (!Object.hasOwn(config.ears, ear)) {
     io.stderr.write(`frond-ear house-export: unknown ear ${ear}\n${USAGE}`);
+    return 1;
+  }
+  // The ear's name is the reader and the source: it can't be withheld, so an
+  // identity-shaped one refuses the export whole.
+  const earIssue = nameIssue(ear);
+  if (earIssue !== null) {
+    io.stderr.write(
+      `frond-ear house-export: refused: the ear's name is identity-shaped (${earIssue}), and every export names its ear; nothing was printed\n`,
+    );
     return 1;
   }
   const canticle = config.canticle;
@@ -434,6 +555,13 @@ export async function runHouseExport(
     manifest,
     daemon,
   });
+  const found = identityIn(doc);
+  if (found.length > 0) {
+    io.stderr.write(
+      `frond-ear house-export: refused: identity-shaped output at ${found.map((f) => `${f.at} (${f.reason})`).join(", ")}; nothing was printed\n`,
+    );
+    return 1;
+  }
   io.stdout.write(`${JSON.stringify(doc, null, 2)}\n`);
   return 0;
 }
