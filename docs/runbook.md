@@ -888,6 +888,15 @@ It fails closed. An identity-shaped ear name refuses the export, since every exp
 over every string and number in the document refuses it whole if any identity shape is left, saying where and
 why, never what. Either way it prints nothing and exits 1.
 
+`frond-ear house-export --gap-names` prints every name `deck.gaps` can carry (`kind: "frond-house-gap-names/0"`,
+`source: "frond-ear <short sha>[+dirty]"`): `names`, and the three sets that say which way each pushes,
+`board_empty` (the board is held, or might be: no `live` count), `walk_breaks` (the walk is `partial`) and
+`not_coverage` (not every station is made partial). It reads no config and asks the daemon nothing. The list is
+`GAP_NAMES` in `src/canticle/house-cli.ts`; every gap map there takes only those names, so a new gap is a type
+error until it is listed, and `test/house-gap-names.test.ts` holds the list to the names the code pushes. A reader
+with its own table of gap names (ews-concept-new's house card, `scripts/check-gap-names.mjs`) checks it against
+this output whenever frond-ear moves.
+
 ### Delivery modes
 
 By default nothing heard reaches a session unasked (frond-ear#65). An ear opts in with a `canticle.delivery`

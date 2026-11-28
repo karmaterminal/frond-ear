@@ -72,7 +72,8 @@ export interface HouseIo {
   now?: () => number;
 }
 
-const USAGE = "usage: frond-ear house-export --ear <name> [--offline]\n";
+const USAGE =
+  "usage: frond-ear house-export --ear <name> [--offline]\n       frond-ear house-export --gap-names\n";
 
 export const HOUSE_EXPORT_KIND = "frond-house-export/0";
 
@@ -275,7 +276,7 @@ type DaemonView =
       untunedMore: number;
       truncated: boolean;
       /** Closed gap names and how often each was seen (never the guide's prose). */
-      gaps: Map<string, number>;
+      gaps: Map<GapName, number>;
       /** Stations a row-level omission or coverage hole names. */
       rowGaps: Set<string>;
       /** Rows (station:stream keys) whose live count or age wasn't a count. */
@@ -317,10 +318,59 @@ const LISTENER_WORDS = new Set([
 ]);
 
 /**
+ * Every name `deck.gaps` can carry (🌿 on ews#15): the one list a reader holds its own
+ * table to, printed by `house-export --gap-names`. Every gap map here takes only these,
+ * so a new name is a type error until it is added (test/house-gap-names.test.ts checks
+ * the list against the names the code pushes, both ways).
+ */
+export const GAP_NAMES = [
+  "applied_tune_changed",
+  "applied_tune_disagrees",
+  "awaiting_landing",
+  "blind",
+  "canticle_off",
+  "canticle_state_changed",
+  "canticle_state_contradicts",
+  "canticle_state_unknown",
+  "changed_mid_walk",
+  "config_daemon_mismatch",
+  "count_changed",
+  "coverage_unknown",
+  "daemon_unreachable",
+  "duplicate_row",
+  "ear_muted",
+  "ended",
+  "host_mute",
+  "joined_late",
+  "not_listening",
+  "omitted_other_tuned",
+  "omitted_untuned",
+  "order_violation",
+  "page_refused",
+  "page_unparsed",
+  "presence_changed",
+  "presence_disagrees",
+  "records_lost",
+  "row_count_mismatch",
+  "row_coverage_unknown",
+  "row_local_omissions",
+  "row_unparsed",
+  "runtime_scope_unverified",
+  "tuned_changed",
+  "unrecognized_gap",
+  "unrecognized_word",
+  "untuned_count_mismatch",
+  "untuned_partial_source",
+  "untuned_unlisted",
+  "verification_changed",
+] as const;
+export type GapName = (typeof GAP_NAMES)[number];
+
+/**
  * The guide's gap lines (guide.ts `gapLines`) by their closed names: the prose never
  * leaves here. A line it doesn't know is `unrecognized_gap`, a gap all the same.
  */
-const GAP_LINES: ReadonlyArray<[RegExp, string]> = [
+const GAP_LINES: ReadonlyArray<[RegExp, GapName]> = [
   [/^the host daemon's receptor ended its run cleanly/u, "ended"],
   [/^the listener is not bound/u, "not_listening"],
   [/^no datagram heard lately/u, "blind"],
@@ -344,7 +394,7 @@ const GAP_LINES: ReadonlyArray<[RegExp, string]> = [
  * Gaps that hold the board empty, or might: nothing on it is a count, so `live` is
  * unknown. A gap line it doesn't know is taken as the worst.
  */
-const BOARD_EMPTY = new Set([
+const BOARD_EMPTY = new Set<GapName>([
   "unrecognized_gap",
   "ended",
   "not_listening",
@@ -352,7 +402,7 @@ const BOARD_EMPTY = new Set([
   "awaiting_landing",
 ]);
 /** Gaps in the walk itself: the guide wasn't read whole, or didn't add up. */
-const WALK_BREAKS = new Set([
+const WALK_BREAKS = new Set<GapName>([
   "order_violation",
   "changed_mid_walk",
   "row_unparsed",
@@ -366,7 +416,7 @@ const WALK_BREAKS = new Set([
  * Gaps that don't make every station partial: a mute on this ear changes pushes, not the
  * board; a row's own omissions or coverage hole make only that row's station partial.
  */
-const NOT_COVERAGE = new Set([
+const NOT_COVERAGE = new Set<GapName>([
   "applied_tune_changed",
   "applied_tune_disagrees",
   "tuned_changed",
@@ -381,7 +431,31 @@ const NOT_COVERAGE = new Set([
   "row_coverage_unknown",
 ]);
 
-function gapName(line: unknown): string {
+export const GAP_NAMES_KIND = "frond-house-gap-names/0";
+
+/**
+ * `house-export --gap-names`: every name `deck.gaps` can carry, and the three sets that
+ * say which way each pushes, so a reader can hold its table to this checkout (🌿, ews#15).
+ */
+export function gapNamesDoc(revision: string): {
+  kind: typeof GAP_NAMES_KIND;
+  source: string;
+  names: GapName[];
+  board_empty: GapName[];
+  walk_breaks: GapName[];
+  not_coverage: GapName[];
+} {
+  return {
+    kind: GAP_NAMES_KIND,
+    source: `frond-ear ${revision}`,
+    names: [...GAP_NAMES],
+    board_empty: [...BOARD_EMPTY].sort(),
+    walk_breaks: [...WALK_BREAKS].sort(),
+    not_coverage: [...NOT_COVERAGE].sort(),
+  };
+}
+
+function gapName(line: unknown): GapName {
   if (typeof line !== "string") return "unrecognized_gap";
   return GAP_LINES.find(([re]) => re.test(line))?.[1] ?? "unrecognized_gap";
 }
@@ -459,8 +533,8 @@ async function readDaemon(
     throw new HouseError("status unparsed");
   }
   const canticle = obj(obj(statusDoc)?.canticle);
-  const gaps = new Map<string, number>();
-  const gap = (name: string, n = 1) =>
+  const gaps = new Map<GapName, number>();
+  const gap = (name: GapName, n = 1) =>
     gaps.set(name, (gaps.get(name) ?? 0) + n);
   const presence = new Map<string, string>();
   for (const [name, state] of Object.entries(obj(canticle?.stations) ?? {})) {
@@ -490,7 +564,7 @@ async function readDaemon(
   let listener = "unknown";
   let truncated = false;
   let broken = false;
-  const guideGaps = new Map<string, number>();
+  const guideGaps = new Map<GapName, number>();
   const untunedAt = new Map<string, number>();
   const countChanged = new Set<string>();
   const badCounts = new Set<string>();
@@ -599,7 +673,7 @@ async function readDaemon(
       guideSays.add("on");
       // Every page's coverage signals count, not just the first's (🌫 at f22fae03): a gap
       // line on any page is kept, by name, at the most any one page said it.
-      const pageGaps = new Map<string, number>();
+      const pageGaps = new Map<GapName, number>();
       if (view.gaps !== undefined) {
         if (Array.isArray(view.gaps)) {
           for (const line of view.gaps) {
@@ -1116,7 +1190,9 @@ export function houseExport(input: {
     const name = pattern.slice(0, at);
     if (name !== "*") addStream(building(name), name, pattern.slice(at + 1));
   }
-  const gaps = new Map(daemon.kind === "daemon" ? daemon.gaps : []);
+  const gaps = new Map<GapName, number>(
+    daemon.kind === "daemon" ? daemon.gaps : [],
+  );
   if (mismatch > 0) gaps.set("config_daemon_mismatch", mismatch);
   if (daemon.kind === "config" && daemon.listener === "not reached")
     gaps.set("daemon_unreachable", 1);
@@ -1324,17 +1400,32 @@ export async function runHouseExport(
   argv: string[],
   io: HouseIo,
 ): Promise<number> {
-  let values: { ear?: string; offline?: boolean };
+  let values: { ear?: string; offline?: boolean; "gap-names"?: boolean };
   try {
     ({ values } = parseArgs({
       args: argv,
-      options: { ear: { type: "string" }, offline: { type: "boolean" } },
+      options: {
+        ear: { type: "string" },
+        offline: { type: "boolean" },
+        "gap-names": { type: "boolean" },
+      },
     }));
   } catch (error) {
     io.stderr.write(
       `${error instanceof Error ? error.message : String(error)}\n${USAGE}`,
     );
     return 1;
+  }
+  // The gap list is the code's own, so it needs no ear, config or daemon.
+  if (values["gap-names"]) {
+    if (values.ear !== undefined || values.offline !== undefined) {
+      io.stderr.write(`--gap-names takes no other option\n${USAGE}`);
+      return 1;
+    }
+    io.stdout.write(
+      `${JSON.stringify(gapNamesDoc((io.revision ?? gitRevision)()), null, 2)}\n`,
+    );
+    return 0;
   }
   const ear = values.ear;
   if (!ear) {
