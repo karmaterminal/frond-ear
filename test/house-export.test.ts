@@ -16,6 +16,9 @@ import {
   revisionWord,
   runHouseExport,
 } from "../src/canticle/house-cli.ts";
+import { guideView } from "../src/canticle/guide.ts";
+import type { GuideItem, GuideSourceView } from "../src/canticle/receptor.ts";
+import { RECORD_V } from "../src/canticle/records.ts";
 import { tunes } from "../src/canticle/tune.ts";
 import type { CliRequest } from "../src/client.ts";
 import { parseConfig } from "../src/config.ts";
@@ -71,6 +74,8 @@ const ALLOWED_KEYS = new Set([
   "live",
   "newest_age_ms",
   "left_out",
+  "walk",
+  "gaps",
   "untuned_more",
   "truncated",
   "may_read_complete",
@@ -263,6 +268,8 @@ interface Export {
     window_start_ms: null;
     manifest: string;
     stations: Station[];
+    walk: string;
+    gaps: Array<{ name: string; count: number }>;
     left_out: {
       untuned_more: number;
       truncated: boolean;
@@ -730,4 +737,679 @@ test("house-export: the source names a short revision only: a sha long enough to
     "unknown",
   );
   assert.equal(revisionWord("not a sha", ""), "unknown");
+});
+
+// 🌿 on #147 (F1): the export turned the guide's "unknown" into "complete". Every gap the
+// guide says, every row-level omission or coverage hole, and every break in the walk now
+// reaches the export as a closed name and a count, and makes streams partial; a board the
+// guide says is held empty gives live unknown, never 0.
+
+const T0 = 1_800_000_000_000;
+const item = (o: Partial<GuideItem> = {}): GuideItem => ({
+  station: "ops",
+  key: OPS,
+  stream: "ops.fleet",
+  seq: "1",
+  epoch: 1,
+  class: "advisory",
+  heardAt: T0 - 2_000,
+  ageMs: 2_000,
+  expiresInMs: 60_000,
+  ...o,
+});
+const view = (o: Partial<GuideSourceView> = {}): GuideSourceView => ({
+  now: T0,
+  tuned: true,
+  listening: true,
+  blind: false,
+  lastDatagramAt: T0,
+  stations: [{ name: "ops", presence: "EQUIPPED_SPEAKING" }],
+  items: [item()],
+  untuned: [],
+  ...o,
+});
+
+/** A daemon whose guide is the real guide.ts over `v`, paged as the daemon pages it. */
+function guideDaemon(
+  v: GuideSourceView,
+  o: {
+    mode?: "immediate" | "mute";
+    status?: object;
+    page?: (n: number, text: string) => { ok: boolean; text: string };
+  } = {},
+): Setup["request"] {
+  let n = 0;
+  return async (message) => {
+    if (message.type === "status") {
+      return {
+        ok: true,
+        text: JSON.stringify({
+          canticle: o.status ?? {
+            source: "host-daemon",
+            stations: { ops: "EQUIPPED_SPEAKING" },
+          },
+        }),
+      };
+    }
+    const args = (message as { args: Record<string, unknown> }).args;
+    // A page an override replaces may carry a cursor the real guide refuses.
+    let text = "";
+    try {
+      text = JSON.stringify(
+        guideView(v, {
+          ear: "scribe",
+          limit: Number(args.limit ?? 20),
+          cursor: args.cursor as string | undefined,
+          mode: () => o.mode ?? "immediate",
+        }),
+      );
+    } catch (error) {
+      if (!o.page) throw error;
+    }
+    const page = n++;
+    return o.page ? o.page(page, text) : { ok: true, text };
+  };
+}
+
+const gapNames = (doc: Export) => doc.deck.gaps.map((g) => g.name);
+const allPartial = (doc: Export) =>
+  doc.deck.stations.every((st) => st.streams_known === "partial");
+
+test("house-export coverage: a clean guide is complete, with no gaps", async () => {
+  const s = setup();
+  try {
+    const { doc } = await run(s, undefined, { request: guideDaemon(view()) });
+    assert.equal(doc.deck.walk, "complete");
+    assert.deepEqual(doc.deck.gaps, []);
+    assert.equal(station(doc, "ops").streams_known, "complete");
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export coverage: each gap the guide says becomes its closed name, and streams go partial", async () => {
+  const cases: Array<[string, Partial<GuideSourceView>]> = [
+    ["ended", { ended: true }],
+    ["not_listening", { listening: false }],
+    ["blind", { blind: true }],
+    ["joined_late", { joinedLate: { snapshot: "truncated" } }],
+    ["host_mute", { hostMute: { until: null, by: "ops" } }],
+    ["records_lost", { recordsLost: true }],
+    ["awaiting_landing", { awaitingLanding: true }],
+    [
+      "omitted_other_tuned",
+      {
+        otherOmitted: {
+          station: "",
+          stream: "",
+          key: "",
+          count: 3,
+          from: T0 - 9_000,
+          to: T0 - 1_000,
+          until: T0 + 60_000,
+          total: 3,
+          pushable: 0,
+          pushableTotal: 0,
+          serial: 1,
+        },
+      },
+    ],
+    [
+      "omitted_untuned",
+      {
+        untunedOmitted: {
+          count: 2,
+          from: T0 - 9_000,
+          to: T0 - 1_000,
+          until: T0 + 60_000,
+        },
+      },
+    ],
+    [
+      "coverage_unknown",
+      {
+        retuned: [
+          {
+            pattern: "*:ops.fleet",
+            at: T0 - 5_000,
+            dropped: 4,
+            until: T0 + 60_000,
+          },
+        ],
+      },
+    ],
+  ];
+  for (const [name, o] of cases) {
+    const s = setup();
+    try {
+      const { code, doc } = await run(s, undefined, {
+        request: guideDaemon(view(o)),
+      });
+      assert.equal(code, 0, name);
+      assert.ok(
+        gapNames(doc).includes(name),
+        `${name}: ${JSON.stringify(doc.deck.gaps)}`,
+      );
+      assert.ok(allPartial(doc), `${name}: partial everywhere`);
+    } finally {
+      s.dispose();
+    }
+  }
+});
+
+test("house-export coverage: 🌿's repro: under the host's mute, or before landing, the board is held empty: live unknown, never complete, live 0", async () => {
+  for (const o of [
+    { hostMute: { until: null, by: "ops" } },
+    { awaitingLanding: true as const },
+  ]) {
+    const s = setup();
+    try {
+      const { doc } = await run(s, undefined, {
+        request: guideDaemon(view({ ...o, items: [] })),
+      });
+      for (const st of doc.deck.stations) {
+        assert.equal(st.streams_known, "partial", st.name);
+        for (const x of st.streams)
+          assert.equal(x.live, null, `${st.name}:${x.stream}`);
+      }
+    } finally {
+      s.dispose();
+    }
+  }
+});
+
+test("house-export coverage: through the real consumer: host mute, no landing yet, records lost", async () => {
+  const muted = setup();
+  try {
+    muted.host.landing({ mute: { until: null, by: "ops" } });
+    const { doc } = await run(muted);
+    assert.ok(gapNames(doc).includes("host_mute"));
+    assert.equal(
+      station(doc, "ops").streams.find((x) => x.stream === "ops.fleet")?.live,
+      null,
+    );
+  } finally {
+    muted.dispose();
+  }
+  const lost = setup();
+  try {
+    lost.host.sing(1);
+    // A record v1 sequence gap: the consumer loses records and clears its live set.
+    lost.host.consumer.feed(
+      {
+        v: RECORD_V,
+        type: "health",
+        rec_seq: 999,
+        run: lost.host.run,
+        last_datagram_at: lost.h.clock.now(),
+        reasons: [],
+      },
+      lost.h.clock.now(),
+    );
+    const { doc } = await run(lost);
+    assert.ok(
+      gapNames(doc).includes("records_lost"),
+      JSON.stringify(doc.deck.gaps),
+    );
+    assert.ok(allPartial(doc));
+  } finally {
+    lost.dispose();
+  }
+  const fresh = setup();
+  try {
+    // A new connection that has had hello but no landing_state yet.
+    fresh.host.consumer.feed(
+      { v: RECORD_V, type: "hello", rec_seq: 1, run: "c3d4" },
+      fresh.h.clock.now(),
+    );
+    const { doc } = await run(fresh);
+    assert.ok(
+      gapNames(doc).includes("awaiting_landing"),
+      JSON.stringify(doc.deck.gaps),
+    );
+    assert.ok(
+      doc.deck.stations.every((st) => st.streams.every((x) => x.live === null)),
+    );
+  } finally {
+    fresh.dispose();
+  }
+});
+
+test("house-export coverage: this ear muted is a push fact, not a coverage gap", async () => {
+  const s = setup();
+  try {
+    const { doc } = await run(s, undefined, {
+      request: guideDaemon(view(), { mode: "mute" }),
+    });
+    assert.deepEqual(doc.deck.gaps, [{ name: "ear_muted", count: 1 }]);
+    assert.equal(station(doc, "ops").streams_known, "complete");
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export coverage: a row's local omissions or coverage hole makes its station partial", async () => {
+  const s = setup();
+  try {
+    const { doc } = await run(s, undefined, {
+      request: guideDaemon(
+        view({
+          omitted: [
+            {
+              station: "alpha",
+              stream: "chatter",
+              key: ALPHA,
+              count: 2,
+              from: T0 - 9_000,
+              to: T0 - 1_000,
+              until: T0 + 60_000,
+              total: 2,
+              pushable: 0,
+              pushableTotal: 0,
+              serial: 1,
+            },
+          ],
+        }),
+      ),
+    });
+    assert.ok(
+      doc.deck.gaps.some(
+        (g) => g.name === "row_local_omissions" && g.count === 1,
+      ),
+      JSON.stringify(doc.deck.gaps),
+    );
+    assert.equal(station(doc, "alpha").streams_known, "partial");
+    // A row's hole is that station's: it says nothing about another station's streams.
+    assert.equal(station(doc, "ops").streams_known, "complete");
+    assert.equal(doc.deck.walk, "complete");
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export coverage: a broken walk is partial with a reason, never a clean end", async () => {
+  const many = view({
+    items: Array.from({ length: 150 }, (_, i) =>
+      item({ stream: `s${String(i).padStart(3, "0")}`, seq: String(i) }),
+    ),
+  });
+  const breaks: Array<
+    [string, (n: number, text: string) => { ok: boolean; text: string }]
+  > = [
+    [
+      "page_unparsed",
+      (n, text) =>
+        n === 1 ? { ok: true, text: "not json" } : { ok: true, text },
+    ],
+    [
+      "page_unparsed",
+      (n, text) => (n === 1 ? { ok: true, text: "[]" } : { ok: true, text }),
+    ],
+    [
+      "page_refused",
+      (n, text) => (n === 1 ? { ok: false, text: "busy" } : { ok: true, text }),
+    ],
+    [
+      "page_unparsed",
+      (n, text) =>
+        n === 1
+          ? { ok: true, text: '{"listener":"listening"}' }
+          : { ok: true, text },
+    ],
+    [
+      "row_count_mismatch",
+      (n, text) => {
+        if (n !== 1) return { ok: true, text };
+        const v = JSON.parse(text) as Record<string, unknown>;
+        return { ok: true, text: JSON.stringify({ ...v, streams: 151 }) };
+      },
+    ],
+  ];
+  for (const [name, page] of breaks) {
+    const s = setup();
+    try {
+      const { code, doc } = await run(s, undefined, {
+        request: guideDaemon(many, { page }),
+      });
+      assert.equal(code, 0);
+      assert.equal(doc.deck.walk, "partial", name);
+      assert.ok(gapNames(doc).includes(name), JSON.stringify(doc.deck.gaps));
+      assert.ok(allPartial(doc));
+    } finally {
+      s.dispose();
+    }
+  }
+});
+
+test("house-export coverage: a guide whose rows don't add up to its own count, or repeat across pages, is partial; a repeat is never summed", async () => {
+  const short = setup();
+  try {
+    const { doc } = await run(short, undefined, {
+      request: guideDaemon(view(), {
+        page: (_n, text) => {
+          const v = JSON.parse(text) as Record<string, unknown>;
+          return { ok: true, text: JSON.stringify({ ...v, streams: 3 }) };
+        },
+      }),
+    });
+    assert.ok(gapNames(doc).includes("row_count_mismatch"));
+    assert.equal(doc.deck.walk, "partial");
+  } finally {
+    short.dispose();
+  }
+  const dup = setup();
+  try {
+    let first: Record<string, unknown> | undefined;
+    const { doc } = await run(dup, undefined, {
+      request: guideDaemon(
+        view({
+          items: [
+            item({ seq: "1" }),
+            item({ seq: "2" }),
+            item({ seq: "3" }),
+            item({ seq: "4" }),
+          ],
+        }),
+        {
+          page: (n, text) => {
+            if (n === 0) {
+              const v = JSON.parse(text) as Record<string, unknown>;
+              first = v;
+              return {
+                ok: true,
+                text: JSON.stringify({ ...v, streams: 2, nextCursor: "again" }),
+              };
+            }
+            return { ok: true, text: JSON.stringify({ ...first, streams: 2 }) };
+          },
+        },
+      ),
+    });
+    assert.ok(
+      gapNames(doc).includes("duplicate_row"),
+      JSON.stringify(doc.deck.gaps),
+    );
+    assert.equal(
+      station(doc, "ops").streams.find((x) => x.stream === "ops.fleet")?.live,
+      4,
+      "4, not 8",
+    );
+    assert.equal(doc.deck.walk, "partial");
+  } finally {
+    dup.dispose();
+  }
+});
+
+test("house-export coverage: an untuned list that is absent, or doesn't add up, is partial", async () => {
+  for (const [name, o] of [
+    ["untuned_unlisted", { untuned: undefined }],
+  ] as const) {
+    const s = setup();
+    try {
+      const v = view();
+      delete (v as { untuned?: unknown }).untuned;
+      void o;
+      const { doc } = await run(s, undefined, { request: guideDaemon(v) });
+      assert.ok(gapNames(doc).includes(name), JSON.stringify(doc.deck.gaps));
+      assert.ok(allPartial(doc));
+    } finally {
+      s.dispose();
+    }
+  }
+  const odd = setup();
+  try {
+    const { doc } = await run(odd, undefined, {
+      request: guideDaemon(
+        view({ untuned: [item({ station: "alpha", stream: "chatter" })] }),
+        {
+          page: (_n, text) => {
+            const v = JSON.parse(text) as { untuned: Record<string, unknown> };
+            return {
+              ok: true,
+              text: JSON.stringify({
+                ...v,
+                untuned: { ...v.untuned, streams: 9 },
+              }),
+            };
+          },
+        },
+      ),
+    });
+    assert.ok(gapNames(doc).includes("untuned_count_mismatch"));
+  } finally {
+    odd.dispose();
+  }
+  const embedded = setup();
+  try {
+    const { doc } = await run(embedded, undefined, {
+      request: guideDaemon(view(), {
+        status: { state: "listening", stations: { ops: "EQUIPPED_SPEAKING" } },
+      }),
+    });
+    // The embedded listener lists untuned only on streams some ear tunes.
+    assert.ok(gapNames(doc).includes("untuned_partial_source"));
+    assert.ok(allPartial(doc));
+  } finally {
+    embedded.dispose();
+  }
+});
+
+test("house-export coverage: a gap line it doesn't know is a gap, not nothing", async () => {
+  const s = setup();
+  try {
+    const { doc } = await run(s, undefined, {
+      request: guideDaemon(view(), {
+        page: (_n, text) => {
+          const v = JSON.parse(text) as Record<string, unknown>;
+          return {
+            ok: true,
+            text: JSON.stringify({ ...v, gaps: [`some new gap ${SENTINEL}`] }),
+          };
+        },
+      }),
+    });
+    assert.deepEqual(doc.deck.gaps, [{ name: "unrecognized_gap", count: 1 }]);
+    assert.ok(allPartial(doc));
+    assert.ok(
+      !JSON.stringify(doc).includes(SENTINEL),
+      "gap prose never reaches the export",
+    );
+  } finally {
+    s.dispose();
+  }
+});
+
+// 🌿 F4: state words come from fixed lists; anything else is unknown, and counted.
+test("house-export: a presence, verification or listener word outside the closed lists is unknown, and counted", async () => {
+  const s = setup();
+  try {
+    const { doc, out } = await run(s, undefined, {
+      request: guideDaemon(view(), {
+        status: {
+          source: "host-daemon",
+          stations: { ops: "Free Text Here", alpha: "EQUIPPED_QUIET" },
+        },
+        page: (_n, text) => {
+          const v = JSON.parse(text) as {
+            rows: Array<Record<string, unknown>>;
+          };
+          return {
+            ok: true,
+            text: JSON.stringify({
+              ...v,
+              listener: "Listening Kind Of",
+              rows: v.rows.map((r) => ({ ...r, verification: "Trust Me" })),
+            }),
+          };
+        },
+      }),
+    });
+    assert.ok(
+      !out.includes("Free Text") &&
+        !out.includes("Trust Me") &&
+        !out.includes("Kind Of"),
+    );
+    assert.equal(station(doc, "ops").presence, "unknown");
+    assert.equal(station(doc, "ops").verification, null);
+    assert.equal(station(doc, "alpha").presence, "EQUIPPED_QUIET");
+    assert.equal(doc.deck.listener, "unknown");
+    assert.ok(
+      doc.deck.gaps.some(
+        (g) => g.name === "unrecognized_word" && g.count === 3,
+      ),
+      JSON.stringify(doc.deck.gaps),
+    );
+  } finally {
+    s.dispose();
+  }
+});
+
+// 🌿 F2: token-shaped names are withheld too, and the look says what is checked.
+test("house-export: token-shaped, UUID and separator-split id names are withheld", async () => {
+  const names = [
+    `ghp_${"a1B2c3D4e5F6g7H8i9J0".repeat(2)}`,
+    "AKIAIOSFODNN7EXAMPLE",
+    "AbCdEfGh12345678IjKlMnOp",
+    "550e8400-e29b-41d4-a716-446655440000",
+    "1122611838-010535946",
+    "f6eecf2f.43082a97",
+    "xoxb-1234-abcd",
+  ];
+  const s = setup({}, undefined, {
+    manifestStations: names.map((name) => ({ name, streams: ["chatter"] })),
+    tune: ["*:ops.fleet", "ops:sk-abcdef0123456789abcd"],
+  });
+  try {
+    const { code, out, doc } = await run(s, ["--ear", "scribe", "--offline"]);
+    assert.equal(code, 0);
+    for (const name of [...names, "sk-abcdef0123456789abcd"]) {
+      assert.ok(!out.includes(name), name.slice(0, 6));
+    }
+    const count = (field: string) =>
+      doc.withheld
+        .filter((w) => w.field === field)
+        .reduce((n, w) => n + w.count, 0);
+    assert.equal(count("deck.stations"), names.length);
+    assert.equal(count("reader.may_read"), 1);
+    assert.ok(doc.withheld.some((w) => w.reason === "token shape"));
+    assert.match(JSON.parse(out).look as string, /token-shaped/u);
+  } finally {
+    s.dispose();
+  }
+});
+
+// 🌿 F3: error paths repeat no socket path, daemon reply or config value.
+test("house-export: error lines name what failed, never a path, a daemon reply or a config value", async () => {
+  const s = setup();
+  try {
+    const gone = Object.assign(
+      new Error(`connect ENOENT /run/user/1000/${SENTINEL}/daemon.sock`),
+      { code: "ENOENT" },
+    );
+    const a = await run(s, undefined, { request: () => Promise.reject(gone) });
+    assert.match(a.err, /daemon not reached \(ENOENT\)/u);
+    assert.ok(!a.err.includes(SENTINEL) && !a.err.includes("/run/"));
+    const b = await run(s, undefined, {
+      request: async (m) =>
+        m.type === "status"
+          ? { ok: true, text: `{"canticle": ${SENTINEL}` }
+          : { ok: true, text: "{}" },
+    });
+    assert.match(b.err, /daemon not reached/u);
+    assert.ok(!b.err.includes(SENTINEL), b.err);
+  } finally {
+    s.dispose();
+  }
+  // A config the parser refuses, whose bad value carries the sentinel.
+  const dir = mkdtempSync(join(tmpdir(), "frond-ear-house-bad-"));
+  try {
+    const configPath = join(dir, "frond-ear.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        botUserId: BOT,
+        ears: { scribe: { target: "claude-channel" } },
+        canticle: {
+          enabled: true,
+          manifestPath: join(dir, "m.json"),
+          tune: { scribe: [`BAD:${SENTINEL}`] },
+        },
+      }),
+    );
+    const c = await run({
+      env: { FROND_EAR_CONFIG: configPath },
+      request: () => Promise.reject(new Error("unused")),
+    });
+    assert.equal(c.code, 1);
+    assert.match(c.err, /the config could not be read or parsed/u);
+    assert.ok(!c.err.includes(SENTINEL) && !c.err.includes(dir), c.err);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("house-export coverage: a row's coverage hole alone makes its own station partial", async () => {
+  const s = setup();
+  try {
+    const { doc } = await run(s, undefined, {
+      request: guideDaemon(
+        view({
+          items: [item(), item({ station: "alpha", stream: "chatter" })],
+        }),
+        {
+          page: (_n, text) => {
+            const v = JSON.parse(text) as {
+              rows: Array<Record<string, unknown>>;
+            };
+            const rows = v.rows.map((r) =>
+              r.station === "alpha"
+                ? {
+                    ...r,
+                    coverageUnknown: {
+                      tunedAt: "2026-11-28T00:00:00Z",
+                      dropped: 1,
+                      until: "2026-11-28T01:00:00Z",
+                    },
+                  }
+                : r,
+            );
+            return { ok: true, text: JSON.stringify({ ...v, rows }) };
+          },
+        },
+      ),
+    });
+    assert.deepEqual(doc.deck.gaps, [
+      { name: "row_coverage_unknown", count: 1 },
+    ]);
+    assert.equal(station(doc, "alpha").streams_known, "partial");
+    assert.equal(station(doc, "ops").streams_known, "complete");
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export coverage: a guide longer than the pages it reads is truncated and partial", async () => {
+  const s = setup();
+  try {
+    const { doc } = await run(s, undefined, {
+      request: guideDaemon(
+        view({
+          items: Array.from({ length: 2_050 }, (_, i) =>
+            item({ stream: `s${String(i).padStart(4, "0")}`, seq: String(i) }),
+          ),
+        }),
+      ),
+    });
+    assert.equal(doc.deck.left_out.truncated, true);
+    assert.equal(doc.deck.walk, "partial");
+    assert.ok(allPartial(doc));
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export: 17 digits in a row is already a Discord id's shape", () => {
+  assert.deepEqual(identityIn({ a: "x12345678901234567" }), [
+    { at: "a", reason: "discord-id shape" },
+  ]);
 });

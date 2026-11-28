@@ -30,7 +30,11 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 
-import { request as daemonRequest, type CliRequest } from "../client.ts";
+import {
+  DaemonTimeoutError,
+  request as daemonRequest,
+  type CliRequest,
+} from "../client.ts";
 import {
   loadConfigFile,
   runtimeOptions,
@@ -55,18 +59,17 @@ const USAGE = "usage: frond-ear house-export --ear <name> [--offline]\n";
 export const HOUSE_EXPORT_KIND = "frond-house-export/0";
 
 const LOOK =
-  "names and state words only: no payload text, item content, key, Discord id, path or token";
+  "names and state words only: no payload text, item content, and no id-, key-, path- or token-shaped string";
 
 /** A station or stream name the export will print: identifier-safe, and no identity shape. */
 const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u;
-/** A closed state word (presence, verification, delivery mode, listener). */
-const WORD = /^[A-Za-z][A-Za-z_: -]{0,39}$/u;
 
 /** Why a name was withheld: the shape it had, never its value. */
 export type Withheld =
   | "discord-id shape"
   | "key-id shape"
   | "path shape"
+  | "token shape"
   | "not an identifier";
 
 /**
@@ -76,10 +79,33 @@ export type Withheld =
  * tune's `f6eecf2f43082a97:ops.fleet`, a manifest station named by a Discord id (🌫, #147).
  */
 export function identityShape(text: string): Withheld | null {
-  if (/[0-9]{17,20}/u.test(text)) return "discord-id shape";
-  if (/[0-9a-f]{16}/iu.test(text)) return "key-id shape";
+  // An id split by `-`, `.` or `_` is the same id (🌿 F2): judge it with those removed,
+  // which finds every run the text itself has, too.
+  const joined = text.replace(/[-._]/gu, "");
+  if (/[0-9]{17,}/u.test(joined)) return "discord-id shape";
+  if (/[0-9a-f]{16}/iu.test(joined)) return "key-id shape";
+  if (tokenShaped(text)) return "token shape";
   if (/[\\/]|^~/u.test(text)) return "path shape";
   return null;
+}
+
+/**
+ * Credential-shaped text (🌿 F2): the usual token prefixes, an AWS key id, a three-part
+ * bot token or JWT, or a long run that mixes upper case, lower case and digits, as base64
+ * keys do. The frond's names are short lowercase words, so none of them is near this.
+ */
+function tokenShaped(text: string): boolean {
+  if (/(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{16,}/u.test(text)) return true;
+  if (/(?:^|[^A-Za-z0-9])(?:sk|pk|rk)-[A-Za-z0-9_-]{16,}/u.test(text))
+    return true;
+  if (/xox[abposr]-/u.test(text) || /AKIA[0-9A-Z]{16}/u.test(text)) return true;
+  if (/[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{20,}/u.test(text))
+    return true;
+  for (const run of text.match(/[A-Za-z0-9_+-]{20,}/gu) ?? []) {
+    if (/[A-Z]/u.test(run) && /[a-z]/u.test(run) && /[0-9]/u.test(run))
+      return true;
+  }
+  return /[A-Za-z0-9]{32,}/u.test(text) && /[0-9]/u.test(text);
 }
 
 /** Why a station or stream name can't be printed, or null when it can. */
@@ -216,32 +242,139 @@ type DaemonView =
       kind: "daemon";
       listener: string;
       presence: Map<string, string>;
-      rows: unknown[];
-      untuned: unknown[];
+      rows: Array<Record<string, unknown>>;
+      untuned: Array<Record<string, unknown>>;
       untunedMore: number;
       truncated: boolean;
+      /** Closed gap names and how often each was seen (never the guide's prose). */
+      gaps: Map<string, number>;
+      /** Stations a row-level omission or coverage hole names. */
+      rowGaps: Set<string>;
     }
   | { kind: "config"; listener: "not reached" | "not asked" | "canticle off" };
 
-/** `status`'s canticle presence table and every page of `canticle_guide`, as a CLI client. */
+/** An error whose message is frond-ear's own words, safe to print. */
+class HouseError extends Error {}
+
+/** The closed presence, verification and listener words (🌿 F4): anything else is unknown. */
+const PRESENCE_WORDS = new Set([
+  "EQUIPPED_SPEAKING",
+  "EQUIPPED_QUIET",
+  "UNEQUIPPED_PRESENT",
+  "ROOT_UNKNOWN",
+  "UNOBSERVABLE",
+  "UNOBSERVABLE:signed_off",
+  "unknown",
+]);
+const VERIFICATION_WORDS = new Set(["verified", "ROOT_UNKNOWN"]);
+const LISTENER_WORDS = new Set([
+  "listening",
+  "not listening",
+  "ended",
+  "blind",
+]);
+
+/**
+ * The guide's gap lines (guide.ts `gapLines`) by their closed names: the prose never
+ * leaves here. A line it doesn't know is `unrecognized_gap`, a gap all the same.
+ */
+const GAP_LINES: ReadonlyArray<[RegExp, string]> = [
+  [/^the host daemon's receptor ended its run cleanly/u, "ended"],
+  [/^the listener is not bound/u, "not_listening"],
+  [/^no datagram heard lately/u, "blind"],
+  [/^joined the host daemon's run late/u, "joined_late"],
+  [/^the host daemon's receptor is muted/u, "host_mute"],
+  [/^records were lost on the host daemon's socket/u, "records_lost"],
+  [
+    /^this connection to the host daemon has had no landing_state yet/u,
+    "awaiting_landing",
+  ],
+  [/^this ear is muted/u, "ear_muted"],
+  [
+    /^local omission \(live_overflow\): other tuned streams/u,
+    "omitted_other_tuned",
+  ],
+  [/^local omission \(live_overflow\): untuned streams/u, "omitted_untuned"],
+  [/^coverage unknown:/u, "coverage_unknown"],
+];
+
+/** Gaps that hold the board empty: nothing on it is a count, so `live` is unknown. */
+const BOARD_EMPTY = new Set([
+  "ended",
+  "not_listening",
+  "host_mute",
+  "awaiting_landing",
+]);
+/** Gaps in the walk itself: the guide wasn't read whole, or didn't add up. */
+const WALK_BREAKS = new Set([
+  "page_unparsed",
+  "page_refused",
+  "row_count_mismatch",
+  "duplicate_row",
+  "untuned_count_mismatch",
+]);
+/**
+ * Gaps that don't make every station partial: a mute on this ear changes pushes, not the
+ * board; a row's own omissions or coverage hole make only that row's station partial.
+ */
+const NOT_COVERAGE = new Set([
+  "ear_muted",
+  "row_local_omissions",
+  "row_coverage_unknown",
+]);
+
+function gapName(line: unknown): string {
+  if (typeof line !== "string") return "unrecognized_gap";
+  return GAP_LINES.find(([re]) => re.test(line))?.[1] ?? "unrecognized_gap";
+}
+
+const rowKey = (row: Record<string, unknown>) =>
+  JSON.stringify([row.station, row.stream]);
+
+/**
+ * `status`'s canticle presence table and every page of `canticle_guide`, as a CLI client.
+ * The walk ends cleanly only on a page with no `nextCursor`: a page refused or unparsed
+ * after the first, rows that don't add up to the guide's own `streams`, or a row repeated
+ * across pages is a gap, and the deck says partial.
+ */
 async function readDaemon(
   ear: string,
   ask: NonNullable<HouseIo["request"]>,
 ): Promise<DaemonView> {
   const status = await ask({ type: "status" });
-  if (!status.ok) throw new Error("status refused");
-  const canticle = obj(obj(JSON.parse(status.text))?.canticle);
+  if (!status.ok) throw new HouseError("status refused");
+  let statusDoc: unknown;
+  try {
+    statusDoc = JSON.parse(status.text);
+  } catch {
+    throw new HouseError("status unparsed");
+  }
+  const canticle = obj(obj(statusDoc)?.canticle);
+  const gaps = new Map<string, number>();
+  const gap = (name: string, n = 1) =>
+    gaps.set(name, (gaps.get(name) ?? 0) + n);
   const presence = new Map<string, string>();
   for (const [name, state] of Object.entries(obj(canticle?.stations) ?? {})) {
-    if (typeof state === "string") presence.set(name, state);
+    if (typeof state !== "string") continue;
+    if (PRESENCE_WORDS.has(state)) presence.set(name, state);
+    else {
+      presence.set(name, "unknown");
+      gap("unrecognized_word");
+    }
   }
-  const rows: unknown[] = [];
-  let untuned: unknown[] = [];
+  // The embedded listener's untuned list covers only streams some ear tunes.
+  if (canticle?.source !== "host-daemon") gap("untuned_partial_source");
+  const rows: Array<Record<string, unknown>> = [];
+  const seen = new Set<string>();
+  const rowGaps = new Set<string>();
+  let untuned: Array<Record<string, unknown>> = [];
   let untunedMore = 0;
   // Only the guide's own word says the listener is listening; with no guide view, unknown.
   let listener = "unknown";
+  let claimed: number | undefined;
   let cursor: string | undefined;
   let truncated = false;
+  let broken = false;
   for (let page = 0; ; page++) {
     if (page === MAX_PAGES) {
       truncated = true;
@@ -252,27 +385,97 @@ async function readDaemon(
       tool: "canticle_guide",
       args: { ear, limit: 100, ...(cursor ? { cursor } : {}) },
     });
-    if (!result.ok) throw new Error("canticle_guide refused");
+    if (!result.ok) {
+      if (page === 0) throw new HouseError("canticle_guide refused");
+      gap("page_refused");
+      broken = true;
+      break;
+    }
     let view: Record<string, unknown> | undefined;
     try {
       view = obj(JSON.parse(result.text));
     } catch {
-      // "canticle: this ear tunes no station:stream", with nothing untuned on air.
       view = undefined;
     }
-    if (view === undefined) {
-      if (/not enabled/u.test(result.text)) listener = "canticle off";
+    if (view === undefined || !Array.isArray(view.rows)) {
+      // Two plain answers are the guide's own, and only on a first page.
+      if (page === 0 && /^canticle is not enabled/u.test(result.text)) {
+        listener = "canticle off";
+      } else if (
+        !(
+          page === 0 &&
+          /^canticle: this ear tunes no station:stream/u.test(result.text)
+        )
+      ) {
+        gap("page_unparsed");
+        broken = true;
+      }
       break;
     }
-    if (typeof view.listener === "string") listener = view.listener;
-    if (Array.isArray(view.rows)) rows.push(...view.rows);
-    const u = obj(view.untuned);
-    if (page === 0 && u !== undefined) {
-      untuned = Array.isArray(u.rows) ? u.rows : [];
-      untunedMore = count(u.more) ?? 0;
+    if (typeof view.listener === "string") {
+      if (LISTENER_WORDS.has(view.listener)) listener = view.listener;
+      else gap("unrecognized_word");
+    }
+    const streams = count(view.streams);
+    if (page === 0) {
+      claimed = streams ?? undefined;
+      if (streams === null) gap("row_count_mismatch");
+      if (view.gaps !== undefined) {
+        if (Array.isArray(view.gaps))
+          for (const line of view.gaps) gap(gapName(line));
+        else gap("unrecognized_gap");
+      }
+      const u = obj(view.untuned);
+      if (u === undefined) gap("untuned_unlisted");
+      else {
+        const listed = Array.isArray(u.rows) ? u.rows : [];
+        const more = count(u.more) ?? 0;
+        const kept = new Set<string>();
+        for (const raw of listed) {
+          const row = obj(raw);
+          if (row === undefined || kept.has(rowKey(row))) {
+            gap("untuned_count_mismatch");
+            continue;
+          }
+          kept.add(rowKey(row));
+          untuned.push(row);
+        }
+        untunedMore = more;
+        if (count(u.streams) !== listed.length + more)
+          gap("untuned_count_mismatch");
+      }
+    } else if (streams !== claimed) gap("row_count_mismatch");
+    for (const raw of view.rows) {
+      const row = obj(raw);
+      if (row === undefined) {
+        gap("page_unparsed");
+        continue;
+      }
+      if (seen.has(rowKey(row))) {
+        gap("duplicate_row");
+        continue;
+      }
+      seen.add(rowKey(row));
+      rows.push(row);
+      if (obj(row.localOmissions) !== undefined) {
+        gap("row_local_omissions");
+        if (typeof row.station === "string") rowGaps.add(row.station);
+      }
+      if (obj(row.coverageUnknown) !== undefined) {
+        gap("row_coverage_unknown");
+        if (typeof row.station === "string") rowGaps.add(row.station);
+      }
     }
     cursor = typeof view.nextCursor === "string" ? view.nextCursor : undefined;
     if (cursor === undefined) break;
+  }
+  if (
+    !broken &&
+    !truncated &&
+    claimed !== undefined &&
+    rows.length !== claimed
+  ) {
+    gap("row_count_mismatch");
   }
   return {
     kind: "daemon",
@@ -282,6 +485,8 @@ async function readDaemon(
     untuned,
     untunedMore,
     truncated,
+    gaps,
+    rowGaps,
   };
 }
 
@@ -375,18 +580,26 @@ export function houseExport(input: {
     const name = pattern.slice(0, at);
     if (name !== "*") addStream(building(name), name, pattern.slice(at + 1));
   }
+  const gaps = new Map(daemon.kind === "daemon" ? daemon.gaps : []);
   if (daemon.kind === "daemon") {
+    // readDaemon already held every presence word to the closed list.
     for (const [name, state] of daemon.presence) {
       if (!named(name)) continue;
-      building(name).presence = WORD.test(state) ? state : "unknown";
+      building(name).presence = state;
     }
-    for (const raw of [...daemon.rows, ...daemon.untuned]) {
-      const row = obj(raw);
-      if (row === undefined || !named(row.station)) continue;
+    for (const row of [...daemon.rows, ...daemon.untuned]) {
+      if (!named(row.station)) continue;
       const st = building(row.station);
-      if (typeof row.verification === "string" && WORD.test(row.verification)) {
-        if (st.verification !== "ROOT_UNKNOWN")
+      if (daemon.rowGaps.has(row.station)) st.lost = true;
+      if (typeof row.verification === "string") {
+        if (!VERIFICATION_WORDS.has(row.verification)) {
+          gaps.set(
+            "unrecognized_word",
+            (gaps.get("unrecognized_word") ?? 0) + 1,
+          );
+        } else if (st.verification !== "ROOT_UNKNOWN") {
           st.verification = row.verification;
+        }
       }
       const s = addStream(st, row.station, row.stream);
       if (s === undefined) continue;
@@ -397,7 +610,12 @@ export function houseExport(input: {
     }
   }
   const live = daemon.kind === "daemon";
-  const complete = live && !daemon.truncated && daemon.untunedMore === 0;
+  // Complete only when the walk read every page whole and the guide named no coverage gap:
+  // a gap the guide says is unknown stays unknown here (🌿 F1).
+  const coverageGap = [...gaps.keys()].some((name) => !NOT_COVERAGE.has(name));
+  const boardEmpty = [...gaps.keys()].some((name) => BOARD_EMPTY.has(name));
+  const complete =
+    live && !daemon.truncated && daemon.untunedMore === 0 && !coverageGap;
   const out: StationOut[] = [...stations.entries()]
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
     .map(([name, st]) => ({
@@ -412,8 +630,8 @@ export function houseExport(input: {
           stream,
           tuned: tunes(patterns, name, stream),
           admitted: st.manifestStreams?.has(stream) === true ? true : null,
-          live: live ? s.live : null,
-          newest_age_ms: live ? s.newestAgeMs : null,
+          live: live && !boardEmpty ? s.live : null,
+          newest_age_ms: live && !boardEmpty ? s.newestAgeMs : null,
         })),
     }));
 
@@ -451,11 +669,20 @@ export function houseExport(input: {
     },
     deck: {
       view: daemon.kind,
-      listener: WORD.test(listener) ? listener : "unknown",
+      listener,
       connected: daemon.kind === "daemon" && listener === "listening",
       window_start_ms: null,
       manifest: manifest instanceof Manifest ? "read" : manifest,
       stations: out,
+      walk:
+        daemon.kind === "daemon" &&
+        !daemon.truncated &&
+        ![...gaps.keys()].some((name) => WALK_BREAKS.has(name))
+          ? "complete"
+          : "partial",
+      gaps: [...gaps.entries()]
+        .map(([name, n]) => ({ name, count: n }))
+        .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)),
       left_out: {
         untuned_more: daemon.kind === "daemon" ? daemon.untunedMore : 0,
         truncated: daemon.kind === "daemon" && daemon.truncated,
@@ -478,6 +705,21 @@ export function houseExport(input: {
               : 0,
       ),
   };
+}
+
+/**
+ * What an error line may say (🌿 F3): frond-ear's own words, a system error code, or that
+ * it timed out. Never a message from elsewhere, which can carry a socket path, part of a
+ * daemon reply, or a config value.
+ */
+function errorWord(error: unknown): string {
+  if (error instanceof HouseError) return error.message;
+  if (error instanceof DaemonTimeoutError) return "timed out";
+  const code = (error as { code?: unknown } | null)?.code;
+  if (typeof code === "string" && /^[A-Z][A-Z0-9_]{1,31}$/u.test(code))
+    return code;
+  if (error instanceof SyntaxError) return "not JSON";
+  return "error";
 }
 
 export async function runHouseExport(
@@ -508,12 +750,14 @@ export async function runHouseExport(
     );
   } catch (error) {
     io.stderr.write(
-      `frond-ear house-export: the config could not be read: ${error instanceof Error ? error.message : String(error)}\n`,
+      `frond-ear house-export: the config could not be read or parsed (${errorWord(error)}); FROND_EAR_CONFIG names it\n`,
     );
     return 1;
   }
   if (!Object.hasOwn(config.ears, ear)) {
-    io.stderr.write(`frond-ear house-export: unknown ear ${ear}\n${USAGE}`);
+    io.stderr.write(
+      `frond-ear house-export: unknown ear ${nameIssue(ear) === null ? ear : "(an identity-shaped name, not repeated)"}\n${USAGE}`,
+    );
     return 1;
   }
   // The ear's name is the reader and the source: it can't be withheld, so an
@@ -551,7 +795,7 @@ export async function runHouseExport(
       daemon = await readDaemon(ear, ask);
     } catch (error) {
       io.stderr.write(
-        `frond-ear house-export: daemon not reached (${error instanceof Error ? error.message : String(error)}): config and manifest only\n`,
+        `frond-ear house-export: daemon not reached (${errorWord(error)}): config and manifest only\n`,
       );
       daemon = { kind: "config", listener: "not reached" };
     }
