@@ -319,9 +319,11 @@ const LISTENER_WORDS = new Set([
 
 /**
  * Every name `deck.gaps` can carry (🌿 on ews#15): the one list a reader holds its own
- * table to, printed by `house-export --gap-names`. Every gap map here takes only these,
- * so a new name is a type error until it is added (test/house-gap-names.test.ts checks
- * the list against the names the code pushes, both ways).
+ * table to, printed by `house-export --gap-names`. Every gap map here is typed to these, so
+ * the type check catches a literal push of an unlisted name, and
+ * test/house-gap-names.test.ts checks the list against the names the code pushes, both
+ * ways. Neither sees a widened alias, a cast or a computed call (🌫, 🌿 on frond-ear#148),
+ * so the export checks at run time too: any other name refuses it whole (`refuseUnlisted`).
  */
 export const GAP_NAMES = [
   "applied_tune_changed",
@@ -432,6 +434,44 @@ const NOT_COVERAGE = new Set<GapName>([
 ]);
 
 export const GAP_NAMES_KIND = "frond-house-gap-names/0";
+
+const LISTED_GAPS: ReadonlySet<string> = new Set(GAP_NAMES);
+
+/**
+ * What is wrong with the printed text's `deck.gaps`, or null: it must be a list of
+ * `{name, count}` whose every name is in GAP_NAMES. Counted, never a name repeated.
+ */
+function printedGapsIssue(text: string): string | null {
+  const gaps = obj(obj(JSON.parse(text) as unknown)?.deck)?.gaps;
+  if (
+    !Array.isArray(gaps) ||
+    !gaps.every((gap) => typeof obj(gap)?.name === "string")
+  )
+    return "deck.gaps is not a list of gap names";
+  const n = gaps.filter(
+    (gap) => !LISTED_GAPS.has((gap as { name: string }).name),
+  ).length;
+  return n === 0
+    ? null
+    : `${n} gap name${n === 1 ? "" : "s"} outside GAP_NAMES`;
+}
+
+/** A gap name outside GAP_NAMES reached the export: it is refused whole, never dropped. */
+class UnlistedGapError extends Error {}
+
+/**
+ * Fails closed on any name outside GAP_NAMES, however it got in: the type on the recorders
+ * is no barrier to a widened alias or a cast. The message counts them and never repeats one.
+ */
+function refuseUnlisted(names: Iterable<string>, at: string): void {
+  let n = 0;
+  for (const name of names) if (!LISTED_GAPS.has(name)) n += 1;
+  if (n > 0) {
+    throw new UnlistedGapError(
+      `refused: ${n} gap name${n === 1 ? "" : "s"} outside GAP_NAMES at ${at}; nothing was printed`,
+    );
+  }
+}
 
 /**
  * `house-export --gap-names`: every name `deck.gaps` can carry, and the three sets that
@@ -1034,6 +1074,9 @@ export function houseExport(input: {
   daemon: DaemonView;
 }): object {
   const { ear, canticle, manifest, daemon } = input;
+  // The daemon's view as it comes in, whatever recorder built it (🌫, 🌿 on frond-ear#148).
+  if (daemon.kind === "daemon")
+    refuseUnlisted(daemon.gaps.keys(), "the daemon's view");
   // The running daemon's view decides (🌿 R6): it reads canticle.enabled and canticle.tune
   // only at its start, so the file can be newer. The file is a cross-check.
   const configEnabled = canticle?.enabled === true;
@@ -1290,6 +1333,14 @@ export function houseExport(input: {
     }));
 
   const listener = daemon.listener;
+  // And the list as it is printed: a name set while the export was built is caught here.
+  const deckGaps = [...gaps.entries()]
+    .map(([name, n]) => ({ name, count: n }))
+    .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  refuseUnlisted(
+    deckGaps.map((gap) => gap.name),
+    "deck.gaps",
+  );
   return {
     kind: HOUSE_EXPORT_KIND,
     source: `frond-ear ${input.revision} ear ${ear}`,
@@ -1351,9 +1402,7 @@ export function houseExport(input: {
         ![...gaps.keys()].some((name) => WALK_BREAKS.has(name))
           ? "complete"
           : "partial",
-      gaps: [...gaps.entries()]
-        .map(([name, n]) => ({ name, count: n }))
-        .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)),
+      gaps: deckGaps,
       left_out: {
         untuned_more: daemon.kind === "daemon" ? daemon.untunedMore : 0,
         // How many untuned streams it did list, so a reader can say "50 shown, 10 left
@@ -1494,14 +1543,21 @@ export async function runHouseExport(
       daemon = { kind: "config", listener: "not reached" };
     }
   }
-  const doc = houseExport({
-    ear,
-    revision: (io.revision ?? gitRevision)(),
-    now: (io.now ?? Date.now)(),
-    canticle,
-    manifest,
-    daemon,
-  });
+  let doc: object;
+  try {
+    doc = houseExport({
+      ear,
+      revision: (io.revision ?? gitRevision)(),
+      now: (io.now ?? Date.now)(),
+      canticle,
+      manifest,
+      daemon,
+    });
+  } catch (error) {
+    if (!(error instanceof UnlistedGapError)) throw error;
+    io.stderr.write(`frond-ear house-export: ${error.message}\n`);
+    return 1;
+  }
   const found = identityIn(doc);
   if (found.length > 0) {
     io.stderr.write(
@@ -1509,6 +1565,16 @@ export async function runHouseExport(
     );
     return 1;
   }
-  io.stdout.write(`${JSON.stringify(doc, null, 2)}\n`);
+  // Last, the very text that is printed (🌿 on #149): it is serialized once, and its own
+  // deck.gaps is read back from it, so nothing done to `doc` after this can reach stdout.
+  const text = `${JSON.stringify(doc, null, 2)}\n`;
+  const printed = printedGapsIssue(text);
+  if (printed !== null) {
+    io.stderr.write(
+      `frond-ear house-export: refused: ${printed} at the printed document; nothing was printed\n`,
+    );
+    return 1;
+  }
+  io.stdout.write(text);
   return 0;
 }
