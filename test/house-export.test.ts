@@ -1776,3 +1776,172 @@ test("house-export coverage: 🌫's case: 60 untuned streams: 50 listed, 10 left
     s.dispose();
   }
 });
+
+// 🌫 at 7fe187da: the change check compared untuned counts, not which streams. Swapping
+// one untuned stream for another between pages kept the counts and passed as complete.
+test("house-export coverage: 🌫's swap: page 2's untuned list names a different stream, same count: changed_mid_walk", async () => {
+  const s = setup();
+  try {
+    for (let i = 0; i < 150; i++) {
+      s.host.sing(10 + i, { station: `st${String(i).padStart(3, "0")}` });
+    }
+    s.host.sing(500, { station: "alpha", stream: "privatea" });
+    let pages = 0;
+    const { doc } = await run(s, undefined, {
+      request: async (message) => {
+        if (message.type === "call" && pages++ === 1) {
+          s.host.pluck(500, { station: "alpha", stream: "privatea" });
+          s.host.sing(501, { station: "alpha", stream: "privateb" });
+        }
+        return s.request(message);
+      },
+    });
+    assert.equal(pages, 2);
+    assert.ok(
+      gapNames(doc).includes("changed_mid_walk"),
+      JSON.stringify(doc.deck.gaps),
+    );
+    assert.equal(doc.deck.walk, "partial");
+    assert.ok(allPartial(doc));
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export coverage: control: the same untuned stream on every page is no change", async () => {
+  const s = setup();
+  try {
+    for (let i = 0; i < 150; i++) {
+      s.host.sing(10 + i, { station: `st${String(i).padStart(3, "0")}` });
+    }
+    s.host.sing(500, { station: "alpha", stream: "privatea" });
+    const { doc } = await run(s);
+    assert.ok(
+      !gapNames(doc).includes("changed_mid_walk"),
+      JSON.stringify(doc.deck.gaps),
+    );
+    assert.equal(doc.deck.walk, "complete");
+    assert.equal(doc.deck.left_out.untuned_listed, 1);
+  } finally {
+    s.dispose();
+  }
+});
+
+// The same rule for the tuned rows and the presence table: compared by identity. A tuned
+// row that leaves after it was read while another arrives behind the cursor keeps every
+// count, so the walk re-reads its first page and the presence table at the end.
+test("house-export coverage: a tuned row swapped behind the cursor, same total: the re-read first page catches it", async () => {
+  const s = setup();
+  try {
+    for (let i = 0; i < 150; i++) {
+      s.host.sing(10 + i, { station: `st${String(i).padStart(3, "0")}` });
+    }
+    let pages = 0;
+    const { doc } = await run(s, undefined, {
+      request: async (message) => {
+        if (message.type === "call" && pages++ === 1) {
+          s.host.pluck(10, { station: "st000" }); // read on page 1, now gone
+          s.host.sing(900, { station: "aaa" }); // sorts before the cursor: page 2 can't see it
+        }
+        return s.request(message);
+      },
+    });
+    assert.ok(
+      gapNames(doc).includes("changed_mid_walk"),
+      JSON.stringify(doc.deck.gaps),
+    );
+    assert.equal(doc.deck.walk, "partial");
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export coverage: a station that joins the presence table during the walk is a changed walk", async () => {
+  const s = setup();
+  try {
+    let pages = 0;
+    const { doc } = await run(s, undefined, {
+      request: async (message) => {
+        if (message.type === "call" && pages++ === 0) {
+          s.host.presence("newcomer", "EQUIPPED_QUIET");
+        }
+        return s.request(message);
+      },
+    });
+    assert.ok(
+      gapNames(doc).includes("changed_mid_walk"),
+      JSON.stringify(doc.deck.gaps),
+    );
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export coverage: control: a presence word that changes is a reading in time, not a changed walk", async () => {
+  const s = setup();
+  try {
+    let pages = 0;
+    const { doc } = await run(s, undefined, {
+      request: async (message) => {
+        if (message.type === "call" && pages++ === 0) {
+          s.host.presence("ops", "EQUIPPED_QUIET");
+        }
+        return s.request(message);
+      },
+    });
+    assert.ok(
+      !gapNames(doc).includes("changed_mid_walk"),
+      JSON.stringify(doc.deck.gaps),
+    );
+    assert.equal(doc.deck.walk, "complete");
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export coverage: a re-read first page it can't read is a changed walk, never a pass", async () => {
+  const s = setup();
+  try {
+    const { doc } = await run(s, undefined, {
+      request: guideDaemon(view({ items: manyItems() }), {
+        page: (n, text) =>
+          n === 2 ? { ok: true, text: "not json" } : { ok: true, text },
+      }),
+    });
+    assert.ok(
+      gapNames(doc).includes("changed_mid_walk"),
+      JSON.stringify(doc.deck.gaps),
+    );
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export coverage: one station leaving the presence table as another joins keeps the count, and is still a change", async () => {
+  const s = setup();
+  try {
+    const guide = guideDaemon(view());
+    let statuses = 0;
+    const { doc } = await run(s, undefined, {
+      request: async (message) => {
+        if (message.type !== "status") return guide(message);
+        const stations =
+          statuses++ === 0
+            ? { ops: "EQUIPPED_SPEAKING", alpha: "EQUIPPED_QUIET" }
+            : { ops: "EQUIPPED_SPEAKING", beta: "EQUIPPED_QUIET" };
+        return {
+          ok: true,
+          text: JSON.stringify({
+            canticle: { source: "host-daemon", stations },
+          }),
+        };
+      },
+    });
+    assert.ok(
+      gapNames(doc).includes("changed_mid_walk"),
+      JSON.stringify(doc.deck.gaps),
+    );
+  } finally {
+    s.dispose();
+  }
+});

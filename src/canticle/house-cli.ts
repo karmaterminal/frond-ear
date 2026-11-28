@@ -386,6 +386,8 @@ async function readDaemon(
   let broken = false;
   const guideGaps = new Map<string, number>();
   const untunedSeen = new Set<string>();
+  const firstPageKeys: string[] = [];
+  let pagesRead = 0;
   let unreadableRows = 0;
   let untunedUnlisted = false;
   let firstSignature: string | undefined;
@@ -458,10 +460,22 @@ async function readDaemon(
         listener = pageListener;
     }
     const u = obj(view.untuned);
+    // By identity, not by count (🌫 at 7fe187da): which gap names, which listener word,
+    // and which untuned station:stream names this page lists, beside its totals. One
+    // untuned stream swapped for another between pages is a change, though the counts match.
+    const untunedNames =
+      u === undefined
+        ? null
+        : (Array.isArray(u.rows) ? u.rows : [])
+            .map((raw) => {
+              const row = obj(raw);
+              return row === undefined ? "?" : rowKey(row);
+            })
+            .sort();
     const signature = JSON.stringify([
       [...pageGaps.entries()].sort(),
       pageListener,
-      u === undefined ? null : [count(u.streams), count(u.more)],
+      u === undefined ? null : [count(u.streams), count(u.more), untunedNames],
     ]);
     if (firstSignature === undefined) firstSignature = signature;
     else if (signature !== firstSignature && !changed) {
@@ -523,6 +537,7 @@ async function readDaemon(
         continue;
       }
       seen.add(rowKey(row));
+      if (page === 0) firstPageKeys.push(rowKey(row));
       rows.push(row);
       if (obj(row.localOmissions) !== undefined) {
         gap("row_local_omissions");
@@ -533,6 +548,7 @@ async function readDaemon(
         if (typeof row.station === "string") rowGaps.add(row.station);
       }
     }
+    pagesRead = page + 1;
     cursor = typeof view.nextCursor === "string" ? view.nextCursor : undefined;
     if (cursor === undefined) break;
   }
@@ -545,6 +561,57 @@ async function readDaemon(
     gap("row_count_mismatch");
   }
   for (const [name, n] of guideGaps) gap(name, n);
+  // Compared by identity at the end (🌫 at 7fe187da). A tuned row that leaves after it was
+  // read, while another arrives behind the cursor, keeps every count: so a walk of more than
+  // one page reads its first page again and compares the station:stream names. The presence
+  // table is read again too, and compared by station names; a changed word is a reading in
+  // time, not a change in what the walk covers. Either difference is changed_mid_walk.
+  if (!broken && !truncated && !changed) {
+    let differs = false;
+    if (pagesRead > 1) {
+      const again = await ask({
+        type: "call",
+        tool: "canticle_guide",
+        args: { ear, limit: 100 },
+      }).catch(() => undefined);
+      let rows: unknown;
+      try {
+        rows = again?.ok ? obj(JSON.parse(again.text))?.rows : undefined;
+      } catch {
+        rows = undefined;
+      }
+      const keys = Array.isArray(rows)
+        ? rows.map((raw) => {
+            const row = obj(raw);
+            return row === undefined ? "?" : rowKey(row);
+          })
+        : undefined;
+      if (
+        keys === undefined ||
+        JSON.stringify(keys) !== JSON.stringify(firstPageKeys)
+      ) {
+        differs = true;
+      }
+    }
+    const after = await ask({ type: "status" }).catch(() => undefined);
+    let names: string[] | undefined;
+    try {
+      const stations = obj(
+        obj(obj(after?.ok ? JSON.parse(after.text) : undefined)?.canticle)
+          ?.stations,
+      );
+      names = stations === undefined ? undefined : Object.keys(stations).sort();
+    } catch {
+      names = undefined;
+    }
+    if (
+      names === undefined ||
+      JSON.stringify(names) !== JSON.stringify([...presence.keys()].sort())
+    ) {
+      differs = true;
+    }
+    if (differs) gap("changed_mid_walk");
+  }
   return {
     kind: "daemon",
     listener,
