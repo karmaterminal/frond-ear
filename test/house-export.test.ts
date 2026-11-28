@@ -77,6 +77,7 @@ const ALLOWED_KEYS = new Set([
   "walk",
   "gaps",
   "untuned_more",
+  "untuned_listed",
   "truncated",
   "may_read_complete",
   "may_read_withheld",
@@ -272,6 +273,7 @@ interface Export {
     gaps: Array<{ name: string; count: number }>;
     left_out: {
       untuned_more: number;
+      untuned_listed: number;
       truncated: boolean;
     };
   };
@@ -1746,6 +1748,30 @@ test("house-export coverage: an unreadable row alone breaks the walk: it still c
     });
     assert.deepEqual(doc.deck.gaps, [{ name: "row_unparsed", count: 1 }]);
     assert.equal(doc.deck.walk, "partial");
+  } finally {
+    s.dispose();
+  }
+});
+
+// 🌫 (07:17Z): a whole walk can sit beside a capped untuned list. The export says how many
+// untuned streams it listed and how many it left out, apart from the walk.
+test("house-export coverage: 🌫's case: 60 untuned streams: 50 listed, 10 left out, and the walk keeps its own word", async () => {
+  const s = setup();
+  try {
+    for (let i = 0; i < 60; i++) {
+      s.host.sing(10 + i, {
+        station: "frond-scribe",
+        stream: `wide${String(i).padStart(2, "0")}`,
+      });
+    }
+    const { doc } = await run(s);
+    assert.equal(doc.deck.left_out.untuned_listed, 50);
+    assert.equal(doc.deck.left_out.untuned_more, 10);
+    assert.equal(doc.deck.walk, "complete");
+    assert.ok(
+      allPartial(doc),
+      "streams can't be complete while untuned ones are left out",
+    );
   } finally {
     s.dispose();
   }

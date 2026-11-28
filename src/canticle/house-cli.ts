@@ -759,6 +759,9 @@ export function houseExport(input: {
         .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)),
       left_out: {
         untuned_more: daemon.kind === "daemon" ? daemon.untunedMore : 0,
+        // How many untuned streams it did list, so a reader can say "50 shown, 10 left
+        // out" apart from the walk (🌫, 07:17Z).
+        untuned_listed: daemon.kind === "daemon" ? daemon.untuned.length : 0,
         truncated: daemon.kind === "daemon" && daemon.truncated,
       },
     },
