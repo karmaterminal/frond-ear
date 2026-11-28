@@ -2369,3 +2369,186 @@ test("house-export coverage: a guide presence word that disagrees with a steady 
     s.dispose();
   }
 });
+
+// 🌫 at c392ded7: a row's metadata on a later sighting was lost behind identity dedup. An
+// untuned row read verified, then ROOT_UNKNOWN on a later page, exported as verified.
+test("house-export coverage: 🌫's repro: an untuned row's verification turns ROOT_UNKNOWN on a later page, then back: unknown, named", async () => {
+  const s = setup();
+  try {
+    for (let i = 0; i < 150; i++) {
+      s.host.sing(10 + i, { station: `st${String(i).padStart(3, "0")}` });
+    }
+    s.host.sing(500, { station: "alpha", stream: "chatter" }); // untuned: listed on every page
+    let calls = 0;
+    const { doc } = await run(s, undefined, {
+      request: async (message) => {
+        if (message.type === "call") {
+          const n = calls++;
+          if (n === 1) s.host.presence("alpha", "ROOT_UNKNOWN"); // page 2 says ROOT_UNKNOWN
+          if (n === 2) s.host.presence("alpha", "EQUIPPED_QUIET"); // and it's back by the re-walk
+        }
+        return s.request(message);
+      },
+    });
+    const alpha = station(doc, "alpha");
+    assert.notEqual(alpha.verification, "verified", "never first-seen-wins");
+    assert.equal(alpha.presence, "unknown");
+    assert.equal(alpha.streams_known, "partial");
+    assert.ok(
+      gapNames(doc).includes("verification_changed"),
+      JSON.stringify(doc.deck.gaps),
+    );
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export coverage: control: an untuned row whose verification holds across every sighting keeps it", async () => {
+  const s = setup();
+  try {
+    for (let i = 0; i < 150; i++) {
+      s.host.sing(10 + i, { station: `st${String(i).padStart(3, "0")}` });
+    }
+    s.host.sing(500, { station: "alpha", stream: "chatter" });
+    const { doc } = await run(s);
+    assert.equal(station(doc, "alpha").verification, "verified");
+    assert.equal(station(doc, "alpha").presence, "EQUIPPED_QUIET");
+    assert.ok(!gapNames(doc).includes("verification_changed"));
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export coverage: a row's verification that contradicts the status table's presence is a disagreement", async () => {
+  const s = setup();
+  try {
+    const { doc } = await run(s, undefined, {
+      request: guideDaemon(
+        view({
+          untuned: [item({ station: "alpha", stream: "chatter" })],
+          stations: [
+            { name: "ops", presence: "EQUIPPED_SPEAKING" },
+            { name: "alpha", presence: "ROOT_UNKNOWN" },
+          ],
+        }),
+        {
+          status: {
+            source: "host-daemon",
+            stations: { ops: "EQUIPPED_SPEAKING", alpha: "EQUIPPED_QUIET" },
+          },
+        },
+      ),
+    });
+    assert.equal(station(doc, "alpha").presence, "unknown");
+    assert.ok(
+      gapNames(doc).includes("presence_disagrees"),
+      JSON.stringify(doc.deck.gaps),
+    );
+    assert.equal(station(doc, "ops").presence, "EQUIPPED_SPEAKING");
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export coverage: a station the status table doesn't hold, whose row's verification flips, reads unknown and partial; others stay complete", async () => {
+  const s = setup();
+  try {
+    const { doc } = await run(s, undefined, {
+      request: guideDaemon(
+        view({
+          items: manyItems(),
+          untuned: [item({ station: "beta", stream: "chatter" })],
+        }),
+        {
+          status: {
+            source: "host-daemon",
+            stations: { ops: "EQUIPPED_SPEAKING", alpha: "EQUIPPED_QUIET" },
+          },
+          page: (n, text) => {
+            if (n !== 1) return { ok: true, text };
+            const v = JSON.parse(text) as {
+              untuned: { rows: Array<Record<string, unknown>> };
+            };
+            return {
+              ok: true,
+              text: JSON.stringify({
+                ...v,
+                untuned: {
+                  ...v.untuned,
+                  rows: v.untuned.rows.map((r) => ({
+                    ...r,
+                    verification: "ROOT_UNKNOWN",
+                  })),
+                },
+              }),
+            };
+          },
+        },
+      ),
+    });
+    assert.ok(
+      gapNames(doc).includes("verification_changed"),
+      JSON.stringify(doc.deck.gaps),
+    );
+    assert.equal(station(doc, "beta").presence, "unknown");
+    assert.equal(station(doc, "beta").verification, null);
+    assert.equal(station(doc, "beta").streams_known, "partial");
+    assert.equal(station(doc, "alpha").streams_known, "complete", "only beta");
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export coverage: a tuned row whose verification differs on the re-walk is verification_changed", async () => {
+  const s = setup();
+  try {
+    const { doc } = await run(s, undefined, {
+      request: guideDaemon(view({ items: manyItems() }), {
+        status: {
+          source: "host-daemon",
+          stations: { alpha: "EQUIPPED_QUIET" },
+        },
+        page: rewalkEdit((r) =>
+          r.stream === "s000" ? { ...r, verification: "ROOT_UNKNOWN" } : r,
+        ),
+      }),
+    });
+    assert.ok(
+      gapNames(doc).includes("verification_changed"),
+      JSON.stringify(doc.deck.gaps),
+    );
+    assert.equal(station(doc, "ops").verification, null);
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export coverage: a status word of unknown says nothing a sighting can contradict", async () => {
+  const s = setup();
+  try {
+    const { doc } = await run(s, undefined, {
+      request: guideDaemon(
+        view({
+          untuned: [item({ station: "alpha", stream: "chatter" })],
+          // the guide holds alpha ROOT_UNKNOWN, so its row says ROOT_UNKNOWN
+          stations: [
+            { name: "ops", presence: "EQUIPPED_SPEAKING" },
+            { name: "alpha", presence: "ROOT_UNKNOWN" },
+          ],
+        }),
+        {
+          status: {
+            source: "host-daemon",
+            stations: { ops: "EQUIPPED_SPEAKING", alpha: "unknown" },
+          },
+        },
+      ),
+    });
+    assert.ok(
+      !gapNames(doc).includes("presence_disagrees"),
+      JSON.stringify(doc.deck.gaps),
+    );
+  } finally {
+    s.dispose();
+  }
+});

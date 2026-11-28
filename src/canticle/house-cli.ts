@@ -266,6 +266,8 @@ type DaemonView =
       rowGaps: Set<string>;
       /** Rows (station:stream keys) whose live count or age wasn't a count. */
       badCounts: Set<string>;
+      /** Stations a row of which gave two verification words across its sightings. */
+      unsure: Set<string>;
     }
   | { kind: "config"; listener: "not reached" | "not asked" | "canticle off" };
 
@@ -341,6 +343,7 @@ const WALK_BREAKS = new Set([
  * board; a row's own omissions or coverage hole make only that row's station partial.
  */
 const NOT_COVERAGE = new Set([
+  "verification_changed",
   "presence_changed",
   "presence_disagrees",
   "ear_muted",
@@ -409,6 +412,22 @@ async function readDaemon(
   /** Every row either pass read, for the presence check: each carries its station's word. */
   const presenceRows: Array<Record<string, unknown>> = [];
   let untunedUnlisted = false;
+  // Every sighting's metadata, kept apart from the identity set (🌫 at c392ded7): the same
+  // row seen on several pages or passes must say the same verification word, and that word
+  // must agree with the status table. First-seen never wins.
+  const verificationsOf = new Map<string, Set<string>>();
+  const verificationSightings: Array<{ station: string; word: string }> = [];
+  const sighted = (row: Record<string, unknown>) => {
+    if (typeof row.verification !== "string") return;
+    const key = rowKey(row);
+    let words = verificationsOf.get(key);
+    if (words === undefined) verificationsOf.set(key, (words = new Set()));
+    words.add(row.verification);
+    verificationSightings.push({
+      station: row.station as string,
+      word: row.verification,
+    });
+  };
   let firstSignature: string | undefined;
   let changed = false;
   let disordered = false;
@@ -572,6 +591,7 @@ async function readDaemon(
             badCounts.add(rowKey(row));
             rowGaps.add(row.station);
           }
+          sighted(row);
           if (!untunedSeen.has(rowKey(row))) {
             untunedSeen.add(rowKey(row));
             untuned.push(row);
@@ -602,6 +622,7 @@ async function readDaemon(
           unreadableRows += 1; // a row the guide gave: it counts toward its total
           continue;
         }
+        sighted(row);
         if (seen.has(rowKey(row))) {
           gap("duplicate_row");
           continue;
@@ -701,6 +722,26 @@ async function readDaemon(
     if (typeof word !== "string" || !presence.has(station)) continue;
     if (word !== presence.get(station)) disagree.add(station);
   }
+  // The guide says ROOT_UNKNOWN exactly when it holds the station ROOT_UNKNOWN, and verified
+  // otherwise: a sighting's word that doesn't fit the status table's is a disagreement too.
+  for (const { station, word } of verificationSightings) {
+    const state = presence.get(station);
+    if (state === undefined || state === "unknown") continue;
+    if (word !== (state === "ROOT_UNKNOWN" ? "ROOT_UNKNOWN" : "verified")) {
+      disagree.add(station);
+    }
+  }
+  // The same row with two words across its sightings: its station's verification and
+  // presence are unknown, and its streams partial.
+  const unsure = new Set<string>();
+  for (const [key, words] of verificationsOf) {
+    if (words.size > 1) unsure.add((JSON.parse(key) as [string, string])[0]);
+  }
+  for (const station of unsure) {
+    presence.set(station, "unknown");
+    rowGaps.add(station);
+  }
+  if (unsure.size > 0) gap("verification_changed", unsure.size);
   for (const station of flipped) {
     presence.set(station, "unknown");
     rowGaps.add(station);
@@ -715,6 +756,7 @@ async function readDaemon(
     kind: "daemon",
     listener,
     badCounts,
+    unsure,
     presence,
     rows,
     untuned,
@@ -831,6 +873,8 @@ export function houseExport(input: {
             "unrecognized_word",
             (gaps.get("unrecognized_word") ?? 0) + 1,
           );
+        } else if (daemon.unsure.has(row.station)) {
+          st.verification = null; // two words across its sightings: unknown
         } else if (st.verification !== "ROOT_UNKNOWN") {
           st.verification = row.verification;
         }
