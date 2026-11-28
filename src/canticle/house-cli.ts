@@ -353,37 +353,6 @@ function inOrder(a: [string, string], b: [string, string]): boolean {
   return a[1] < b[1];
 }
 
-/** Every page of the guide again, as station:stream names in order; undefined if unread. */
-async function rewalk(
-  ear: string,
-  ask: NonNullable<HouseIo["request"]>,
-): Promise<string[] | undefined> {
-  const keys: string[] = [];
-  let cursor: string | undefined;
-  for (let page = 0; page < MAX_PAGES; page++) {
-    const result = await ask({
-      type: "call",
-      tool: "canticle_guide",
-      args: { ear, limit: 100, ...(cursor ? { cursor } : {}) },
-    }).catch(() => undefined);
-    let view: Record<string, unknown> | undefined;
-    try {
-      view = result?.ok ? obj(JSON.parse(result.text)) : undefined;
-    } catch {
-      view = undefined;
-    }
-    if (view === undefined || !Array.isArray(view.rows)) return undefined;
-    for (const raw of view.rows) {
-      const row = obj(raw);
-      if (row === undefined) return undefined;
-      keys.push(rowKey(row));
-    }
-    cursor = typeof view.nextCursor === "string" ? view.nextCursor : undefined;
-    if (cursor === undefined) return keys;
-  }
-  return undefined;
-}
-
 const rowKey = (row: Record<string, unknown>) =>
   JSON.stringify([row.station, row.stream]);
 
@@ -421,233 +390,261 @@ async function readDaemon(
   // The embedded listener's untuned list covers only streams some ear tunes.
   if (canticle?.source !== "host-daemon") gap("untuned_partial_source");
   const rows: Array<Record<string, unknown>> = [];
-  const seen = new Set<string>();
   const rowGaps = new Set<string>();
-  let untuned: Array<Record<string, unknown>> = [];
+  const untuned: Array<Record<string, unknown>> = [];
   let untunedMore = 0;
   // Only the guide's own word says the listener is listening; with no guide view, unknown.
   let listener = "unknown";
-  let claimed: number | undefined;
-  let cursor: string | undefined;
   let truncated = false;
   let broken = false;
   const guideGaps = new Map<string, number>();
   const untunedSeen = new Set<string>();
-  const walkKeys: string[] = [];
   const badCounts = new Set<string>();
-  let lastPlace: [string, string] | undefined;
-  let disordered = false;
-  let pagesRead = 0;
-  let unreadableRows = 0;
+  /** Every row either pass read, for the presence check: each carries its station's word. */
+  const presenceRows: Array<Record<string, unknown>> = [];
   let untunedUnlisted = false;
   let firstSignature: string | undefined;
   let changed = false;
-  for (let page = 0; ; page++) {
-    if (page === MAX_PAGES) {
-      truncated = true;
+  let disordered = false;
+  /** Each pass's station:stream names in order: the walk, then its one re-walk. */
+  const passKeys: string[][] = [];
+  let firstPassPages = 0;
+  // Two passes over the guide: the walk, then (when it took more than one page and stood)
+  // one re-walk to validate it. Every reply of either pass is a page like any other (🌫 at
+  // 5c7ffc65): its gaps, listener word, untuned identities and presence words go into the
+  // same accumulators, and any difference between pages is changed_mid_walk. The re-walk's
+  // rows are compared, not counted: the export's rows and counts are the first pass's.
+  for (let pass = 0; pass < 2; pass++) {
+    if (
+      pass === 1 &&
+      !(firstPassPages > 1 && !broken && !truncated && !changed)
+    )
       break;
-    }
-    const result = await ask({
-      type: "call",
-      tool: "canticle_guide",
-      args: { ear, limit: 100, ...(cursor ? { cursor } : {}) },
-    });
-    if (!result.ok) {
-      if (page === 0) throw new HouseError("canticle_guide refused");
-      gap("page_refused");
-      broken = true;
-      break;
-    }
-    let view: Record<string, unknown> | undefined;
-    try {
-      view = obj(JSON.parse(result.text));
-    } catch {
-      view = undefined;
-    }
-    if (view === undefined || !Array.isArray(view.rows)) {
-      // Two plain answers are the guide's own, and only on a first page.
-      if (page === 0 && /^canticle is not enabled/u.test(result.text)) {
-        listener = "canticle off";
-      } else if (
-        !(
+    const keys: string[] = [];
+    passKeys.push(keys);
+    const seen = new Set<string>();
+    let lastPlace: [string, string] | undefined;
+    let claimed: number | undefined;
+    let cursor: string | undefined;
+    let unreadableRows = 0;
+    let passBroken = false;
+    let page = 0;
+    for (; ; page++) {
+      if (page === MAX_PAGES) {
+        truncated = true;
+        break;
+      }
+      const result = await ask({
+        type: "call",
+        tool: "canticle_guide",
+        args: { ear, limit: 100, ...(cursor ? { cursor } : {}) },
+      }).catch((error: unknown) => {
+        if (pass === 0 && page === 0) throw error;
+        return { ok: false, text: "" };
+      });
+      if (!result.ok) {
+        if (pass === 0 && page === 0)
+          throw new HouseError("canticle_guide refused");
+        gap("page_refused");
+        broken = passBroken = true;
+        break;
+      }
+      let view: Record<string, unknown> | undefined;
+      try {
+        view = obj(JSON.parse(result.text));
+      } catch {
+        view = undefined;
+      }
+      if (view === undefined || !Array.isArray(view.rows)) {
+        // Two plain answers are the guide's own, and only on the walk's first page.
+        if (
+          pass === 0 &&
           page === 0 &&
-          /^canticle: this ear tunes no station:stream/u.test(result.text)
-        )
-      ) {
-        gap("page_unparsed");
-        broken = true;
-      }
-      break;
-    }
-    // Every page's coverage signals count, not just the first's (🌫 at f22fae03): a gap
-    // line on any page is kept, by name, at the most any one page said it. Pages that
-    // disagree (gap names, listener word, untuned list) saw the state change under the
-    // walk, which is a break of its own.
-    const pageGaps = new Map<string, number>();
-    if (view.gaps !== undefined) {
-      if (Array.isArray(view.gaps)) {
-        for (const line of view.gaps) {
-          const name = gapName(line);
-          pageGaps.set(name, (pageGaps.get(name) ?? 0) + 1);
+          /^canticle is not enabled/u.test(result.text)
+        ) {
+          listener = "canticle off";
+        } else if (
+          !(
+            pass === 0 &&
+            page === 0 &&
+            /^canticle: this ear tunes no station:stream/u.test(result.text)
+          )
+        ) {
+          gap("page_unparsed");
+          broken = passBroken = true;
         }
-      } else pageGaps.set("unrecognized_gap", 1);
-    }
-    for (const [name, n] of pageGaps) {
-      guideGaps.set(name, Math.max(guideGaps.get(name) ?? 0, n));
-    }
-    let pageListener = "none";
-    if (typeof view.listener === "string") {
-      if (LISTENER_WORDS.has(view.listener)) pageListener = view.listener;
-      else {
-        pageListener = "unrecognized";
-        if (page === 0) gap("unrecognized_word");
+        break;
       }
-    }
-    // The worst word any page gave stands: a later "listening" never hides an earlier
-    // "blind". Two different words are a changed walk, below, and the deck stays partial.
-    if (pageListener !== "none" && pageListener !== "unrecognized") {
-      if (listener === "unknown" || listener === "listening")
-        listener = pageListener;
-    }
-    const u = obj(view.untuned);
-    // By identity, not by count (🌫 at 7fe187da): which gap names, which listener word,
-    // and which untuned station:stream names this page lists, beside its totals. One
-    // untuned stream swapped for another between pages is a change, though the counts match.
-    const untunedNames =
-      u === undefined
-        ? null
-        : (Array.isArray(u.rows) ? u.rows : [])
-            .map((raw) => {
-              const row = obj(raw);
-              return row === undefined ? "?" : rowKey(row);
-            })
-            .sort();
-    const signature = JSON.stringify([
-      [...pageGaps.entries()].sort(),
-      pageListener,
-      u === undefined ? null : [count(u.streams), count(u.more), untunedNames],
-    ]);
-    if (firstSignature === undefined) firstSignature = signature;
-    else if (signature !== firstSignature && !changed) {
-      changed = true;
-      gap("changed_mid_walk");
-    }
-    const streams = count(view.streams);
-    if (page === 0) {
-      claimed = streams ?? undefined;
-      if (streams === null) gap("row_count_mismatch");
-    } else if (streams !== claimed) gap("row_count_mismatch");
-    // The untuned list comes on every page (🌿 round 2): each page's rows are kept, once
-    // each, and the most any page said was past its list stands.
-    if (u === undefined) {
-      if (!untunedUnlisted) gap("untuned_unlisted");
-      untunedUnlisted = true;
-    } else {
-      const listed = Array.isArray(u.rows) ? u.rows : [];
-      const more = count(u.more);
-      const kept = new Set<string>();
-      for (const raw of listed) {
-        const row = obj(raw);
-        if (row === undefined || kept.has(rowKey(row))) {
+      // Every page's coverage signals count, not just the first's (🌫 at f22fae03): a gap
+      // line on any page is kept, by name, at the most any one page said it.
+      const pageGaps = new Map<string, number>();
+      if (view.gaps !== undefined) {
+        if (Array.isArray(view.gaps)) {
+          for (const line of view.gaps) {
+            const name = gapName(line);
+            pageGaps.set(name, (pageGaps.get(name) ?? 0) + 1);
+          }
+        } else pageGaps.set("unrecognized_gap", 1);
+      }
+      for (const [name, n] of pageGaps) {
+        guideGaps.set(name, Math.max(guideGaps.get(name) ?? 0, n));
+      }
+      let pageListener = "none";
+      if (typeof view.listener === "string") {
+        if (LISTENER_WORDS.has(view.listener)) pageListener = view.listener;
+        else {
+          pageListener = "unrecognized";
+          if (pass === 0 && page === 0) gap("unrecognized_word");
+        }
+      }
+      // The worst word any page gave stands: a later "listening" never hides an earlier
+      // "blind".
+      if (pageListener !== "none" && pageListener !== "unrecognized") {
+        if (listener === "unknown" || listener === "listening")
+          listener = pageListener;
+      }
+      const u = obj(view.untuned);
+      // By identity, not by count (🌫 at 7fe187da): which gap names, which listener word,
+      // and which untuned station:stream names this page lists, beside its totals.
+      const untunedNames =
+        u === undefined
+          ? null
+          : (Array.isArray(u.rows) ? u.rows : [])
+              .map((raw) => {
+                const row = obj(raw);
+                return row === undefined ? "?" : rowKey(row);
+              })
+              .sort();
+      const signature = JSON.stringify([
+        [...pageGaps.entries()].sort(),
+        pageListener,
+        u === undefined
+          ? null
+          : [count(u.streams), count(u.more), untunedNames],
+      ]);
+      if (firstSignature === undefined) firstSignature = signature;
+      else if (signature !== firstSignature && !changed) {
+        changed = true;
+        gap("changed_mid_walk");
+      }
+      const streams = count(view.streams);
+      if (page === 0) {
+        claimed = streams ?? undefined;
+        if (streams === null) gap("row_count_mismatch");
+        // A re-walk with a different total fails its own count check, and its rows
+        // differ from the walk's: both are caught there.
+      } else if (streams !== claimed) gap("row_count_mismatch");
+      // The untuned list comes on every page (🌿 round 2): each page's rows are kept, once
+      // each, and the most any page said was past its list stands.
+      if (u === undefined) {
+        if (!untunedUnlisted) gap("untuned_unlisted");
+        untunedUnlisted = true;
+      } else {
+        const listed = Array.isArray(u.rows) ? u.rows : [];
+        const more = count(u.more);
+        const kept = new Set<string>();
+        for (const raw of listed) {
+          const row = obj(raw);
+          if (row === undefined || kept.has(rowKey(row))) {
+            gap("untuned_count_mismatch");
+            continue;
+          }
+          kept.add(rowKey(row));
+          if (!untunedSeen.has(rowKey(row))) {
+            untunedSeen.add(rowKey(row));
+            untuned.push(row);
+          }
+        }
+        if (more === null && u.more !== undefined)
           gap("untuned_count_mismatch");
+        untunedMore = Math.max(untunedMore, more ?? 0);
+        if (count(u.streams) !== listed.length + (more ?? 0))
+          gap("untuned_count_mismatch");
+      }
+      for (const raw of view.rows) {
+        const row = obj(raw);
+        if (row === undefined) {
+          gap("page_unparsed");
           continue;
         }
-        kept.add(rowKey(row));
-        if (!untunedSeen.has(rowKey(row))) {
-          untunedSeen.add(rowKey(row));
-          untuned.push(row);
+        // A row it can't read is counted and breaks the walk, never left out quietly.
+        const unreadable =
+          typeof row.station !== "string" ||
+          typeof row.stream !== "string" ||
+          (row.localOmissions !== undefined &&
+            obj(row.localOmissions) === undefined) ||
+          (row.coverageUnknown !== undefined &&
+            obj(row.coverageUnknown) === undefined);
+        if (unreadable) {
+          gap("row_unparsed");
+          unreadableRows += 1; // a row the guide gave: it counts toward its total
+          continue;
         }
+        if (seen.has(rowKey(row))) {
+          gap("duplicate_row");
+          continue;
+        }
+        // The guide's order is a contract (🌿 round 3): rows come in (station, stream)
+        // code-unit order across every page. A row that doesn't is an inconsistent walk.
+        const place: [string, string] = [
+          row.station as string,
+          row.stream as string,
+        ];
+        if (lastPlace !== undefined && !inOrder(lastPlace, place)) {
+          if (!disordered) gap("order_violation");
+          disordered = true;
+        }
+        lastPlace = place;
+        seen.add(rowKey(row));
+        keys.push(rowKey(row));
+        presenceRows.push(row);
+        // A live count or age that isn't one is unknown, never a vouched 0 (🌿 round 3).
+        const liveOk = count(row.live) !== null;
+        const ageOk = row.newestAgeS === null || count(row.newestAgeS) !== null;
+        if (!liveOk || !ageOk) {
+          gap("row_unparsed");
+          badCounts.add(rowKey(row));
+          rowGaps.add(row.station as string);
+        }
+        if (obj(row.localOmissions) !== undefined) {
+          gap("row_local_omissions");
+          rowGaps.add(row.station as string);
+        }
+        if (obj(row.coverageUnknown) !== undefined) {
+          gap("row_coverage_unknown");
+          rowGaps.add(row.station as string);
+        }
+        if (pass === 0) rows.push(row);
       }
-      if (more === null && u.more !== undefined) gap("untuned_count_mismatch");
-      untunedMore = Math.max(untunedMore, more ?? 0);
-      if (count(u.streams) !== listed.length + (more ?? 0))
-        gap("untuned_count_mismatch");
+      cursor =
+        typeof view.nextCursor === "string" ? view.nextCursor : undefined;
+      if (cursor === undefined) break;
     }
-    for (const raw of view.rows) {
-      const row = obj(raw);
-      if (row === undefined) {
-        gap("page_unparsed");
-        continue;
-      }
-      // A row it can't read is counted and breaks the walk, never left out quietly.
-      const unreadable =
-        typeof row.station !== "string" ||
-        typeof row.stream !== "string" ||
-        (row.localOmissions !== undefined &&
-          obj(row.localOmissions) === undefined) ||
-        (row.coverageUnknown !== undefined &&
-          obj(row.coverageUnknown) === undefined);
-      if (unreadable) {
-        gap("row_unparsed");
-        unreadableRows += 1; // a row the guide gave: it counts toward its total
-        continue;
-      }
-      if (seen.has(rowKey(row))) {
-        gap("duplicate_row");
-        continue;
-      }
-      // The guide's order is a contract (🌿 round 3): rows come in (station, stream)
-      // code-unit order across every page. A row that doesn't is an inconsistent walk.
-      const place: [string, string] = [
-        row.station as string,
-        row.stream as string,
-      ];
-      if (lastPlace !== undefined && !inOrder(lastPlace, place)) {
-        if (!disordered) gap("order_violation");
-        disordered = true;
-      }
-      lastPlace = place;
-      seen.add(rowKey(row));
-      walkKeys.push(rowKey(row));
-      // A live count or age that isn't one is unknown, never a vouched 0 (🌿 round 3).
-      const liveOk = count(row.live) !== null;
-      const ageOk = row.newestAgeS === null || count(row.newestAgeS) !== null;
-      if (!liveOk || !ageOk) {
-        gap("row_unparsed");
-        badCounts.add(rowKey(row));
-        rowGaps.add(row.station as string);
-      }
-      rows.push(row);
-      if (obj(row.localOmissions) !== undefined) {
-        gap("row_local_omissions");
-        if (typeof row.station === "string") rowGaps.add(row.station);
-      }
-      if (obj(row.coverageUnknown) !== undefined) {
-        gap("row_coverage_unknown");
-        if (typeof row.station === "string") rowGaps.add(row.station);
-      }
+    if (pass === 0) firstPassPages = page + 1;
+    if (
+      !passBroken &&
+      !truncated &&
+      claimed !== undefined &&
+      keys.length + unreadableRows !== claimed
+    ) {
+      gap("row_count_mismatch");
     }
-    pagesRead = page + 1;
-    cursor = typeof view.nextCursor === "string" ? view.nextCursor : undefined;
-    if (cursor === undefined) break;
   }
+  // The re-walk, when it stood, must name the same rows in the same order: a tuned row
+  // swapped behind the cursor on any page keeps every count (🌿 round 3).
   if (
+    passKeys.length === 2 &&
     !broken &&
-    !truncated &&
-    claimed !== undefined &&
-    rows.length + unreadableRows !== claimed
+    !changed &&
+    JSON.stringify(passKeys[1]) !== JSON.stringify(passKeys[0])
   ) {
-    gap("row_count_mismatch");
+    changed = true;
+    gap("changed_mid_walk");
   }
   for (const [name, n] of guideGaps) gap(name, n);
-  // Compared by identity at the end (🌫 at 7fe187da). A tuned row that leaves after it was
-  // read, while another arrives behind the cursor, keeps every count: so a walk of more than
-  // one page reads its first page again and compares the station:stream names. The presence
-  // table is read again too, and compared by station names; a changed word is a reading in
-  // time, not a change in what the walk covers. Either difference is changed_mid_walk.
+  // The presence table is read again too, and compared by station names; a changed word
+  // is a reading in time, not a change in what the walk covers.
   if (!broken && !truncated && !changed) {
-    let differs = false;
-    if (pagesRead > 1) {
-      // The whole walk again, compared by station:stream names in order (🌿 round 3): a
-      // row swapped behind the cursor on any page keeps every count.
-      const again = await rewalk(ear, ask);
-      if (
-        again === undefined ||
-        JSON.stringify(again) !== JSON.stringify(walkKeys)
-      ) {
-        differs = true;
-      }
-    }
     const after = await ask({ type: "status" }).catch(() => undefined);
     let names: string[] | undefined;
     try {
@@ -663,14 +660,13 @@ async function readDaemon(
       names === undefined ||
       JSON.stringify(names) !== JSON.stringify([...presence.keys()].sort())
     ) {
-      differs = true;
+      gap("changed_mid_walk");
     }
-    if (differs) gap("changed_mid_walk");
   }
   // A station whose guide presence word disagrees with the status table is unknown, and
   // its streams partial (🌿 round 3): "visible: yes" beside a later UNOBSERVABLE is no answer.
   const disagree = new Set<string>();
-  for (const row of rows) {
+  for (const row of presenceRows) {
     const word = row.presence;
     const station = row.station as string;
     if (typeof word !== "string" || !presence.has(station)) continue;

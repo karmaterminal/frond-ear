@@ -1899,7 +1899,7 @@ test("house-export coverage: control: a presence word that changes is a reading 
   }
 });
 
-test("house-export coverage: a re-read first page it can't read is a changed walk, never a pass", async () => {
+test("house-export coverage: a re-walk page it can't read is a broken walk like any other, never a pass", async () => {
   const s = setup();
   try {
     const { doc } = await run(s, undefined, {
@@ -1908,10 +1908,12 @@ test("house-export coverage: a re-read first page it can't read is a changed wal
           n === 2 ? { ok: true, text: "not json" } : { ok: true, text },
       }),
     });
+    // Re-walk replies are pages like any other (🌫 at 5c7ffc65).
     assert.ok(
-      gapNames(doc).includes("changed_mid_walk"),
+      gapNames(doc).includes("page_unparsed"),
       JSON.stringify(doc.deck.gaps),
     );
+    assert.equal(doc.deck.walk, "partial");
   } finally {
     s.dispose();
   }
@@ -2063,5 +2065,110 @@ test("house-export coverage: a row whose live or age isn't a count exports unkno
     } finally {
       s.dispose();
     }
+  }
+});
+
+// 🌫 at 5c7ffc65: the validation re-walk kept only its tuned names and threw away the
+// rest of what it saw. Its replies are pages like any other now.
+test("house-export coverage: 🌫's repro: receive goes blind before the re-walk; its gap and its listener word count", async () => {
+  const s = setup();
+  try {
+    for (let i = 0; i < 150; i++) {
+      s.host.sing(10 + i, { station: `st${String(i).padStart(3, "0")}` });
+    }
+    let calls = 0;
+    const { doc } = await run(s, undefined, {
+      request: async (message) => {
+        // Pages 1 and 2 are clean; the re-walk's first call comes third.
+        if (message.type === "call" && calls++ === 2)
+          s.host.health(["no_datagrams"]);
+        return s.request(message);
+      },
+    });
+    assert.equal(calls, 4, "two pages, then a two-page re-walk");
+    assert.ok(gapNames(doc).includes("blind"), JSON.stringify(doc.deck.gaps));
+    assert.equal(doc.deck.listener, "blind");
+    assert.equal(doc.deck.connected, false);
+    assert.equal(doc.deck.walk, "partial");
+    assert.ok(allPartial(doc));
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export coverage: 🌫's helper repro: an untuned swap during the re-walk is a changed walk", async () => {
+  const s = setup();
+  try {
+    for (let i = 0; i < 150; i++) {
+      s.host.sing(10 + i, { station: `st${String(i).padStart(3, "0")}` });
+    }
+    s.host.sing(500, { station: "alpha", stream: "privatea" });
+    let calls = 0;
+    const { doc } = await run(s, undefined, {
+      request: async (message) => {
+        if (message.type === "call" && calls++ === 3) {
+          s.host.pluck(500, { station: "alpha", stream: "privatea" });
+          s.host.sing(501, { station: "alpha", stream: "privateb" });
+        }
+        return s.request(message);
+      },
+    });
+    assert.ok(
+      gapNames(doc).includes("changed_mid_walk"),
+      JSON.stringify(doc.deck.gaps),
+    );
+    assert.equal(doc.deck.walk, "partial");
+    // What the re-walk saw is kept, as any page's facts are.
+    assert.ok(
+      station(doc, "alpha").streams.some((x) => x.stream === "privateb"),
+    );
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export coverage: a presence word the re-walk's rows give is checked against the status table too", async () => {
+  const s = setup();
+  try {
+    for (let i = 0; i < 150; i++) {
+      s.host.sing(10 + i, { station: `st${String(i).padStart(3, "0")}` });
+    }
+    s.host.sing(1); // ops:ops.fleet, on the first page of each pass
+    let calls = 0;
+    const { doc } = await run(s, undefined, {
+      request: async (message) => {
+        if (message.type === "call" && calls++ === 2)
+          s.host.presence("ops", "UNOBSERVABLE");
+        return s.request(message);
+      },
+    });
+    assert.equal(station(doc, "ops").presence, "unknown");
+    assert.ok(
+      gapNames(doc).includes("presence_disagrees"),
+      JSON.stringify(doc.deck.gaps),
+    );
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export coverage: a presence table it can't read again is a changed walk, never a pass", async () => {
+  const s = setup();
+  try {
+    const guide = guideDaemon(view());
+    let statuses = 0;
+    const { doc } = await run(s, undefined, {
+      request: async (message) => {
+        if (message.type !== "status") return guide(message);
+        if (statuses++ === 0) return guide(message);
+        return { ok: true, text: "not json" };
+      },
+    });
+    assert.ok(
+      gapNames(doc).includes("changed_mid_walk"),
+      JSON.stringify(doc.deck.gaps),
+    );
+  } finally {
+    s.dispose();
   }
 });
