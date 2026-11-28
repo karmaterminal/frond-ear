@@ -752,7 +752,8 @@ by default.
 
 `canticle_guide` is the first slice of the trainboard (binary-canticle RFC-0002 §3.3, "Searching the guide"):
 what is on air now, one row per tuned `station:stream`, read from what the listener already holds. `hear` reads
-the items; the guide only lists them.
+the items; the guide only lists them. What is on air on a stream this ear does not tune is listed apart, in
+`untuned`, so "on air, but not readable here" never reads as an empty board.
 
 ```json
 {
@@ -766,6 +767,7 @@ the items; the guide only lists them.
     {
       "station": "ops",
       "stream": "ops.fleet",
+      "tuned": true,
       "classes": ["advisory"],
       "live": 1,
       "newestHeardAt": "2026-11-26T17:59:58Z",
@@ -784,12 +786,28 @@ the items; the guide only lists them.
       }
     }
   ],
-  "nextCursor": "…"
+  "nextCursor": "…",
+  "untuned": {
+    "streams": 1,
+    "rows": [
+      {
+        "station": "frond-scribe",
+        "stream": "scribe.lighthouse",
+        "tuned": false,
+        "classes": ["live-state"],
+        "live": 1,
+        "newestAgeS": 4,
+        "verification": "verified"
+      }
+    ],
+    "hint": "on air here, but this ear doesn't tune them, so hear can't read them: to read one, add its station:stream to canticle.tune.my-ear in the ear config. …"
+  }
 }
 ```
 
 | Field                              | What it says                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `tuned`                            | `true` on every row: this ear's `canticle.tune` takes the stream in, by the one matcher (`src/canticle/tune.ts`) that `hear`, delivery and the live set's shares read through. A stream it doesn't take in is never a row; it goes on the `untuned` list.                                                                                                                                                                                                                                                                |
 | `classes`, `live`                  | The row's classes, and how many items are on air now: unexpired and not withdrawn.                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `newestHeardAt`, `newestAgeS`      | When the newest live item was first heard, and its receiver-measured age.                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `freshness`                        | `aged` when that item is older than its class's stale limit (RFC-0001 §6.3, as `hear` marks it), `fresh` otherwise, `none live` with nothing live.                                                                                                                                                                                                                                                                                                                                                                       |
@@ -800,6 +818,7 @@ the items; the guide only lists them.
 | `expired`, `localOmissions`        | Items the listener still held past their expiry (never counted live; the embedded listener holds them until its next tick), and records frond-ear's own full live set dropped on this stream while they would still be on air (RFC-0002 §3.1, a local omission). A stream known only by its drops still gets a row, `live: 0`, so a locally dropped stream never looks absent.                                                                                                                                           |
 | `coverageUnknown`                  | The stream's pattern was tuned while frond-ear's live set was dropping untuned records that would still be on air: its records from before `tunedAt` may be missing, how many unknown. A pattern naming its station gets a row even with nothing held.                                                                                                                                                                                                                                                                   |
 | `gaps`                             | Where coverage is unknown, or the board is held empty, each said as itself, whatever the `query`: the listener not bound, blind (every station unknown, not offline), ended, or joined late; the host daemon's receptor-wide MUTE, records lost on the host socket (`records_lost`), or no `landing_state` yet; this ear muted; drops no row can name (the shared count past the 256 streams counted one by one, the untuned share); and each pattern tuned while untuned records were being dropped, in `hear`'s words. |
+| `untuned`                          | What the source holds live on streams this ear doesn't tune, so `hear` can't read it: `streams` (how many match `query`), `rows` (at most 50, sorted as rows are; each `tuned: false`, with `classes`, `live`, `newestAgeS` and `verification`), `more` past those, and a `hint` naming the config key to add. Expired and withdrawn records are left out, as for rows. Names only, never a payload; the hint is words, and the guide changes no config and tunes nothing. Absent from a source that gives no such list. |
 
 - **Metadata only.** `query` is a case-insensitive substring of a station, stream or class name. Each source
   (record v1 and the embedded listener) gives the guide its own metadata-only view, so a guide call never reads,
@@ -810,8 +829,20 @@ the items; the guide only lists them.
   push (it takes no `batch_id`), tunes or mutes nothing and wakes no one. It reads the source's in-memory view
   and the ear's delivery modes, and reaches no network. Reading the modes purges attention rows whose TTL has
   already lapsed, as every read of them does; no live choice changes.
+- **Untuned, and what it shows.** From the host daemon (record v1) the live set holds every verified record the
+  host surfaces, tuned or not, so `untuned` is everything on air there that this ear doesn't read. The embedded
+  listener holds only streams some ear on this daemon tunes (any station), so its `untuned` is only those. An ear
+  that tunes nothing still gets the guide when anything is on air untuned (otherwise the one line saying it tunes
+  nothing). Each `untuned` row shows what the station names already show (`ear_status` lists every station and its
+  presence; record v1's `hear` on-air line too), plus the stream's name, a record count, its classes and the
+  newest's age. Stream names come from the station's manifest entry (whose format allows `[a-z][a-z0-9-]`, up
+  to four dot-joined segments, 64 bytes); the guide makes them tokens like every name it shows, and they are data. They can say what a stream is about (for
+  example `scribe.lighthouse`), which a tune is not meant to hide: the tune is an ear's election of what payload
+  reaches it, not access control, and every ear on the house LAN can be tuned to any allowlisted stream by its
+  config.
 - **Paginated.** `limit` (default 20, at most 100) and `cursor`: pass `nextCursor` back for the next page. The
   cursor is a position in the (station, stream) order, so rows that leave between pages move nothing past it.
+  `untuned` is not paginated: every page carries the same bounded list.
 - **Not yet:** payload search, a descriptor stream (station, stream axes, topic and sample, RFC-0002 §3.3), DNS-SD
   enumeration, and withdrawal marks for the embedded source, whose listener drops a plucked item at once (it is
   excluded, not shown withdrawn).

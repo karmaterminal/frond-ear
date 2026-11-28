@@ -57,6 +57,7 @@ import {
   MAX_WITHDRAWALS,
   type Withdrawal,
 } from "./receptor.ts";
+import { tunes } from "./tune.ts";
 import { MAX_CLAMP_TTL_S } from "./wire.ts";
 
 export const RECORD_V = "canticle-receptor-record/1";
@@ -130,19 +131,6 @@ interface LiveRecord {
    * removes it then) but not rendered, since a `retract` may have been missed.
    */
   carried?: boolean;
-}
-
-/** Does a `station:stream` tune (`*` for any station) take in this record's stream? */
-function tunes(
-  patterns: readonly string[],
-  station: string,
-  stream: string,
-): boolean {
-  return patterns.some((p) => {
-    const at = p.indexOf(":");
-    const s = p.slice(0, at);
-    return (s === "*" || s === station) && p.slice(at + 1) === stream;
-  });
 }
 
 /**
@@ -1683,7 +1671,7 @@ export class RecordConsumer {
     nowMs: number,
     listening: boolean,
   ): GuideSourceView {
-    const view = this.#view(patterns, nowMs, listening, (r): GuideItem => {
+    const meta = (r: LiveRecord): GuideItem => {
       const it = r.item;
       return {
         station: it.station,
@@ -1696,10 +1684,13 @@ export class RecordConsumer {
         ageMs: Math.max(it.ageMs, nowMs - it.issuedAt),
         expiresInMs: r.localExpiryAt - nowMs,
       };
-    });
+    };
+    const others: LiveRecord[] = [];
+    const view = this.#view(patterns, nowMs, listening, meta, others);
     const live = this.health !== "failed" && this.health !== "stopped";
     return {
       ...view,
+      untuned: others.map(meta),
       ...(this.mute !== null ? { hostMute: { ...this.mute } } : {}),
       ...(this.healthReasons.includes("records_lost")
         ? { recordsLost: true }
@@ -1715,6 +1706,8 @@ export class RecordConsumer {
     nowMs: number,
     listening: boolean,
     project: (r: LiveRecord) => T,
+    /** Gets the records this view would show but `patterns` doesn't tune (the guide's). */
+    others?: LiveRecord[],
   ): Omit<HearView, "items" | "capability"> & { items: T[] } {
     const tuned = (station: string, stream: string) =>
       tunes(patterns, station, stream);
@@ -1750,9 +1743,9 @@ export class RecordConsumer {
         this.#ranOut(r, nowMs);
         continue;
       }
-      if (r.carried || !deliverable || !tuned(r.item.station, r.item.stream))
-        continue;
-      items.push(project(r));
+      if (r.carried || !deliverable) continue;
+      if (tuned(r.item.station, r.item.stream)) items.push(project(r));
+      else others?.push(r);
     }
     const withdrawn: WithdrawnMark[] = [];
     for (const [idem, mark] of this.#withdrawn) {

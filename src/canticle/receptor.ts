@@ -18,6 +18,7 @@ import { systemClock, systemTimers } from "../types.ts";
 import { CLASSES, EXPIRED_SHOWN_MS, expiryIsNews, SCOPE_NAMES } from "./ids.ts";
 import { Listener, type ListenerEvent, type SafetyState } from "./listener.ts";
 import type { Manifest } from "./manifest.ts";
+import { tunes } from "./tune.ts";
 import {
   FLAG_EXERCISE,
   FLAG_REFRESH,
@@ -248,6 +249,12 @@ export interface GuideSourceView
   recordsLost?: boolean;
   /** Record v1: this connection's `landing_state` hasn't come yet, so nothing is deliverable. */
   awaitingLanding?: boolean;
+  /**
+   * Live records the source holds on streams this ear does not tune (`tunes`, the matcher
+   * `items` pass), metadata only like `items`: on air, but not readable here, since `hear`
+   * reads through the tune. Held, deliverable, unexpired and not withdrawn, as `items` are.
+   */
+  untuned?: GuideItem[];
 }
 
 export interface ReceptorOptions {
@@ -270,19 +277,6 @@ type ReceptorState = "starting" | "listening" | "backoff" | "stopped";
 export type ReceptorHealth =
   | { state: "ok" }
   | { state: "failed"; reason: "state_not_durable"; error: string };
-
-/** "station:stream" tune patterns → does this item belong to this ear? */
-function tuned(
-  patterns: readonly string[],
-  station: string,
-  stream: string,
-): boolean {
-  return patterns.some((p) => {
-    const at = p.indexOf(":");
-    const s = p.slice(0, at);
-    return (s === "*" || s === station) && p.slice(at + 1) === stream;
-  });
-}
 
 /** §14.13 `root=`: the declared lineage root, or the item itself when it has none. */
 function rootOf(
@@ -693,18 +687,20 @@ export class CanticleReceptor {
    * What one ear's guide lists now: the same records as `live`, metadata only. It never
    * reads a record's body, purpose, state key or body ref (RFC-0002 §3.3).
    */
-  #guideItems(ear: string): GuideItem[] {
-    if (this.#notDurable !== undefined) return [];
+  #guideItems(ear: string): { items: GuideItem[]; untuned: GuideItem[] } {
+    if (this.#notDurable !== undefined) return { items: [], untuned: [] };
     const tune = this.#options.config.tune;
     const patterns = Object.hasOwn(tune, ear) ? (tune[ear] ?? []) : [];
     const now = this.#clock.now();
-    const out: GuideItem[] = [];
+    const items: GuideItem[] = [];
+    const untuned: GuideItem[] = [];
     for (const h of this.#listener.current.values()) {
       const entry = this.#options.manifest.entry(Buffer.from(h.kid, "hex"));
       const station = entry?.name ?? h.kid;
       const it = h.item;
       const stream = entry?.streamNames.get(it.stream);
-      if (stream === undefined || !tuned(patterns, station, stream)) continue;
+      if (stream === undefined) continue;
+      const out = tunes(patterns, station, stream) ? items : untuned;
       const offset = this.#listener.clockOffset(h.kid);
       out.push({
         station,
@@ -718,7 +714,7 @@ export class CanticleReceptor {
         expiresInMs: Math.max(0, h.localExpiry - now),
       });
     }
-    return out;
+    return { items, untuned };
   }
 
   /** What one ear hears right now: live items on its tuned station:streams. */
@@ -734,7 +730,7 @@ export class CanticleReceptor {
       const stream = this.#options.manifest
         .entry(Buffer.from(h.kid, "hex"))
         ?.streamNames.get(h.item.stream);
-      if (stream === undefined || !tuned(patterns, station, stream)) continue;
+      if (stream === undefined || !tunes(patterns, station, stream)) continue;
       const it = h.item;
       const offset = this.#listener.clockOffset(h.kid);
       out.push({
@@ -810,7 +806,25 @@ export class CanticleReceptor {
 
   /** `hearView` for the guide: metadata only, no body read (RFC-0002 §3.3). */
   guideView(ear: string): GuideSourceView {
-    return { ...this.#viewOf(ear), items: this.#guideItems(ear) };
+    const view = this.#viewOf(ear);
+    const { items, untuned } = this.#guideItems(ear);
+    // An untuned row's verification reads its station's presence, which `#viewOf` keeps
+    // to tuned stations (hear's on-air line); ear_status shows every station's anyway.
+    const named = new Set(view.stations.map((s) => s.name));
+    const stations = [...view.stations];
+    for (const kid of this.#listener.stations.keys()) {
+      const name =
+        this.#options.manifest.entry(Buffer.from(kid, "hex"))?.name ?? kid;
+      if (named.has(name) || !untuned.some((i) => i.station === name)) continue;
+      named.add(name);
+      stations.push({
+        name,
+        presence: view.blind
+          ? "unknown"
+          : this.#listener.presenceState(kid, view.now),
+      });
+    }
+    return { ...view, stations, items, untuned };
   }
 
   #viewOf(ear: string): Omit<HearView, "items" | "capability"> {
@@ -849,7 +863,7 @@ export class CanticleReceptor {
     now: number,
   ): { withdrawals?: Withdrawal[] } {
     const withdrawals = [...this.#withdrawals.values()].filter(
-      (w) => w.until > now && tuned(patterns, w.station, w.stream),
+      (w) => w.until > now && tunes(patterns, w.station, w.stream),
     );
     return withdrawals.length > 0 ? { withdrawals } : {};
   }

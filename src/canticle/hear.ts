@@ -12,6 +12,7 @@ import { randomBytes } from "node:crypto";
 
 import { cleanName, cleanText } from "../render.ts";
 import type { HearView, LiveItem } from "./receptor.ts";
+import { tunes } from "./tune.ts";
 
 /** Receiver-measured age (now − issued_at − δ̂) above which an item is marked `aged` (§6.3). */
 export const STALE_AFTER_MS: Readonly<Record<string, number>> = {
@@ -323,11 +324,7 @@ export function hearResult(
   if (options.delivery !== undefined) head.push(options.delivery);
   const wanted = options.stream;
   const narrow = wanted
-    ? (station: string, stream: string) => {
-        const at = wanted.indexOf(":");
-        const s = wanted.slice(0, at);
-        return (s === "*" || s === station) && wanted.slice(at + 1) === stream;
-      }
+    ? (station: string, stream: string) => tunes([wanted], station, stream)
     : undefined;
   head.push(...omissionLines(view, narrow));
   if (view.stations.length > 0) {
