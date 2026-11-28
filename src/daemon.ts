@@ -4542,7 +4542,8 @@ export class Daemon {
     const cursor = stringArg(args, "cursor");
     const limit = numberArg(args, "limit", 20, 100);
     const view = this.options.canticleGuide(ear);
-    if (!view.tuned) {
+    // An ear that tunes nothing still sees what is on air untuned, when anything is.
+    if (!view.tuned && (view.untuned ?? []).length === 0) {
       return "canticle: this ear tunes no station:stream (config canticle.tune).";
     }
     const delivery = this.canticle;

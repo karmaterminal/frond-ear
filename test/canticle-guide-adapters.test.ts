@@ -238,6 +238,67 @@ test("adapters: a guide call reads no body from the embedded listener; hear does
   }
 });
 
+test("adapters: the embedded listener's untuned records are listed by name, no body read; hear reads none", async () => {
+  // Another station's chatter is tuned here, so the listener holds chatter, but not test1's.
+  const config = canticleConfig(undefined, {
+    source: "embedded",
+    manifestPath: "unused",
+    tune: { scribe: ["test2:chatter"] },
+  });
+  let receptor: CanticleReceptor | undefined;
+  const h = harness(config, {
+    canticleHear: (ear) => receptor!.hearView(ear),
+    canticleGuide: (ear) => receptor!.guideView(ear),
+  });
+  try {
+    h.clock.value = T0 + 10_000;
+    receptor = new CanticleReceptor({
+      config: config.canticle!,
+      manifest: Manifest.fromJson(vectors.manifest),
+      store: h.store,
+      logger: new StructuredLogger(() => {}),
+      clock: h.clock,
+      timers: h.timers,
+      socket: () =>
+        ({
+          on: () => {},
+          bind: (_port: number, _host: string, bound: () => void) => bound(),
+          close: () => {},
+        }) as never,
+    });
+    receptor.start();
+    const shim = h.attach("scribe");
+    const held = captured(heldListenerItem, () => {
+      receptor!.receive(signed(1));
+      receptor!.receive(signed(2, { 10: "silas" }));
+    });
+    assert.ok(held.length >= 2, `held ${held.length}`);
+    const reads = poison(held, ["body", "purpose", "stateKey", "bodyRef"]);
+    await guideCalls(h, shim);
+    const view = JSON.parse(
+      (await h.call(shim, "canticle_guide", {})).text,
+    ) as {
+      rows: unknown[];
+      untuned?: {
+        rows: Array<{ station: string; stream: string; live: number }>;
+      };
+    };
+    assert.deepEqual(view.rows, []);
+    assert.deepEqual(
+      view.untuned?.rows.map((r) => `${r.station}:${r.stream}:${r.live}`),
+      ["test1:chatter:2"],
+    );
+    assert.match(
+      (await h.call(shim, "hear", {})).text,
+      /nothing live on your tuned streams/u,
+    );
+    assert.equal(reads.length, 0, `body reads: ${reads.join(", ")}`);
+  } finally {
+    receptor?.stop();
+    h.dispose();
+  }
+});
+
 interface Board {
   listener: string;
   delivery: string;
