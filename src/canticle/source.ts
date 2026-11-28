@@ -121,6 +121,21 @@ export class GuardedEmbedded implements CanticleSource {
   }
 }
 
+/**
+ * How the daemon reads a source (cli.ts wires these): `hear` and the delivery modes read
+ * the full view, and `canticle_guide` the metadata-only one, so a guide call reads no
+ * payload in either source (binary-canticle RFC-0002 §3.3, #138).
+ */
+export function canticleViews(source: CanticleSource): {
+  canticleHear: (ear: string) => HearView;
+  canticleGuide: (ear: string) => GuideSourceView;
+} {
+  return {
+    canticleHear: (ear) => source.hearView(ear),
+    canticleGuide: (ear) => source.guideView(ear),
+  };
+}
+
 export function createCanticleSource(
   config: CanticleConfig,
   deps: {
