@@ -11,7 +11,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { identityIn, runHouseExport } from "../src/canticle/house-cli.ts";
+import {
+  identityIn,
+  revisionWord,
+  runHouseExport,
+} from "../src/canticle/house-cli.ts";
 import { tunes } from "../src/canticle/tune.ts";
 import type { CliRequest } from "../src/client.ts";
 import { parseConfig } from "../src/config.ts";
@@ -270,7 +274,7 @@ interface Export {
 async function run(
   s: Pick<Setup, "env" | "request">,
   argv: string[] = ["--ear", "scribe"],
-  extra: { request?: Setup["request"] } = {},
+  extra: { request?: Setup["request"]; revision?: string } = {},
 ): Promise<{ code: number; out: string; err: string; doc: Export }> {
   let out = "";
   let err = "";
@@ -279,7 +283,7 @@ async function run(
     stderr: { write: (text: string) => (err += text) },
     env: s.env,
     request: extra.request ?? s.request,
-    revision: () => "abc1234",
+    revision: () => extra.revision ?? "abc1234",
   });
   return {
     code,
@@ -687,4 +691,43 @@ test("house-export: a whole real export passes its own backstop", async () => {
   } finally {
     s.dispose();
   }
+});
+
+test("house-export: the backstop refuses the whole export when an unchecked field holds an identity shape", async () => {
+  const s = setup();
+  try {
+    // The revision is no name, so no name check sees it: only the last pass over the output can.
+    const { code, out, err } = await run(s, undefined, {
+      revision: "0123456789abcdef",
+    });
+    assert.equal(code, 1);
+    assert.equal(out, "");
+    assert.match(
+      err,
+      /refused: identity-shaped output at source \(key-id shape\)/u,
+    );
+    assert.ok(!err.includes("0123456789abcdef"));
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export: the backstop finds an identity-shaped key, and its place never repeats the key", () => {
+  const found = identityIn({ a: { [DISCORD]: { b: "ok", c: KEYISH } } });
+  assert.deepEqual(found, [
+    { at: "a.<withheld key>", reason: "discord-id shape" },
+    { at: "a.<withheld key>.c", reason: "key-id shape" },
+  ]);
+  assert.ok(!JSON.stringify(found).includes(DISCORD));
+});
+
+test("house-export: the source names a short revision only: a sha long enough to be a key id reads unknown", () => {
+  assert.equal(revisionWord("f6b1324", ""), "f6b1324");
+  assert.equal(revisionWord("f6b1324abcde", " M x"), "f6b1324abcde+dirty");
+  assert.equal(revisionWord("0123456789abcdef", ""), "unknown");
+  assert.equal(
+    revisionWord("f6b13243e8ceef6207acf0f0bbc9e6a5631a7b14", ""),
+    "unknown",
+  );
+  assert.equal(revisionWord("not a sha", ""), "unknown");
 });

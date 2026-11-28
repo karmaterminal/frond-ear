@@ -126,9 +126,11 @@ export function identityIn(
       value.forEach((item, i) => walk(item, `${at}[${i}]`));
     } else if (typeof value === "object" && value !== null) {
       for (const [key, item] of Object.entries(value)) {
-        const place = at === "" ? key : `${at}.${key}`;
+        // An identity-shaped key is its own finding, and its place never names it.
         const reason = identityShape(key);
-        if (reason !== null) found.push({ at: `${place} (key)`, reason });
+        const name = reason === null ? key : "<withheld key>";
+        const place = at === "" ? name : `${at}.${name}`;
+        if (reason !== null) found.push({ at: place, reason });
         walk(item, place);
       }
     }
@@ -177,6 +179,16 @@ const count = (value: unknown): number | null =>
     ? value
     : null;
 
+/**
+ * The source's revision word from `git rev-parse --short` and `git status --porcelain`: at
+ * most 12 hex digits, since a longer one would read as a key id; anything else is unknown.
+ */
+export function revisionWord(sha: string, porcelain: string): string {
+  return /^[0-9a-f]{7,12}$/u.test(sha)
+    ? `${sha}${porcelain === "" ? "" : "+dirty"}`
+    : "unknown";
+}
+
 function gitRevision(): string {
   const repo = join(import.meta.dirname, "..", "..");
   try {
@@ -193,10 +205,7 @@ function gitRevision(): string {
       ["-C", repo, "status", "--porcelain", "--untracked-files=no"],
       { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
     ).trim();
-    // At most 12 digits: a longer one would read as a key id to the backstop.
-    return /^[0-9a-f]{7,12}$/u.test(sha)
-      ? `${sha}${dirty === "" ? "" : "+dirty"}`
-      : "unknown";
+    return revisionWord(sha, dirty);
   } catch {
     return "unknown";
   }
