@@ -13,7 +13,7 @@ import { streamId } from "../src/canticle/ids.ts";
 import { Manifest } from "../src/canticle/manifest.ts";
 import { RECORD_V } from "../src/canticle/records.ts";
 import { CanticleReceptor } from "../src/canticle/receptor.ts";
-import { KIND_ITEM, SIGN_DOMAIN } from "../src/canticle/wire.ts";
+import { KIND_BEACON, KIND_ITEM, SIGN_DOMAIN } from "../src/canticle/wire.ts";
 import { StructuredLogger } from "../src/logger.ts";
 import { canticleConfig, setup } from "./canticle-host.ts";
 import { harness, type Harness } from "./helpers.ts";
@@ -156,13 +156,29 @@ const secret = createPrivateKey({
   type: "pkcs8",
 });
 
+/** A frame of `kind` from test1 with these fields, signed. */
+function framed(
+  kind: number,
+  fields: Record<number, cbor.CborValue | number>,
+): Uint8Array {
+  const m: cbor.CborMap = new Map();
+  for (const [k, v] of Object.entries(fields))
+    m.set(BigInt(k), typeof v === "number" ? BigInt(v) : v);
+  const unsigned = Buffer.concat([
+    Buffer.from([0x42, 0x43, 2, kind]),
+    Buffer.from(test1.key_id, "hex"),
+    cbor.encode(m),
+  ]);
+  const signature = sign(null, Buffer.concat([SIGN_DOMAIN, unsigned]), secret);
+  return new Uint8Array(Buffer.concat([unsigned, signature]));
+}
+
 /** A signed ITEM from test1 on `chatter`, issued at T0; `extra` sets more fields. */
 function signed(
   seq: number,
   extra: Record<number, cbor.CborValue | number> = {},
 ) {
-  const m: cbor.CborMap = new Map();
-  const fields: Record<number, cbor.CborValue | number> = {
+  return framed(KIND_ITEM, {
     1: 1, // epoch
     2: streamId("chatter"),
     3: seq,
@@ -174,16 +190,20 @@ function signed(
     11: 0, // hop
     13: 1, // text
     ...extra,
-  };
-  for (const [k, v] of Object.entries(fields))
-    m.set(BigInt(k), typeof v === "number" ? BigInt(v) : v);
-  const unsigned = Buffer.concat([
-    Buffer.from([0x42, 0x43, 2, KIND_ITEM]),
-    Buffer.from(test1.key_id, "hex"),
-    cbor.encode(m),
-  ]);
-  const signature = sign(null, Buffer.concat([SIGN_DOMAIN, unsigned]), secret);
-  return new Uint8Array(Buffer.concat([unsigned, signature]));
+  });
+}
+
+/** A signed BEACON from test1 at `wallclock`, naming no root: its presence reads ROOT_UNKNOWN. */
+function beacon(bseq: number, wallclock: number) {
+  return framed(KIND_BEACON, {
+    1: 1, // epoch
+    2: bseq,
+    3: wallclock,
+    4: 1_000, // period
+    5: "canticle-regulation/1",
+    6: [],
+    8: 16_000,
+  });
 }
 
 test("adapters: a guide call reads no body from the embedded listener; hear does", async () => {
@@ -293,6 +313,72 @@ test("adapters: the embedded listener's untuned records are listed by name, no b
       /nothing live on your tuned streams/u,
     );
     assert.equal(reads.length, 0, `body reads: ${reads.join(", ")}`);
+  } finally {
+    receptor?.stop();
+    h.dispose();
+  }
+});
+
+// 🌿 gap 2 on #145: the embedded `guideView` adds presence for stations seen only in
+// untuned items (hear's `#viewOf` keeps stations to tuned ones), since an untuned row's
+// verification reads its station's presence. That loop could be cut with nothing red.
+test("adapters: on the embedded path an untuned row's station keeps its presence, and reads unknown when blind", async () => {
+  const config = canticleConfig(undefined, {
+    source: "embedded",
+    manifestPath: "unused",
+    tune: { scribe: ["test2:chatter"] },
+  });
+  let receptor: CanticleReceptor | undefined;
+  const h = harness(config, {
+    canticleHear: (ear) => receptor!.hearView(ear),
+    canticleGuide: (ear) => receptor!.guideView(ear),
+  });
+  try {
+    h.clock.value = T0 + 10_000;
+    receptor = new CanticleReceptor({
+      config: config.canticle!,
+      manifest: Manifest.fromJson(vectors.manifest),
+      store: h.store,
+      logger: new StructuredLogger(() => {}),
+      clock: h.clock,
+      timers: h.timers,
+      socket: () =>
+        ({
+          on: () => {},
+          bind: (_port: number, _host: string, bound: () => void) => bound(),
+          close: () => {},
+        }) as never,
+    });
+    receptor.start();
+    const shim = h.attach("scribe");
+    receptor.receive(beacon(1, h.clock.now()));
+    receptor.receive(signed(1));
+    const untunedRow = async () => {
+      const view = JSON.parse(
+        (await h.call(shim, "canticle_guide", {})).text,
+      ) as {
+        rows: unknown[];
+        untuned?: { rows: Array<{ station: string; verification: string }> };
+      };
+      assert.deepEqual(view.rows, []);
+      assert.equal(view.untuned?.rows.length, 1, JSON.stringify(view.untuned));
+      return view.untuned!.rows[0]!;
+    };
+    // The control: hear's view leaves test1 out, as it tunes only test2.
+    assert.deepEqual(receptor.hearView("scribe").stations, []);
+    assert.deepEqual(receptor.guideView("scribe").stations, [
+      { name: "test1", presence: "ROOT_UNKNOWN" },
+    ]);
+    const row = await untunedRow();
+    assert.equal(row.station, "test1");
+    assert.equal(row.verification, "ROOT_UNKNOWN", "from test1's presence");
+    // No datagram for longer than the blind window: presence is unknown, not the last one.
+    h.clock.advance(31_000);
+    assert.equal(receptor.guideView("scribe").blind, true);
+    assert.deepEqual(receptor.guideView("scribe").stations, [
+      { name: "test1", presence: "unknown" },
+    ]);
+    assert.equal((await untunedRow()).verification, "verified");
   } finally {
     receptor?.stop();
     h.dispose();

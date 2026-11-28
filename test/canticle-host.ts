@@ -262,34 +262,62 @@ export class Host {
 
   /** A new connection asks for, and gets, a complete join snapshot of the run. */
   rejoin(): void {
-    this.consumer.reconnected({ joinSnapshot: true });
-    this.listening = true;
+    const steps = this.rejoinSteps();
+    steps.hello();
+    steps.landing();
+    steps.entries();
+    steps.end();
+  }
+
+  /**
+   * `rejoin` one step at a time, so a test can look between them: the new connection and
+   * its `hello`, then the baseline `landing_state`, then the snapshot's entries, then
+   * `snapshot_end`. Call each once, in that order.
+   */
+  rejoinSteps(): {
+    hello(): void;
+    landing(): void;
+    entries(): void;
+    end(): void;
+  } {
     const now = this.now;
     const feed = (type: string, recSeq: number, extra: R) =>
       this.consumer.feed(
         { v: RECORD_V, type, rec_seq: recSeq, run: this.run, ...extra },
         now,
       );
-    feed("hello", 1, { join_snapshot: true });
-    this.#seq += 1;
-    const w = this.#seq; // the latest landing_state is the baseline, and W
-    feed("landing_state", w, { mute: null, breaker: "closed" });
-    const entries = [
-      ...[...this.stations].map(([name, state]) =>
-        this.#presenceFields(name, state),
-      ),
-      ...[...this.onAir.values()].filter(
-        (f) => (f.times as { local_expiry_at: number }).local_expiry_at > now,
-      ),
-    ];
-    entries.forEach((entry, i) =>
-      feed("snapshot", w, { snap_seq: i + 1, entry }),
-    );
-    feed("snapshot_end", w, {
-      watermark: w,
-      count: entries.length,
-      truncated: false,
-    });
+    let w = 0;
+    let count = 0;
+    return {
+      hello: () => {
+        this.consumer.reconnected({ joinSnapshot: true });
+        this.listening = true;
+        feed("hello", 1, { join_snapshot: true });
+      },
+      landing: () => {
+        this.#seq += 1;
+        w = this.#seq; // the latest landing_state is the baseline, and W
+        feed("landing_state", w, { mute: null, breaker: "closed" });
+      },
+      entries: () => {
+        const entries = [
+          ...[...this.stations].map(([name, state]) =>
+            this.#presenceFields(name, state),
+          ),
+          ...[...this.onAir.values()].filter(
+            (f) =>
+              (f.times as { local_expiry_at: number }).local_expiry_at > now,
+          ),
+        ];
+        count = entries.length;
+        entries.forEach((entry, i) =>
+          feed("snapshot", w, { snap_seq: i + 1, entry }),
+        );
+      },
+      end: () => {
+        feed("snapshot_end", w, { watermark: w, count, truncated: false });
+      },
+    };
   }
 
   view() {

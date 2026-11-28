@@ -350,3 +350,48 @@ test("untuned: names are sanitized tokens as on rows; only metadata fields are r
     undefined,
   );
 });
+
+// 🌿 gap 1 on #145: records.ts lists an untuned record only past the same deliverable gate
+// rows pass (`if (r.carried || !deliverable) continue;` ahead of the tuned/untuned split).
+// Nothing pinned that for the untuned list: listed above the gate, an untuned station was
+// named under a host mute, with the link down, before `landing_state` and inside a join
+// snapshot. Each step here is held, then lifted, through the guide tool.
+test("untuned: nothing is listed while the source can't deliver (host mute, link down, before landing_state, inside a join snapshot); it comes back when it can", async () => {
+  const { h, host } = setup(undefined);
+  try {
+    const shim = h.attach("scribe");
+    const lighthouse = { station: "frond-scribe", stream: "scribe.lighthouse" };
+    host.sing(1);
+    host.sing(2, loud(lighthouse));
+    const look = async () => {
+      const { raw, view } = await guide(h, shim);
+      assert.doesNotMatch(raw, new RegExp(SENTINEL, "u"), "no payload");
+      return { rows: names(view.rows), untuned: names(view.untuned!.rows) };
+    };
+    const deliverable = {
+      rows: ["ops:ops.fleet"],
+      untuned: ["frond-scribe:scribe.lighthouse"],
+    };
+    const held = { rows: [], untuned: [] };
+    assert.deepEqual(await look(), deliverable, "the control: on air, listed");
+
+    host.landing({ mute: { until: null, by: "operator" } });
+    assert.deepEqual(await look(), held, "a host MUTE holds the untuned list");
+    host.landing({ mute: null });
+    assert.deepEqual(await look(), deliverable, "the mute lifted");
+
+    host.drop();
+    assert.deepEqual(await look(), held, "link down: nothing deliverable");
+    const steps = host.rejoinSteps();
+    steps.hello();
+    assert.deepEqual(await look(), held, "a new connection, no landing_state");
+    steps.landing();
+    assert.deepEqual(await look(), held, "landing_state; the snapshot not yet");
+    steps.entries();
+    assert.deepEqual(await look(), held, "inside the join snapshot");
+    steps.end();
+    assert.deepEqual(await look(), deliverable, "snapshot_end: deliverable");
+  } finally {
+    h.dispose();
+  }
+});
