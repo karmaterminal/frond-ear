@@ -185,6 +185,14 @@ export class RecordClient {
       counts: { ...this.consumer.counts },
       liveSet,
       stations: Object.fromEntries(this.consumer.presence),
+      // The tune this source applies, per ear: fixed at its start, whatever the config file
+      // says now (a restart applies an edit). Read-only; house-export reads it (🌿 R6).
+      appliedTune: Object.fromEntries(
+        Object.entries(this.#options.tune).map(([ear, patterns]) => [
+          ear,
+          [...patterns],
+        ]),
+      ),
     };
   }
 }

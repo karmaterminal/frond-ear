@@ -24,6 +24,14 @@
 //   looks (the guide's read of delivery modes purges attention rows whose TTL had already
 //   lapsed, as every such read does); it starts, stops and writes nothing itself.
 //   `--offline` skips the daemon.
+// - The running daemon's view decides (🌿 R6, 🌫): it reads canticle.enabled and
+//   canticle.tune only at its start. payload_text and the canticle state are the daemon's;
+//   may_read is the tune its source says it applies (status `appliedTune`, a read-only
+//   field). A daemon that doesn't say it proves only the streams it listed as tuned, so
+//   may_read is those, and offline it is empty. The file's tune is kept apart as
+//   basis.may_read_configured, configured intent and never proof. Any difference between
+//   file and daemon is config_daemon_mismatch; an unproven scope is runtime_scope_unverified;
+//   either way may_read_complete is false.
 // - Known limit (🌿 round 4): the walk is checked by a re-walk and a second status read,
 //   so a change that happens and reverts between those reads (a row swapped and swapped
 //   back, a word flipped and flipped back) is invisible to any client re-read. Only a
@@ -176,7 +184,8 @@ const DAEMON_TIMEOUT_MS = 5_000;
 
 interface StreamOut {
   stream: string;
-  tuned: boolean;
+  /** The daemon's answer; null when nothing it said can tell. */
+  tuned: boolean | null;
   admitted: boolean | null;
   live: number | null;
   newest_age_ms: number | null;
@@ -268,8 +277,12 @@ type DaemonView =
       badCounts: Set<string>;
       /** Stations a row of which gave two verification words across its sightings. */
       unsure: Set<string>;
+      /** Whether the running daemon has canticle on. */
+      canticleOn: boolean;
+      /** The tune its source applies to this ear, when its status says so. */
+      appliedTune: string[] | undefined;
     }
-  | { kind: "config"; listener: "not reached" | "not asked" | "canticle off" };
+  | { kind: "config"; listener: "not reached" | "not asked" };
 
 /** An error whose message is frond-ear's own words, safe to print. */
 class HouseError extends Error {}
@@ -343,6 +356,9 @@ const WALK_BREAKS = new Set([
  * board; a row's own omissions or coverage hole make only that row's station partial.
  */
 const NOT_COVERAGE = new Set([
+  "count_changed",
+  "config_daemon_mismatch",
+  "runtime_scope_unverified",
   "verification_changed",
   "presence_changed",
   "presence_disagrees",
@@ -397,7 +413,16 @@ async function readDaemon(
     }
   }
   // The embedded listener's untuned list covers only streams some ear tunes.
-  if (canticle?.source !== "host-daemon") gap("untuned_partial_source");
+  // The running daemon's own canticle state and the tune its source applies (🌿 R6): both
+  // are fixed at the daemon's start, so the config file can be newer than either.
+  let canticleOn = canticle !== undefined && canticle.state !== "disabled";
+  const appliedRaw = obj(canticle?.appliedTune)?.[ear];
+  const appliedTune =
+    Array.isArray(appliedRaw) && appliedRaw.every((p) => typeof p === "string")
+      ? (appliedRaw as string[])
+      : undefined;
+  if (canticleOn && canticle?.source !== "host-daemon")
+    gap("untuned_partial_source");
   const rows: Array<Record<string, unknown>> = [];
   const rowGaps = new Set<string>();
   const untuned: Array<Record<string, unknown>> = [];
@@ -407,7 +432,8 @@ async function readDaemon(
   let truncated = false;
   let broken = false;
   const guideGaps = new Map<string, number>();
-  const untunedSeen = new Set<string>();
+  const untunedAt = new Map<string, number>();
+  const countChanged = new Set<string>();
   const badCounts = new Set<string>();
   /** Every row either pass read, for the presence check: each carries its station's word. */
   const presenceRows: Array<Record<string, unknown>> = [];
@@ -488,6 +514,7 @@ async function readDaemon(
           /^canticle is not enabled/u.test(result.text)
         ) {
           listener = "canticle off";
+          canticleOn = false;
         } else if (
           !(
             pass === 0 &&
@@ -592,9 +619,28 @@ async function readDaemon(
             rowGaps.add(row.station);
           }
           sighted(row);
-          if (!untunedSeen.has(rowKey(row))) {
-            untunedSeen.add(rowKey(row));
+          const key = rowKey(row);
+          const at = untunedAt.get(key);
+          if (at === undefined) {
+            untunedAt.set(key, untuned.length);
             untuned.push(row);
+          } else {
+            // The same untuned row on a later page (🌿 R6-3): a live count that differs, or a
+            // newest age that drops (a newer record), is count_changed and the count unknown.
+            // An age that only grows is time passing: the latest sighting's stands.
+            const prior = untuned[at]!;
+            const priorAge = count(prior.newestAgeS);
+            const age = count(row.newestAgeS);
+            const differs =
+              count(prior.live) !== count(row.live) ||
+              (priorAge !== null && age !== null && age < priorAge);
+            if (differs && !countChanged.has(key)) {
+              countChanged.add(key);
+              gap("count_changed");
+              badCounts.add(key);
+              rowGaps.add(row.station);
+            }
+            if (!differs) untuned[at] = row;
           }
         }
         if (more === null && u.more !== undefined)
@@ -688,7 +734,8 @@ async function readDaemon(
   // The presence table is read again too, and compared by station names; a changed word
   // is a reading in time, not a change in what the walk covers.
   const flipped = new Set<string>();
-  if (!broken && !truncated && !changed) {
+  // With canticle off there is no presence table to compare.
+  if (canticleOn && !broken && !truncated && !changed) {
     const after = await ask({ type: "status" }).catch(() => undefined);
     let names: string[] | undefined;
     try {
@@ -757,6 +804,8 @@ async function readDaemon(
     listener,
     badCounts,
     unsure,
+    canticleOn,
+    appliedTune,
     presence,
     rows,
     untuned,
@@ -777,13 +826,56 @@ export function houseExport(input: {
   daemon: DaemonView;
 }): object {
   const { ear, canticle, manifest, daemon } = input;
-  const enabled = canticle?.enabled === true;
-  const patterns =
-    enabled && Object.hasOwn(canticle.tune, ear)
+  // The running daemon's view decides (🌿 R6): it reads canticle.enabled and canticle.tune
+  // only at its start, so the file can be newer. The file is a cross-check.
+  const configEnabled = canticle?.enabled === true;
+  const configPatterns =
+    configEnabled && Object.hasOwn(canticle.tune, ear)
       ? [...(canticle.tune[ear] ?? [])]
       : [];
+  const live0 = daemon.kind === "daemon";
+  const enabled = live0 ? daemon.canticleOn : configEnabled;
+  // The scope: the daemon's applied tune when it says it; else only what its tuned rows
+  // prove (a row it listed as tuned); offline, nothing (the file's tune is unverified).
+  const applied = live0 && daemon.canticleOn ? daemon.appliedTune : undefined;
+  const scopeBasis = !live0
+    ? "none: the config's tune is unverified against a running daemon"
+    : !daemon.canticleOn
+      ? "none: canticle is off in the running daemon"
+      : applied !== undefined
+        ? "the running daemon's applied tune"
+        : "the running daemon's tuned rows only (it doesn't say its tune)";
+  const provenRows =
+    live0 && daemon.canticleOn && applied === undefined
+      ? [
+          ...new Set(
+            daemon.rows.map(
+              (row) => `${String(row.station)}:${String(row.stream)}`,
+            ),
+          ),
+        ].sort()
+      : [];
+  const patterns = applied ?? provenRows;
+  let mismatch = 0;
+  if (live0 && daemon.canticleOn !== configEnabled) mismatch += 1;
+  if (applied !== undefined) {
+    const a = new Set(applied);
+    const c = new Set(configPatterns);
+    for (const p of a) if (!c.has(p)) mismatch += 1;
+    for (const p of c) if (!a.has(p)) mismatch += 1;
+  } else if (live0 && daemon.canticleOn) {
+    // Without the daemon's tune, its rows still contradict the file where they can.
+    for (const row of daemon.rows) {
+      if (!tunes(configPatterns, String(row.station), String(row.stream)))
+        mismatch += 1;
+    }
+    for (const row of daemon.untuned) {
+      if (tunes(configPatterns, String(row.station), String(row.stream)))
+        mismatch += 1;
+    }
+  }
   const delivery =
-    enabled && Object.hasOwn(canticle.delivery, ear)
+    enabled && canticle !== undefined && Object.hasOwn(canticle.delivery, ear)
       ? canticle.delivery[ear]
       : undefined;
   const pushStations = Object.entries(delivery?.stations ?? {});
@@ -846,6 +938,19 @@ export function houseExport(input: {
   // says it is incomplete, so a card never reads its absence as a definite no. It adds
   // nothing to the deck: it is counted once, under the reader.
   const mayRead: string[] = [];
+  const configured: string[] = [];
+  for (const pattern of configPatterns) {
+    const issue = patternIssue(pattern);
+    if (issue !== null) {
+      if (applied === undefined) withhold("reader.may_read", issue, pattern);
+      continue;
+    }
+    configured.push(pattern);
+    const at = pattern.indexOf(":");
+    const name = pattern.slice(0, at);
+    if (name !== "*" && nameIssue(name) === null)
+      addStream(building(name), name, pattern.slice(at + 1));
+  }
   for (const pattern of patterns) {
     const issue = patternIssue(pattern);
     if (issue !== null) {
@@ -858,6 +963,18 @@ export function houseExport(input: {
     if (name !== "*") addStream(building(name), name, pattern.slice(at + 1));
   }
   const gaps = new Map(daemon.kind === "daemon" ? daemon.gaps : []);
+  if (mismatch > 0) gaps.set("config_daemon_mismatch", mismatch);
+  if (applied === undefined && (!live0 || daemon.canticleOn))
+    gaps.set("runtime_scope_unverified", 1);
+  // Canticle off in the daemon: nothing is heard, so no stream is vouched for (each reads
+  // unknown, as a coverage gap makes it), and the board is no count of anything.
+  if (live0 && !daemon.canticleOn) gaps.set("canticle_off", 1);
+  // Which list each row came back in is the daemon's own tune at work.
+  const rowTuned = new Map<string, boolean>();
+  if (daemon.kind === "daemon") {
+    for (const row of daemon.rows) rowTuned.set(rowKey(row), true);
+    for (const row of daemon.untuned) rowTuned.set(rowKey(row), false);
+  }
   if (daemon.kind === "daemon") {
     // readDaemon already held every presence word to the closed list.
     for (const [name, state] of daemon.presence) {
@@ -916,7 +1033,11 @@ export function houseExport(input: {
         .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
         .map(([stream, s]) => ({
           stream,
-          tuned: tunes(patterns, name, stream),
+          // The daemon's own answer: the list the row came back in; else its applied tune;
+          // else unknown (🌿 R6), never the file's tune.
+          tuned:
+            rowTuned.get(JSON.stringify([name, stream])) ??
+            (applied !== undefined ? tunes(applied, name, stream) : null),
           admitted: st.manifestStreams?.has(stream) === true ? true : null,
           // A stream no row reached is 0 only when the deck vouches for the whole board;
           // otherwise it is unknown (🌿 round 2), and a row it read keeps its count.
@@ -943,12 +1064,19 @@ export function houseExport(input: {
       reader: ear,
       payload_text: enabled,
       may_read: mayRead,
-      may_read_complete: mayRead.length === patterns.length,
+      may_read_complete:
+        mayRead.length === patterns.length &&
+        applied !== undefined &&
+        mismatch === 0,
       // How many tune patterns were withheld: a reader carries it, so a stream no kept
       // pattern matches reads unknown there, never outside the scope.
       may_read_withheld: patterns.length - mayRead.length,
       basis: {
         canticle: enabled ? "enabled" : "disabled",
+        scope: scopeBasis,
+        config_patterns: configPatterns.length,
+        // The file's tune: configured intent, never proof of what the daemon reads (🌫).
+        may_read_configured: configured,
         hear: enabled ? "payload text of tuned streams" : "off",
         push: {
           mode: delivery?.mode ?? "off",
@@ -1070,7 +1198,12 @@ export async function runHouseExport(
   }
   const canticle = config.canticle;
   let manifest: Manifest | "unreadable" | "none" = "none";
-  if (canticle?.enabled) {
+  // The manifest names the fleet's stations whatever the file says of canticle.enabled:
+  // the running daemon may have canticle on.
+  if (
+    typeof canticle?.manifestPath === "string" &&
+    canticle.manifestPath !== ""
+  ) {
     try {
       manifest = Manifest.fromJson(
         JSON.parse(readFileSync(canticle.manifestPath, "utf8")),
@@ -1083,8 +1216,8 @@ export async function runHouseExport(
     }
   }
   let daemon: DaemonView;
-  if (!canticle?.enabled) daemon = { kind: "config", listener: "canticle off" };
-  else if (values.offline) daemon = { kind: "config", listener: "not asked" };
+  // The daemon is asked whatever the file says: its own canticle state decides (🌿 R6).
+  if (values.offline) daemon = { kind: "config", listener: "not asked" };
   else {
     const ask =
       io.request ??

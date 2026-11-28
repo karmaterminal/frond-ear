@@ -81,6 +81,9 @@ const ALLOWED_KEYS = new Set([
   "truncated",
   "may_read_complete",
   "may_read_withheld",
+  "scope",
+  "config_patterns",
+  "may_read_configured",
   "withheld",
   "field",
   "reason",
@@ -117,12 +120,14 @@ interface Setup {
 /** A config file and a manifest on disk, a daemon serving them, and a host daemon feeding it. */
 function setup(
   canticle: R = {},
-  status: (host: Host) => object = (host) => ({
+  status: (host: Host, ear: string) => object = (host, ear) => ({
     source: "host-daemon",
     state: "connected",
     socket: `/run/${SENTINEL}/canticle.sock`,
     lastError: `payload ${SENTINEL}`,
     stations: Object.fromEntries(host.consumer.presence),
+    // The tune the running source applies: fixed at its start (RecordClient's options).
+    appliedTune: { [ear]: host.tune },
   }),
   opts: {
     ear?: string;
@@ -198,7 +203,7 @@ function setup(
   let host: Host | undefined;
   const h = harness(parseConfig(raw), {
     canticleGuide: () => host!.guideView(),
-    canticleStatus: () => status(host!),
+    canticleStatus: () => status(host!, ear),
   });
   host = new Host(h.clock, tune);
   host.start();
@@ -227,7 +232,7 @@ function setup(
 
 interface Stream {
   stream: string;
-  tuned: boolean;
+  tuned: boolean | null;
   admitted: boolean | null;
   live: number | null;
   newest_age_ms: number | null;
@@ -253,6 +258,9 @@ interface Export {
     may_read_withheld: number;
     basis: {
       canticle: string;
+      scope: string;
+      config_patterns: number;
+      may_read_configured: string[];
       hear: string;
       push: {
         mode: string;
@@ -528,8 +536,13 @@ test("house-export: with the daemon not reached, the deck is config and manifest
     assert.ok(ops.streams.every((x) => x.live === null));
     assert.deepEqual(
       doc.reader.may_read,
+      [],
+      "the file's tune proves nothing without the daemon (🌿 R6)",
+    );
+    assert.deepEqual(
+      doc.reader.basis.may_read_configured,
       TUNE,
-      "the reader stands on config alone",
+      "kept as configured intent",
     );
   } finally {
     s.dispose();
@@ -564,7 +577,11 @@ test("house-export: canticle off: no payload text, nothing tuned", async () => {
     assert.deepEqual(doc.reader.may_read, []);
     assert.equal(doc.reader.basis.canticle, "disabled");
     assert.equal(doc.reader.basis.hear, "off");
-    assert.equal(doc.deck.listener, "canticle off");
+    assert.equal(
+      doc.deck.listener,
+      "not asked",
+      "offline: the daemon's own state is unknown",
+    );
   } finally {
     s.dispose();
   }
@@ -789,6 +806,7 @@ function guideDaemon(
           canticle: o.status ?? {
             source: "host-daemon",
             stations: { ops: "EQUIPPED_SPEAKING" },
+            appliedTune: { scribe: TUNE },
           },
         }),
       };
@@ -2548,6 +2566,377 @@ test("house-export coverage: a status word of unknown says nothing a sighting ca
       !gapNames(doc).includes("presence_disagrees"),
       JSON.stringify(doc.deck.gaps),
     );
+  } finally {
+    s.dispose();
+  }
+});
+
+// 🌿 R6 on #147: the running daemon's view decides. canticle.tune and canticle.enabled are
+// read by the daemon only at its start; the file is a cross-check, never the answer.
+import { RecordClient } from "../src/canticle/record-client.ts";
+import { StructuredLogger } from "../src/logger.ts";
+import { readFileSync as readFile } from "node:fs";
+
+/** Rewrites the config file on disk as an edit would, with no daemon restart. */
+function editConfig(
+  env: NodeJS.ProcessEnv,
+  edit: (raw: Record<string, any>) => void,
+): void {
+  const path = env.FROND_EAR_CONFIG!;
+  const raw = JSON.parse(readFile(path, "utf8")) as Record<string, any>;
+  edit(raw);
+  writeFileSync(path, JSON.stringify(raw));
+}
+
+test("house-export scope: 🌿's repro: a tune edited in the file without a restart: the daemon's applied tune decides, and the mismatch is named", async () => {
+  const s = setup();
+  try {
+    s.host.sing(500, { station: "alpha", stream: "chatter" }); // untuned for the running daemon
+    editConfig(s.env, (raw) => {
+      raw.canticle.tune.scribe = [
+        ...TUNE.filter((p) => p !== "quiet:whisper"),
+        "alpha:chatter",
+      ];
+    });
+    const { doc } = await run(s);
+    assert.deepEqual(
+      doc.reader.may_read,
+      TUNE,
+      "what the running daemon applies",
+    );
+    assert.equal(doc.reader.may_read_complete, false);
+    assert.equal(doc.reader.basis.scope, "the running daemon's applied tune");
+    assert.ok(
+      doc.deck.gaps.some(
+        (g) => g.name === "config_daemon_mismatch" && g.count === 2,
+      ),
+      JSON.stringify(doc.deck.gaps),
+    );
+    assert.equal(
+      station(doc, "alpha").streams.find((x) => x.stream === "chatter")?.tuned,
+      false,
+      "the daemon doesn't tune it",
+    );
+    assert.equal(
+      station(doc, "quiet").streams.find((x) => x.stream === "whisper")?.tuned,
+      true,
+      "the daemon still tunes it",
+    );
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export scope: 🌿's repro: canticle on in the file, off in the running daemon: payload text off, the board unknown", async () => {
+  const s = setup();
+  try {
+    // A daemon with no canticle source: status says disabled, the guide says not enabled.
+    const raw = JSON.parse(readFile(s.env.FROND_EAR_CONFIG!, "utf8")) as Record<
+      string,
+      unknown
+    >;
+    const off = harness(parseConfig(raw));
+    try {
+      const cli = off.attach(undefined, { role: "cli" });
+      let id = 1;
+      const { doc } = await run(s, undefined, {
+        request: async (message) => {
+          const at = ++id;
+          await cli.send({ ...message, id: at } as never);
+          const r = cli.connection.results().find((x) => x.id === at)!;
+          return { ok: r.ok, text: r.text };
+        },
+      });
+      assert.equal(doc.reader.payload_text, false);
+      assert.equal(doc.reader.basis.canticle, "disabled");
+      assert.deepEqual(doc.reader.may_read, []);
+      assert.equal(doc.reader.may_read_complete, false);
+      assert.equal(doc.deck.listener, "canticle off");
+      assert.equal(doc.deck.connected, false);
+      assert.ok(
+        gapNames(doc).includes("config_daemon_mismatch"),
+        JSON.stringify(doc.deck.gaps),
+      );
+      assert.ok(
+        doc.deck.stations.every((st) =>
+          st.streams.every((x) => x.live === null),
+        ),
+      );
+      assert.ok(allPartial(doc));
+      assert.ok(
+        !gapNames(doc).includes("changed_mid_walk"),
+        "no presence table to compare, not a change",
+      );
+    } finally {
+      off.dispose();
+    }
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export scope: canticle off in the file, on in the running daemon: the daemon is asked, and it decides", async () => {
+  const s = setup();
+  try {
+    s.host.sing(1);
+    editConfig(s.env, (raw) => {
+      raw.canticle.enabled = false;
+    });
+    const { doc } = await run(s);
+    assert.equal(doc.reader.payload_text, true);
+    assert.equal(doc.deck.listener, "listening");
+    assert.deepEqual(doc.reader.may_read, TUNE);
+    assert.ok(gapNames(doc).includes("config_daemon_mismatch"));
+    assert.equal(
+      station(doc, "ops").streams.find((x) => x.stream === "ops.fleet")?.live,
+      1,
+    );
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export scope: config and daemon agree: the scope is whole, and no mismatch", async () => {
+  const s = setup();
+  try {
+    const { doc } = await run(s);
+    assert.equal(doc.reader.may_read_complete, true);
+    assert.equal(doc.reader.basis.scope, "the running daemon's applied tune");
+    assert.equal(doc.reader.basis.config_patterns, TUNE.length);
+    assert.ok(!gapNames(doc).includes("config_daemon_mismatch"));
+    assert.ok(!gapNames(doc).includes("runtime_scope_unverified"));
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export scope: --offline says the scope is the config's, unverified: nothing in it can prove a read", async () => {
+  const s = setup();
+  try {
+    const { doc } = await run(s, ["--ear", "scribe", "--offline"]);
+    assert.equal(
+      doc.reader.basis.scope,
+      "none: the config's tune is unverified against a running daemon",
+    );
+    assert.deepEqual(doc.reader.may_read, []);
+    assert.equal(doc.reader.may_read_complete, false);
+    assert.equal(doc.reader.basis.config_patterns, TUNE.length);
+    assert.deepEqual(
+      doc.reader.basis.may_read_configured,
+      TUNE,
+      "configured intent, labelled apart",
+    );
+    assert.ok(gapNames(doc).includes("runtime_scope_unverified"));
+    assert.ok(
+      doc.deck.stations.every((st) =>
+        st.streams.every((x) => x.tuned === null),
+      ),
+    );
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export scope: a daemon that doesn't say its tune: only its tuned rows prove a read, and rows the file contradicts are named", async () => {
+  const s = setup({}, (host) => ({
+    source: "host-daemon",
+    stations: Object.fromEntries(host.consumer.presence),
+  }));
+  try {
+    s.host.sing(1); // ops:ops.fleet, tuned by the daemon
+    s.host.sing(500, { station: "alpha", stream: "chatter" });
+    editConfig(s.env, (raw) => {
+      raw.canticle.tune.scribe = ["alpha:chatter"]; // the file now tunes the untuned row, not ops.fleet
+    });
+    const { doc } = await run(s);
+    assert.equal(
+      doc.reader.basis.scope,
+      "the running daemon's tuned rows only (it doesn't say its tune)",
+    );
+    assert.deepEqual(doc.reader.may_read, ["ops:ops.fleet"]);
+    assert.equal(doc.reader.may_read_complete, false);
+    assert.ok(gapNames(doc).includes("runtime_scope_unverified"));
+    assert.ok(
+      doc.deck.gaps.some(
+        (g) => g.name === "config_daemon_mismatch" && g.count === 2,
+      ),
+      JSON.stringify(doc.deck.gaps),
+    );
+    assert.equal(
+      station(doc, "ops").streams.find((x) => x.stream === "ops.fleet")?.tuned,
+      true,
+    );
+    assert.equal(
+      station(doc, "alpha").streams.find((x) => x.stream === "chatter")?.tuned,
+      false,
+    );
+    assert.equal(
+      station(doc, "quiet").streams.find((x) => x.stream === "chatter")?.tuned,
+      null,
+      "no row and no applied tune: unknown",
+    );
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export scope: the record v1 source says the tune it applies (appliedTune), fixed at its start", () => {
+  const client = new RecordClient({
+    socketPath: "/nonexistent/canticle.sock",
+    tune: { scribe: ["*:ops.fleet"] },
+    logger: new StructuredLogger(() => {}),
+  });
+  assert.deepEqual((client.status() as { appliedTune: unknown }).appliedTune, {
+    scribe: ["*:ops.fleet"],
+  });
+});
+
+// 🌿 R6-3: an untuned row's numbers on later sightings were lost behind dedup too.
+test("house-export coverage: an untuned row whose live count changes across sightings reads unknown, named count_changed", async () => {
+  const s = setup();
+  try {
+    const { doc } = await run(s, undefined, {
+      request: guideDaemon(
+        view({
+          items: manyItems(),
+          untuned: [item({ station: "alpha", stream: "chatter" })],
+        }),
+        {
+          page: (n, text) => {
+            if (n !== 1) return { ok: true, text };
+            const v = JSON.parse(text) as {
+              untuned: { rows: Array<Record<string, unknown>> };
+            };
+            return {
+              ok: true,
+              text: JSON.stringify({
+                ...v,
+                untuned: {
+                  ...v.untuned,
+                  rows: v.untuned.rows.map((r) => ({ ...r, live: 5 })),
+                },
+              }),
+            };
+          },
+        },
+      ),
+    });
+    const x = station(doc, "alpha").streams.find((y) => y.stream === "chatter");
+    assert.equal(x?.live, null);
+    assert.ok(
+      gapNames(doc).includes("count_changed"),
+      JSON.stringify(doc.deck.gaps),
+    );
+    assert.equal(station(doc, "alpha").streams_known, "partial");
+    assert.equal(station(doc, "ops").streams_known, "complete", "only alpha");
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export coverage: an untuned row's age that only grows keeps the latest; one that drops is count_changed", async () => {
+  for (const [later, changed] of [
+    [9, false],
+    [0, true],
+  ] as const) {
+    const s = setup();
+    try {
+      const { doc } = await run(s, undefined, {
+        request: guideDaemon(
+          view({
+            items: manyItems(),
+            untuned: [item({ station: "alpha", stream: "chatter" })],
+          }),
+          {
+            page: (n, text) => {
+              if (n < 1) return { ok: true, text };
+              const v = JSON.parse(text) as {
+                untuned: { rows: Array<Record<string, unknown>> };
+              };
+              return {
+                ok: true,
+                text: JSON.stringify({
+                  ...v,
+                  untuned: {
+                    ...v.untuned,
+                    rows: v.untuned.rows.map((r) => ({
+                      ...r,
+                      newestAgeS: later,
+                    })),
+                  },
+                }),
+              };
+            },
+          },
+        ),
+      });
+      const x = station(doc, "alpha").streams.find(
+        (y) => y.stream === "chatter",
+      );
+      assert.equal(
+        gapNames(doc).includes("count_changed"),
+        changed,
+        JSON.stringify(doc.deck.gaps),
+      );
+      if (!changed)
+        assert.equal(x?.newest_age_ms, 9_000, "the latest sighting's age");
+    } finally {
+      s.dispose();
+    }
+  }
+});
+
+test("house-export scope: the daemon's canticle state from either of its words: status disabled, or a guide that says not enabled", async () => {
+  const cases: Array<[string, Parameters<typeof guideDaemon>[1]]> = [
+    [
+      "status disabled",
+      { status: { state: "disabled", appliedTune: { scribe: TUNE } } },
+    ],
+    [
+      "guide not enabled",
+      {
+        page: () => ({
+          ok: true,
+          text: "canticle is not enabled on this daemon (config canticle.enabled).",
+        }),
+      },
+    ],
+  ];
+  for (const [what, o] of cases) {
+    const s = setup();
+    try {
+      const { doc } = await run(s, undefined, {
+        request: guideDaemon(view(), o),
+      });
+      assert.equal(doc.reader.payload_text, false, what);
+      assert.deepEqual(doc.reader.may_read, [], what);
+      assert.ok(
+        gapNames(doc).includes("canticle_off"),
+        `${what}: ${JSON.stringify(doc.deck.gaps)}`,
+      );
+    } finally {
+      s.dispose();
+    }
+  }
+});
+
+test("house-export scope: an appliedTune that isn't a list of patterns is a daemon that didn't say", async () => {
+  const s = setup();
+  try {
+    const { doc } = await run(s, undefined, {
+      request: guideDaemon(view(), {
+        status: {
+          source: "host-daemon",
+          stations: { ops: "EQUIPPED_SPEAKING" },
+          appliedTune: { scribe: ["*:ops.fleet", 7] },
+        },
+      }),
+    });
+    assert.equal(
+      doc.reader.basis.scope,
+      "the running daemon's tuned rows only (it doesn't say its tune)",
+    );
+    assert.ok(gapNames(doc).includes("runtime_scope_unverified"));
   } finally {
     s.dispose();
   }
