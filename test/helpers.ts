@@ -200,6 +200,8 @@ export function harness(
     canticleHear?: (ear: string) => HearView;
     /** The metadata-only view `canticle_guide` reads (RFC-0002 §3.3). */
     canticleGuide?: (ear: string) => GuideSourceView;
+    /** The canticle source's status, as ear_status (and `frond-ear status`) show it. */
+    canticleStatus?: () => object;
     gatewayStatus?: () => { state: string; closeCode?: number };
     env?: NodeJS.ProcessEnv;
     /** The TCP shared token, for a test that serves this daemon over listenTcp. */
@@ -235,6 +237,9 @@ export function harness(
     nonce: () => options.nonce ?? "nonce-1",
     ...(options.canticleHear ? { canticleHear: options.canticleHear } : {}),
     ...(options.canticleGuide ? { canticleGuide: options.canticleGuide } : {}),
+    ...(options.canticleStatus
+      ? { canticleStatus: options.canticleStatus }
+      : {}),
     ...(options.gatewayStatus ? { gatewayStatus: options.gatewayStatus } : {}),
     attachmentsDir: join(directory, "attachments"),
     ...(options.env ? { env: options.env } : {}),

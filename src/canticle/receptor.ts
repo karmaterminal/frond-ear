@@ -886,6 +886,14 @@ export class CanticleReceptor {
           this.#listener.presenceState(kid, now),
         ]),
       ),
+
+      // The tune this receptor applies, per ear: fixed at its start (house-export reads it).
+      appliedTune: Object.fromEntries(
+        Object.entries(this.#options.config.tune).map(([ear, patterns]) => [
+          ear,
+          [...patterns],
+        ]),
+      ),
     };
   }
 }
