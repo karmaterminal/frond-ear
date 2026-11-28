@@ -32,6 +32,11 @@
 //   basis.may_read_configured, configured intent and never proof. Any difference between
 //   file and daemon is config_daemon_mismatch; an unproven scope is runtime_scope_unverified;
 //   either way may_read_complete is false.
+//   appliedTune counts only when both status reads report the same set and every guide
+//   row's list agrees with it (🌿 R7, 🌫); a disputed tune is kept as basis.may_read_observed
+//   and never in may_read, since a card reads any matching pattern there as yes. The
+//   canticle state likewise: missing, refused, changed between reads or contradicted by the
+//   guide is unknown, never off.
 // - Known limit (🌿 round 4): the walk is checked by a re-walk and a second status read,
 //   so a change that happens and reverts between those reads (a row swapped and swapped
 //   back, a word flipped and flipped back) is invisible to any client re-read. Only a
@@ -277,10 +282,14 @@ type DaemonView =
       badCounts: Set<string>;
       /** Stations a row of which gave two verification words across its sightings. */
       unsure: Set<string>;
-      /** Whether the running daemon has canticle on. */
-      canticleOn: boolean;
-      /** The tune its source applies to this ear, when its status says so. */
+      /** The running daemon's canticle state, when its reads and its guide agree. */
+      canticleState: CanticleState;
+      /** The tune its source applies to this ear: only when both reads and every row agree. */
       appliedTune: string[] | undefined;
+      /** Every applied tune pattern either status read reported, accepted or not. */
+      observedTune: string[];
+      /** Rows the daemon listed tuned on one sighting and untuned on another. */
+      tunedUnknown: Set<string>;
     }
   | { kind: "config"; listener: "not reached" | "not asked" };
 
@@ -356,6 +365,9 @@ const WALK_BREAKS = new Set([
  * board; a row's own omissions or coverage hole make only that row's station partial.
  */
 const NOT_COVERAGE = new Set([
+  "applied_tune_changed",
+  "applied_tune_disagrees",
+  "tuned_changed",
   "count_changed",
   "config_daemon_mismatch",
   "runtime_scope_unverified",
@@ -371,6 +383,34 @@ function gapName(line: unknown): string {
   if (typeof line !== "string") return "unrecognized_gap";
   return GAP_LINES.find(([re]) => re.test(line))?.[1] ?? "unrecognized_gap";
 }
+
+type CanticleState = "on" | "off" | "unknown";
+
+/**
+ * One status read's canticle facts: its state (on, off, or unknown when the read says
+ * nothing or its source was refused) and the tune its source says it applies to `ear`.
+ */
+function canticleOf(
+  canticle: Record<string, unknown> | undefined,
+  ear: string,
+): { state: CanticleState; applied: string[] | undefined } {
+  const raw = obj(canticle?.appliedTune)?.[ear];
+  const applied =
+    Array.isArray(raw) && raw.every((p) => typeof p === "string")
+      ? (raw as string[])
+      : undefined;
+  const state: CanticleState =
+    canticle === undefined || canticle.state === "refused"
+      ? "unknown"
+      : canticle.state === "disabled"
+        ? "off"
+        : "on";
+  return { state, applied };
+}
+
+const sameSet = (a: readonly string[], b: readonly string[]) =>
+  JSON.stringify([...new Set(a)].sort()) ===
+  JSON.stringify([...new Set(b)].sort());
 
 /** Strictly after, in the guide's one sort: (station, stream) by code unit. */
 function inOrder(a: [string, string], b: [string, string]): boolean {
@@ -414,14 +454,12 @@ async function readDaemon(
   }
   // The embedded listener's untuned list covers only streams some ear tunes.
   // The running daemon's own canticle state and the tune its source applies (🌿 R6): both
-  // are fixed at the daemon's start, so the config file can be newer than either.
-  let canticleOn = canticle !== undefined && canticle.state !== "disabled";
-  const appliedRaw = obj(canticle?.appliedTune)?.[ear];
-  const appliedTune =
-    Array.isArray(appliedRaw) && appliedRaw.every((p) => typeof p === "string")
-      ? (appliedRaw as string[])
-      : undefined;
-  if (canticleOn && canticle?.source !== "host-daemon")
+  // are fixed at the daemon's start, so the config file can be newer than either. They are
+  // taken only when both status reads and the guide's own rows agree (🌿 R7, 🌫).
+  const first = canticleOf(canticle, ear);
+  let canticleState: CanticleState = first.state;
+  let guideSaid: "on" | "off" | undefined;
+  if (first.state === "on" && canticle?.source !== "host-daemon")
     gap("untuned_partial_source");
   const rows: Array<Record<string, unknown>> = [];
   const rowGaps = new Set<string>();
@@ -443,6 +481,14 @@ async function readDaemon(
   // must agree with the status table. First-seen never wins.
   const verificationsOf = new Map<string, Set<string>>();
   const verificationSightings: Array<{ station: string; word: string }> = [];
+  /** Which list (tuned or untuned) each row came back in, at every sighting. */
+  const listedAs = new Map<string, Set<boolean>>();
+  const listIn = (row: Record<string, unknown>, tuned: boolean) => {
+    const key = rowKey(row);
+    let lists = listedAs.get(key);
+    if (lists === undefined) listedAs.set(key, (lists = new Set()));
+    lists.add(tuned);
+  };
   const sighted = (row: Record<string, unknown>) => {
     if (typeof row.verification !== "string") return;
     const key = rowKey(row);
@@ -514,7 +560,7 @@ async function readDaemon(
           /^canticle is not enabled/u.test(result.text)
         ) {
           listener = "canticle off";
-          canticleOn = false;
+          guideSaid = "off";
         } else if (
           !(
             pass === 0 &&
@@ -527,6 +573,7 @@ async function readDaemon(
         }
         break;
       }
+      guideSaid ??= "on";
       // Every page's coverage signals count, not just the first's (🌫 at f22fae03): a gap
       // line on any page is kept, by name, at the most any one page said it.
       const pageGaps = new Map<string, number>();
@@ -619,6 +666,7 @@ async function readDaemon(
             rowGaps.add(row.station);
           }
           sighted(row);
+          listIn(row, false);
           const key = rowKey(row);
           const at = untunedAt.get(key);
           if (at === undefined) {
@@ -669,6 +717,7 @@ async function readDaemon(
           continue;
         }
         sighted(row);
+        listIn(row, true);
         if (seen.has(rowKey(row))) {
           gap("duplicate_row");
           continue;
@@ -731,27 +780,77 @@ async function readDaemon(
     gap("changed_mid_walk");
   }
   for (const [name, n] of guideGaps) gap(name, n);
-  // The presence table is read again too, and compared by station names; a changed word
-  // is a reading in time, not a change in what the walk covers.
+  // The status is read again at the end, always (🌿 R7, 🌫): its canticle state and the
+  // tune its source applies are compared with the first read's, as sets, and its presence
+  // table by station names. A changed presence word is a reading in time, not a change in
+  // what the walk covers.
   const flipped = new Set<string>();
+  const after = await ask({ type: "status" }).catch(() => undefined);
+  let afterCanticle: Record<string, unknown> | undefined;
+  let afterRead = false;
+  try {
+    afterCanticle = obj(
+      obj(after?.ok ? JSON.parse(after.text) : undefined)?.canticle,
+    );
+    afterRead = after?.ok === true;
+  } catch {
+    afterCanticle = undefined;
+  }
+  const second = afterRead ? canticleOf(afterCanticle, ear) : undefined;
+  // The canticle state: a status read that says nothing, a refused source, two reads that
+  // differ, or a guide that contradicts the status, leave it unknown, never off.
+  if (first.state === "unknown") gap("canticle_state_unknown");
+  else if (second === undefined || second.state !== first.state) {
+    gap("canticle_state_changed");
+    canticleState = "unknown";
+  } else if (
+    (first.state === "off" && guideSaid === "on") ||
+    (first.state === "on" && guideSaid === "off")
+  ) {
+    gap("canticle_state_contradicts");
+    canticleState = "unknown";
+  }
+  // The applied tune: the same set in both reads, and every row's list agrees with it, or
+  // it isn't the scope. A disputed tune is kept only as observed, never as may_read.
+  let appliedTune: string[] | undefined;
+  const observed = [
+    ...new Set([...(first.applied ?? []), ...(second?.applied ?? [])]),
+  ];
+  if (first.applied !== undefined || second?.applied !== undefined) {
+    if (
+      first.applied !== undefined &&
+      second?.applied !== undefined &&
+      sameSet(first.applied, second.applied)
+    ) {
+      appliedTune = first.applied;
+    } else gap("applied_tune_changed");
+  }
+  // A row listed tuned on one sighting and untuned on another: unknown either way.
+  const tunedUnknown = new Set<string>();
+  for (const [key, lists] of listedAs)
+    if (lists.size > 1) tunedUnknown.add(key);
+  if (tunedUnknown.size > 0) gap("tuned_changed", tunedUnknown.size);
+  if (appliedTune !== undefined) {
+    const tune = appliedTune;
+    const disagrees = [...listedAs].some(([key, lists]) => {
+      const [station, stream] = JSON.parse(key) as [string, string];
+      return [...lists].some((tuned) => tunes(tune, station, stream) !== tuned);
+    });
+    if (disagrees) {
+      gap("applied_tune_disagrees");
+      appliedTune = undefined;
+    }
+  }
   // With canticle off there is no presence table to compare.
-  if (canticleOn && !broken && !truncated && !changed) {
-    const after = await ask({ type: "status" }).catch(() => undefined);
-    let names: string[] | undefined;
-    try {
-      const stations = obj(
-        obj(obj(after?.ok ? JSON.parse(after.text) : undefined)?.canticle)
-          ?.stations,
-      );
-      names = stations === undefined ? undefined : Object.keys(stations).sort();
-      // A word that flips between the two reads (🌿 round 4) is no answer: that station
-      // reads unknown, named presence_changed, never the first word alone.
-      for (const [name, word] of Object.entries(stations ?? {})) {
-        const before = presence.get(name);
-        if (before !== undefined && word !== before) flipped.add(name);
-      }
-    } catch {
-      names = undefined;
+  if (canticleState === "on" && !broken && !truncated && !changed) {
+    const stations = obj(afterCanticle?.stations);
+    const names =
+      stations === undefined ? undefined : Object.keys(stations).sort();
+    // A word that flips between the two reads (🌿 round 4) is no answer: that station
+    // reads unknown, named presence_changed, never the first word alone.
+    for (const [name, word] of Object.entries(stations ?? {})) {
+      const before = presence.get(name);
+      if (before !== undefined && word !== before) flipped.add(name);
     }
     if (
       names === undefined ||
@@ -804,8 +903,10 @@ async function readDaemon(
     listener,
     badCounts,
     unsure,
-    canticleOn,
+    canticleState,
     appliedTune,
+    observedTune: observed,
+    tunedUnknown,
     presence,
     rows,
     untuned,
@@ -834,36 +935,46 @@ export function houseExport(input: {
       ? [...(canticle.tune[ear] ?? [])]
       : [];
   const live0 = daemon.kind === "daemon";
-  const enabled = live0 ? daemon.canticleOn : configEnabled;
+  const state: CanticleState = live0 ? daemon.canticleState : "unknown";
+  const on = live0 && state === "on";
+  // payload_text is the daemon's: on, off, or (its state unclear) unknown; offline, the file's.
+  const enabled: boolean | null = live0
+    ? state === "unknown"
+      ? null
+      : state === "on"
+    : configEnabled;
   // The scope: the daemon's applied tune when it says it; else only what its tuned rows
   // prove (a row it listed as tuned); offline, nothing (the file's tune is unverified).
-  const applied = live0 && daemon.canticleOn ? daemon.appliedTune : undefined;
+  const applied = on ? daemon.appliedTune : undefined;
   const scopeBasis = !live0
     ? "none: the config's tune is unverified against a running daemon"
-    : !daemon.canticleOn
+    : state === "off"
       ? "none: canticle is off in the running daemon"
-      : applied !== undefined
-        ? "the running daemon's applied tune"
-        : "the running daemon's tuned rows only (it doesn't say its tune)";
+      : state === "unknown"
+        ? "none: the running daemon's canticle state is unknown"
+        : applied !== undefined
+          ? "the running daemon's applied tune"
+          : "the running daemon's tuned rows only (it doesn't say its tune)";
+  // A row the daemon listed both ways proves nothing (🌿 R7).
   const provenRows =
-    live0 && daemon.canticleOn && applied === undefined
+    on && applied === undefined
       ? [
           ...new Set(
-            daemon.rows.map(
-              (row) => `${String(row.station)}:${String(row.stream)}`,
-            ),
+            daemon.rows
+              .filter((row) => !daemon.tunedUnknown.has(rowKey(row)))
+              .map((row) => `${String(row.station)}:${String(row.stream)}`),
           ),
         ].sort()
       : [];
   const patterns = applied ?? provenRows;
   let mismatch = 0;
-  if (live0 && daemon.canticleOn !== configEnabled) mismatch += 1;
+  if (live0 && state !== "unknown" && on !== configEnabled) mismatch += 1;
   if (applied !== undefined) {
     const a = new Set(applied);
     const c = new Set(configPatterns);
     for (const p of a) if (!c.has(p)) mismatch += 1;
     for (const p of c) if (!a.has(p)) mismatch += 1;
-  } else if (live0 && daemon.canticleOn) {
+  } else if (on) {
     // Without the daemon's tune, its rows still contradict the file where they can.
     for (const row of daemon.rows) {
       if (!tunes(configPatterns, String(row.station), String(row.stream)))
@@ -939,6 +1050,10 @@ export function houseExport(input: {
   // nothing to the deck: it is counted once, under the reader.
   const mayRead: string[] = [];
   const configured: string[] = [];
+  const observedKept =
+    daemon.kind === "daemon"
+      ? daemon.observedTune.filter((p) => patternIssue(p) === null)
+      : [];
   for (const pattern of configPatterns) {
     const issue = patternIssue(pattern);
     if (issue !== null) {
@@ -964,16 +1079,17 @@ export function houseExport(input: {
   }
   const gaps = new Map(daemon.kind === "daemon" ? daemon.gaps : []);
   if (mismatch > 0) gaps.set("config_daemon_mismatch", mismatch);
-  if (applied === undefined && (!live0 || daemon.canticleOn))
+  if (applied === undefined && state !== "off")
     gaps.set("runtime_scope_unverified", 1);
   // Canticle off in the daemon: nothing is heard, so no stream is vouched for (each reads
   // unknown, as a coverage gap makes it), and the board is no count of anything.
-  if (live0 && !daemon.canticleOn) gaps.set("canticle_off", 1);
+  if (live0 && state === "off") gaps.set("canticle_off", 1);
   // Which list each row came back in is the daemon's own tune at work.
   const rowTuned = new Map<string, boolean>();
   if (daemon.kind === "daemon") {
     for (const row of daemon.rows) rowTuned.set(rowKey(row), true);
     for (const row of daemon.untuned) rowTuned.set(rowKey(row), false);
+    for (const key of daemon.tunedUnknown) rowTuned.delete(key);
   }
   if (daemon.kind === "daemon") {
     // readDaemon already held every presence word to the closed list.
@@ -1072,12 +1188,21 @@ export function houseExport(input: {
       // pattern matches reads unknown there, never outside the scope.
       may_read_withheld: patterns.length - mayRead.length,
       basis: {
-        canticle: enabled ? "enabled" : "disabled",
+        canticle:
+          enabled === null ? "unknown" : enabled ? "enabled" : "disabled",
         scope: scopeBasis,
         config_patterns: configPatterns.length,
         // The file's tune: configured intent, never proof of what the daemon reads (🌫).
         may_read_configured: configured,
-        hear: enabled ? "payload text of tuned streams" : "off",
+        // The applied tune the daemon's status reported, accepted or not (🌫): observed,
+        // never proof once the reads or its rows disputed it.
+        may_read_observed: observedKept,
+        hear:
+          enabled === null
+            ? "unknown"
+            : enabled
+              ? "payload text of tuned streams"
+              : "off",
         push: {
           mode: delivery?.mode ?? "off",
           style: delivery?.style ?? "records",

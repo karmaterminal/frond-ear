@@ -84,6 +84,7 @@ const ALLOWED_KEYS = new Set([
   "scope",
   "config_patterns",
   "may_read_configured",
+  "may_read_observed",
   "withheld",
   "field",
   "reason",
@@ -261,6 +262,7 @@ interface Export {
       scope: string;
       config_patterns: number;
       may_read_configured: string[];
+      may_read_observed: string[];
       hear: string;
       push: {
         mode: string;
@@ -1017,7 +1019,7 @@ test("house-export coverage: a row's local omissions or coverage hole makes its 
           omitted: [
             {
               station: "alpha",
-              stream: "chatter",
+              stream: "ops.deploy",
               key: ALPHA,
               count: 2,
               from: T0 - 9_000,
@@ -1050,7 +1052,7 @@ test("house-export coverage: a row's local omissions or coverage hole makes its 
 test("house-export coverage: a broken walk is partial with a reason, never a clean end", async () => {
   const many = view({
     items: Array.from({ length: 150 }, (_, i) =>
-      item({ stream: `s${String(i).padStart(3, "0")}`, seq: String(i) }),
+      item({ station: `st${String(i).padStart(3, "0")}`, seq: String(i) }),
     ),
   });
   const breaks: Array<
@@ -1374,7 +1376,7 @@ test("house-export coverage: a row's coverage hole alone makes its own station p
     const { doc } = await run(s, undefined, {
       request: guideDaemon(
         view({
-          items: [item(), item({ station: "alpha", stream: "chatter" })],
+          items: [item(), item({ station: "alpha", stream: "ops.deploy" })],
         }),
         {
           page: (_n, text) => {
@@ -1415,7 +1417,10 @@ test("house-export coverage: a guide longer than the pages it reads is truncated
       request: guideDaemon(
         view({
           items: Array.from({ length: 2_050 }, (_, i) =>
-            item({ stream: `s${String(i).padStart(4, "0")}`, seq: String(i) }),
+            item({
+              station: `st${String(i).padStart(4, "0")}`,
+              seq: String(i),
+            }),
           ),
         }),
       ),
@@ -1470,7 +1475,10 @@ test("house-export coverage: the same gap on every page is counted once per name
         view({
           blind: true,
           items: Array.from({ length: 150 }, (_, i) =>
-            item({ stream: `s${String(i).padStart(3, "0")}`, seq: String(i) }),
+            item({
+              station: `st${String(i).padStart(3, "0")}`,
+              seq: String(i),
+            }),
           ),
         }),
       ),
@@ -1485,7 +1493,7 @@ test("house-export coverage: the same gap on every page is counted once per name
 test("house-export coverage: a listener word or untuned list that changes between pages is a walk that changed under it", async () => {
   const many = view({
     items: Array.from({ length: 150 }, (_, i) =>
-      item({ stream: `s${String(i).padStart(3, "0")}`, seq: String(i) }),
+      item({ station: `st${String(i).padStart(3, "0")}`, seq: String(i) }),
     ),
   });
   const edits: Array<
@@ -1546,7 +1554,10 @@ test("house-export coverage: a later page's listening never hides an earlier pag
       request: guideDaemon(
         view({
           items: Array.from({ length: 150 }, (_, i) =>
-            item({ stream: `s${String(i).padStart(3, "0")}`, seq: String(i) }),
+            item({
+              station: `st${String(i).padStart(3, "0")}`,
+              seq: String(i),
+            }),
           ),
         }),
         {
@@ -1575,7 +1586,9 @@ test("house-export coverage: a later page's listening never hides an earlier pag
 // what the walk didn't reach, or can't vouch for, is unknown rather than 0.
 const manyItems = () =>
   Array.from({ length: 150 }, (_, i) =>
-    item({ stream: `s${String(i).padStart(3, "0")}`, seq: String(i) }),
+    // One station per row, each on ops.fleet, so the test daemon's tune (*:ops.fleet)
+    // really tunes every tuned row (🌿 R7: fixtures must agree with their appliedTune).
+    item({ station: `st${String(i).padStart(3, "0")}`, seq: String(i) }),
   );
 
 test("house-export coverage: 🌿's repro: page 2's untuned list reporting 43 more is kept, and the deck is partial", async () => {
@@ -1639,7 +1652,7 @@ test("house-export coverage: a stream no row reached reads live unknown when the
       "never reached: unknown, not 0",
     );
     assert.equal(
-      station(doc, "ops").streams.find((x) => x.stream === "s000")?.live,
+      station(doc, "st000").streams.find((x) => x.stream === "ops.fleet")?.live,
       1,
       "a row it read keeps its count",
     );
@@ -2017,7 +2030,10 @@ test("house-export coverage: a row out of the guide's order is an inconsistent w
             rows: Array<Record<string, unknown>>;
           };
           // page 2's first row now sorts before page 1's last
-          const rows = [{ ...v.rows[0], stream: "s050x" }, ...v.rows.slice(1)];
+          const rows = [
+            { ...v.rows[0], station: "st050x" },
+            ...v.rows.slice(1),
+          ];
           return { ok: true, text: JSON.stringify({ ...v, rows }) };
         },
       }),
@@ -2195,10 +2211,13 @@ test("house-export coverage: a presence table it can't read again is a changed w
         return { ok: true, text: "not json" };
       },
     });
+    // An unreadable second status read leaves the daemon's state unknown, so nothing is
+    // vouched for: never a pass (🌿 R7).
     assert.ok(
-      gapNames(doc).includes("changed_mid_walk"),
+      gapNames(doc).includes("canticle_state_changed"),
       JSON.stringify(doc.deck.gaps),
     );
+    assert.ok(allPartial(doc));
   } finally {
     s.dispose();
   }
@@ -2217,18 +2236,18 @@ test("house-export coverage: 🌿's repro: re-walk rows get the same row checks:
   const cases: Array<
     [string, (r: Record<string, unknown>) => Record<string, unknown>]
   > = [
-    ["row_unparsed", (r) => (r.stream === "s000" ? { ...r, live: null } : r)],
+    ["row_unparsed", (r) => (r.station === "st000" ? { ...r, live: null } : r)],
     [
       "row_local_omissions",
       (r) =>
-        r.stream === "s000"
+        r.station === "st000"
           ? { ...r, localOmissions: { reason: "live_overflow", count: 2 } }
           : r,
     ],
     [
       "row_coverage_unknown",
       (r) =>
-        r.stream === "s000"
+        r.station === "st000"
           ? { ...r, coverageUnknown: { tunedAt: "x", dropped: 1, until: "y" } }
           : r,
     ],
@@ -2245,7 +2264,7 @@ test("house-export coverage: 🌿's repro: re-walk rows get the same row checks:
         gapNames(doc).includes(name),
         `${name}: ${JSON.stringify(doc.deck.gaps)}`,
       );
-      assert.equal(station(doc, "ops").streams_known, "partial", name);
+      assert.equal(station(doc, "st000").streams_known, "partial", name);
     } finally {
       s.dispose();
     }
@@ -2258,12 +2277,12 @@ test("house-export coverage: a re-walk row's null live makes that stream's count
     const { doc } = await run(s, undefined, {
       request: guideDaemon(view({ items: manyItems() }), {
         page: rewalkEdit((r) =>
-          r.stream === "s000" ? { ...r, live: null } : r,
+          r.station === "st000" ? { ...r, live: null } : r,
         ),
       }),
     });
     assert.equal(
-      station(doc, "ops").streams.find((x) => x.stream === "s000")?.live,
+      station(doc, "st000").streams.find((x) => x.stream === "ops.fleet")?.live,
       null,
     );
   } finally {
@@ -2527,7 +2546,7 @@ test("house-export coverage: a tuned row whose verification differs on the re-wa
           stations: { alpha: "EQUIPPED_QUIET" },
         },
         page: rewalkEdit((r) =>
-          r.stream === "s000" ? { ...r, verification: "ROOT_UNKNOWN" } : r,
+          r.station === "st000" ? { ...r, verification: "ROOT_UNKNOWN" } : r,
         ),
       }),
     });
@@ -2535,7 +2554,7 @@ test("house-export coverage: a tuned row whose verification differs on the re-wa
       gapNames(doc).includes("verification_changed"),
       JSON.stringify(doc.deck.gaps),
     );
-    assert.equal(station(doc, "ops").verification, null);
+    assert.equal(station(doc, "st000").verification, null);
   } finally {
     s.dispose();
   }
@@ -2886,32 +2905,40 @@ test("house-export coverage: an untuned row's age that only grows keeps the late
   }
 });
 
-test("house-export scope: the daemon's canticle state from either of its words: status disabled, or a guide that says not enabled", async () => {
-  const cases: Array<[string, Parameters<typeof guideDaemon>[1]]> = [
+test("house-export scope: the daemon's canticle state: off only when status and guide both say so; a contradiction is unknown", async () => {
+  const notEnabled = () => ({
+    ok: true,
+    text: "canticle is not enabled on this daemon (config canticle.enabled).",
+  });
+  const cases: Array<
+    [string, Parameters<typeof guideDaemon>[1], boolean | null, string]
+  > = [
     [
-      "status disabled",
-      { status: { state: "disabled", appliedTune: { scribe: TUNE } } },
+      "both say off",
+      {
+        status: { state: "disabled", appliedTune: { scribe: TUNE } },
+        page: notEnabled,
+      },
+      false,
+      "canticle_off",
     ],
     [
-      "guide not enabled",
-      {
-        page: () => ({
-          ok: true,
-          text: "canticle is not enabled on this daemon (config canticle.enabled).",
-        }),
-      },
+      "status on, guide not enabled",
+      { page: notEnabled },
+      null,
+      "canticle_state_contradicts",
     ],
   ];
-  for (const [what, o] of cases) {
+  for (const [what, o, payload, name] of cases) {
     const s = setup();
     try {
       const { doc } = await run(s, undefined, {
         request: guideDaemon(view(), o),
       });
-      assert.equal(doc.reader.payload_text, false, what);
+      assert.equal(doc.reader.payload_text, payload, what);
       assert.deepEqual(doc.reader.may_read, [], what);
       assert.ok(
-        gapNames(doc).includes("canticle_off"),
+        gapNames(doc).includes(name),
         `${what}: ${JSON.stringify(doc.deck.gaps)}`,
       );
     } finally {
@@ -2937,6 +2964,305 @@ test("house-export scope: an appliedTune that isn't a list of patterns is a daem
       "the running daemon's tuned rows only (it doesn't say its tune)",
     );
     assert.ok(gapNames(doc).includes("runtime_scope_unverified"));
+  } finally {
+    s.dispose();
+  }
+});
+
+// 🌿 R7 on #147: appliedTune is taken as the daemon's scope only when it holds still and
+// agrees with the daemon's own rows.
+test("house-export scope: 🌿's repro: the daemon restarts on a new tune between the status read and the guide: appliedTune is not trusted", async () => {
+  const s = setup();
+  try {
+    s.host.sing(1); // ops:ops.fleet
+    s.host.sing(500, { station: "alpha", stream: "chatter" }); // untuned before the restart
+    let statuses = 0;
+    let restarted = false;
+    const { doc } = await run(s, undefined, {
+      request: async (message) => {
+        if (message.type === "status") statuses += 1;
+        if (message.type === "call" && statuses === 1 && !restarted) {
+          // After status read 1 and before the guide, the daemon comes back on a new tune.
+          restarted = true;
+          s.host.tune = ["*:ops.fleet", "alpha:chatter"];
+        }
+        return s.request(message);
+      },
+    });
+    assert.ok(
+      gapNames(doc).includes("applied_tune_changed"),
+      JSON.stringify(doc.deck.gaps),
+    );
+    assert.equal(doc.reader.may_read_complete, false);
+    assert.equal(
+      doc.reader.basis.scope,
+      "the running daemon's tuned rows only (it doesn't say its tune)",
+    );
+    assert.ok(gapNames(doc).includes("runtime_scope_unverified"));
+    assert.equal(
+      station(doc, "alpha").streams.find((x) => x.stream === "chatter")?.tuned,
+      true,
+      "the row's own list",
+    );
+    assert.equal(
+      station(doc, "quiet").streams.find((x) => x.stream === "whisper")?.tuned,
+      null,
+      "no row: unknown",
+    );
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export scope: an appliedTune its own rows contradict is not trusted, though both reads agree", async () => {
+  const s = setup();
+  try {
+    const { doc } = await run(s, undefined, {
+      request: guideDaemon(
+        view({
+          items: [item(), item({ station: "alpha", stream: "chatter" })],
+        }),
+      ),
+    });
+    assert.ok(
+      gapNames(doc).includes("applied_tune_disagrees"),
+      JSON.stringify(doc.deck.gaps),
+    );
+    assert.equal(doc.reader.may_read_complete, false);
+    assert.deepEqual(
+      doc.reader.may_read,
+      ["alpha:chatter", "ops:ops.fleet"],
+      "only what its rows prove",
+    );
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export scope: control: an appliedTune that holds and fits every row stays the scope", async () => {
+  const s = setup();
+  try {
+    s.host.sing(1);
+    s.host.sing(500, { station: "alpha", stream: "chatter" });
+    const { doc } = await run(s);
+    assert.ok(!gapNames(doc).includes("applied_tune_changed"));
+    assert.ok(!gapNames(doc).includes("applied_tune_disagrees"));
+    assert.equal(doc.reader.may_read_complete, true);
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export scope: R7-2: a status with no canticle object, or disabled while the guide answers, or a refused source: canticle state unknown, never off", async () => {
+  const cases: Array<[string, Parameters<typeof guideDaemon>[1], string]> = [
+    ["no canticle object", {}, "canticle_state_unknown"],
+    [
+      "disabled but answering",
+      { status: { state: "disabled" } },
+      "canticle_state_contradicts",
+    ],
+    [
+      "refused source",
+      { status: { source: "embedded", state: "refused" } },
+      "canticle_state_unknown",
+    ],
+  ];
+  for (const [what, o, name] of cases) {
+    const s = setup();
+    try {
+      const base = guideDaemon(view(), o);
+      const request: Setup["request"] =
+        what === "no canticle object"
+          ? async (m) =>
+              m.type === "status"
+                ? { ok: true, text: JSON.stringify({ paused: false }) }
+                : base(m)
+          : base;
+      const { doc } = await run(s, undefined, { request });
+      assert.equal(doc.reader.payload_text, null, what);
+      assert.equal(doc.reader.basis.canticle, "unknown", what);
+      assert.ok(
+        gapNames(doc).includes(name),
+        `${what}: ${JSON.stringify(doc.deck.gaps)}`,
+      );
+      assert.ok(!gapNames(doc).includes("canticle_off"), what);
+      assert.equal(doc.reader.may_read_complete, false, what);
+      // An unknown state is no claim, so it can't disagree with the file.
+      assert.ok(!gapNames(doc).includes("config_daemon_mismatch"), what);
+    } finally {
+      s.dispose();
+    }
+  }
+});
+
+test("house-export scope: a row the daemon lists tuned on one page and untuned on another is tuned unknown, named tuned_changed", async () => {
+  const s = setup();
+  try {
+    const { doc } = await run(s, undefined, {
+      request: guideDaemon(view({ items: manyItems() }), {
+        status: { source: "host-daemon", stations: {} },
+        page: (n, text) => {
+          if (n !== 1) return { ok: true, text };
+          const v = JSON.parse(text) as Record<string, unknown>;
+          // page 2 lists st000:ops.fleet (a page-1 tuned row) as untuned too
+          return {
+            ok: true,
+            text: JSON.stringify({
+              ...v,
+              untuned: {
+                streams: 1,
+                rows: [
+                  {
+                    station: "st000",
+                    stream: "ops.fleet",
+                    tuned: false,
+                    classes: ["advisory"],
+                    live: 1,
+                    newestAgeS: 2,
+                    verification: "verified",
+                  },
+                ],
+              },
+            }),
+          };
+        },
+      }),
+    });
+    assert.ok(
+      gapNames(doc).includes("tuned_changed"),
+      JSON.stringify(doc.deck.gaps),
+    );
+    assert.equal(
+      station(doc, "st000").streams.find((x) => x.stream === "ops.fleet")
+        ?.tuned,
+      null,
+    );
+    assert.ok(
+      !doc.reader.may_read.includes("st000:ops.fleet"),
+      "not proven either way",
+    );
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export scope: 🌫's repro: status read 1 from one daemon, the guide and status read 2 from another: the disputed tune is not in may_read at all", async () => {
+  const s = setup({}, undefined, { tune: ["*:ops.fleet"] }); // daemon A, and the file
+  const raw = JSON.parse(readFile(s.env.FROND_EAR_CONFIG!, "utf8")) as Record<
+    string,
+    unknown
+  >;
+  let hostB: Host | undefined;
+  const b = harness(parseConfig(raw), {
+    canticleGuide: () => hostB!.guideView(),
+    canticleStatus: () => ({
+      source: "host-daemon",
+      stations: Object.fromEntries(hostB!.consumer.presence),
+      appliedTune: { scribe: hostB!.tune },
+    }),
+  });
+  try {
+    hostB = new Host(b.clock, ["alpha:privatea"]); // daemon B, same presence table
+    hostB.start();
+    hostB.sing(1); // ops:ops.fleet, untuned on B
+    hostB.sing(2, { station: "alpha", stream: "privatea" }); // tuned on B
+    const cliB = b.attach(undefined, { role: "cli" });
+    let id = 5_000;
+    let first = true;
+    const { doc } = await run(s, undefined, {
+      request: async (message) => {
+        if (message.type === "status" && first) {
+          first = false;
+          return s.request(message); // read 1: daemon A says *:ops.fleet
+        }
+        const at = ++id;
+        await cliB.send({ ...message, id: at } as never);
+        const r = cliB.connection.results().find((x) => x.id === at)!;
+        return { ok: r.ok, text: r.text };
+      },
+    });
+    assert.ok(
+      gapNames(doc).includes("applied_tune_changed"),
+      JSON.stringify(doc.deck.gaps),
+    );
+    assert.ok(
+      !doc.reader.may_read.includes("*:ops.fleet"),
+      "a disputed wildcard never reaches may_read",
+    );
+    assert.deepEqual(
+      doc.reader.may_read,
+      ["alpha:privatea"],
+      "only what the guide's rows vouch for",
+    );
+    assert.deepEqual([...doc.reader.basis.may_read_observed].sort(), [
+      "*:ops.fleet",
+      "alpha:privatea",
+    ]);
+    assert.equal(doc.reader.may_read_complete, false);
+    assert.equal(
+      station(doc, "ops").streams.find((x) => x.stream === "ops.fleet")?.tuned,
+      false,
+    );
+    assert.equal(
+      station(doc, "alpha").streams.find((x) => x.stream === "privatea")?.tuned,
+      true,
+    );
+  } finally {
+    b.dispose();
+    s.dispose();
+  }
+});
+
+test("house-export scope: the canticle state changing between the two status reads is unknown, named canticle_state_changed", async () => {
+  const s = setup();
+  try {
+    const guide = guideDaemon(view());
+    let statuses = 0;
+    const { doc } = await run(s, undefined, {
+      request: async (message) => {
+        if (message.type !== "status" || statuses++ === 0)
+          return guide(message);
+        return {
+          ok: true,
+          text: JSON.stringify({ canticle: { state: "disabled" } }),
+        };
+      },
+    });
+    assert.ok(
+      gapNames(doc).includes("canticle_state_changed"),
+      JSON.stringify(doc.deck.gaps),
+    );
+    assert.equal(doc.reader.payload_text, null);
+    assert.equal(
+      doc.reader.basis.scope,
+      "none: the running daemon's canticle state is unknown",
+    );
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export coverage: a second status read with canticle on but no presence table is a changed walk", async () => {
+  const s = setup();
+  try {
+    const guide = guideDaemon(view());
+    let statuses = 0;
+    const { doc } = await run(s, undefined, {
+      request: async (message) => {
+        if (message.type !== "status" || statuses++ === 0)
+          return guide(message);
+        return {
+          ok: true,
+          text: JSON.stringify({
+            canticle: { source: "host-daemon", appliedTune: { scribe: TUNE } },
+          }),
+        };
+      },
+    });
+    assert.ok(
+      gapNames(doc).includes("changed_mid_walk"),
+      JSON.stringify(doc.deck.gaps),
+    );
   } finally {
     s.dispose();
   }
