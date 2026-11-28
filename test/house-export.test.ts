@@ -1413,3 +1413,140 @@ test("house-export: 17 digits in a row is already a Discord id's shape", () => {
     { at: "a", reason: "discord-id shape" },
   ]);
 });
+
+// 🌫 at f22fae03: gap lines were read only from page 1. A clean first page, then a
+// degraded second: every page's gaps count, and a walk whose pages disagree is partial.
+test("house-export coverage: 🌫's repro: a gap that appears on page 2 reaches the export, and the walk is partial", async () => {
+  const s = setup();
+  try {
+    for (let i = 0; i < 150; i++) {
+      s.host.sing(10 + i, { station: `st${String(i).padStart(3, "0")}` });
+    }
+    let pages = 0;
+    const { doc } = await run(s, undefined, {
+      request: async (message) => {
+        if (message.type === "call" && pages++ === 1) {
+          // Receive goes blind between page 1 and page 2.
+          s.host.health(["no_datagrams"]);
+        }
+        return s.request(message);
+      },
+    });
+    assert.equal(pages, 2);
+    assert.ok(gapNames(doc).includes("blind"), JSON.stringify(doc.deck.gaps));
+    assert.ok(gapNames(doc).includes("changed_mid_walk"));
+    assert.equal(doc.deck.walk, "partial");
+    assert.ok(allPartial(doc));
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export coverage: the same gap on every page is counted once per name, not once per page", async () => {
+  const s = setup();
+  try {
+    const { doc } = await run(s, undefined, {
+      request: guideDaemon(
+        view({
+          blind: true,
+          items: Array.from({ length: 150 }, (_, i) =>
+            item({ stream: `s${String(i).padStart(3, "0")}`, seq: String(i) }),
+          ),
+        }),
+      ),
+    });
+    assert.deepEqual(doc.deck.gaps, [{ name: "blind", count: 1 }]);
+    assert.equal(doc.deck.walk, "complete", "the pages agree");
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export coverage: a listener word or untuned list that changes between pages is a walk that changed under it", async () => {
+  const many = view({
+    items: Array.from({ length: 150 }, (_, i) =>
+      item({ stream: `s${String(i).padStart(3, "0")}`, seq: String(i) }),
+    ),
+  });
+  const edits: Array<
+    [string, (v: Record<string, unknown>) => Record<string, unknown>]
+  > = [
+    ["listener", (v) => ({ ...v, listener: "blind" })],
+    [
+      "untuned",
+      (v) => ({
+        ...v,
+        untuned: {
+          streams: 1,
+          rows: [{ station: "alpha", stream: "chatter", live: 1 }],
+        },
+      }),
+    ],
+    [
+      "untuned gone",
+      (v) => {
+        const { untuned: _gone, ...rest } = v;
+        void _gone;
+        return rest;
+      },
+    ],
+  ];
+  for (const [what, edit] of edits) {
+    const s = setup();
+    try {
+      const { doc } = await run(s, undefined, {
+        request: guideDaemon(many, {
+          page: (n, text) =>
+            n === 1
+              ? {
+                  ok: true,
+                  text: JSON.stringify(
+                    edit(JSON.parse(text) as Record<string, unknown>),
+                  ),
+                }
+              : { ok: true, text },
+        }),
+      });
+      assert.ok(
+        gapNames(doc).includes("changed_mid_walk"),
+        `${what}: ${JSON.stringify(doc.deck.gaps)}`,
+      );
+      assert.equal(doc.deck.walk, "partial", what);
+      assert.ok(allPartial(doc), what);
+    } finally {
+      s.dispose();
+    }
+  }
+});
+
+test("house-export coverage: a later page's listening never hides an earlier page's blind", async () => {
+  const s = setup();
+  try {
+    const { doc } = await run(s, undefined, {
+      request: guideDaemon(
+        view({
+          items: Array.from({ length: 150 }, (_, i) =>
+            item({ stream: `s${String(i).padStart(3, "0")}`, seq: String(i) }),
+          ),
+        }),
+        {
+          page: (n, text) =>
+            n === 0
+              ? {
+                  ok: true,
+                  text: JSON.stringify({
+                    ...(JSON.parse(text) as object),
+                    listener: "blind",
+                  }),
+                }
+              : { ok: true, text },
+        },
+      ),
+    });
+    assert.equal(doc.deck.listener, "blind");
+    assert.equal(doc.deck.connected, false);
+    assert.ok(gapNames(doc).includes("changed_mid_walk"));
+  } finally {
+    s.dispose();
+  }
+});

@@ -307,6 +307,7 @@ const BOARD_EMPTY = new Set([
 ]);
 /** Gaps in the walk itself: the guide wasn't read whole, or didn't add up. */
 const WALK_BREAKS = new Set([
+  "changed_mid_walk",
   "page_unparsed",
   "page_refused",
   "row_count_mismatch",
@@ -375,6 +376,9 @@ async function readDaemon(
   let cursor: string | undefined;
   let truncated = false;
   let broken = false;
+  const guideGaps = new Map<string, number>();
+  let firstSignature: string | undefined;
+  let changed = false;
   for (let page = 0; ; page++) {
     if (page === MAX_PAGES) {
       truncated = true;
@@ -412,20 +416,51 @@ async function readDaemon(
       }
       break;
     }
+    // Every page's coverage signals count, not just the first's (🌫 at f22fae03): a gap
+    // line on any page is kept, by name, at the most any one page said it. Pages that
+    // disagree (gap names, listener word, untuned list) saw the state change under the
+    // walk, which is a break of its own.
+    const pageGaps = new Map<string, number>();
+    if (view.gaps !== undefined) {
+      if (Array.isArray(view.gaps)) {
+        for (const line of view.gaps) {
+          const name = gapName(line);
+          pageGaps.set(name, (pageGaps.get(name) ?? 0) + 1);
+        }
+      } else pageGaps.set("unrecognized_gap", 1);
+    }
+    for (const [name, n] of pageGaps) {
+      guideGaps.set(name, Math.max(guideGaps.get(name) ?? 0, n));
+    }
+    let pageListener = "none";
     if (typeof view.listener === "string") {
-      if (LISTENER_WORDS.has(view.listener)) listener = view.listener;
-      else gap("unrecognized_word");
+      if (LISTENER_WORDS.has(view.listener)) pageListener = view.listener;
+      else {
+        pageListener = "unrecognized";
+        if (page === 0) gap("unrecognized_word");
+      }
+    }
+    // The worst word any page gave stands: a later "listening" never hides an earlier
+    // "blind". Two different words are a changed walk, below, and the deck stays partial.
+    if (pageListener !== "none" && pageListener !== "unrecognized") {
+      if (listener === "unknown" || listener === "listening")
+        listener = pageListener;
+    }
+    const u = obj(view.untuned);
+    const signature = JSON.stringify([
+      [...pageGaps.entries()].sort(),
+      pageListener,
+      u === undefined ? null : [count(u.streams), count(u.more)],
+    ]);
+    if (firstSignature === undefined) firstSignature = signature;
+    else if (signature !== firstSignature && !changed) {
+      changed = true;
+      gap("changed_mid_walk");
     }
     const streams = count(view.streams);
     if (page === 0) {
       claimed = streams ?? undefined;
       if (streams === null) gap("row_count_mismatch");
-      if (view.gaps !== undefined) {
-        if (Array.isArray(view.gaps))
-          for (const line of view.gaps) gap(gapName(line));
-        else gap("unrecognized_gap");
-      }
-      const u = obj(view.untuned);
       if (u === undefined) gap("untuned_unlisted");
       else {
         const listed = Array.isArray(u.rows) ? u.rows : [];
@@ -477,6 +512,7 @@ async function readDaemon(
   ) {
     gap("row_count_mismatch");
   }
+  for (const [name, n] of guideGaps) gap(name, n);
   return {
     kind: "daemon",
     listener,
