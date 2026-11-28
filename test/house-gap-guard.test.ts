@@ -65,9 +65,13 @@ let copies = 0;
 async function sneakCopy(
   anchor: string,
   insert: string,
+  before = false,
 ): Promise<{ runHouseExport: typeof runHouseExport }> {
   assert.equal(SOURCE.split(anchor).length, 2, "the anchor must occur once");
-  const text = SOURCE.replace(anchor, anchor + insert).replace(
+  const text = SOURCE.replace(
+    anchor,
+    before ? insert + anchor : anchor + insert,
+  ).replace(
     /from "(\.\.?\/[^"]+)"/gu,
     (_, rel: string) => `from "${pathToFileURL(join(SRC, rel)).href}"`,
   );
@@ -199,4 +203,45 @@ test("houseExport itself refuses a daemon view carrying an unlisted gap name", (
     deck: { gaps: Array<{ name: string }> };
   };
   assert.ok(doc.deck.gaps.some((g) => g.name === "host_mute"));
+});
+
+// 🌿's nit on #149: the document is checked again as it is serialized, so a change to it after it was built
+// (here, written in right after the build, and right after the identity check) is refused too.
+const BUILT = "  const found = identityIn(doc);\n";
+const IDENTITY_CHECKED =
+  '      `frond-ear house-export: refused: identity-shaped output at ${found.map((f) => `${f.at} (${f.reason})`).join(", ")}; nothing was printed\\n`,\n    );\n    return 1;\n  }\n';
+const LATE_PUSH = `  (doc as { deck: { gaps: Array<{ name: string; count: number }> } }).deck.gaps.push({ name: "${UNLISTED}", count: 1 });\n`;
+const AT_PRINT =
+  /^frond-ear house-export: refused: 1 gap name outside GAP_NAMES at the printed document; nothing was printed\n$/u;
+
+for (const [name, anchor, before] of [
+  ["right after it is built", BUILT, true],
+  ["right after the identity check", IDENTITY_CHECKED, false],
+] as const) {
+  test(`a gap pushed onto the document ${name} refuses the whole export, no stdout`, async () => {
+    const { code, out, err } = await run(
+      (await sneakCopy(anchor, LATE_PUSH, before)).runHouseExport,
+    );
+    assert.equal(out, "", "nothing may reach stdout");
+    assert.equal(code, 1);
+    assert.match(err, AT_PRINT);
+  });
+}
+
+test("a document whose deck.gaps isn't a list of names is refused as it is printed", async () => {
+  for (const late of [
+    "  delete (doc as { deck: { gaps?: unknown } }).deck.gaps;\n",
+    "  (doc as { deck: { gaps: unknown } }).deck.gaps = [{ name: 7, count: 1 }];\n",
+  ]) {
+    const { code, out, err } = await run(
+      (await sneakCopy(IDENTITY_CHECKED, late)).runHouseExport,
+    );
+    assert.equal(out, "", late);
+    assert.equal(code, 1, late);
+    assert.match(
+      err,
+      /^frond-ear house-export: refused: deck\.gaps is not a list of gap names at the printed document; nothing was printed\n$/u,
+      late,
+    );
+  }
 });

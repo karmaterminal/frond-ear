@@ -437,6 +437,25 @@ export const GAP_NAMES_KIND = "frond-house-gap-names/0";
 
 const LISTED_GAPS: ReadonlySet<string> = new Set(GAP_NAMES);
 
+/**
+ * What is wrong with the printed text's `deck.gaps`, or null: it must be a list of
+ * `{name, count}` whose every name is in GAP_NAMES. Counted, never a name repeated.
+ */
+function printedGapsIssue(text: string): string | null {
+  const gaps = obj(obj(JSON.parse(text) as unknown)?.deck)?.gaps;
+  if (
+    !Array.isArray(gaps) ||
+    !gaps.every((gap) => typeof obj(gap)?.name === "string")
+  )
+    return "deck.gaps is not a list of gap names";
+  const n = gaps.filter(
+    (gap) => !LISTED_GAPS.has((gap as { name: string }).name),
+  ).length;
+  return n === 0
+    ? null
+    : `${n} gap name${n === 1 ? "" : "s"} outside GAP_NAMES`;
+}
+
 /** A gap name outside GAP_NAMES reached the export: it is refused whole, never dropped. */
 class UnlistedGapError extends Error {}
 
@@ -1546,6 +1565,16 @@ export async function runHouseExport(
     );
     return 1;
   }
-  io.stdout.write(`${JSON.stringify(doc, null, 2)}\n`);
+  // Last, the very text that is printed (🌿 on #149): it is serialized once, and its own
+  // deck.gaps is read back from it, so nothing done to `doc` after this can reach stdout.
+  const text = `${JSON.stringify(doc, null, 2)}\n`;
+  const printed = printedGapsIssue(text);
+  if (printed !== null) {
+    io.stderr.write(
+      `frond-ear house-export: refused: ${printed} at the printed document; nothing was printed\n`,
+    );
+    return 1;
+  }
+  io.stdout.write(text);
   return 0;
 }
