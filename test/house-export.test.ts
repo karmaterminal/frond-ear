@@ -1945,3 +1945,123 @@ test("house-export coverage: one station leaving the presence table as another j
     s.dispose();
   }
 });
+
+// 🌿 round 3 on #147 (his helper's repros).
+test("house-export coverage: 🌿's repro: a tuned row swapped on a middle page, total unchanged: the whole walk is compared again", async () => {
+  const s = setup();
+  try {
+    for (let i = 0; i < 250; i++) {
+      s.host.sing(10 + i, { station: `st${String(i).padStart(3, "0")}` });
+    }
+    let pages = 0;
+    const { doc } = await run(s, undefined, {
+      request: async (message) => {
+        if (message.type === "call" && pages++ === 2) {
+          s.host.retract(130, "expired", { station: "st120" }); // read on page 2, now gone
+          s.host.sing(900, { station: "st1205" }); // between page 1's end and the cursor
+        }
+        return s.request(message);
+      },
+    });
+    assert.ok(
+      gapNames(doc).includes("changed_mid_walk"),
+      JSON.stringify(doc.deck.gaps),
+    );
+    assert.equal(doc.deck.walk, "partial");
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export coverage: a row out of the guide's order is an inconsistent walk (order_violation)", async () => {
+  const s = setup();
+  try {
+    const { doc } = await run(s, undefined, {
+      request: guideDaemon(view({ items: manyItems() }), {
+        page: (n, text) => {
+          if (n % 2 !== 1) return { ok: true, text }; // the same on the re-walk
+          const v = JSON.parse(text) as {
+            rows: Array<Record<string, unknown>>;
+          };
+          // page 2's first row now sorts before page 1's last
+          const rows = [{ ...v.rows[0], stream: "s050x" }, ...v.rows.slice(1)];
+          return { ok: true, text: JSON.stringify({ ...v, rows }) };
+        },
+      }),
+    });
+    // The re-walk sees the same pages, so the order break stands alone.
+    assert.deepEqual(doc.deck.gaps, [{ name: "order_violation", count: 1 }]);
+    assert.equal(doc.deck.walk, "partial");
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export coverage: 🌿's repro: the guide's presence word and the status table disagree: unknown, with a named gap", async () => {
+  const s = setup();
+  try {
+    s.host.sing(1);
+    let calls = 0;
+    const { doc } = await run(s, undefined, {
+      request: async (message) => {
+        // After the status read, before the guide: ops goes unobservable.
+        if (message.type === "call" && calls++ === 0)
+          s.host.presence("ops", "UNOBSERVABLE");
+        return s.request(message);
+      },
+    });
+    assert.equal(station(doc, "ops").presence, "unknown");
+    assert.ok(
+      gapNames(doc).includes("presence_disagrees"),
+      JSON.stringify(doc.deck.gaps),
+    );
+    assert.equal(station(doc, "ops").streams_known, "partial");
+    assert.equal(
+      station(doc, "alpha").presence,
+      "EQUIPPED_QUIET",
+      "a station both agree on keeps its word",
+    );
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export coverage: a row whose live or age isn't a count exports unknown, never a vouched 0", async () => {
+  const edits: Array<(r: Record<string, unknown>) => Record<string, unknown>> =
+    [
+      (r) => ({ ...r, live: null }),
+      (r) => ({ ...r, live: "4" }),
+      (r) => ({ ...r, live: -1 }),
+      (r) => ({ ...r, newestAgeS: "2" }),
+    ];
+  for (const edit of edits) {
+    const s = setup();
+    try {
+      const { doc } = await run(s, undefined, {
+        request: guideDaemon(view(), {
+          page: (_n, text) => {
+            const v = JSON.parse(text) as {
+              rows: Array<Record<string, unknown>>;
+            };
+            return {
+              ok: true,
+              text: JSON.stringify({ ...v, rows: v.rows.map(edit) }),
+            };
+          },
+        }),
+      });
+      const x = station(doc, "ops").streams.find(
+        (y) => y.stream === "ops.fleet",
+      );
+      assert.equal(x?.live, null, JSON.stringify(x));
+      assert.equal(x?.newest_age_ms, null);
+      assert.ok(
+        gapNames(doc).includes("row_unparsed"),
+        JSON.stringify(doc.deck.gaps),
+      );
+      assert.equal(station(doc, "ops").streams_known, "partial");
+    } finally {
+      s.dispose();
+    }
+  }
+});

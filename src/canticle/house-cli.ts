@@ -192,7 +192,13 @@ interface Building {
   manifestStreams: Set<string> | undefined;
   streams: Map<
     string,
-    { live: number; newestAgeMs: number | null; rowSeen: boolean }
+    {
+      live: number;
+      newestAgeMs: number | null;
+      rowSeen: boolean;
+      /** A row gave a live count or age that wasn't one. */
+      countUnknown: boolean;
+    }
   >;
   /** A stream of this station was withheld, so its list is partial. */
   lost: boolean;
@@ -253,6 +259,8 @@ type DaemonView =
       gaps: Map<string, number>;
       /** Stations a row-level omission or coverage hole names. */
       rowGaps: Set<string>;
+      /** Rows (station:stream keys) whose live count or age wasn't a count. */
+      badCounts: Set<string>;
     }
   | { kind: "config"; listener: "not reached" | "not asked" | "canticle off" };
 
@@ -314,6 +322,7 @@ const BOARD_EMPTY = new Set([
 ]);
 /** Gaps in the walk itself: the guide wasn't read whole, or didn't add up. */
 const WALK_BREAKS = new Set([
+  "order_violation",
   "changed_mid_walk",
   "row_unparsed",
   "page_unparsed",
@@ -327,6 +336,7 @@ const WALK_BREAKS = new Set([
  * board; a row's own omissions or coverage hole make only that row's station partial.
  */
 const NOT_COVERAGE = new Set([
+  "presence_disagrees",
   "ear_muted",
   "row_local_omissions",
   "row_coverage_unknown",
@@ -335,6 +345,43 @@ const NOT_COVERAGE = new Set([
 function gapName(line: unknown): string {
   if (typeof line !== "string") return "unrecognized_gap";
   return GAP_LINES.find(([re]) => re.test(line))?.[1] ?? "unrecognized_gap";
+}
+
+/** Strictly after, in the guide's one sort: (station, stream) by code unit. */
+function inOrder(a: [string, string], b: [string, string]): boolean {
+  if (a[0] !== b[0]) return a[0] < b[0];
+  return a[1] < b[1];
+}
+
+/** Every page of the guide again, as station:stream names in order; undefined if unread. */
+async function rewalk(
+  ear: string,
+  ask: NonNullable<HouseIo["request"]>,
+): Promise<string[] | undefined> {
+  const keys: string[] = [];
+  let cursor: string | undefined;
+  for (let page = 0; page < MAX_PAGES; page++) {
+    const result = await ask({
+      type: "call",
+      tool: "canticle_guide",
+      args: { ear, limit: 100, ...(cursor ? { cursor } : {}) },
+    }).catch(() => undefined);
+    let view: Record<string, unknown> | undefined;
+    try {
+      view = result?.ok ? obj(JSON.parse(result.text)) : undefined;
+    } catch {
+      view = undefined;
+    }
+    if (view === undefined || !Array.isArray(view.rows)) return undefined;
+    for (const raw of view.rows) {
+      const row = obj(raw);
+      if (row === undefined) return undefined;
+      keys.push(rowKey(row));
+    }
+    cursor = typeof view.nextCursor === "string" ? view.nextCursor : undefined;
+    if (cursor === undefined) return keys;
+  }
+  return undefined;
 }
 
 const rowKey = (row: Record<string, unknown>) =>
@@ -386,7 +433,10 @@ async function readDaemon(
   let broken = false;
   const guideGaps = new Map<string, number>();
   const untunedSeen = new Set<string>();
-  const firstPageKeys: string[] = [];
+  const walkKeys: string[] = [];
+  const badCounts = new Set<string>();
+  let lastPlace: [string, string] | undefined;
+  let disordered = false;
   let pagesRead = 0;
   let unreadableRows = 0;
   let untunedUnlisted = false;
@@ -536,8 +586,27 @@ async function readDaemon(
         gap("duplicate_row");
         continue;
       }
+      // The guide's order is a contract (🌿 round 3): rows come in (station, stream)
+      // code-unit order across every page. A row that doesn't is an inconsistent walk.
+      const place: [string, string] = [
+        row.station as string,
+        row.stream as string,
+      ];
+      if (lastPlace !== undefined && !inOrder(lastPlace, place)) {
+        if (!disordered) gap("order_violation");
+        disordered = true;
+      }
+      lastPlace = place;
       seen.add(rowKey(row));
-      if (page === 0) firstPageKeys.push(rowKey(row));
+      walkKeys.push(rowKey(row));
+      // A live count or age that isn't one is unknown, never a vouched 0 (🌿 round 3).
+      const liveOk = count(row.live) !== null;
+      const ageOk = row.newestAgeS === null || count(row.newestAgeS) !== null;
+      if (!liveOk || !ageOk) {
+        gap("row_unparsed");
+        badCounts.add(rowKey(row));
+        rowGaps.add(row.station as string);
+      }
       rows.push(row);
       if (obj(row.localOmissions) !== undefined) {
         gap("row_local_omissions");
@@ -569,26 +638,12 @@ async function readDaemon(
   if (!broken && !truncated && !changed) {
     let differs = false;
     if (pagesRead > 1) {
-      const again = await ask({
-        type: "call",
-        tool: "canticle_guide",
-        args: { ear, limit: 100 },
-      }).catch(() => undefined);
-      let rows: unknown;
-      try {
-        rows = again?.ok ? obj(JSON.parse(again.text))?.rows : undefined;
-      } catch {
-        rows = undefined;
-      }
-      const keys = Array.isArray(rows)
-        ? rows.map((raw) => {
-            const row = obj(raw);
-            return row === undefined ? "?" : rowKey(row);
-          })
-        : undefined;
+      // The whole walk again, compared by station:stream names in order (🌿 round 3): a
+      // row swapped behind the cursor on any page keeps every count.
+      const again = await rewalk(ear, ask);
       if (
-        keys === undefined ||
-        JSON.stringify(keys) !== JSON.stringify(firstPageKeys)
+        again === undefined ||
+        JSON.stringify(again) !== JSON.stringify(walkKeys)
       ) {
         differs = true;
       }
@@ -612,9 +667,24 @@ async function readDaemon(
     }
     if (differs) gap("changed_mid_walk");
   }
+  // A station whose guide presence word disagrees with the status table is unknown, and
+  // its streams partial (🌿 round 3): "visible: yes" beside a later UNOBSERVABLE is no answer.
+  const disagree = new Set<string>();
+  for (const row of rows) {
+    const word = row.presence;
+    const station = row.station as string;
+    if (typeof word !== "string" || !presence.has(station)) continue;
+    if (word !== presence.get(station)) disagree.add(station);
+  }
+  for (const station of disagree) {
+    presence.set(station, "unknown");
+    rowGaps.add(station);
+  }
+  if (disagree.size > 0) gap("presence_disagrees", disagree.size);
   return {
     kind: "daemon",
     listener,
+    badCounts,
     presence,
     rows,
     untuned,
@@ -686,7 +756,7 @@ export function houseExport(input: {
     }
     let s = st.streams.get(stream);
     if (s === undefined) {
-      s = { live: 0, newestAgeMs: null, rowSeen: false };
+      s = { live: 0, newestAgeMs: null, rowSeen: false, countUnknown: false };
       st.streams.set(stream, s);
     }
     return s;
@@ -740,6 +810,7 @@ export function houseExport(input: {
       if (s === undefined) continue;
       s.live += count(row.live) ?? 0;
       s.rowSeen = true;
+      if (daemon.badCounts.has(rowKey(row))) s.countUnknown = true;
       const age = count(row.newestAgeS);
       if (age !== null)
         s.newestAgeMs = Math.min(s.newestAgeMs ?? Infinity, age * 1_000);
@@ -768,9 +839,12 @@ export function houseExport(input: {
           admitted: st.manifestStreams?.has(stream) === true ? true : null,
           // A stream no row reached is 0 only when the deck vouches for the whole board;
           // otherwise it is unknown (🌿 round 2), and a row it read keeps its count.
-          live: live && !boardEmpty && (s.rowSeen || complete) ? s.live : null,
+          live:
+            live && !boardEmpty && !s.countUnknown && (s.rowSeen || complete)
+              ? s.live
+              : null,
           newest_age_ms:
-            live && !boardEmpty && (s.rowSeen || complete)
+            live && !boardEmpty && !s.countUnknown && (s.rowSeen || complete)
               ? s.newestAgeMs
               : null,
         })),
