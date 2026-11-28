@@ -1877,23 +1877,36 @@ test("house-export coverage: a station that joins the presence table during the 
   }
 });
 
-test("house-export coverage: control: a presence word that changes is a reading in time, not a changed walk", async () => {
+test("house-export coverage: 🌿's repro: a presence word that flips between the two status reads is unknown, named presence_changed", async () => {
   const s = setup();
   try {
     let pages = 0;
     const { doc } = await run(s, undefined, {
       request: async (message) => {
         if (message.type === "call" && pages++ === 0) {
-          s.host.presence("ops", "EQUIPPED_QUIET");
+          s.host.presence("ops", "UNOBSERVABLE");
         }
         return s.request(message);
       },
     });
+    assert.equal(
+      station(doc, "ops").presence,
+      "unknown",
+      "never the first word alone",
+    );
     assert.ok(
-      !gapNames(doc).includes("changed_mid_walk"),
+      gapNames(doc).includes("presence_changed"),
       JSON.stringify(doc.deck.gaps),
     );
-    assert.equal(doc.deck.walk, "complete");
+    assert.equal(station(doc, "ops").streams_known, "partial");
+    // A word is a reading in time: the walk itself didn't change.
+    assert.ok(!gapNames(doc).includes("changed_mid_walk"));
+    assert.equal(station(doc, "alpha").presence, "EQUIPPED_QUIET");
+    assert.equal(
+      station(doc, "alpha").streams_known,
+      "complete",
+      "only the flipped station",
+    );
   } finally {
     s.dispose();
   }
@@ -2168,6 +2181,190 @@ test("house-export coverage: a presence table it can't read again is a changed w
       gapNames(doc).includes("changed_mid_walk"),
       JSON.stringify(doc.deck.gaps),
     );
+  } finally {
+    s.dispose();
+  }
+});
+
+// 🌿 round 4: the re-walk's rows go through every per-row check, and untuned rows too.
+const rewalkEdit =
+  (edit: (r: Record<string, unknown>) => Record<string, unknown>) =>
+  (n: number, text: string) => {
+    if (n < 2) return { ok: true, text }; // the walk's two pages are clean
+    const v = JSON.parse(text) as { rows: Array<Record<string, unknown>> };
+    return { ok: true, text: JSON.stringify({ ...v, rows: v.rows.map(edit) }) };
+  };
+
+test("house-export coverage: 🌿's repro: re-walk rows get the same row checks: a null live, a new local omission, a new coverage hole", async () => {
+  const cases: Array<
+    [string, (r: Record<string, unknown>) => Record<string, unknown>]
+  > = [
+    ["row_unparsed", (r) => (r.stream === "s000" ? { ...r, live: null } : r)],
+    [
+      "row_local_omissions",
+      (r) =>
+        r.stream === "s000"
+          ? { ...r, localOmissions: { reason: "live_overflow", count: 2 } }
+          : r,
+    ],
+    [
+      "row_coverage_unknown",
+      (r) =>
+        r.stream === "s000"
+          ? { ...r, coverageUnknown: { tunedAt: "x", dropped: 1, until: "y" } }
+          : r,
+    ],
+  ];
+  for (const [name, edit] of cases) {
+    const s = setup();
+    try {
+      const { doc } = await run(s, undefined, {
+        request: guideDaemon(view({ items: manyItems() }), {
+          page: rewalkEdit(edit),
+        }),
+      });
+      assert.ok(
+        gapNames(doc).includes(name),
+        `${name}: ${JSON.stringify(doc.deck.gaps)}`,
+      );
+      assert.equal(station(doc, "ops").streams_known, "partial", name);
+    } finally {
+      s.dispose();
+    }
+  }
+});
+
+test("house-export coverage: a re-walk row's null live makes that stream's count unknown", async () => {
+  const s = setup();
+  try {
+    const { doc } = await run(s, undefined, {
+      request: guideDaemon(view({ items: manyItems() }), {
+        page: rewalkEdit((r) =>
+          r.stream === "s000" ? { ...r, live: null } : r,
+        ),
+      }),
+    });
+    assert.equal(
+      station(doc, "ops").streams.find((x) => x.stream === "s000")?.live,
+      null,
+    );
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export coverage: 🌿's repro: an untuned row whose live isn't a count exports unknown, never 0", async () => {
+  for (const bad of [null, "1", -2]) {
+    const s = setup();
+    try {
+      const { doc } = await run(s, undefined, {
+        request: guideDaemon(
+          view({ untuned: [item({ station: "alpha", stream: "chatter" })] }),
+          {
+            page: (_n, text) => {
+              const v = JSON.parse(text) as {
+                untuned: { rows: Array<Record<string, unknown>> };
+              };
+              return {
+                ok: true,
+                text: JSON.stringify({
+                  ...v,
+                  untuned: {
+                    ...v.untuned,
+                    rows: v.untuned.rows.map((r) => ({ ...r, live: bad })),
+                  },
+                }),
+              };
+            },
+          },
+        ),
+      });
+      const x = station(doc, "alpha").streams.find(
+        (y) => y.stream === "chatter",
+      );
+      assert.equal(x?.live, null, String(bad));
+      assert.ok(
+        gapNames(doc).includes("row_unparsed"),
+        JSON.stringify(doc.deck.gaps),
+      );
+      assert.equal(station(doc, "alpha").streams_known, "partial");
+    } finally {
+      s.dispose();
+    }
+  }
+});
+
+test("house-export coverage: an untuned row with an unreadable age or name is row_unparsed", async () => {
+  const edits: Array<
+    [string, (r: Record<string, unknown>) => Record<string, unknown>]
+  > = [
+    ["age", (r) => ({ ...r, newestAgeS: "3" })],
+    ["station", (r) => ({ ...r, station: 7 })],
+  ];
+  for (const [what, edit] of edits) {
+    const s = setup();
+    try {
+      const { doc } = await run(s, undefined, {
+        request: guideDaemon(
+          view({ untuned: [item({ station: "alpha", stream: "chatter" })] }),
+          {
+            page: (_n, text) => {
+              const v = JSON.parse(text) as {
+                untuned: { rows: Array<Record<string, unknown>> };
+              };
+              return {
+                ok: true,
+                text: JSON.stringify({
+                  ...v,
+                  untuned: { ...v.untuned, rows: v.untuned.rows.map(edit) },
+                }),
+              };
+            },
+          },
+        ),
+      });
+      assert.ok(
+        gapNames(doc).includes("row_unparsed"),
+        `${what}: ${JSON.stringify(doc.deck.gaps)}`,
+      );
+      if (what === "age") {
+        assert.equal(
+          station(doc, "alpha").streams.find((x) => x.stream === "chatter")
+            ?.live,
+          null,
+        );
+      }
+    } finally {
+      s.dispose();
+    }
+  }
+});
+
+test("house-export coverage: a guide presence word that disagrees with a steady status table is unknown and partial", async () => {
+  const s = setup();
+  try {
+    const { doc } = await run(s, undefined, {
+      request: guideDaemon(
+        view({ stations: [{ name: "ops", presence: "UNOBSERVABLE" }] }),
+        {
+          status: {
+            source: "host-daemon",
+            stations: { ops: "EQUIPPED_SPEAKING", alpha: "EQUIPPED_QUIET" },
+          },
+        },
+      ),
+    });
+    assert.equal(station(doc, "ops").presence, "unknown");
+    assert.equal(station(doc, "ops").streams_known, "partial");
+    assert.ok(
+      gapNames(doc).includes("presence_disagrees"),
+      JSON.stringify(doc.deck.gaps),
+    );
+    assert.ok(
+      !gapNames(doc).includes("presence_changed"),
+      "the table itself held steady",
+    );
+    assert.equal(station(doc, "alpha").streams_known, "complete");
   } finally {
     s.dispose();
   }

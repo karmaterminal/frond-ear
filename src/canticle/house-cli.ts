@@ -24,6 +24,11 @@
 //   looks (the guide's read of delivery modes purges attention rows whose TTL had already
 //   lapsed, as every such read does); it starts, stops and writes nothing itself.
 //   `--offline` skips the daemon.
+// - Known limit (🌿 round 4): the walk is checked by a re-walk and a second status read,
+//   so a change that happens and reverts between those reads (a row swapped and swapped
+//   back, a word flipped and flipped back) is invisible to any client re-read. Only a
+//   generation token on the guide, bumped on every change to what it lists, would close
+//   that; it is a frond-ear follow-up, not built here.
 
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
@@ -336,6 +341,7 @@ const WALK_BREAKS = new Set([
  * board; a row's own omissions or coverage hole make only that row's station partial.
  */
 const NOT_COVERAGE = new Set([
+  "presence_changed",
   "presence_disagrees",
   "ear_muted",
   "row_local_omissions",
@@ -550,6 +556,22 @@ async function readDaemon(
             continue;
           }
           kept.add(rowKey(row));
+          // The same row checks as a tuned row's (🌿 round 4): a name that isn't one, or a
+          // live count or age that isn't a count, is row_unparsed, and the count unknown.
+          if (
+            typeof row.station !== "string" ||
+            typeof row.stream !== "string"
+          ) {
+            gap("row_unparsed");
+            continue;
+          }
+          const ageOk =
+            row.newestAgeS === null || count(row.newestAgeS) !== null;
+          if (count(row.live) === null || !ageOk) {
+            gap("row_unparsed");
+            badCounts.add(rowKey(row));
+            rowGaps.add(row.station);
+          }
           if (!untunedSeen.has(rowKey(row))) {
             untunedSeen.add(rowKey(row));
             untuned.push(row);
@@ -644,6 +666,7 @@ async function readDaemon(
   for (const [name, n] of guideGaps) gap(name, n);
   // The presence table is read again too, and compared by station names; a changed word
   // is a reading in time, not a change in what the walk covers.
+  const flipped = new Set<string>();
   if (!broken && !truncated && !changed) {
     const after = await ask({ type: "status" }).catch(() => undefined);
     let names: string[] | undefined;
@@ -653,6 +676,12 @@ async function readDaemon(
           ?.stations,
       );
       names = stations === undefined ? undefined : Object.keys(stations).sort();
+      // A word that flips between the two reads (🌿 round 4) is no answer: that station
+      // reads unknown, named presence_changed, never the first word alone.
+      for (const [name, word] of Object.entries(stations ?? {})) {
+        const before = presence.get(name);
+        if (before !== undefined && word !== before) flipped.add(name);
+      }
     } catch {
       names = undefined;
     }
@@ -672,6 +701,11 @@ async function readDaemon(
     if (typeof word !== "string" || !presence.has(station)) continue;
     if (word !== presence.get(station)) disagree.add(station);
   }
+  for (const station of flipped) {
+    presence.set(station, "unknown");
+    rowGaps.add(station);
+  }
+  if (flipped.size > 0) gap("presence_changed", flipped.size);
   for (const station of disagree) {
     presence.set(station, "unknown");
     rowGaps.add(station);
@@ -791,7 +825,6 @@ export function houseExport(input: {
     for (const row of [...daemon.rows, ...daemon.untuned]) {
       if (!named(row.station)) continue;
       const st = building(row.station);
-      if (daemon.rowGaps.has(row.station)) st.lost = true;
       if (typeof row.verification === "string") {
         if (!VERIFICATION_WORDS.has(row.verification)) {
           gaps.set(
@@ -813,6 +846,14 @@ export function houseExport(input: {
     }
   }
   const live = daemon.kind === "daemon";
+  // A station-level hole (a row's, a presence word that disagreed or flipped) makes that
+  // station partial whether or not any row of it was read.
+  if (daemon.kind === "daemon") {
+    for (const name of daemon.rowGaps) {
+      const st = stations.get(name);
+      if (st !== undefined) st.lost = true;
+    }
+  }
   // Complete only when the walk read every page whole and the guide named no coverage gap:
   // a gap the guide says is unknown stays unknown here (🌿 F1).
   const coverageGap = [...gaps.keys()].some((name) => !NOT_COVERAGE.has(name));
