@@ -459,6 +459,7 @@ async function readDaemon(
   const first = canticleOf(canticle, ear);
   let canticleState: CanticleState = first.state;
   let guideSaid: "on" | "off" | undefined;
+  let guideTunesNothing = false;
   if (first.state === "on" && canticle?.source !== "host-daemon")
     gap("untuned_partial_source");
   const rows: Array<Record<string, unknown>> = [];
@@ -562,12 +563,16 @@ async function readDaemon(
           listener = "canticle off";
           guideSaid = "off";
         } else if (
-          !(
-            pass === 0 &&
-            page === 0 &&
-            /^canticle: this ear tunes no station:stream/u.test(result.text)
-          )
+          pass === 0 &&
+          page === 0 &&
+          /^canticle: this ear tunes no station:stream/u.test(result.text)
         ) {
+          // A plain success, and an observed fact (🌫 at 1b89902e): canticle is on and the
+          // applied tuning is empty. Empty tuning, not empty air: a tuned ear with nothing on
+          // air answers rows [] instead.
+          guideSaid = "on";
+          guideTunesNothing = true;
+        } else {
           gap("page_unparsed");
           broken = passBroken = true;
         }
@@ -830,6 +835,15 @@ async function readDaemon(
   for (const [key, lists] of listedAs)
     if (lists.size > 1) tunedUnknown.add(key);
   if (tunedUnknown.size > 0) gap("tuned_changed", tunedUnknown.size);
+  // The guide said this ear tunes nothing: an applied tune with any pattern disagrees.
+  if (
+    appliedTune !== undefined &&
+    guideTunesNothing &&
+    appliedTune.length > 0
+  ) {
+    gap("applied_tune_disagrees");
+    appliedTune = undefined;
+  }
   if (appliedTune !== undefined) {
     const tune = appliedTune;
     const disagrees = [...listedAs].some(([key, lists]) => {

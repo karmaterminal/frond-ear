@@ -3267,3 +3267,150 @@ test("house-export coverage: a second status read with canticle on but no presen
     s.dispose();
   }
 });
+
+// 🌫 at 1b89902e: the guide's plain "this ear tunes no station:stream" is an observed fact
+// (canticle on, the applied tuning empty), reconciled like any other.
+test("house-export scope: 🌫's repro: both status reads say a wildcard, the guide says it tunes nothing: the wildcard leaves may_read", async () => {
+  const s = setup({}, undefined, { tune: ["*:ops.fleet"] }); // daemon A: both status reads
+  const raw = JSON.parse(readFile(s.env.FROND_EAR_CONFIG!, "utf8")) as Record<
+    string,
+    unknown
+  >;
+  let hostB: Host | undefined;
+  const b = harness(parseConfig(raw), {
+    canticleGuide: () => hostB!.guideView(),
+  });
+  try {
+    hostB = new Host(b.clock, []); // daemon B tunes nothing, and nothing is on air untuned
+    hostB.start();
+    const cliB = b.attach(undefined, { role: "cli" });
+    let id = 7_000;
+    const { doc } = await run(s, undefined, {
+      request: async (message) => {
+        if (message.type === "status") return s.request(message);
+        const at = ++id;
+        await cliB.send({ ...message, id: at } as never);
+        const r = cliB.connection.results().find((x) => x.id === at)!;
+        assert.match(
+          r.text,
+          /tunes no station:stream/u,
+          "the guide's own plain reply",
+        );
+        return { ok: r.ok, text: r.text };
+      },
+    });
+    assert.ok(
+      gapNames(doc).includes("applied_tune_disagrees"),
+      JSON.stringify(doc.deck.gaps),
+    );
+    assert.deepEqual(
+      doc.reader.may_read,
+      [],
+      "the disputed wildcard never reaches may_read",
+    );
+    assert.deepEqual(doc.reader.basis.may_read_observed, ["*:ops.fleet"]);
+    assert.equal(doc.reader.may_read_complete, false);
+  } finally {
+    b.dispose();
+    s.dispose();
+  }
+});
+
+test("house-export scope: the helper's repro: status disabled around a guide that says it tunes nothing: contradicts, unknown, never off", async () => {
+  const s = setup();
+  try {
+    const { doc } = await run(s, undefined, {
+      request: async (message) =>
+        message.type === "status"
+          ? {
+              ok: true,
+              text: JSON.stringify({ canticle: { state: "disabled" } }),
+            }
+          : {
+              ok: true,
+              text: "canticle: this ear tunes no station:stream (config canticle.tune).",
+            },
+    });
+    assert.ok(
+      gapNames(doc).includes("canticle_state_contradicts"),
+      JSON.stringify(doc.deck.gaps),
+    );
+    assert.equal(doc.reader.payload_text, null);
+    assert.ok(!gapNames(doc).includes("canticle_off"));
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export scope: control: empty air is not empty tuning: a tuned ear with nothing on air keeps its applied tune", async () => {
+  const s = setup();
+  try {
+    const { doc } = await run(s); // nothing sung: the guide answers rows [], not "tunes no"
+    assert.ok(
+      !gapNames(doc).includes("applied_tune_disagrees"),
+      JSON.stringify(doc.deck.gaps),
+    );
+    assert.deepEqual(doc.reader.may_read, TUNE);
+    assert.equal(doc.reader.may_read_complete, true);
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export scope: a daemon that says it tunes nothing, beside an empty applied tune, agrees", async () => {
+  const s = setup({}, undefined, { tune: [] });
+  try {
+    const { doc } = await run(s);
+    assert.ok(
+      !gapNames(doc).includes("applied_tune_disagrees"),
+      JSON.stringify(doc.deck.gaps),
+    );
+    assert.deepEqual(doc.reader.may_read, []);
+    assert.equal(doc.reader.payload_text, true);
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export coverage: a first page that is neither JSON nor one of the guide's plain answers is unparsed, never empty tuning", async () => {
+  const s = setup();
+  try {
+    const { doc } = await run(s, undefined, {
+      request: guideDaemon(view(), {
+        page: (n, text) =>
+          n === 0 ? { ok: true, text: "something else" } : { ok: true, text },
+      }),
+    });
+    assert.ok(
+      gapNames(doc).includes("page_unparsed"),
+      JSON.stringify(doc.deck.gaps),
+    );
+    assert.ok(!gapNames(doc).includes("applied_tune_disagrees"));
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export coverage: the plain no-tune reply on a later page is a broken walk, not a fact", async () => {
+  const s = setup();
+  try {
+    const { doc } = await run(s, undefined, {
+      request: guideDaemon(view({ items: manyItems() }), {
+        page: (n, text) =>
+          n === 1
+            ? {
+                ok: true,
+                text: "canticle: this ear tunes no station:stream (config canticle.tune).",
+              }
+            : { ok: true, text },
+      }),
+    });
+    assert.ok(
+      gapNames(doc).includes("page_unparsed"),
+      JSON.stringify(doc.deck.gaps),
+    );
+    assert.equal(doc.deck.walk, "partial");
+  } finally {
+    s.dispose();
+  }
+});
