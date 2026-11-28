@@ -108,6 +108,8 @@ usage:
                                       may_read) and a deck of stations and streams, tuned and untuned, from the
                                       manifest and the daemon's status and canticle_guide; --offline asks the
                                       daemon nothing. Names and state words only: no payload text, key, id or path
+  frond-ear house-export --gap-names   print every name deck.gaps can carry, and which way each pushes (board held,
+                                      walk broken, not coverage), as JSON a reader holds its own table to
   frond-ear inject --chat <id> --author <id> [--guild <id>] [--name <n>] [--bot] [--mention] <text…>
                                       push a synthetic MESSAGE_CREATE (dry-run or FROND_EAR_ALLOW_INJECT=1)
   frond-ear connector-echo [--public-url https://<host>] [--auth none|bearer|oauth] …
