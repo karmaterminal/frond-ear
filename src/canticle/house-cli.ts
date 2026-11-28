@@ -190,7 +190,10 @@ interface Building {
   presence: string | null;
   verification: string | null;
   manifestStreams: Set<string> | undefined;
-  streams: Map<string, { live: number; newestAgeMs: number | null }>;
+  streams: Map<
+    string,
+    { live: number; newestAgeMs: number | null; rowSeen: boolean }
+  >;
   /** A stream of this station was withheld, so its list is partial. */
   lost: boolean;
 }
@@ -298,8 +301,12 @@ const GAP_LINES: ReadonlyArray<[RegExp, string]> = [
   [/^coverage unknown:/u, "coverage_unknown"],
 ];
 
-/** Gaps that hold the board empty: nothing on it is a count, so `live` is unknown. */
+/**
+ * Gaps that hold the board empty, or might: nothing on it is a count, so `live` is
+ * unknown. A gap line it doesn't know is taken as the worst.
+ */
 const BOARD_EMPTY = new Set([
+  "unrecognized_gap",
   "ended",
   "not_listening",
   "host_mute",
@@ -308,6 +315,7 @@ const BOARD_EMPTY = new Set([
 /** Gaps in the walk itself: the guide wasn't read whole, or didn't add up. */
 const WALK_BREAKS = new Set([
   "changed_mid_walk",
+  "row_unparsed",
   "page_unparsed",
   "page_refused",
   "row_count_mismatch",
@@ -377,6 +385,9 @@ async function readDaemon(
   let truncated = false;
   let broken = false;
   const guideGaps = new Map<string, number>();
+  const untunedSeen = new Set<string>();
+  let unreadableRows = 0;
+  let untunedUnlisted = false;
   let firstSignature: string | undefined;
   let changed = false;
   for (let page = 0; ; page++) {
@@ -461,29 +472,50 @@ async function readDaemon(
     if (page === 0) {
       claimed = streams ?? undefined;
       if (streams === null) gap("row_count_mismatch");
-      if (u === undefined) gap("untuned_unlisted");
-      else {
-        const listed = Array.isArray(u.rows) ? u.rows : [];
-        const more = count(u.more) ?? 0;
-        const kept = new Set<string>();
-        for (const raw of listed) {
-          const row = obj(raw);
-          if (row === undefined || kept.has(rowKey(row))) {
-            gap("untuned_count_mismatch");
-            continue;
-          }
-          kept.add(rowKey(row));
+    } else if (streams !== claimed) gap("row_count_mismatch");
+    // The untuned list comes on every page (🌿 round 2): each page's rows are kept, once
+    // each, and the most any page said was past its list stands.
+    if (u === undefined) {
+      if (!untunedUnlisted) gap("untuned_unlisted");
+      untunedUnlisted = true;
+    } else {
+      const listed = Array.isArray(u.rows) ? u.rows : [];
+      const more = count(u.more);
+      const kept = new Set<string>();
+      for (const raw of listed) {
+        const row = obj(raw);
+        if (row === undefined || kept.has(rowKey(row))) {
+          gap("untuned_count_mismatch");
+          continue;
+        }
+        kept.add(rowKey(row));
+        if (!untunedSeen.has(rowKey(row))) {
+          untunedSeen.add(rowKey(row));
           untuned.push(row);
         }
-        untunedMore = more;
-        if (count(u.streams) !== listed.length + more)
-          gap("untuned_count_mismatch");
       }
-    } else if (streams !== claimed) gap("row_count_mismatch");
+      if (more === null && u.more !== undefined) gap("untuned_count_mismatch");
+      untunedMore = Math.max(untunedMore, more ?? 0);
+      if (count(u.streams) !== listed.length + (more ?? 0))
+        gap("untuned_count_mismatch");
+    }
     for (const raw of view.rows) {
       const row = obj(raw);
       if (row === undefined) {
         gap("page_unparsed");
+        continue;
+      }
+      // A row it can't read is counted and breaks the walk, never left out quietly.
+      const unreadable =
+        typeof row.station !== "string" ||
+        typeof row.stream !== "string" ||
+        (row.localOmissions !== undefined &&
+          obj(row.localOmissions) === undefined) ||
+        (row.coverageUnknown !== undefined &&
+          obj(row.coverageUnknown) === undefined);
+      if (unreadable) {
+        gap("row_unparsed");
+        unreadableRows += 1; // a row the guide gave: it counts toward its total
         continue;
       }
       if (seen.has(rowKey(row))) {
@@ -508,7 +540,7 @@ async function readDaemon(
     !broken &&
     !truncated &&
     claimed !== undefined &&
-    rows.length !== claimed
+    rows.length + unreadableRows !== claimed
   ) {
     gap("row_count_mismatch");
   }
@@ -587,7 +619,7 @@ export function houseExport(input: {
     }
     let s = st.streams.get(stream);
     if (s === undefined) {
-      s = { live: 0, newestAgeMs: null };
+      s = { live: 0, newestAgeMs: null, rowSeen: false };
       st.streams.set(stream, s);
     }
     return s;
@@ -640,6 +672,7 @@ export function houseExport(input: {
       const s = addStream(st, row.station, row.stream);
       if (s === undefined) continue;
       s.live += count(row.live) ?? 0;
+      s.rowSeen = true;
       const age = count(row.newestAgeS);
       if (age !== null)
         s.newestAgeMs = Math.min(s.newestAgeMs ?? Infinity, age * 1_000);
@@ -666,8 +699,13 @@ export function houseExport(input: {
           stream,
           tuned: tunes(patterns, name, stream),
           admitted: st.manifestStreams?.has(stream) === true ? true : null,
-          live: live && !boardEmpty ? s.live : null,
-          newest_age_ms: live && !boardEmpty ? s.newestAgeMs : null,
+          // A stream no row reached is 0 only when the deck vouches for the whole board;
+          // otherwise it is unknown (🌿 round 2), and a row it read keeps its count.
+          live: live && !boardEmpty && (s.rowSeen || complete) ? s.live : null,
+          newest_age_ms:
+            live && !boardEmpty && (s.rowSeen || complete)
+              ? s.newestAgeMs
+              : null,
         })),
     }));
 

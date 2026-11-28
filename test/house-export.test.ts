@@ -1550,3 +1550,203 @@ test("house-export coverage: a later page's listening never hides an earlier pag
     s.dispose();
   }
 });
+
+// 🌿 round 2 on #147 (his helper's repros): the untuned list counts from every page, and
+// what the walk didn't reach, or can't vouch for, is unknown rather than 0.
+const manyItems = () =>
+  Array.from({ length: 150 }, (_, i) =>
+    item({ stream: `s${String(i).padStart(3, "0")}`, seq: String(i) }),
+  );
+
+test("house-export coverage: 🌿's repro: page 2's untuned list reporting 43 more is kept, and the deck is partial", async () => {
+  const s = setup();
+  try {
+    const { doc } = await run(s, undefined, {
+      request: guideDaemon(view({ items: manyItems() }), {
+        page: (n, text) => {
+          if (n !== 1) return { ok: true, text };
+          const v = JSON.parse(text) as Record<string, unknown>;
+          return {
+            ok: true,
+            text: JSON.stringify({
+              ...v,
+              untuned: {
+                streams: 44,
+                rows: [
+                  {
+                    station: "alpha",
+                    stream: "chatter",
+                    tuned: false,
+                    classes: ["advisory"],
+                    live: 1,
+                    newestAgeS: 3,
+                    verification: "verified",
+                  },
+                ],
+                more: 43,
+              },
+            }),
+          };
+        },
+      }),
+    });
+    assert.equal(doc.deck.left_out.untuned_more, 43);
+    assert.equal(doc.deck.walk, "partial");
+    assert.ok(allPartial(doc));
+    // The row page 2 listed is kept too.
+    assert.equal(
+      station(doc, "alpha").streams.find((x) => x.stream === "chatter")?.live,
+      1,
+    );
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export coverage: a stream no row reached reads live unknown when the deck can't vouch for it", async () => {
+  const s = setup();
+  try {
+    const { doc } = await run(s, undefined, {
+      request: guideDaemon(view({ items: manyItems() }), {
+        page: (n, text) =>
+          n === 1 ? { ok: true, text: "not json" } : { ok: true, text },
+      }),
+    });
+    assert.equal(doc.deck.walk, "partial");
+    assert.equal(
+      station(doc, "alpha").streams.find((x) => x.stream === "chatter")?.live,
+      null,
+      "never reached: unknown, not 0",
+    );
+    assert.equal(
+      station(doc, "ops").streams.find((x) => x.stream === "s000")?.live,
+      1,
+      "a row it read keeps its count",
+    );
+  } finally {
+    s.dispose();
+  }
+  const clean = setup();
+  try {
+    const { doc } = await run(clean, undefined, {
+      request: guideDaemon(view()),
+    });
+    assert.equal(
+      station(doc, "alpha").streams.find((x) => x.stream === "chatter")?.live,
+      0,
+      "a whole walk vouches for nothing on air",
+    );
+  } finally {
+    clean.dispose();
+  }
+});
+
+test("house-export coverage: a row it can't read is counted and breaks the walk, never vanishes", async () => {
+  const bad: Array<
+    [string, (r: Record<string, unknown>) => Record<string, unknown>]
+  > = [
+    ["station not a string", (r) => ({ ...r, station: 7 })],
+    ["stream not a string", (r) => ({ ...r, stream: null })],
+    ["localOmissions not an object", (r) => ({ ...r, localOmissions: 3 })],
+    [
+      "coverageUnknown not an object",
+      (r) => ({ ...r, coverageUnknown: "yes" }),
+    ],
+  ];
+  for (const [what, edit] of bad) {
+    const s = setup();
+    try {
+      const { doc } = await run(s, undefined, {
+        request: guideDaemon(view(), {
+          page: (_n, text) => {
+            const v = JSON.parse(text) as {
+              rows: Array<Record<string, unknown>>;
+            };
+            return {
+              ok: true,
+              text: JSON.stringify({ ...v, rows: v.rows.map(edit) }),
+            };
+          },
+        }),
+      });
+      assert.ok(
+        gapNames(doc).includes("row_unparsed"),
+        `${what}: ${JSON.stringify(doc.deck.gaps)}`,
+      );
+      assert.equal(doc.deck.walk, "partial", what);
+      assert.ok(allPartial(doc), what);
+    } finally {
+      s.dispose();
+    }
+  }
+});
+
+test("house-export coverage: under a gap line it doesn't know, counts are unknown, never shown as measured", async () => {
+  const s = setup();
+  try {
+    const { doc } = await run(s, undefined, {
+      request: guideDaemon(view(), {
+        page: (_n, text) => {
+          const v = JSON.parse(text) as Record<string, unknown>;
+          return {
+            ok: true,
+            text: JSON.stringify({ ...v, gaps: ["a gap from a newer guide"] }),
+          };
+        },
+      }),
+    });
+    assert.ok(
+      doc.deck.stations.every((st) => st.streams.every((x) => x.live === null)),
+    );
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export coverage: an untuned row every page repeats is counted once", async () => {
+  const s = setup();
+  try {
+    const { doc } = await run(s, undefined, {
+      request: guideDaemon(
+        view({
+          items: manyItems(),
+          untuned: [item({ station: "alpha", stream: "chatter" })],
+        }),
+      ),
+    });
+    assert.equal(
+      station(doc, "alpha").streams.find((x) => x.stream === "chatter")?.live,
+      1,
+      "1, not 2",
+    );
+    assert.equal(doc.deck.walk, "complete");
+  } finally {
+    s.dispose();
+  }
+});
+
+test("house-export coverage: an unreadable row alone breaks the walk: it still counts toward the guide's total", async () => {
+  const s = setup();
+  try {
+    const { doc } = await run(s, undefined, {
+      request: guideDaemon(view(), {
+        page: (_n, text) => {
+          const v = JSON.parse(text) as {
+            rows: Array<Record<string, unknown>>;
+          };
+          return {
+            ok: true,
+            text: JSON.stringify({
+              ...v,
+              rows: v.rows.map((r) => ({ ...r, stream: 9 })),
+            }),
+          };
+        },
+      }),
+    });
+    assert.deepEqual(doc.deck.gaps, [{ name: "row_unparsed", count: 1 }]);
+    assert.equal(doc.deck.walk, "partial");
+  } finally {
+    s.dispose();
+  }
+});
